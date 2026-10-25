@@ -1363,8 +1363,15 @@ guard_confirm() {
   shift 2
   while :; do
     remaining=$((deadline - SECONDS))
-    ((remaining > 0)) || return 1
-    if (($#)) && "$@"; then ok '已在系统日志里看到新窗口登录成功，自动确认。'; break; fi
+    # prompt=0 means the prompt is on screen without a newline yet.
+    if ((remaining <= 0)); then
+      if ((prompt == 0)); then printf '\n'; fi
+      return 1
+    fi
+    if (($#)) && "$@"; then
+      if ((prompt == 0)); then printf '\n'; fi
+      ok '已在系统日志里看到新窗口登录成功，自动确认。'; break
+    fi
     if ((prompt)); then
       printf '等待确认（剩余 %s 秒）：新窗口登录成功后这里会自动确认；没有自动确认时，在【这个窗口】输入 CONNECTED 并回车；新窗口登录失败就在这里输入 n，立即恢复: ' "$remaining"
       prompt=0
@@ -1382,7 +1389,7 @@ guard_confirm() {
       prompt=1
     else
       rc=$?
-      ((rc > 128)) || return 1
+      if ((rc <= 128)); then printf '\n'; return 1; fi
     fi
   done
   # Confirmed: cancel the timer and any start job it already queued for its
@@ -1783,7 +1790,8 @@ ssh_harden_stage() {
   fi
   if [[ "$(ssh_effective_value "$effective" pubkeyauthentication)" != yes ]]; then
     # Some provider images ship password-only SSH; show where it is set.
-    warn "SSH 没有开启公钥登录（当前生效：PubkeyAuthentication $(ssh_effective_value "$effective" pubkeyauthentication || true)）；不修改。"
+    detail="$(ssh_effective_value "$effective" pubkeyauthentication || true)"
+    warn "SSH 没有开启公钥登录（当前生效：PubkeyAuthentication ${detail:-未知}）；不修改。"
     detail="$(grep -RHin '^[[:space:]]*PubkeyAuthentication' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | head -n 5 || true)"
     if [[ -n "$detail" ]]; then printf '设置它的位置：\n%s\n' "$detail"; fi
     module_result ssh skipped 'pubkey auth disabled'; return 0
