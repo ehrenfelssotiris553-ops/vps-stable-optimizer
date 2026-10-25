@@ -6,7 +6,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_key_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_harden_stage
+load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_key_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey ssh_harden_stage
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -72,6 +72,9 @@ confirm_yes() {
 confirm() {
   case "$2" in KEYOK) ((KEYOK)) ;; SUDOOK) ((SUDOOK)) ;; NOCONSOLE) ((NOCONSOLE)) ;; *) fail "unexpected confirmation $2" ;; esac
 }
+confirm_default_yes() {
+  case "$1" in *公钥登录*) record 'ask pubkey'; ((ENABLE_PUBKEY)) ;; *) fail "unexpected Y/n question: $1" ;; esac
+}
 guard_leftovers() { return 1; }
 guard_arm() { record "arm $1"; }
 guard_confirm() { ((GUARD_OK)); }
@@ -114,14 +117,16 @@ journalctl() {
   elif ((SEEN)); then echo "Accepted publickey for $TARGET from 203.0.113.9 port 4 ssh2: ED25519 SHA256:x"; fi
 }
 sshd() {
-  local pa=yes root=yes spec="${3:-}"
+  local pa=yes root=yes pub=yes spec="${3:-}"
   case "$1" in
     -t) return "$SSHD_T_RC" ;;
     -T)
       if ((ALREADY_OFF)) || [[ -f "$SSH_DROPIN" && "$DROPIN_WINS" == 1 ]]; then pa=no; fi
+      # Provider image with "PubkeyAuthentication no"; our 00- drop-in can win.
+      if ((PUBKEY_OFF)); then pub=no; if [[ -f "$SSH_PUBKEY_DROPIN" ]] && ((PUBKEY_WINS)); then pub=yes; fi; fi
       if [[ -f "$SSH_DROPIN" && "$ROOT_WINS" == 1 ]] && grep -Fxq 'PermitRootLogin no' "$SSH_DROPIN"; then root=no; fi
       if [[ "$spec" != user=root,* ]]; then root=yes; [[ -f "$SSH_DROPIN" ]] && grep -Fxq 'PermitRootLogin no' "$SSH_DROPIN" && ((ROOT_WINS)) && root=no; fi
-      printf 'passwordauthentication %s\nkbdinteractiveauthentication %s\npermitrootlogin %s\npubkeyauthentication yes\nauthenticationmethods any\nauthorizedkeysfile %s\n' "$pa" "$pa" "$root" "$AKF" ;;
+      printf 'passwordauthentication %s\nkbdinteractiveauthentication %s\npermitrootlogin %s\npubkeyauthentication %s\nauthenticationmethods any\nauthorizedkeysfile %s\n' "$pa" "$pa" "$root" "$pub" "$AKF" ;;
     *) fail "unexpected sshd $*" ;;
   esac
 }
@@ -135,6 +140,8 @@ new_case() {
   GROUPS_OF=([alice]=' sudo')
   PW=([alice]=P [root]=L)
   SSH_DROPIN="$CASE/sshd_config.d/01-vps-stable-keyonly.conf"
+  SSH_PUBKEY_DROPIN="$CASE/sshd_config.d/00-vps-stable-pubkey.conf"
+  PUBKEY_OFF=0 PUBKEY_WINS=1 ENABLE_PUBKEY=1
   MODE=ssh SUDO_USER=alice LOGIN=alice TARGET=alice SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22'
   SSH_CHOICE='' ADMIN_CHOICE=0 ADMIN_NAME=''
   ADD_MORE=0 KEYOK=0 SUDOOK=0 NOCONSOLE=0 SET_PW=0 GUARD_OK=1 SEEN=1 SUDO_SEEN=1 HOME_SAFE=1
@@ -256,4 +263,27 @@ ssh-keygen -q -t ed25519 -N '' -C 'second key' -f "$TEST_ROOT/id_second" >/dev/n
 printf '\n%s\n\n' "$(cat "$TEST_ROOT/id_second.pub")" > "$CASE/input"
 ssh_harden_stage < "$CASE/input"
 [[ "$(grep -c . "$(auth_file)")" == 2 ]] || fail 'second key merged into the unterminated first line'
-printf 'PASS: SSH hardening: admin account, root login, console guard, key import as the account, evidence and timeout revert.\n'
+# Provider image with "PubkeyAuthentication no": key login is turned on first
+# (password login untouched), then hardening continues as usual.
+new_case pubkey_off_enabled
+PUBKEY_OFF=1
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+grep -Fxq 'ask pubkey' "$CASE/trace" || fail 'enabling key login was not offered'
+grep -Fxq 'PubkeyAuthentication yes' "$SSH_PUBKEY_DROPIN" || fail 'key login drop-in missing'
+[[ -f "$SSH_DROPIN" ]] || fail 'hardening did not continue after enabling key login'
+[[ "$(grep -c '^reload$' "$CASE/trace")" == 2 ]] || fail 'sshd not reloaded for key login and for key-only login'
+grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail 'applied result missing after enabling key login'
+
+new_case pubkey_off_declined
+PUBKEY_OFF=1 ENABLE_PUBKEY=0
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+[[ ! -e "$SSH_PUBKEY_DROPIN" && ! -e "$SSH_DROPIN" ]] || fail 'SSH changed although enabling key login was declined'
+grep -Fxq 'result ssh declined pubkey auth left disabled' "$CASE/trace" || fail 'declined key login not recorded'
+
+new_case pubkey_off_overridden
+PUBKEY_OFF=1 PUBKEY_WINS=0
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+[[ ! -e "$SSH_PUBKEY_DROPIN" && ! -e "$SSH_DROPIN" ]] || fail 'an ineffective key login drop-in was kept'
+grep -q '^result ssh failed' "$CASE/trace" || fail 'ineffective key login drop-in not reported'
+if grep -Fxq reload "$CASE/trace"; then fail 'sshd reloaded for an ineffective setting'; fi
+printf 'PASS: SSH hardening: admin account, root login, console guard, key import as the account, evidence, timeout revert and key login turned on first.\n'

@@ -169,7 +169,15 @@ timezone_ask < "$TEST_ROOT/tz-input"
 grep -Fq 'Asia/Shanghai' "$TEST_ROOT/log" || fail 'no suggestion for a partial timezone name'
 printf '\n' > "$TEST_ROOT/tz-input"; timezone_ask < "$TEST_ROOT/tz-input"
 [[ -z "$TZ_CHOICE" ]] || fail 'Enter did not keep the timezone'
-printf 'PASS: timezone lookup with suggestions.\n'
+# Common zones are offered by number: 1 is Asia/Shanghai, 2 Asia/Hong_Kong.
+printf '1\n' > "$TEST_ROOT/tz-input"; timezone_ask < "$TEST_ROOT/tz-input" > "$TEST_ROOT/tz-menu"
+[[ "$TZ_CHOICE" == Asia/Shanghai ]] || fail 'menu number 1 did not choose Asia/Shanghai'
+grep -Fq '北京时间' "$TEST_ROOT/tz-menu" || fail 'common timezone list not shown'
+printf '02\n' > "$TEST_ROOT/tz-input"; timezone_ask < "$TEST_ROOT/tz-input" > /dev/null
+[[ "$TZ_CHOICE" == Asia/Hong_Kong ]] || fail 'a leading zero broke the menu number'
+printf '99\nEurope/London\n' > "$TEST_ROOT/tz-input"; timezone_ask < "$TEST_ROOT/tz-input" > /dev/null
+[[ "$TZ_CHOICE" == Europe/London ]] || fail 'an out-of-range number was not asked again'
+printf 'PASS: timezone lookup with a numbered list of common zones and suggestions.\n'
 
 # Confirmation words explain near misses instead of silently cancelling.
 if ! [[ -t 0 ]]; then

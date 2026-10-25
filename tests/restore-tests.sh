@@ -25,6 +25,7 @@ F2B_DIR="$TMP/f2b"
 F2B_FILE="$F2B_DIR/jail.d/99-vps-stable-sshd.local"
 F2B_ACTION_FILE="$F2B_DIR/action.d/vps-stable-ufw-sshd.conf"
 SSH_DROPIN="$TMP/ssh/01-vps-stable-keyonly.conf"
+SSH_PUBKEY_DROPIN="$TMP/ssh/00-vps-stable-pubkey.conf"
 mkdir -p "$RESTORE_ROOT"
 chmod 700 "$STATE_ROOT" "$RESTORE_ROOT"
 ok() { printf '[OK] %s\n' "$*"; }
@@ -398,7 +399,26 @@ printf 'PASS: Fail2ban rollback unbans first, keeps shared actions and reloads a
   expect "$(cat "$TMP/ssh/trace")" reload
   expect "$(restore_read ssh_dropin state)" restored
 )
-printf 'PASS: SSH key-only drop-in rollback reloads sshd.\n'
+# Image that had key login off: both drop-ins go back, sshd reloads once.
+(
+  RESTORE_ROOT="$TMP/ssh2/restore-v2"
+  mkdir -p "$RESTORE_ROOT" "$TMP/ssh2"; chmod 700 "$RESTORE_ROOT"
+  SSH_DROPIN="$TMP/ssh2/01-vps-stable-keyonly.conf" SSH_PUBKEY_DROPIN="$TMP/ssh2/00-vps-stable-pubkey.conf"
+  RESTORE_PARTIAL=0
+  load_optimizer_functions restore_fingerprint
+  restore_snapshot ssh_dropin; restore_snapshot ssh_pubkey_dropin
+  printf 'PubkeyAuthentication yes\n' > "$SSH_PUBKEY_DROPIN"
+  printf 'PasswordAuthentication no\n' > "$SSH_DROPIN"
+  restore_mark ssh_dropin applied; restore_mark ssh_pubkey_dropin applied
+  ssh_reload() { printf 'reload\n' >> "$TMP/ssh2/trace"; }
+  restore_ssh_group > "$TMP/ssh2/out"
+  [[ ! -e "$SSH_DROPIN" && ! -e "$SSH_PUBKEY_DROPIN" ]] || die 'SSH drop-ins survived rollback'
+  expect "$(cat "$TMP/ssh2/trace")" reload
+  expect "$(restore_read ssh_pubkey_dropin state)" restored
+  grep -Fq '记得密码' "$TMP/ssh2/out" || die 'turning key login off again was not announced'
+  expect "$RESTORE_PARTIAL" 0
+)
+printf 'PASS: SSH drop-in rollback (key-only and key-login switch) reloads sshd once.\n'
 
 # sysctl originals: first value wins, only numeric values, restored after the file.
 (

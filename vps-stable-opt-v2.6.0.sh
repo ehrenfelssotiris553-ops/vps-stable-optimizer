@@ -23,6 +23,8 @@ SYSCTL_HARDENING_FILE=/etc/sysctl.d/98-vps-stable-hardening.conf
 F2B_ACTION_FILE=/etc/fail2ban/action.d/vps-stable-ufw-sshd.conf
 # sshd keeps the FIRST value it reads; 01- sorts before cloud-init's 50- file.
 SSH_DROPIN=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
+# Only written when a provider image ships "PubkeyAuthentication no".
+SSH_PUBKEY_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-pubkey.conf
 WARNINGS=0
 AUTO_UPDATES=0
 INSTALL_TOOLS=0
@@ -482,12 +484,23 @@ timezone_resolve() {
   printf '%s\n' "$match"
 }
 
+# Common zones are offered by number; any other zone name can still be typed.
 timezone_ask() {
-  local current answer zone suggestions tries
+  local current answer zone suggestions tries i
+  local -a common=(Asia/Shanghai Asia/Hong_Kong Asia/Taipei Asia/Tokyo Asia/Singapore
+    America/Los_Angeles America/New_York Europe/London Europe/Berlin Etc/UTC)
+  local -a labels=('中国（北京时间）' '香港' '台北' '日本' '新加坡'
+    '美国西部（洛杉矶）' '美国东部（纽约）' '英国（伦敦）' '德国等中欧国家' '世界协调时 UTC')
   current="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
   TZ_CHOICE=''
+  echo "时区（当前 ${current:-未知}），常用的有："
+  for i in "${!common[@]}"; do printf '  %2d. %-20s %s\n' "$((i + 1))" "${common[i]}" "${labels[i]}"; done
+  echo '  也可以直接输入其他时区名（格式 地区/城市，例如 Asia/Seoul）。'
   for ((tries = 0; tries < 3; tries++)); do
-    read -r -p "时区（当前 ${current:-未知}）：输入时区名修改，例如 Asia/Shanghai；直接回车保持不变: " answer || answer=''
+    read -r -p "请选择 [1-${#common[@]}，或输入时区名；直接回车保持不变]: " answer || answer=''
+    if [[ "$answer" =~ ^[0-9]{1,2}$ ]] && ((10#$answer >= 1 && 10#$answer <= ${#common[@]})); then
+      answer="${common[10#$answer - 1]}"
+    fi
     if [[ -z "$answer" || "$answer" == "$current" ]]; then return 0; fi
     if zone="$(timezone_resolve "$answer")"; then TZ_CHOICE="$zone"; return 0; fi
     suggestions=''
@@ -1733,6 +1746,25 @@ ssh_console_guard() {
   confirm '没有可用的控制台密码，仍要关闭 SSH 密码登录吗？' NOCONSOLE
 }
 
+# Some provider images ship "PubkeyAuthentication no". A drop-in that sshd
+# reads before the main file turns key login on; password login is untouched,
+# so this step cannot lock anyone out and needs no guard timer.
+ssh_enable_pubkey() {
+  local user="$1" effective
+  put_file "$SSH_PUBKEY_DROPIN" $'# VPS Stable Optimizer v2.6: allow SSH public key login\nPubkeyAuthentication yes' || return 1
+  if ! sshd -t; then
+    rm -f -- "$SSH_PUBKEY_DROPIN"; warn 'sshd -t 不接受开启公钥登录的配置，已删除。'; return 1
+  fi
+  effective="$(ssh_effective "$user")" || effective=''
+  if [[ "$(ssh_effective_value "$effective" pubkeyauthentication)" != yes ]]; then
+    rm -f -- "$SSH_PUBKEY_DROPIN"
+    warn '开启公钥登录的设置被更早读取的配置覆盖，没有生效，已撤销（请检查 /etc/ssh/sshd_config 开头是否有 Include /etc/ssh/sshd_config.d/*.conf）。'
+    return 1
+  fi
+  if ! ssh_reload; then warn 'sshd 重新加载失败；公钥登录还没有生效。'; return 1; fi
+  ok "已开启 SSH 公钥登录：$SSH_PUBKEY_DROPIN（密码登录照常可用）。"
+}
+
 ssh_harden_stage() {
   say '第13步：SSH 登录加固（可选）'
   local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail
@@ -1789,12 +1821,18 @@ ssh_harden_stage() {
     ok "$user 的 SSH 已经只允许密钥登录。"; module_result ssh present 'password login already disabled'; return 0
   fi
   if [[ "$(ssh_effective_value "$effective" pubkeyauthentication)" != yes ]]; then
-    # Some provider images ship password-only SSH; show where it is set.
+    # Some provider images ship password-only SSH: show where, then offer to
+    # turn key login on first (password login stays as it is).
     detail="$(ssh_effective_value "$effective" pubkeyauthentication || true)"
-    warn "SSH 没有开启公钥登录（当前生效：PubkeyAuthentication ${detail:-未知}）；不修改。"
+    warn "这台服务器关闭了 SSH 公钥登录（当前生效：PubkeyAuthentication ${detail:-未知}）。"
     detail="$(grep -RHin '^[[:space:]]*PubkeyAuthentication' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | head -n 5 || true)"
     if [[ -n "$detail" ]]; then printf '设置它的位置：\n%s\n' "$detail"; fi
-    module_result ssh skipped 'pubkey auth disabled'; return 0
+    echo '只允许密钥登录之前，要先开启公钥登录。这一步只是多一种登录方式，密码登录照常可用，不会把你锁在外面；原来的配置文件不改。'
+    if ! confirm_default_yes '现在开启 SSH 公钥登录吗？'; then
+      ok '保持原来的设置，SSH 加固没有继续。'; module_result ssh declined 'pubkey auth left disabled'; return 0
+    fi
+    if ! ssh_enable_pubkey "$user"; then module_result ssh failed 'could not enable pubkey auth'; return 0; fi
+    effective="$(ssh_effective "$user")" || { warn 'sshd -T -C 执行失败。'; module_result ssh failed 'sshd -T failed'; return 0; }
   fi
   if [[ "$(ssh_effective_value "$effective" authenticationmethods)" != any ]]; then
     warn '检测到自定义的 AuthenticationMethods（例如两步验证）；请人工配置 SSH。'; module_result ssh preserved 'custom AuthenticationMethods'; return 0
@@ -2570,7 +2608,7 @@ backup_config_group() {
 backup_configs() {
   local file unit
   say '保存配置快照与优化前状态'
-  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$SSH_DROPIN" \
+  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
       /etc/ssh/sshd_config /etc/default/ssh /etc/default/ufw \
       /etc/ufw/ufw.conf /etc/ufw/sysctl.conf /etc/ufw/before.rules /etc/ufw/before6.rules \
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
@@ -3229,7 +3267,7 @@ restore_ids() {
     timezone) printf '%s\n' tz ;;
     sysctl) printf '%s\n' sysctl_file ;;
     hosts) printf '%s\n' hosts_file ;;
-    ssh) printf '%s\n' ssh_dropin ;;
+    ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     firewall) printf '%s\n' ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw ;;
     fail2ban) printf '%s\n' f2b_jail f2b_action svc_fail2ban ;;
   esac
@@ -3237,7 +3275,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file zram_file zram_swap journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file ssh_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file zram_file zram_swap journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
 }
 
 restore_label() {
@@ -3249,7 +3287,7 @@ restore_label() {
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
     svc_apt_daily) echo 'APT 每日更新定时器' ;; svc_apt_upgrade) echo 'APT 每日升级定时器' ;;
-    tz) echo '时区' ;; ssh_dropin) echo 'SSH 仅密钥登录配置' ;;
+    tz) echo '时区' ;; ssh_dropin) echo 'SSH 仅密钥登录配置' ;; ssh_pubkey_dropin) echo 'SSH 公钥登录开关' ;;
     ufw_policy_in) echo '防火墙入站默认策略' ;; ufw_policy_out) echo '防火墙出站默认策略' ;;
     ufw_runtime) echo '防火墙开关' ;; svc_ufw) echo '防火墙服务' ;;
     f2b_jail) echo 'Fail2ban SSH 规则' ;; f2b_action) echo 'Fail2ban 封禁动作' ;;
@@ -3267,6 +3305,7 @@ restore_path() {
     apt_auto_file) echo /etc/apt/apt.conf.d/20auto-upgrades ;;
     f2b_action) printf '%s\n' "$F2B_ACTION_FILE" ;;
     ssh_dropin) printf '%s\n' "$SSH_DROPIN" ;;
+    ssh_pubkey_dropin) printf '%s\n' "$SSH_PUBKEY_DROPIN" ;;
     sysctl_file) printf '%s\n' "$SYSCTL_HARDENING_FILE" ;;
     apt_reboot_file) printf '%s\n' "$APT_REBOOT_FILE" ;;
     hosts_file) echo /etc/hosts ;;
@@ -3795,18 +3834,32 @@ restore_firewall_group() {
   restore_resource svc_ufw
 }
 
+# Both SSH drop-ins (key-only, and the key-login switch for images that had it
+# off) go back to their original state, then sshd reloads once.
 restore_ssh_group() {
-  local pending=0
-  if restore_needed ssh_dropin; then pending=1; fi
-  # "applied" with the drop-in already gone: an earlier sshd reload failed.
-  if [[ "$(restore_read ssh_dropin state 2>/dev/null || true)" == applied ]]; then pending=1; fi
+  local id pending=0 failed=0
+  for id in ssh_dropin ssh_pubkey_dropin; do
+    if restore_needed "$id"; then pending=1; fi
+    # "applied" with the drop-in already gone: an earlier sshd reload failed.
+    if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then pending=1; fi
+  done
   ((pending)) || return 0
-  restore_resource ssh_dropin
-  [[ "$(restore_read ssh_dropin state 2>/dev/null || true)" == restored ]] || return 0
-  if ssh_reload; then ok '已恢复 SSH 密码登录；已导入的公钥保留。'
+  if restore_needed ssh_pubkey_dropin; then
+    warn 'SSH 公钥登录会恢复成原来的关闭状态，之后只能用密码登录；请确认你记得密码。'
+  fi
+  for id in ssh_dropin ssh_pubkey_dropin; do
+    [[ -d "$RESTORE_ROOT/$id" ]] || continue
+    restore_resource "$id"
+    # Still "applied" means this restore failed; "clean" was never changed.
+    if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then failed=1; fi
+  done
+  ((failed == 0)) || return 0
+  if ssh_reload; then ok '已恢复 SSH 原来的登录设置；已导入的公钥保留。'
   else
     warn 'SSH 配置已恢复，但 sshd 重新加载失败；重启 ssh 服务后生效。'
-    restore_mark ssh_dropin applied || true
+    for id in ssh_dropin ssh_pubkey_dropin; do
+      if [[ -d "$RESTORE_ROOT/$id" ]]; then restore_mark "$id" applied || true; fi
+    done
     RESTORE_PARTIAL=1
   fi
 }
@@ -3909,7 +3962,7 @@ restore_group_ids() {
   case "$1" in
     firewall) printf '%s\n' ufw_runtime ufw_policy_in ufw_policy_out ufw_ipv6 svc_ufw ;;
     fail2ban) printf '%s\n' f2b_jail f2b_action svc_fail2ban ;;
-    ssh) printf '%s\n' ssh_dropin ;;
+    ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     zram) printf '%s\n' zram_file zram_swap ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
