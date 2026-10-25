@@ -25,6 +25,8 @@ host_has_global_ipv6() { return 1; }
 audit_ufw_ipv6() { echo yes; }
 # Models the user accepting IPv6 protection before UFW is enabled.
 ufw_ipv6_check() { if ((FLIP_IPV6)); then IPV6_FLIPPED=1; fi; }
+# A new SSH login seen in the journal confirms without typing.
+ssh_login_seen_since() { ((LOGIN_SEEN)); }
 
 reset_case() {
   CASE_DIR="$TEST_ROOT/$1"
@@ -44,6 +46,8 @@ reset_case() {
   WEB_CHOICE=''
   FLIP_IPV6=0
   KEY_ONLY=0
+  LOGIN_SEEN=0
+  SERVICE_GONE=0
   FIREWALL_READY=0
   SSH_CONNECTION=''
   SSH_PORTS=()
@@ -90,7 +94,10 @@ systemctl() {
           vps-stable-ufw-rollback-*.timer)
             printf '0\n' > "$CASE_DIR/timer-active"
             printf '1\n' > "$CASE_DIR/timer-stop-called" ;;
-          vps-stable-ufw-rollback-*.service) printf '0\n' > "$CASE_DIR/service-queued" ;;
+          vps-stable-ufw-rollback-*.service)
+            # Real systemd: the never-run transient service is already unloaded.
+            if ((SERVICE_GONE)); then printf 'Failed to stop %s: Unit %s not loaded.\n' "$item" "$item" >&2; return 5; fi
+            printf '0\n' > "$CASE_DIR/service-queued" ;;
           *) fail "unmocked systemctl stop target: $item" ;;
         esac
       done ;;
@@ -226,5 +233,21 @@ fi
 if [[ "$FIREWALL_READY" == 1 && "$(cat "$CASE_DIR/ufw-active")" == 0 ]]; then
   fail 'queued rollback disabled firewall after it was marked ready'
 fi
+
+# Reported on a real VPS: CONNECTED typed in time, but stopping the guard's
+# transient service failed with "not loaded" and the firewall was turned off.
+reset_case service_unit_already_unloaded
+SERVICE_GONE=1
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" 2> "$CASE_DIR/stderr"
+[[ "$FIREWALL_READY" == 1 && "$(cat "$CASE_DIR/ufw-active")" == 1 ]] || fail 'an unloaded guard service made a confirmed firewall fail'
+[[ "$(cat "$CASE_DIR/timer-active")" == 0 ]] || fail 'guard timer kept after confirmation'
+
+# A new SSH login through the enabled firewall confirms without typing anything.
+reset_case confirmed_by_new_login
+LOGIN_SEEN=1
+firewall_stage < "$CASE_DIR/input"
+[[ "$FIREWALL_READY" == 1 && "$(cat "$CASE_DIR/timer-active")" == 0 ]] || fail 'a new SSH login did not confirm the firewall'
+grep -q '自动确认' "$CASE_DIR/messages" || fail 'automatic confirmation not reported'
 
 printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports and conservative takeover.\n'

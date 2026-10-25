@@ -164,6 +164,11 @@ if guard_try 'n\n'; then fail 'n did not restore'; fi
 if guard_try 'connected\n'; then fail 'end of input after a typo was accepted'; fi
 if guard_try ''; then fail 'no input was accepted'; fi
 if guard_confirm unit "$((SECONDS - 1))" < /dev/null > /dev/null 2>&1; then fail 'expired deadline accepted'; fi
+# A new login seen by the check command confirms without any input.
+rm -f "$TEST_ROOT/guard-stopped"; reset
+guard_confirm unit "$((SECONDS + 100))" true < /dev/null > "$TEST_ROOT/guard-out" 2>&1 || fail 'check command did not confirm'
+grep -Fxq 'guard stop' "$TEST_ROOT/trace" || fail 'guard timer not cancelled after automatic confirmation'
+if guard_confirm unit "$((SECONDS + 100))" false < /dev/null > /dev/null 2>&1; then fail 'failed check plus no input was accepted'; fi
 printf 'PASS: CONNECTED retries on typos with an uppercase hint; n, timeout and end of input restore.\n'
 
 # Ubuntu 26.04 release entry.

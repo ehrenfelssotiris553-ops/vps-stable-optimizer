@@ -83,10 +83,15 @@ if firewall_conflict; then fail 'empty inspectable rules rejected'; fi
 # What iptables-nft and `ufw disable` leave behind: empty base chains, accept policy.
 NFT_RULES=$'table ip filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n}\ntable ip6 filter {\n\tchain OUTPUT {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}'
 if firewall_conflict; then fail 'inert empty nftables chains blocked takeover'; fi
+# A "#" note above a table (newer nft) is not a rule.
+NFT_RULES=$'# Warning: table ip filter is managed by iptables-nft, do not touch!\ntable ip filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n}'
+if firewall_conflict; then fail 'an nft comment line blocked takeover'; fi
 NFT_RULES=$'table inet administrator {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}'
 firewall_conflict || fail 'drop policy chain missed'
 NFT_RULES=$'table inet administrator {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\ttcp dport 22 accept\n\t}\n}'
+: > "$TEST_DIR/warnings"
 firewall_conflict || fail 'nftables rule missed'
+grep -Fq 'tcp dport 22 accept' "$TEST_DIR/warnings" || fail 'the blocking nftables rule was not named'
 NFT_RULES=$'table inet administrator {\n\tset blocked {\n\t\ttype ipv4_addr\n\t}\n}'
 firewall_conflict || fail 'nftables set missed'
 NFT_RULES=''

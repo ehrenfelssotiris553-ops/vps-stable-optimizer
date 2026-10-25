@@ -75,7 +75,8 @@ VPS 机器管家 V2.6.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 
 大多数问题用 y 或回车回答：[Y/n] 回车表示「做」，[y/N] 回车表示「不做」。
 只有三处要输入单词，提示里会写出要输入什么（区分大小写）：
-  CONNECTED  防火墙、SSH 加固后，在新的 SSH 窗口登录成功再输入；180 秒内没有确认会自动撤销。
+  CONNECTED  防火墙、SSH 加固后，新开一个 SSH 窗口登录：登录成功通常会自动确认。没有自动确认时，
+             回到原来的窗口输入（不是新窗口）；180 秒内没有确认会自动撤销。
   NOCONSOLE  没有控制台密码时仍要关闭 SSH 密码登录（不推荐）。
   UNINSTALL  卸载本工具（会删除全部备份）。
 开荒建议在 tmux 或 screen 里运行，SSH 断线时不会中断。
@@ -327,28 +328,32 @@ ssh_detect() {
 }
 
 # iptables-nft and `ufw disable` leave empty base chains with an accept policy.
-# Those are inert and are ignored; any rule, set, map or non-accept policy counts.
+# Those are inert and are ignored, as are "#" comment lines (newer nft prints
+# notes there); any rule, set, map or non-accept policy counts and is printed.
 nft_ruleset_has_policy() {
   awk '
     {line=$0; sub(/^[ \t]+/,"",line); sub(/[ \t]+$/,"",line)}
-    line=="" || line=="}" {next}
+    line=="" || line=="}" || line ~ /^#/ {next}
     line ~ /^table [a-z0-9]+ [A-Za-z0-9_.-]+ \{$/ {next}
     line ~ /^chain [A-Za-z0-9_.-]+ \{$/ {next}
     line ~ /^type [a-z]+ hook [a-z]+ (device "?[A-Za-z0-9_.-]+"? )?priority [A-Za-z0-9_+-]+; policy accept;$/ {next}
-    {found=1; exit}
+    {print line; found=1; exit}
     END {exit !found}'
 }
 
+# Each finding names the service or the exact line, so a refusal can be checked.
 firewall_conflict() {
-  active firewalld && return 0
-  active nftables && return 0
-  local rules bin inspected=0
+  if active firewalld; then warn '检测到 firewalld 正在运行。'; return 0; fi
+  if active nftables; then warn '检测到 nftables 服务正在运行（它会加载自己的防火墙规则）。'; return 0; fi
+  local rules bin offender inspected=0
   if command -v nft >/dev/null; then
     inspected=1
     if ! rules="$(nft list ruleset 2>/dev/null)"; then
       warn '无法读取 nftables 规则，不自动接管防火墙。'; return 0
     fi
-    if nft_ruleset_has_policy <<< "$rules"; then return 0; fi
+    if offender="$(nft_ruleset_has_policy <<< "$rules")"; then
+      warn "nftables 里有其他防火墙规则：${offender:0:160}"; return 0
+    fi
   fi
   for bin in iptables-save ip6tables-save; do
     command -v "$bin" >/dev/null || continue
@@ -356,7 +361,9 @@ firewall_conflict() {
     if ! rules="$("$bin" 2>/dev/null)"; then
       warn "无法读取 $bin 的规则，不自动接管防火墙。"; return 0
     fi
-    if grep -Eq '^(-A[[:space:]]|:[^[:space:]]+[[:space:]]+(DROP|REJECT))' <<< "$rules"; then return 0; fi
+    if offender="$(grep -m 1 -E '^(-A[[:space:]]|:[^[:space:]]+[[:space:]]+(DROP|REJECT))' <<< "$rules")"; then
+      warn "$bin 里有其他防火墙规则：${offender:0:160}"; return 0
+    fi
   done
   if (( !inspected )); then
     warn '没有可用的防火墙检查工具，不自动接管防火墙。'; return 0
@@ -583,7 +590,7 @@ session_resilience_check() {
 attention_banner() {
   printf '\a'
   say '需要你在场：SSH 加固与防火墙确认'
-  echo '接下来会请你新开 SSH 窗口登录确认；每次确认有 180 秒，超时会自动撤销对应的修改。'
+  echo '接下来会请你新开一个 SSH 窗口登录，证明修改后仍能登录：登录成功后会自动确认；没有自动确认时，回到这个窗口输入 CONNECTED。每次确认有 180 秒，超时会自动撤销对应的修改。'
 }
 
 # Removes old kernels only when APT's simulation removes nothing else and
@@ -1337,27 +1344,61 @@ guard_arm() {
   active "$unit.timer"
 }
 
-# Success means CONNECTED arrived in time and the still-pending guard was
-# cancelled before its job ran; callers must re-verify the protected state.
-# A typo asks again until the deadline; n, timeout or end of input restore.
+# Any SSH login accepted since SINCE (epoch seconds), optionally for USER: a new
+# connection got through, which is what the firewall guard needs to see.
+ssh_login_seen_since() {
+  local since="$1" user="${2:-}"
+  command -v journalctl >/dev/null || return 1
+  journalctl -q --since "@$since" -t sshd -t sshd-session -o cat --no-pager 2>/dev/null |
+    awk -v u="$user" '$1 == "Accepted" && $3 == "for" && (u == "" || $4 == u) {found = 1} END {exit !found}'
+}
+
+# Success means the confirmation arrived in time and the still-pending guard
+# was cancelled before its job ran; callers must re-verify the protected state.
+# Confirmed by the optional CHECK command (a new SSH login in the journal,
+# polled every 2 seconds) or by CONNECTED typed in THIS window. A typo asks
+# again until the deadline; n, timeout or end of input restore.
 guard_confirm() {
-  local unit="$1" deadline="$2" remaining answer started
+  local unit="$1" deadline="$2" remaining answer started rc prompt=1
+  shift 2
   while :; do
     remaining=$((deadline - SECONDS))
     ((remaining > 0)) || return 1
+    if (($#)) && "$@"; then ok '已在系统日志里看到新窗口登录成功，自动确认。'; break; fi
+    if ((prompt)); then
+      printf '等待确认（剩余 %s 秒）：新窗口登录成功后这里会自动确认；没有自动确认时，在【这个窗口】输入 CONNECTED 并回车；新窗口登录失败就在这里输入 n，立即恢复: ' "$remaining"
+      prompt=0
+    fi
     answer=''
-    read -r -t "$remaining" -p "请在剩余 $remaining 秒内输入 [CONNECTED]（新窗口登录失败就输入 n，立即恢复）: " answer || return 1
-    case "$answer" in
-      CONNECTED) break ;;
-      n|N) return 1 ;;
-    esac
-    if [[ "${answer^^}" == CONNECTED ]]; then echo '要用大写：CONNECTED（区分大小写），请再输入一次。'
-    else echo '输入的不是 CONNECTED。新窗口登录成功就输入 CONNECTED；登录失败输入 n 立即恢复，或等计时结束自动恢复。'; fi
+    # Short reads let the journal check run in between; a half-typed line stays
+    # in the terminal's line buffer until Enter, so typing is never lost.
+    if read -r -t 2 answer; then
+      case "$answer" in
+        CONNECTED) break ;;
+        n|N) return 1 ;;
+      esac
+      if [[ "${answer^^}" == CONNECTED ]]; then echo '要用大写：CONNECTED（区分大小写），请再输入一次。'
+      else echo '输入的不是 CONNECTED。在新窗口登录成功后，回到这个窗口输入 CONNECTED（新窗口里不用输入）；登录失败输入 n 立即恢复，或等计时结束自动恢复。'; fi
+      prompt=1
+    else
+      rc=$?
+      ((rc > 128)) || return 1
+    fi
   done
-  active "$unit.timer" || return 1
-  systemctl stop "$unit.timer" "$unit.service" || return 1
+  # Confirmed: cancel the timer and any start job it already queued for its
+  # service. Each failure says why, so it is not mistaken for "no CONNECTED".
+  if ! active "$unit.timer"; then
+    warn "已收到确认，但自动撤销计时器已经到期（$unit.timer），撤销可能已经执行。"; return 1
+  fi
+  # A transient service that never ran may already be unloaded once its timer
+  # stops; "not loaded" is not an error here.
+  systemctl stop "$unit.timer" >/dev/null 2>&1 || true
+  systemctl stop "$unit.service" >/dev/null 2>&1 || true
+  if active "$unit.timer"; then warn "已收到确认，但无法停止自动撤销计时器（$unit.timer）。"; return 1; fi
+  # An unloaded unit reports 0 or nothing; a start time means the undo ran.
   started="$(systemctl show "$unit.service" --property=ExecMainStartTimestampMonotonic --value 2>/dev/null || true)"
-  [[ "$started" == 0 ]] && ! active "$unit.timer"
+  if [[ -n "$started" && "$started" != 0 ]]; then warn '已收到确认，但自动撤销已经执行过。'; return 1; fi
+  return 0
 }
 
 web_ports_wanted() {
@@ -1424,7 +1465,7 @@ firewall_stage() {
   say '第14步：防火墙（需要新 SSH 窗口确认）'
   FIREWALL_READY=0
   command -v ufw >/dev/null || { warn '还没有安装 ufw，请先运行一键开荒。'; module_result firewall skipped 'ufw missing'; return 0; }
-  local state rules p ip unit deadline ssh_verb=limit web=0
+  local state rules p ip unit deadline since ssh_verb=limit web=0
   if ! state="$(ufw status 2>/dev/null)"; then
     warn '无法确定防火墙状态，跳过。'; module_result firewall failed 'UFW state unknown'; return 0
   fi
@@ -1510,16 +1551,22 @@ firewall_stage() {
   if ! ufw --force enable; then
     warn '开启防火墙失败，自动撤销计时器保持启用。'; module_result firewall failed 'ufw enable failed'; return 0
   fi
+  # Only logins after this moment went through the enabled firewall.
+  since="$(date +%s)"
   ufw status numbered
-  echo '保留原 SSH 窗口；新开第二个 SSH 会话并成功登录，再输入 CONNECTED。'
-  if guard_confirm "$unit" "$deadline" && ufw_active; then
-    ok '防火墙已保留，自动撤销计时器已取消。'
-    FIREWALL_READY=1
-    ufw status verbose
-    module_result firewall applied "SSH ${SSH_PORTS[*]} ($ssh_verb)"
-    return 0
+  echo '请保留这个窗口不要关。现在新开一个 SSH 窗口登录服务器：登录成功后，这里通常几秒内就会自动确认，新窗口里什么都不用输入。'
+  echo '如果没有自动确认，就回到这个窗口输入 CONNECTED；180 秒内没有确认，会自动关闭防火墙恢复原样。'
+  if guard_confirm "$unit" "$deadline" ssh_login_seen_since "$since"; then
+    if ufw_active; then
+      ok '防火墙已保留，自动撤销计时器已取消。'
+      FIREWALL_READY=1
+      ufw status verbose
+      module_result firewall applied "SSH ${SSH_PORTS[*]} ($ssh_verb)"
+      return 0
+    fi
+    warn '已收到确认，但防火墙现在不是开启状态（可能已被自动撤销，或被其他程序关闭）。'
   fi
-  warn '没有及时确认新的登录，正在关闭防火墙。'
+  warn '这次没有确认成功，正在关闭防火墙恢复原样；可以稍后重试。'
   module_result firewall failed 'second SSH login not confirmed; UFW disabled'
   if ufw --force disable; then
     systemctl stop "$unit.timer" || true
@@ -1735,7 +1782,11 @@ ssh_harden_stage() {
     ok "$user 的 SSH 已经只允许密钥登录。"; module_result ssh present 'password login already disabled'; return 0
   fi
   if [[ "$(ssh_effective_value "$effective" pubkeyauthentication)" != yes ]]; then
-    warn 'SSH 没有开启公钥登录（PubkeyAuthentication）；不修改。'; module_result ssh skipped 'pubkey auth disabled'; return 0
+    # Some provider images ship password-only SSH; show where it is set.
+    warn "SSH 没有开启公钥登录（当前生效：PubkeyAuthentication $(ssh_effective_value "$effective" pubkeyauthentication || true)）；不修改。"
+    detail="$(grep -RHin '^[[:space:]]*PubkeyAuthentication' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | head -n 5 || true)"
+    if [[ -n "$detail" ]]; then printf '设置它的位置：\n%s\n' "$detail"; fi
+    module_result ssh skipped 'pubkey auth disabled'; return 0
   fi
   if [[ "$(ssh_effective_value "$effective" authenticationmethods)" != any ]]; then
     warn '检测到自定义的 AuthenticationMethods（例如两步验证）；请人工配置 SSH。'; module_result ssh preserved 'custom AuthenticationMethods'; return 0
@@ -1795,18 +1846,24 @@ ssh_harden_stage() {
   }
   deadline=$((SECONDS + 180))
   if ! ssh_reload; then warn 'sshd 重新加载失败；自动撤销计时器保持启用。'; module_result ssh failed 'sshd reload failed'; return 0; fi
-  echo '已关闭 SSH 密码登录。请保持当前窗口，再新开一个终端，用密钥登录一次：'
+  # Only a key login after the reload proves the new settings work.
+  since="$(date +%s)"
+  echo '已关闭 SSH 密码登录。请保留这个窗口不要关，再新开一个终端，用密钥登录一次：'
   echo "  ssh $user@服务器IP"
   if ((want_admin)); then echo '现在 root 直接登录应该被拒绝，这是正常的。'; fi
-  echo '确认能登录后，回到这里输入 CONNECTED；180 秒内没有确认会自动恢复原来的设置。'
-  if guard_confirm "$unit" "$deadline" && [[ -f "$SSH_DROPIN" ]]; then
-    detail="key-only user=$user"
-    if ((want_admin)); then detail+=' root-ssh=off'; fi
-    ok '新的 SSH 登录设置已保留，自动撤销计时器已取消。'
-    module_result ssh applied "$detail"
-    return 0
+  echo "用密钥登录成功后，这里通常几秒内就会自动确认，新窗口里什么都不用输入。"
+  echo '如果没有自动确认，就回到这个窗口输入 CONNECTED；180 秒内没有确认，会自动恢复原来的设置。'
+  if guard_confirm "$unit" "$deadline" ssh_key_login_seen "$user" "$since"; then
+    if [[ -f "$SSH_DROPIN" ]]; then
+      detail="key-only user=$user"
+      if ((want_admin)); then detail+=' root-ssh=off'; fi
+      ok '新的 SSH 登录设置已保留，自动撤销计时器已取消。'
+      module_result ssh applied "$detail"
+      return 0
+    fi
+    warn '已收到确认，但新的 SSH 配置文件已经不在了（可能已被自动撤销）。'
   fi
-  warn '没有及时确认新的登录：正在恢复原来的 SSH 设置。'
+  warn '这次没有确认成功：正在恢复原来的 SSH 设置；可以稍后重试。'
   rm -f -- "$SSH_DROPIN"
   ssh_reload || warn 'sshd 重新加载失败；如果计时器仍在，它会再试一次。'
   systemctl stop "$unit.timer" 2>/dev/null || true
