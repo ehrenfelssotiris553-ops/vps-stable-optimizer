@@ -7,7 +7,7 @@ umask 077
 
 # Download location and the main script's hash; update the hash on every release.
 RELEASE_BASE_URL='https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main'
-EXPECTED_SHA256='474d13db35a05a167099ba813a42658059203e5db287ff64bfacc11e29053a1e'
+EXPECTED_SHA256='d12a212b1f1b08ce54813a421db01c6d8188d5f58973786c624df2b46b37ed98'
 PAYLOAD_NAME='vps-stable-opt-v2.6.0.sh'
 INSTALL_DIR=/usr/local/lib/vps-stable-opt
 INSTALL_FILE="$INSTALL_DIR/vps-stable-opt.sh"
@@ -139,6 +139,17 @@ secure_file() {
   (( (8#$mode & 8#022) == 0 )) || die "已有安装文件可被其他用户写入：$path"
 }
 
+# What to do with an existing installation, from three SHA-256 values: reuse
+# (this version), upgrade (an intact other version, or an interrupted upgrade
+# to this one, whose script is already in place) or refuse (edited by hand).
+install_existing_action() {
+  local installed="$1" recorded="$2" expected="$3"
+  [[ "$installed" =~ ^[0-9a-f]{64}$ && "$recorded" =~ ^[0-9a-f]{64}$ && "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo refuse; return 0; }
+  if [[ "$installed" == "$expected" && "$recorded" == "$expected" ]]; then echo reuse
+  elif [[ "$installed" == "$recorded" || "$installed" == "$expected" ]]; then echo upgrade
+  else echo refuse; fi
+}
+
 for directory in / /usr /usr/local /usr/local/lib /usr/local/bin /var /var/lib; do secure_dir "$directory"; done
 # Share the stable directory lock used by setup/rollback/uninstall. Acquiring
 # it before publishing any file also prevents install/uninstall races.
@@ -194,12 +205,29 @@ if [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" || -e "$LAUNCHER_FILE" || -L "$LAUN
   secure_dir "$INSTALL_DIR"
   for existing in "$MARKER_FILE" "$HASH_FILE" "$INSTALL_FILE" "$LAUNCHER_FILE"; do secure_file "$existing"; done
   cmp -s -- "$TMP_DIR/marker" "$MARKER_FILE" || die '已有目录不属于本安装器，未覆盖。'
-  cmp -s -- "$TMP_DIR/sha256" "$HASH_FILE" || die '已有安装校验记录不同，未覆盖。'
   cmp -s -- "$TMP_DIR/launcher" "$LAUNCHER_FILE" || die '已有启动命令内容不同，未覆盖。'
-  cmp -s -- "$payload" "$INSTALL_FILE" || die '已有版本或本地内容不同，未覆盖。请按使用说明备份并移除工具入口后重装。'
   entries="$(find -P "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
   [[ "$entries" == $'.installed-sha256\n.installer-owner\nvps-stable-opt.sh' ]] || die '已有安装目录包含其他文件，未接管。'
-  printf '已安装相同版本，直接复用。\n'
+  installed_sha="$(sha256sum -- "$INSTALL_FILE")"; installed_sha="${installed_sha%% *}"
+  recorded_sha="$(cat -- "$HASH_FILE")"
+  case "$(install_existing_action "$installed_sha" "$recorded_sha" "${EXPECTED_SHA256,,}")" in
+    reuse) printf '已安装相同版本，直接复用。\n' ;;
+    upgrade)
+      printf '发现已安装的其他版本：原地替换主脚本；运行记录、配置备份和回退资料都保留。\n'
+      MAIN_STAGE="$(mktemp "$INSTALL_DIR/.main.XXXXXXXX")"
+      HASH_STAGE="$(mktemp "$INSTALL_DIR/.sha256.XXXXXXXX")"
+      install -m 700 -- "$payload" "$MAIN_STAGE"
+      install -m 600 -- "$TMP_DIR/sha256" "$HASH_STAGE"
+      # Script first, then its hash: if this is interrupted, running the
+      # installer again finds the new script in place and finishes the job.
+      mv -fT -- "$MAIN_STAGE" "$INSTALL_FILE"; MAIN_STAGE=''
+      mv -fT -- "$HASH_STAGE" "$HASH_FILE"; HASH_STAGE=''
+      if ! cmp -s -- "$payload" "$INSTALL_FILE" || ! cmp -s -- "$TMP_DIR/sha256" "$HASH_FILE"; then
+        die '替换后核对失败；请重新运行安装命令。'
+      fi
+      printf '已更新到这个版本。\n' ;;
+    *) die '已安装的主脚本和它的校验记录对不上（可能被手动改过），未覆盖。请先检查 /usr/local/lib/vps-stable-opt/。' ;;
+  esac
 else
   mkdir -m 755 -- "$INSTALL_DIR"
   CREATED_DIR=1

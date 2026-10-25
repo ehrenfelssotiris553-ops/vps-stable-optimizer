@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure sysctl_hardening_pairs sysctl_key_configured sysctl_hardening_stage hostname_resolves hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure sysctl_hardening_pairs sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -45,7 +45,17 @@ if grep -Fxq autoremove "$TEST_ROOT/trace"; then fail 'cleanup removed the runni
 reset; SIM='Reading package lists...'
 kernel_cleanup
 if grep -Fxq autoremove "$TEST_ROOT/trace"; then fail 'cleanup ran with nothing to remove'; fi
-printf 'PASS: old kernel cleanup removes only old kernel packages.\n'
+SIM='Purg linux-image-6.1.0-18-amd64 [6.1.76-1]'
+confirm_yes() { record "ask $1"; ((KEEP_ANSWER)); }
+reset; KEEP_ANSWER=0; kernel_cleanup --ask
+grep -q '^ask ' "$TEST_ROOT/trace" || fail 'single-item cleanup did not ask before removing kernels'
+if grep -Fxq autoremove "$TEST_ROOT/trace"; then fail 'declined cleanup still removed kernels'; fi
+reset; KEEP_ANSWER=1; kernel_cleanup --ask
+grep -Fxq autoremove "$TEST_ROOT/trace" || fail 'confirmed cleanup did not remove kernels'
+reset; kernel_cleanup
+if grep -q '^ask ' "$TEST_ROOT/trace"; then fail 'setup cleanup asked again after the up-front question'; fi
+unset -f confirm_yes
+printf 'PASS: old kernel cleanup removes only old kernel packages and asks first when requested.\n'
 
 # Reboot window: written only when no other APT file sets a reboot policy.
 APT_REBOOT_FILE="$TEST_ROOT/apt/53-vps-stable-auto-reboot"
@@ -104,11 +114,16 @@ printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys and records
   reset; HOSTS_CHOICE=0; hosts_stage
   [[ "$(grep -c . "$TEST_ROOT/hosts")" == 1 ]] || fail 'hosts changed without consent'
   reset; HOSTS_CHOICE=1
-  printf() { builtin printf "$@"; if [[ "$1" == $'127.0.1.1\t%s\n' ]]; then RESOLVES=1; fi; }
+  printf() { builtin printf "$@"; if [[ "${2:-}" == $'127.0.1.1\tvps-1' ]]; then RESOLVES=1; fi; }
   hosts_stage
   grep -Fxq $'127.0.1.1\tvps-1' "$TEST_ROOT/hosts" || fail 'hostname line not added'
+  # A last line without a newline must not swallow the new entry.
+  builtin printf '127.0.0.1 localhost\n::1 localhost' > "$TEST_ROOT/hosts"
+  reset; RESOLVES=0; hosts_stage
+  grep -Fxq '::1 localhost' "$TEST_ROOT/hosts" || fail 'unterminated last line was merged with the new entry'
+  grep -Fxq $'127.0.1.1\tvps-1' "$TEST_ROOT/hosts" || fail 'entry not on its own line'
 )
-printf 'PASS: hosts fix needs consent and appends the Debian-style line.\n'
+printf 'PASS: hosts fix needs consent, appends the Debian-style line and keeps an unterminated last line intact.\n'
 
 # UFW IPV6 switch rewrites exactly one simple assignment.
 (
@@ -172,6 +187,8 @@ printf 'port %s\n' "$$" > "$LOCK_OWNER_FILE"
 [[ "$(lock_holder_text)" == *端口管理* ]] || fail 'lock holder not named'
 printf 'port 999999\n' > "$LOCK_OWNER_FILE"
 [[ "$(lock_holder_text)" != *PID* ]] || fail 'stale lock owner reported as running'
+printf 'item %s\n' "$$" > "$LOCK_OWNER_FILE"
+[[ "$(lock_holder_text)" == *单项设置* ]] || fail 'single-item menu not named in the lock message'
 printf 'PASS: lock message names the running task.\n'
 
 # Log rotation keeps the newest files per prefix.

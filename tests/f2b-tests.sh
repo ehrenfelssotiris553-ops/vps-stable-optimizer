@@ -5,7 +5,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test-common.sh
 source "$HERE/test-common.sh"
-load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_replace_owned_file fail2ban_stage
+load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_replace_owned_file f2b_jail_ready fail2ban_stage
 # Backup policy is exercised by backup-tests.sh and entry-tests.sh. This test
 # replaces only that dependency while testing the actual Fail2ban transition.
 backup_config_path() { :; }
@@ -15,6 +15,7 @@ TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 PASS=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+sleep() { printf 'sleep\n' >> "$CASE_DIR/events"; }
 passed() { PASS=$((PASS+1)); printf 'PASS: %s\n' "$*"; }
 new_case() {
   CASE_DIR="$TEST_ROOT/$1"
@@ -37,7 +38,8 @@ ok() { printf '%s\n' "$*" >> "$CASE_DIR/ok"; }
 warn() { printf '%s\n' "$*" >> "$CASE_DIR/warn"; }
 ufw_active() { ((UFW_ACTIVE)); }
 ssh_detect() { SSH_PORTS=(22 2222); ((SSH_OK)); }
-available() { return 0; }
+available() { [[ ! -e "$CASE_DIR/no-index" ]]; }
+apt_index_ready() { printf 'refresh\n' >> "$CASE_DIR/events"; rm -f -- "$CASE_DIR/no-index"; }
 installed() {
   case "$1" in fail2ban) ((PKG_FAIL2BAN));; python3-systemd) ((PKG_SYSTEMD));; *) return 1;; esac
 }
@@ -67,7 +69,10 @@ fail2ban-client() {
       printf 'test\n' >> "$CASE_DIR/events"
       [[ "$(cat "$F2B_FILE")" == "$(f2b_jail_text '22,2222')" ]] || fail 'testing unexpected jail'
       return "$TEST_STATUS";;
-    'status sshd') printf 'status\n' >> "$CASE_DIR/events"; return "$JAIL_STATUS";;
+    'status sshd') printf 'status\n' >> "$CASE_DIR/events"
+      # Status runs inside $(...): the remaining slow answers live in a file.
+      if [[ -s "$CASE_DIR/slow" ]]; then sed -i '1d' "$CASE_DIR/slow"; return 1; fi
+      return "$JAIL_STATUS";;
     *) fail 'unexpected fail2ban command';;
   esac
 }
@@ -135,6 +140,26 @@ JAIL_STATUS=1
 fail2ban_stage
 if grep -Fq 'Fail2ban 已就绪' "$CASE_DIR/ok"; then fail 'service active was treated as successful sshd protection'; fi
 grep -Fq 'SSH 规则没有加载' "$CASE_DIR/warn" || fail 'missing jail warning absent'
+[[ "$(grep -c '^status$' "$CASE_DIR/events")" == 15 ]] || fail 'a missing jail was not polled for the whole wait'
 passed 'failed sshd status never reports protection success'
+
+# fail2ban.service is Type=simple: the jail can appear a moment after start.
+new_case slow_start
+printf 'starting
+starting
+' > "$CASE_DIR/slow"
+fail2ban_stage
+grep -Fq 'Fail2ban 已就绪' "$CASE_DIR/ok" || fail 'a jail that loads after a short delay was reported as missing'
+grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'slow start not recorded as applied'
+[[ "$(tail -n 5 "$CASE_DIR/events" | tr '\n' ' ')" == 'status sleep status sleep status ' ]] || fail "unexpected wait sequence: $(tr '\n' ' ' < "$CASE_DIR/events")"
+passed 'a jail that loads after start-up is waited for, not reported as failed'
+
+# A fresh image may have no package index: it is refreshed once, not reported missing.
+new_case empty_index
+: > "$CASE_DIR/no-index"
+fail2ban_stage
+[[ "$(head -n 2 "$CASE_DIR/events" | tr '\n' ' ')" == 'refresh install:guard ' ]] || fail "package index not refreshed first: $(tr '\n' ' ' < "$CASE_DIR/events")"
+grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'Fail2ban not configured after refreshing the index'
+passed 'an empty package index is refreshed before Fail2ban is reported missing'
 
 printf '%s Fail2ban mock cases passed.\n' "$PASS"

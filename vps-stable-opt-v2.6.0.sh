@@ -74,7 +74,7 @@ VPS 机器管家 V2.6.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 
 大多数问题用 y 或回车回答：[Y/n] 回车表示「做」，[y/N] 回车表示「不做」。
 只有三处要输入单词，提示里会写出要输入什么（区分大小写）：
-  CONNECTED  防火墙、SSH 加固后，在新的 SSH 窗口登录成功再输入；240 秒内没有确认会自动撤销。
+  CONNECTED  防火墙、SSH 加固后，在新的 SSH 窗口登录成功再输入；180 秒内没有确认会自动撤销。
   NOCONSOLE  没有控制台密码时仍要关闭 SSH 密码登录（不推荐）。
   UNINSTALL  卸载本工具（会删除全部备份）。
 开荒建议在 tmux 或 screen 里运行，SSH 断线时不会中断。
@@ -201,7 +201,7 @@ coreutils_selfcheck() {
     [[ "$(sha256sum -- "$dir/f" | cut -d' ' -f1)" =~ ^[a-f0-9]{64}$ ]] &&
     (($(tail -c 1 -- "$dir/f" | wc -l) == 1)) &&
     df -Pk / | awk 'NR == 2 && NF >= 6 {ok = 1} END {exit !ok}' &&
-    df -Pi / | awk 'NR == 2 && $5 ~ /%$/ {ok = 1} END {exit !ok}' &&
+    df -Pi / | awk 'NR == 2 && ($5 ~ /%$/ || $5 == "-") {ok = 1} END {exit !ok}' &&
     [[ "$(readlink -f -- "$dir/f")" == "$(cd -- "$dir" && pwd -P)/f" ]] &&
     cp -p -- "$dir/f" "$dir/g" && mv -fT -- "$dir/g" "$dir/h" && [[ -f "$dir/h" && ! -e "$dir/g" ]] &&
     [[ "$(date -u +%Y%m%d)" =~ ^[0-9]{8}$ ]]
@@ -398,6 +398,7 @@ apt_index_stage() {
     warn '软件索引更新失败，关闭增量下载后再试一次。'
     apt-get update -o APT::Update::Error-Mode=any -o Acquire::PDiffs=false || die 'APT 软件索引更新失败：请检查软件源；如提示 "not valid yet"，说明系统时间不准，请先校准时间。'
   fi
+  APT_INDEX_READY=1
   echo '-- 当前系统版本内的升级模拟（不修改软件源，不跨大版本） --'
   # --with-new-pkgs lets new kernel ABI packages install; nothing is ever removed.
   if ! simulation="$(apt-get -s upgrade --with-new-pkgs 2>&1)"; then
@@ -499,7 +500,7 @@ setup_questions() {
     timezone_ask
     TZ_ASKED=1
   fi
-  if confirm_yes '加固 SSH 登录吗？（只允许密钥登录，带 240 秒防失联保护）（推荐）'; then
+  if confirm_yes '加固 SSH 登录吗？（只允许密钥登录，带防失联保护）（推荐）'; then
     SSH_CHOICE=1
     login="${SUDO_USER:-}"
     [[ -n "$login" && "$login" != root ]] || login="$(logname 2>/dev/null || id -un)"
@@ -562,8 +563,9 @@ attention_banner() {
 
 # Removes old kernels only when APT's simulation removes nothing else and
 # never the running kernel; the newest installed kernel stays as well.
+# With --ask the simulated list is confirmed first (setup asks up front).
 kernel_cleanup() {
-  local sim pkg running
+  local ask="${1:-}" sim pkg running
   local -a removed=()
   running="$(uname -r)"
   sim="$(apt-get -s autoremove --purge 2>&1)" || { warn '旧内核清理模拟失败，跳过。'; return 0; }
@@ -576,6 +578,7 @@ kernel_cleanup() {
     fi
   done
   printf '将清理旧内核：%s\n' "${removed[*]}"
+  if [[ "$ask" == --ask ]] && ! confirm_yes '确认删除这些旧内核吗？（删除后无法撤销）'; then ok '保留旧内核。'; return 0; fi
   if apt-get -y -q autoremove --purge; then ok "已清理 ${#removed[@]} 个旧内核包。"
   else warn '旧内核清理失败，请人工检查。'; fi
 }
@@ -663,14 +666,15 @@ upgrade_only_stage() {
   if ((KERNEL_UPDATE)); then module_result upgrade applied 'upgraded; new kernel needs reboot'
   else module_result upgrade applied 'upgraded'; fi
   ok '系统软件已升级。'
-  if confirm_yes '顺便清理不再需要的旧内核吗？（保留正在运行的和最新的内核；删除后无法撤销）'; then kernel_cleanup; fi
+  echo '检查是否有可以清理的旧内核（保留正在运行的和最新的内核）：'
+  kernel_cleanup --ask
 }
 
-ITEM_APT_READY=0
-item_apt_ready() {
-  if ((ITEM_APT_READY)); then return 0; fi
+APT_INDEX_READY=0
+apt_index_ready() {
+  if ((APT_INDEX_READY)); then return 0; fi
   echo '正在更新软件索引……'
-  if apt-get update -o APT::Update::Error-Mode=any >/dev/null; then ITEM_APT_READY=1; return 0; fi
+  if apt-get update -o APT::Update::Error-Mode=any >/dev/null; then APT_INDEX_READY=1; return 0; fi
   warn '软件索引更新失败：请检查网络和软件源；如提示 "not valid yet"，先校准系统时间。'
   return 1
 }
@@ -682,10 +686,12 @@ item_apt_ready() {
 # A wildcard that could cover either target, or a targeted exclusion, also
 # causes a skip. All '/' separators normalize to dots here only for detection;
 # ambiguous mixed notation may cause an extra skip, never an override.
+# Distribution defaults are not an administrator policy (see sysctl_vendor_default).
 bbr_config_conflict() {
   local f line k v has_value
   for f in "$@"; do
     [[ -f "$f" ]] || continue
+    if sysctl_vendor_default "$f"; then continue; fi
     if [[ ! -r "$f" ]]; then
       warn "无法读取内核参数配置 $f，跳过 BBR。"
       return 0
@@ -725,6 +731,15 @@ bbr_config_conflict() {
     done < "$f"
   done
   return 1
+}
+
+# A packaged file in /usr/lib or /lib that systemd-sysctl applies before this
+# tool's file (files run in name order, so ours wins). Ubuntu 22.04 ships
+# 50-default.conf with "-net.core.default_qdisc = fq_codel" there.
+sysctl_vendor_default() {
+  local file="$1"
+  case "${file%/*}" in /usr/lib/sysctl.d|/lib/sysctl.d) ;; *) return 1 ;; esac
+  [[ "${file##*/}" < "${BBR_FILE##*/}" ]]
 }
 
 bbr_stage() {
@@ -992,6 +1007,14 @@ sysctl_hardening_stage() {
   else warn '部分内核参数没有生效，请查看日志。'; module_result sysctl failed 'sysctl -p failed'; fi
 }
 
+# Appends LINE to FILE; an unterminated last line is ended first, so the two
+# never merge into one.
+append_line_safely() {
+  local file="$1" line="$2"
+  if [[ -s "$file" && "$(tail -c 1 -- "$file" | wc -l)" -eq 0 ]]; then printf '\n' >> "$file" || return 1; fi
+  printf '%s\n' "$line" >> "$file"
+}
+
 # Adds "127.0.1.1 <hostname>" (the Debian convention) when the name does not resolve.
 hosts_stage() {
   say '第12步：主机名解析'
@@ -1002,7 +1025,7 @@ hosts_stage() {
   if [[ ! "$name" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]]; then warn "主机名格式异常：$name，不修改 /etc/hosts。"; module_result hosts skipped 'unusual hostname'; return 0; fi
   if [[ ! -f /etc/hosts || -L /etc/hosts ]]; then warn '/etc/hosts 不是普通文件，不修改。'; module_result hosts skipped 'hosts not a regular file'; return 0; fi
   backup_config_path /etc/hosts || die '无法备份 /etc/hosts'
-  if printf '127.0.1.1\t%s\n' "$name" >> /etc/hosts && hostname_resolves; then
+  if append_line_safely /etc/hosts "127.0.1.1"$'\t'"$name" && hostname_resolves; then
     record_config_change /etc/hosts line-appended || die '无法记录 /etc/hosts 变更。'
     ok "已在 /etc/hosts 加入：127.0.1.1 $name"; module_result hosts applied "$name"
   else
@@ -1108,6 +1131,17 @@ f2b_replace_owned_file() {
   record_config_change "$file" managed-transition || die '无法记录这次配置变更。'
 }
 
+# fail2ban.service is Type=simple: systemctl returns before the server's socket
+# exists, so the jail is polled for up to 15 seconds and its status printed.
+f2b_jail_ready() {
+  local i out
+  for ((i = 0; i < 15; i++)); do
+    if out="$(fail2ban-client status sshd 2>/dev/null)"; then printf '%s\n' "$out"; return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
 fail2ban_stage() {
   say '第15步：Fail2ban（防火墙生效后，只封 SSH 端口）'
   if [[ "${FIREWALL_READY:-0}" != 1 ]]; then
@@ -1148,6 +1182,8 @@ fail2ban_stage() {
   else jail="$(f2b_jail_text "$joined" "$(f2b_ignore_address)")"; fi
   for pkg in fail2ban python3-systemd; do
     installed "$pkg" && continue
+    # A fresh image may have no package index yet: refresh it once first.
+    available "$pkg" || apt_index_ready || true
     if ! available "$pkg"; then warn "找不到软件包 $pkg，跳过 Fail2ban。"; return 0; fi
     needed+=("$pkg")
   done
@@ -1193,7 +1229,7 @@ fail2ban_stage() {
   else
     if ! systemctl start fail2ban; then warn '无法启动 Fail2ban。'; return 0; fi
   fi
-  if fail2ban-client status sshd; then
+  if f2b_jail_ready; then
     ok "Fail2ban 已就绪：只封禁 SSH 端口 $joined 的 TCP 连接，每次封 12 小时。"
     module_result fail2ban applied "sshd jail on $joined"
   else
@@ -1218,10 +1254,12 @@ ufw_rule() {
 # An inactive UFW may still contain rules. Allow rules only widen access and
 # cannot lock the SSH session out; anything else requires administrator review.
 # Allowed: allow rules, the SSH rate limit, and Fail2ban-style SSH bans (one
-# address denied on an SSH port). Bans pile up while the firewall is paused.
+# address denied on SSH ports only, e.g. "port 22,2222"). Bans pile up while
+# the firewall is paused.
 ufw_stored_rules_safe() {
-  local rules line port allowed
-  local ban='^ufw (prepend |insert [0-9]+ )?deny (proto tcp )?from ([0-9A-Fa-f:./]+) to any port ([0-9]+)( proto tcp)?$'
+  local rules line port allowed src
+  local -a listed=()
+  local ban='^ufw (prepend |insert [0-9]+ )?deny (proto tcp )?from ([0-9A-Fa-f:./]+) to any port ([0-9]+(,[0-9]+)*)( proto tcp)?$'
   rules="$(ufw show added)" || { warn '无法读取已保存的 UFW 规则。'; return 1; }
   while IFS= read -r line; do
     [[ "$line" == "ufw "* ]] || continue
@@ -1229,9 +1267,14 @@ ufw_stored_rules_safe() {
     allowed=0
     for port in "${SSH_PORTS[@]}"; do
       if [[ "$line" == "ufw limit $port/tcp" ]]; then allowed=1; break; fi
-      if [[ "$line" =~ $ban && "${BASH_REMATCH[4]}" == "$port" && ( -n "${BASH_REMATCH[2]}" || -n "${BASH_REMATCH[5]}" ) ]] &&
-         port_source_valid "${BASH_REMATCH[3]}"; then allowed=1; break; fi
     done
+    if (( !allowed )) && [[ "$line" =~ $ban ]] && [[ -n "${BASH_REMATCH[2]}" || -n "${BASH_REMATCH[6]}" ]]; then
+      src="${BASH_REMATCH[3]}"
+      IFS=, read -r -a listed <<< "${BASH_REMATCH[4]}"
+      allowed=1
+      for port in "${listed[@]}"; do [[ " ${SSH_PORTS[*]} " == *" $port "* ]] || allowed=0; done
+      port_source_valid "$src" || allowed=0
+    fi
     if (( !allowed )); then
       warn "未开启的 UFW 里有需要人工核对的规则：$line。保持不变，不自动开启。"
       return 1
@@ -1573,6 +1616,7 @@ admin_prepare() {
     ok "已创建账户：$name"
   fi
   if ! command -v sudo >/dev/null; then
+    available sudo || apt_index_ready || true
     if available sudo; then install_pkgs sudo || { warn '安装 sudo 失败。'; return 1; }
     else warn '没有可用的 sudo 软件包，无法创建管理员。'; return 1; fi
   fi
@@ -1722,7 +1766,7 @@ ssh_harden_stage() {
   echo '已关闭 SSH 密码登录。请保持当前窗口，再新开一个终端，用密钥登录一次：'
   echo "  ssh $user@服务器IP"
   if ((want_admin)); then echo '现在 root 直接登录应该被拒绝，这是正常的。'; fi
-  echo '确认能登录后，回到这里输入 CONNECTED；240 秒内没有确认会自动恢复原来的设置。'
+  echo '确认能登录后，回到这里输入 CONNECTED；180 秒内没有确认会自动恢复原来的设置。'
   if guard_confirm "$unit" "$deadline" && [[ -f "$SSH_DROPIN" ]]; then
     detail="key-only user=$user"
     if ((want_admin)); then detail+=' root-ssh=off'; fi
@@ -1927,7 +1971,7 @@ preflight_report() {
   say '执行前体检（只读）'
   PREFLIGHT_BLOCKERS=0
   SOURCE_REVIEW_REQUIRED=0
-  local path target free_mb free_inodes percent options audit locks
+  local path target free_mb total_inodes free_inodes percent options audit locks
   support_lifecycle_report
   for path in / /var /boot; do
     [[ -d "$path" ]] || continue
@@ -1940,9 +1984,12 @@ preflight_report() {
     else
       ((free_mb>=650)) || preflight_block "$path 剩余空间不足 650MiB。"
     fi
-    free_inodes="$(df -Pi -- "$path" | awk 'NR==2 {print $4}')"
-    percent="$(df -Pi -- "$path" | awk 'NR==2 {print $5}')"
-    if [[ "$free_inodes" =~ ^[0-9]+$ ]]; then
+    total_inodes='' free_inodes='' percent=''
+    read -r total_inodes free_inodes percent < <(df -Pi -- "$path" | awk 'NR==2 {print $2, $4, $5}') || true
+    # btrfs and other dynamic-inode filesystems report 0 inodes: no inode limit.
+    if [[ "$total_inodes" == 0 ]]; then
+      free_inodes='不限（动态分配）'
+    elif [[ "$free_inodes" =~ ^[0-9]+$ ]]; then
       ((free_inodes>=1000)) || preflight_block "$path 剩余 inode 不足 1000 个。"
     else warn "无法确定 $path 的 inode 剩余量。"; fi
     printf '%s：剩余 %s MiB，剩余 inode %s，inode 使用率 %s\n' "$path" "$free_mb" "$free_inodes" "$percent"
@@ -2070,6 +2117,7 @@ audit_mem_values() {
 # Input is POSIX df -Pk / -Pi output. Messages contain no file contents.
 audit_disk_risks() {
   awk -v kind="${1:-磁盘}" '
+    NR>1 && $5=="-" && $2=="0" {seen++; next}
     NR>1 && $5~/^[0-9]+%$/ {
       seen++; used=$5; sub(/%$/,"",used)
       if(used>=90) printf "%s: %s 已用 %s（达到 90%% 提醒线）\n",kind,$6,$5
@@ -2782,7 +2830,7 @@ decision_report() {
   if ( ssh_password_disabled ) >/dev/null 2>&1; then
     decision_line '保留现状' 'SSH 登录' '已经只允许密钥登录。'
   else
-    decision_line '准备调整' 'SSH 登录' '会询问是否只允许密钥登录、是否新建管理员并禁止 root 直接登录：先确认密钥能登录、sudo 可用、控制台有密码，带 240 秒防失联保护；默认不改。'
+    decision_line '准备调整' 'SSH 登录' '会询问是否只允许密钥登录、是否新建管理员并禁止 root 直接登录：先确认密钥能登录、sudo 可用、控制台有密码，带防失联保护（180 秒内没有确认就自动恢复）；默认不改。'
   fi
 
   if [[ ! "${ROOT_GIB:-}" =~ ^[0-9]+$ ]]; then
@@ -2915,6 +2963,7 @@ lock_holder_text() {
     case "$mode" in
       setup) name='一键开荒' ;; firewall) name='防火墙设置' ;; ssh) name='SSH 登录加固' ;;
       port) name='端口管理' ;; rollback) name='撤销设置' ;; uninstall) name='卸载' ;; check) name='Fail2ban 实弹测试' ;;
+      item) name='单项设置' ;;
     esac
     printf '%s正在运行（PID %s）：请等它结束，或回到那个窗口退出后再试。' "$name" "$pid"
   else
@@ -3064,6 +3113,7 @@ RESTORE_ROOT=''
 RESTORE_READY=0
 RESTORE_STAGE=''
 RESTORE_PARTIAL=0
+RESTORE_ADOPT_DRIFT=0
 
 restore_ids() {
   case "$1" in
@@ -3340,8 +3390,19 @@ restore_before_stage() {
     status="$(restore_read "$id" state)" || { bad=1; continue; }
     case "$status" in clean|applied|restored) ;; *) bad=1; continue ;; esac
     if [[ "$fp" != "$last" ]]; then
-      warn "$(restore_label "$id") 在本工具之后被修改过：保持不变，跳过这一步（$stage）。"
-      bad=1
+      # An explicit request (single item, vps firewall/ssh) or the upgrade
+      # step, which tracks firewall/time settings only incidentally, takes the
+      # hand-made change as the new starting point; full setup skips the step.
+      if ((${RESTORE_ADOPT_DRIFT:-0})) || [[ "$stage" == apt_upgrade ]]; then
+        if restore_adopt "$id"; then
+          ok "$(restore_label "$id") 在本工具之后被手动改过：以现在的状态为准继续（撤销时仍恢复到本工具运行前的状态）。"
+        else
+          warn "无法更新 $(restore_label "$id") 的回退记录，跳过这一步：$stage。"; bad=1
+        fi
+      else
+        warn "$(restore_label "$id") 在本工具之后被修改过：保持不变，跳过这一步（$stage）。"
+        bad=1
+      fi
     fi
   done < <(restore_ids "$stage")
   ((bad == 0)) || return 1
@@ -4590,11 +4651,11 @@ vnstat_item_stage() {
 
 item_turn_on() {
   case "$1" in
-    upgrade) item_apt_ready || return 0
+    upgrade) apt_index_ready || return 0
       stage_run apt_upgrade upgrade_only_stage ;;
     updates) AUTO_UPDATES=1
       if ! installed unattended-upgrades; then
-        item_apt_ready || return 0
+        apt_index_ready || return 0
         stage_run apt_upgrade packages_stage unattended-upgrades
       fi
       stage_run updates updates_stage ;;
@@ -4604,7 +4665,7 @@ item_turn_on() {
     sysctl) SYSCTL_CHOICE=1
       stage_run sysctl sysctl_hardening_stage ;;
     zram) ZRAM_CHOICE=1
-      item_apt_ready || return 0
+      apt_index_ready || return 0
       stage_run zram zram_stage ;;
     journal) JOURNAL_FORCE=1
       stage_run journal journal_stage ;;
@@ -4612,7 +4673,7 @@ item_turn_on() {
     ntp) NEED_TIMESYNCD=0
       stage_run ntp ntp_stage
       if ((NEED_TIMESYNCD)); then
-        item_apt_ready || return 0
+        apt_index_ready || return 0
         stage_run apt_upgrade packages_stage systemd-timesyncd
         if installed systemd-timesyncd; then stage_run ntp timesyncd_enable; fi
       fi ;;
@@ -4620,14 +4681,14 @@ item_turn_on() {
       stage_run timezone timezone_stage ;;
     hosts) HOSTS_CHOICE=1
       stage_run hosts hosts_stage ;;
-    tools) item_apt_ready || return 0
+    tools) apt_index_ready || return 0
       stage_run tools tools_item_stage ;;
-    vnstat) item_apt_ready || return 0
+    vnstat) apt_index_ready || return 0
       stage_run tools vnstat_item_stage ;;
-    kernel) kernel_cleanup ;;
+    kernel) kernel_cleanup --ask ;;
     firewall)
       if ! command -v ufw >/dev/null; then
-        item_apt_ready || return 0
+        apt_index_ready || return 0
         stage_run apt_upgrade packages_stage ufw
       fi
       WEB_CHOICE=''
@@ -4636,7 +4697,7 @@ item_turn_on() {
     fail2ban)
       if ! ufw_active; then warn '要先开启防火墙，Fail2ban 才能封禁。'; return 0; fi
       FIREWALL_READY=1
-      item_apt_ready || return 0
+      apt_index_ready || return 0
       stage_run fail2ban fail2ban_stage ;;
     ssh) SSH_CHOICE=1 ADMIN_CHOICE='' ADMIN_NAME=''
       stage_run ssh ssh_harden_stage ;;
@@ -4731,15 +4792,21 @@ item_main() {
   prepare_run_state
   stage_run backup backup_configs
   restore_prepare
+  # Each item is an explicit request, so a hand-made change is the new baseline.
+  RESTORE_ADOPT_DRIFT=1
   item_menu
   finish_run_state
-  if ((UPGRADE_APPROVED && KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; then offer_reboot; fi
+  # Offer a reboot only for an upgrade made in this session; an older pending
+  # reboot is just mentioned.
+  if ((UPGRADE_APPROVED)) && { ((KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; }; then offer_reboot
+  elif [[ -e /var/run/reboot-required ]]; then echo '提示：系统之前的更新还在等待重启，方便时运行 systemctl reboot。'; fi
 }
 
 # A reboot happens only after the user agrees, once the run is recorded complete.
 offer_reboot() {
   if ((UPGRADE_APPROVED && KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; then
-    echo '本次更新需要重启才能完全生效（新内核或系统组件）。现在是开荒阶段，重启最安全。'
+    if ((UPGRADE_APPROVED && KERNEL_UPDATE)); then echo '本次更新包含新内核，需要重启才能生效。'
+    else echo '系统提示需要重启，更新才能完全生效（可能来自本次或之前的更新）。'; fi
     echo '重启后重新登录，输入 vps 选 7「开荒验收」，确认各项优化真的生效。'
     if confirm_yes '现在重启吗？'; then
       sync
@@ -4778,6 +4845,8 @@ main() {
   prepare_run_state
   stage_run backup backup_configs
   restore_prepare
+  # Menu 4/5 are explicit requests for one feature, like the single-item menu.
+  if [[ "$MODE" == ssh || "$MODE" == firewall ]]; then RESTORE_ADOPT_DRIFT=1; fi
   if [[ "$MODE" == ssh ]]; then
     stage_run ssh ssh_harden_stage
   elif [[ "$MODE" == firewall ]]; then

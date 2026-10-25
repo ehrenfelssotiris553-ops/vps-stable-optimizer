@@ -9,7 +9,7 @@ bash -n "$TEST_SCRIPT"
 bash -n "$HERE/../install.sh"
 for test in "$HERE"/*.sh; do bash -n "$test"; done
 printf 'PASS: Bash syntax checks.\n'
-for test in ufw-tests.sh firewall-tests.sh bbr-tests.sh f2b-tests.sh entry-tests.sh backup-tests.sh audit-tests.sh preflight-tests.sh config-write-tests.sh menu-tests.sh decision-tests.sh tool-tests.sh restore-tests.sh stage-hooks-tests.sh journal-policy-tests.sh port-tests.sh ssh-tests.sh verify-tests.sh extras-tests.sh item-tests.sh; do
+for test in ufw-tests.sh firewall-tests.sh bbr-tests.sh f2b-tests.sh entry-tests.sh backup-tests.sh audit-tests.sh preflight-tests.sh config-write-tests.sh menu-tests.sh decision-tests.sh tool-tests.sh restore-tests.sh stage-hooks-tests.sh journal-policy-tests.sh port-tests.sh ssh-tests.sh verify-tests.sh extras-tests.sh item-tests.sh robustness-tests.sh install-tests.sh; do
   printf '\nRunning %s\n' "$test"
   bash "$HERE/$test" "$TEST_SCRIPT"
 done

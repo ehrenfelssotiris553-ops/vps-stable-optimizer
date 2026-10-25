@@ -5,7 +5,7 @@ set -Eeuo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 HERE="$PWD"
 source ./test-common.sh
-load_optimizer_functions bbr_config_conflict bbr_stage bbr_report bbr_quick_status
+load_optimizer_functions sysctl_vendor_default bbr_config_conflict bbr_stage bbr_report bbr_quick_status
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 BBR_FILE="$TEST_ROOT/99-vps-stable-bbr.conf"
@@ -43,6 +43,22 @@ printf '%s\n' 'net.ipv4.tcp_keepalive_time = 90' > "$TEST_ROOT/input.conf"
 expect_clear 'unrelated sysctl setting'
 printf '%s\n' 'net/core/default_qdisc=fq' 'net.ipv4.tcp_congestion_control=bbr' > "$TEST_ROOT/input.conf"
 expect_clear 'matching dotted and slash keys'
+
+# Packaged defaults applied before our 99- file are not an administrator policy:
+# Ubuntu 22.04 ships /usr/lib/sysctl.d/50-default.conf with fq_codel.
+sysctl_vendor_default /usr/lib/sysctl.d/50-default.conf || fail 'Ubuntu 22.04 default treated as administrator policy'
+sysctl_vendor_default /lib/sysctl.d/50-default.conf || fail '/lib/sysctl.d default not recognised'
+if sysctl_vendor_default /usr/lib/sysctl.d/99-zzz.conf; then fail 'packaged file applied after ours was ignored'; fi
+if sysctl_vendor_default /etc/sysctl.d/50-default.conf; then fail '/etc file treated as a packaged default'; fi
+if sysctl_vendor_default /usr/local/lib/sysctl.d/50-x.conf; then fail '/usr/local file treated as a packaged default'; fi
+mkdir -p "$TEST_ROOT/vendor"
+printf '%s\n' '# Fair Queue CoDel packet scheduler to fight bufferbloat' '-net.core.default_qdisc = fq_codel' > "$TEST_ROOT/vendor/50-default.conf"
+eval "$(declare -f sysctl_vendor_default | sed '1s/sysctl_vendor_default/real_vendor_default/')"
+sysctl_vendor_default() { [[ "$1" == "$TEST_ROOT/vendor/"* ]]; }
+if bbr_config_conflict "$TEST_ROOT/vendor/50-default.conf"; then fail 'distribution fq_codel default still blocks BBR'; fi
+cp "$TEST_ROOT/vendor/50-default.conf" "$TEST_ROOT/admin.conf"
+bbr_config_conflict "$TEST_ROOT/admin.conf" || fail 'the same line from an administrator file no longer blocks BBR'
+eval "$(declare -f real_vendor_default | sed '1s/real_vendor_default/sysctl_vendor_default/')"
 
 # Retain real parser under another name; redirect the stage scan to temporary
 # files and record arguments to verify all system config locations are covered.

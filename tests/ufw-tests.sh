@@ -63,10 +63,10 @@ for MOCK_ADDED in 'ufw deny 22/tcp' 'ufw reject from 192.0.2.1' 'ufw limit 8080/
   if ufw_stored_rules_safe; then fail "unknown stored rule accepted: $MOCK_ADDED"; fi
 done
 # Fail2ban bans one address on an SSH port; they pile up while UFW is paused.
-for MOCK_ADDED in 'ufw deny from 198.51.100.7 to any port 22 proto tcp' 'ufw prepend deny proto tcp from 2001:db8::7 to any port 2222' 'ufw insert 1 deny from 203.0.113.0/24 to any port 22 proto tcp'; do
+for MOCK_ADDED in 'ufw deny from 198.51.100.7 to any port 22 proto tcp' 'ufw prepend deny proto tcp from 198.51.100.7 to any port 22,2222' 'ufw prepend deny proto tcp from 2001:db8::7 to any port 2222' 'ufw insert 1 deny from 203.0.113.0/24 to any port 22 proto tcp'; do
   ufw_stored_rules_safe || fail "Fail2ban SSH ban rejected: $MOCK_ADDED"
 done
-for MOCK_ADDED in 'ufw deny from 198.51.100.7 to any port 8080 proto tcp' 'ufw deny from 198.51.100.7 to any port 22' 'ufw deny from any to any port 22 proto tcp' 'ufw deny from 999.1.1.1 to any port 22 proto tcp' 'ufw deny proto udp from 198.51.100.7 to any port 22'; do
+for MOCK_ADDED in 'ufw deny from 198.51.100.7 to any port 8080 proto tcp' 'ufw deny from 198.51.100.7 to any port 22' 'ufw deny from any to any port 22 proto tcp' 'ufw deny from 999.1.1.1 to any port 22 proto tcp' 'ufw deny proto udp from 198.51.100.7 to any port 22' 'ufw deny proto tcp from 198.51.100.7 to any port 22,8080'; do
   if ufw_stored_rules_safe; then fail "non-ban deny rule accepted: $MOCK_ADDED"; fi
 done
 MOCK_READ_FAIL=1
