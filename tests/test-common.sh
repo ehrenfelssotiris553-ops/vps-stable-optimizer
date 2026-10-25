@@ -6,6 +6,8 @@ TESTS_DIR="$HERE"
 TEST_SCRIPT="$TESTS_DIR/../vps-stable-opt.sh"
 if [[ -v VPS_OPT_SCRIPT ]]; then TEST_SCRIPT="$VPS_OPT_SCRIPT"; fi
 [[ -r "$TEST_SCRIPT" ]] || { printf 'Unreadable optimizer: %s\n' "$TEST_SCRIPT" >&2; return 1; }
+# Tests run the same over SSH and locally: the caller's session must not leak in.
+unset SSH_CONNECTION SSH_CLIENT SSH_TTY SUDO_USER
 load_optimizer_functions() {
   local name definition
   for name in "$@"; do

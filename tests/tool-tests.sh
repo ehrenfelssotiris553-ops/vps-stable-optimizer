@@ -67,7 +67,11 @@ printf 'PASS: data/install ownership requires exact markers, payload hash, launc
 
 tool_data_owned() { [[ "$1" == /var/lib/vps-stable-opt ]]; }
 FIND_OUTPUT='' FIND_STATUS=0 MOUNTS=$'/\n/var'
-findmnt() { printf '%s\n' "$MOUNTS"; }
+# util-linux 2.40 (Debian 13) refuses --raw together with --list.
+findmnt() {
+  if [[ " $* " == *' --raw '* && " $* " == *' --list '* ]]; then echo 'findmnt: mutually exclusive arguments: --pairs --list --raw --verify' >&2; return 1; fi
+  printf '%s\n' "$MOUNTS"
+}
 find() { printf '%s' "$FIND_OUTPUT"; return "$FIND_STATUS"; }
 tool_tree_safe /var/lib/vps-stable-opt || fail 'safe mocked data tree rejected'
 FIND_OUTPUT=x

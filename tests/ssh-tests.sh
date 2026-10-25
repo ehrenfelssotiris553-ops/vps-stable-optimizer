@@ -28,7 +28,11 @@ effective=$'passwordauthentication yes\nauthorizedkeysfile .ssh/authorized_keys 
 ROOT_LINES=$'Accepted password for alice from 203.0.113.9 port 1 ssh2\nAccepted publickey for alice2 from 203.0.113.9 port 2 ssh2: ED25519 SHA256:x'
 journalctl() {
   if [[ " $* " == *' -t sudo '* ]]; then
-    printf '%s\n' 'alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id' "${SUDO_LINE:-}"
+    # A different command, failed attempts, and (without _UID=0) a forged line.
+    printf '%s\n' 'alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id' \
+      '    alice : 3 incorrect password attempts ; TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true' \
+      '    alice : user NOT in sudoers ; TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true' "${SUDO_LINE:-}"
+    if [[ " $* " != *' _UID=0 '* ]]; then echo 'alice : TTY=forged ; PWD=/ ; USER=root ; COMMAND=/usr/bin/true'; fi
   else
     printf '%s\n' "$ROOT_LINES" "${JOURNAL_LINE:-}"
     # `logger -t sshd` by a local user: not written as root, so _UID=0 hides it.
@@ -41,7 +45,7 @@ ROOT_LINES=''
 if ssh_login_seen 1; then fail 'a line a local user logged as "sshd" counted as an SSH login'; fi
 JOURNAL_LINE='Accepted publickey for alice from 203.0.113.9 port 3 ssh2: ED25519 SHA256:x'
 ssh_login_seen 1 alice publickey || fail 'key login in the journal was missed'
-if ssh_sudo_seen alice 1; then fail 'a different sudo command counted as the sudo test'; fi
+if ssh_sudo_seen alice 1; then fail 'a different command, a failed attempt or a forged line counted as working sudo'; fi
 SUDO_LINE='alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true'
 ssh_sudo_seen alice 1 || fail 'sudo true in the journal was missed'
 passwd() { [[ "$1" == -S ]] && printf '%s %s 2026-10-25 0 99999 7 -1\n' "$2" "$PW_FIXTURE"; }

@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -62,7 +62,14 @@ printf 'PASS: old kernel cleanup removes only old kernel packages and asks first
 # Reboot window: written only when no other APT file sets a reboot policy.
 APT_REBOOT_FILE="$TEST_ROOT/apt/53-vps-stable-auto-reboot"
 mkdir -p "$TEST_ROOT/apt"
-reset; AUTO_REBOOT_TIME=04:00
+# What APT itself parsed, whatever the syntax (a block, as here) or file name.
+APT_DUMP=''
+apt-config() { [[ "$1" == dump ]] && printf '%s\n' "$APT_DUMP"; }
+reset; AUTO_REBOOT_TIME=04:00 APT_DUMP='Unattended-Upgrade::Automatic-Reboot "false";'
+auto_reboot_configure
+[[ ! -e "$APT_REBOOT_FILE" ]] || fail 'an existing reboot policy (block syntax) was overridden'
+grep -q '^result autoreboot preserved' "$TEST_ROOT/trace" || fail 'existing reboot policy not recorded as kept'
+reset; AUTO_REBOOT_TIME=04:00 APT_DUMP=''
 auto_reboot_configure
 grep -Fxq 'Unattended-Upgrade::Automatic-Reboot-Time "04:00";' "$APT_REBOOT_FILE" || fail 'reboot window not written'
 reset; AUTO_REBOOT_TIME=''; auto_reboot_configure
@@ -70,6 +77,24 @@ grep -q '^result autoreboot declined' "$TEST_ROOT/trace" || fail 'empty reboot t
 reset; AUTO_REBOOT_TIME='25:00'; auto_reboot_configure
 grep -q '^result autoreboot failed' "$TEST_ROOT/trace" || fail 'invalid reboot time accepted'
 printf 'PASS: automatic reboot window validation and writing.\n'
+
+# Automatic updates: an existing policy APT reports (any syntax) is kept.
+APT_FILE="$TEST_ROOT/apt/52-vps-stable-auto-upgrades"
+AUTO_UPDATES=1
+installed() { [[ "$1" == unattended-upgrades ]]; }
+systemctl() { record "systemctl $*"; }
+reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "0";\nAPT::Periodic::Unattended-Upgrade "0";'
+updates_stage
+[[ ! -e "$APT_FILE" ]] || fail 'an administrator policy that turned updates off was overridden'
+grep -q '^result updates preserved' "$TEST_ROOT/trace" || fail 'kept update policy not recorded'
+reset; APT_DUMP=''
+updates_stage
+grep -Fxq 'APT::Periodic::Unattended-Upgrade "1";' "$APT_FILE" || fail 'update policy not written when none existed'
+reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'
+updates_stage
+grep -q '^result updates present' "$TEST_ROOT/trace" || fail 'already enabled updates not recognised'
+unset -f installed systemctl apt-config
+printf 'PASS: automatic updates keep a policy APT already reports, in any syntax.\n'
 
 # sysctl hardening: keys set elsewhere are kept, originals recorded after writing.
 SYSCTL_HARDENING_FILE="$TEST_ROOT/sysctl/98-vps-stable-hardening.conf"
@@ -104,6 +129,10 @@ printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys and records
   sysctl_config_files() { printf '%s\n' "$TEST_ROOT/fixture.conf" /nonexistent/sysctl.d/*.conf; }
   sysctl_key_configured net.ipv4.tcp_syncookies || fail 'slash-notation key not detected'
   if sysctl_key_configured kernel.kptr_restrict; then fail 'unrelated key detected'; fi
+  # A glob policy (all interfaces) covers the key; comments do not count.
+  printf '# kernel.kptr_restrict = 0\nnet.ipv4.conf.*.accept_redirects = 1\n' > "$TEST_ROOT/fixture.conf"
+  sysctl_key_configured net.ipv4.conf.all.accept_redirects || fail 'administrator glob policy not detected'
+  if sysctl_key_configured kernel.kptr_restrict; then fail 'a commented-out key counted as configured'; fi
 )
 
 # /etc/hosts: appended only with consent and when the name does not resolve.

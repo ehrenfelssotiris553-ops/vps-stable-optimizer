@@ -4,7 +4,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions port_parse_spec port_item_count port_item_text port_item_covers port_protocols port_source_valid port_ssh_ports port_rule_text port_listen_note port_risky_names port_open port_rule_parse port_close port_list
+load_optimizer_functions port_parse_spec port_item_count port_item_text port_item_covers port_protocols port_source_valid port_ssh_ports port_rule_text port_listen_note port_risky_names port_open port_rule_parse port_split_blocker port_close port_list port_main
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -177,7 +177,49 @@ reset
 ADDED='ufw allow 18081'
 port_close 18081 both > "$TEST_ROOT/out"
 [[ "$(cat "$TEST_ROOT/calls")" == '--force delete allow 18081' ]] || fail 'combined rule not deleted when closing both'
-printf 'PASS: closing ports protects SSH, matches exactly, explains ranges and splits combined TCP+UDP rules.\n'
+# `ufw show added` is in the order UFW applies the rules. A later deny for the
+# kept protocol would now come first: the split is refused, nothing changes.
+reset
+ADDED=$'ufw allow 18081\nufw deny from 198.18.1.2 to any port 18081 proto tcp'
+port_close 18081 udp > "$TEST_ROOT/out"
+[[ ! -s "$TEST_ROOT/calls" ]] || fail 'split although a later deny would now block the kept TCP'
+grep -Fq '198.18.1.2' "$TEST_ROOT/messages" || fail 'blocking rule not named'
+reset
+ADDED=$'ufw allow 18081\nufw deny from 198.18.1.2'
+port_close 18081 udp > "$TEST_ROOT/out"
+[[ ! -s "$TEST_ROOT/calls" ]] || fail 'split although a later all-ports deny would now block the kept TCP'
+# Earlier rules (Fail2ban bans come first), later rules for the other protocol
+# or for other ports change nothing: the split goes ahead.
+reset
+ADDED=$'ufw deny from 198.51.100.7 to any port 18081 proto tcp\nufw allow 18081\nufw deny 18081/udp\nufw deny from 198.18.1.2 to any port 9000 proto tcp\nufw allow 9000/tcp'
+port_close 18081 udp > "$TEST_ROOT/out"
+[[ "$(cat "$TEST_ROOT/calls")" == $'allow 18081/tcp\n--force delete allow 18081' ]] || fail 'harmless rules blocked the split'
+printf 'PASS: closing ports protects SSH, matches exactly, explains ranges and splits combined TCP+UDP rules only when the order stays equivalent.\n'
+
+# vps port arguments: a missing, misspelt or extra argument stops with an error.
+(
+  eval "$(declare -f port_main | sed 's/\$EUID -eq 0/0 -eq 0/')"
+  die() { printf 'STOP %s\n' "$*"; exit 9; }
+  validate_vm() { :; }
+  start_logging() { :; }
+  port_open() { printf 'open %s %s %s\n' "$1" "$2" "${3:-ALL}"; }
+  port_close() { printf 'close %s %s\n' "$1" "$2"; }
+  port_list() { echo list; }
+  port_menu() { echo menu; }
+  run() { MODE_ARGS=("$@"); ( port_main ) 2>&1 || true; }
+  [[ "$(run open 8080 tcp from 198.51.100.7)" == 'open 8080 tcp 198.51.100.7' ]] || fail 'source rule arguments'
+  [[ "$(run open 8080)" == 'open 8080 both ALL' ]] || fail 'default protocol'
+  [[ "$(run open 8080 from 198.51.100.0/24)" == 'open 8080 both 198.51.100.0/24' ]] || fail 'network source without protocol'
+  [[ "$(run close 22 udp)" == 'close 22 udp' ]] || fail 'close arguments'
+  [[ "$(run list)" == list && "$(run)" == menu ]] || fail 'list and menu'
+  for bad in 'open 8080 tcp from' 'open 8080 from' 'open 8080 tcp 198.51.100.7' 'open' 'open 8080 icmp' \
+             'open 8080 tcp from 999.1.1.1' 'close 22 udp from 198.51.100.7' 'close' 'list extra' 'remove 22'; do
+    # shellcheck disable=SC2086
+    out="$(run $bad)"
+    [[ "$out" == STOP* ]] || fail "vps port $bad was accepted: $out"
+  done
+)
+printf 'PASS: vps port refuses missing, misspelt and extra arguments instead of widening the rule.\n'
 
 reset
 ADDED=$'ufw allow 22/tcp\nufw allow 443:600/udp\nufw allow from 203.0.113.5 to any port 3306 proto tcp\nufw deny from 198.51.100.7 to any port 22 proto tcp'

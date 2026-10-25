@@ -7,7 +7,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl verify_reboot_state upgrade_has_kernel \
-  trim_support check_trim check_fail2ban check_firewall check_journal
+  trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -200,6 +200,34 @@ check_firewall ''
 ssh_candidates() { echo 2222; }
 check_firewall ''
 [[ "$VERIFY_STATUS" == fail ]] || fail 'the OpenSSH profile (port 22) counted for SSH on port 2222'
+ssh_candidates() { echo 22; }
+UFW_STATUS=''
+ufw() {
+  case "$*" in
+    status) printf 'Status: active\n\nTo Action From\n-- ------ ----\n%s\n' "$UFW_STATUS" ;;
+    'status verbose') printf 'Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' ;;
+  esac
+}
+# Rule order: a deny for everyone before an allow for one source blocks SSH.
+UFW_STATUS=$'22/tcp DENY Anywhere\n22/tcp ALLOW 198.18.2.2\n22/tcp (v6) DENY Anywhere (v6)'
+check_firewall ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *挡住* ]] || fail "SSH blocked by an earlier deny passed: $VERIFY_TEXT"
+# An allow for the admin's address first: reachable from there only.
+UFW_STATUS=$'22/tcp ALLOW 198.51.100.7\n22/tcp DENY Anywhere'
+check_firewall ''
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *指定来源* ]] || fail "source-restricted SSH not explained: $VERIFY_TEXT"
+# Fail2ban bans before the general rule do not matter; outgoing rules neither.
+UFW_STATUS=$'22/tcp DENY 176.53.159.198\n22/tcp DENY OUT Anywhere\n22/tcp LIMIT Anywhere\n22/tcp (v6) LIMIT Anywhere (v6)'
+check_firewall ''
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" != *指定来源* ]] || fail "bans before the SSH rule changed the result: $VERIFY_TEXT"
+# Only a persistent "enabled" loads UFW at boot.
+UFW_BOOT=enabled-runtime
+check_firewall ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *enabled-runtime* ]] || fail 'runtime-only enablement passed'
+UFW_BOOT=static
+check_firewall ''
+[[ "$VERIFY_STATUS" == unknown ]] || fail 'a static ufw.service was taken as enabled at boot'
+UFW_BOOT=enabled
 printf 'PASS: Fail2ban needs a running UFW; the firewall must also load at boot.\n'
 
 # The usage sentence ends with ".", which must not be taken for the size.
@@ -208,3 +236,19 @@ journalctl() { echo 'Archived and active journals take up 24.0M in the file syst
 check_journal ''
 [[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'当前占用 24.0M' ]] || fail "journal usage misread: $VERIFY_TEXT"
 printf 'PASS: journal check reads the limit and the current usage.\n'
+
+# The exit code also covers the optional Fail2ban live test (run interactively).
+(
+  eval "$(declare -f verify_main | sed -e 's/((EUID != 0))/false/' -e 's/\[\[ -t 0 \]\]/true/')"
+  LOG_DIR="$TEST_ROOT/no-log-dir" STATE_ROOT="$TEST_ROOT/no-state-dir" F2B_FILE="$TEST_ROOT/jail.local"
+  printf 'action = vps-stable-ufw-sshd\n' > "$F2B_FILE"
+  VERIFY_PASS=0 VERIFY_FAIL=0 VERIFY_NA=0 VERIFY_UNKNOWN=0 VERIFY_EXIT=0
+  verify_summary() { echo 'basic checks all pass'; }
+  confirm_yes() { [[ "$1" == *实弹测试* ]]; }
+  details_report() { :; }
+  active() { [[ "$1" == fail2ban ]]; }
+  verify_f2b_live_test() { verify_line fail '封禁 192.0.2.123' 'injected failure'; }
+  verify_main > /dev/null
+  [[ "$VERIFY_EXIT" == 3 ]] || fail 'a failed live test left the exit code at 0'
+)
+printf 'PASS: the acceptance exit code is set after the optional live test.\n'

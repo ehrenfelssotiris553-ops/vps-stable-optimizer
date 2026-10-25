@@ -27,6 +27,8 @@ F2B_FILE="$F2B_DIR/jail.d/99-vps-stable-sshd.local"
 F2B_ACTION_FILE="$F2B_DIR/action.d/vps-stable-ufw-sshd.conf"
 SSH_DROPIN="$TMP/ssh/01-vps-stable-keyonly.conf"
 SSH_PUBKEY_DROPIN="$TMP/ssh/00-vps-stable-pubkey.conf"
+ZRAM_VENDOR_FILE="$TMP/zram-vendor.conf"
+UFW_CONF="$TMP/ufw.conf"
 mkdir -p "$RESTORE_ROOT"
 chmod 700 "$STATE_ROOT" "$RESTORE_ROOT"
 module_result() { :; }
@@ -378,6 +380,83 @@ value_baseline() {
   : > "$TRACE"
   restore_group_apply firewall
   [[ ! -s "$TRACE" ]] || die 'second rollback changed something or recorded again'
+)
+
+# ufw.service was running before; now the firewall is off but ufw.conf still
+# says ENABLED=yes: starting the service would turn the firewall on. Rollback
+# never does that (like the firewall switch itself).
+(
+  value_fixture fw-service-guard
+  RUNTIME=inactive SVC='disabled:inactive'
+  restore_value() { case "$1" in ufw_runtime) echo "$RUNTIME" ;; svc_ufw) echo "$SVC" ;; *) return 1 ;; esac; }
+  systemctl() {
+    case "$1" in
+      show) echo loaded ;;
+      is-enabled) echo "${SVC%%:*}" ;;
+      is-active) echo "${SVC##*:}" ;;
+      enable) printf 'enable\n' >> "$TRACE"; SVC="enabled:${SVC##*:}" ;;
+      start) printf 'start\n' >> "$TRACE"; SVC="${SVC%%:*}:active" ;;
+      *) die "unexpected systemctl $*" ;;
+    esac
+  }
+  value_baseline svc_ufw enabled:active disabled:inactive
+  printf 'ENABLED=yes\n' > "$UFW_CONF"
+  restore_resource svc_ufw
+  [[ ! -s "$TRACE" ]] || die 'rollback started ufw.service and turned the firewall on'
+  expect "$RESTORE_PARTIAL" 1
+  # With ENABLED=no the service only restores its own state: allowed.
+  printf 'ENABLED=no\n' > "$UFW_CONF"
+  RESTORE_PARTIAL=0
+  restore_resource svc_ufw
+  expect "$(cat "$TRACE")" $'enable\nstart'
+  expect "$RESTORE_PARTIAL" 0
+)
+
+# journald could not be restarted after its file went back: the group stays
+# pending for a retry and is not recorded as undone until the restart works.
+(
+  value_fixture journal-retry
+  JOURNAL_FILE="$TMP/journal-retry/99-vps-stable.conf"
+  RESTART_OK=0
+  systemctl() { [[ "$*" == 'restart systemd-journald' ]] || die "unexpected systemctl $*"; printf 'restart\n' >> "$TRACE"; ((RESTART_OK)); }
+  module_result() { printf 'result %s %s\n' "$1" "$2" >> "$TRACE"; }
+  restore_snapshot journal_file
+  printf '[Journal]\nSystemMaxUse=100M\n' > "$JOURNAL_FILE"
+  restore_mark journal_file applied
+  restore_group_apply journal
+  [[ ! -e "$JOURNAL_FILE" ]] || die 'journal configuration not restored'
+  expect "$RESTORE_PARTIAL" 1
+  if grep -q '^result journal reverted' "$TRACE"; then die 'failed journald restart recorded as undone'; fi
+  restore_group_pending journal || die 'pending journald restart hidden from per-item rollback'
+  RESTART_OK=1 RESTORE_PARTIAL=0; : > "$TRACE"
+  restore_group_apply journal
+  expect "$(cat "$TRACE")" $'restart\nresult journal reverted'
+  if restore_group_pending journal; then die 'journal group still pending after the retry worked'; fi
+)
+
+# zram-generator's own default turns ZRAM on again at boot: rollback says so
+# and offers to remove the package this tool installed.
+(
+  value_fixture zram-vendor
+  ZRAM_FILE="$TMP/zram-vendor/zram-generator.conf"
+  restore_value() { case "$1" in zram_swap) echo absent ;; *) return 1 ;; esac; }
+  value_baseline zram_swap absent absent
+  restore_snapshot zram_file
+  printf '[zram0]\nzram-size = ram / 4\n' > "$ZRAM_FILE"
+  restore_mark zram_file applied
+  printf '[zram0]\n' > "$ZRAM_VENDOR_FILE"
+  installed() { [[ "$1" == systemd-zram-generator ]]; }
+  systemctl() { [[ "$*" == daemon-reload ]] || die "unexpected systemctl $*"; }
+  restore_packages_offer() { printf 'offer %s\n' "$*" >> "$TRACE"; }
+  warn() { printf 'WARN %s\n' "$*" >> "$TRACE"; }
+  restore_zram_group
+  [[ ! -e "$ZRAM_FILE" ]] || die 'ZRAM configuration not removed'
+  grep -q '^WARN systemd-zram-generator' "$TRACE" || die 'package default turning ZRAM back on not explained'
+  grep -Fxq 'offer systemd-zram-generator' "$TRACE" || die 'removal of the package not offered'
+  # Full rollback: the package step at the end asks once for all packages.
+  : > "$TRACE"; printf '[zram0]\nzram-size = ram / 4\n' > "$ZRAM_FILE"; restore_mark zram_file applied
+  RESTORE_ALL=1 restore_zram_group > /dev/null
+  if grep -q '^offer' "$TRACE"; then die 'package offered twice during a full rollback'; fi
 )
 printf 'PASS: rule-level firewall rollback, access-widening order and no re-enabling.\n'
 

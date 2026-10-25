@@ -202,6 +202,17 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
   [[ -d "$STATE_ROOT/restore-v2" && -d "$BACKUP_ROOT/not-a-run" ]] || fail 'something other than run records was removed'
   grep -Fq '已清理 4 次' "$T/log" || fail 'pruning not reported'
 )
+# Wrong clocks can leave names that sort after the current run: it stays anyway.
+(
+  STATE_ROOT="$T/prune2/state" BACKUP_ROOT="$T/prune2/backups"
+  mkdir -p "$STATE_ROOT" "$BACKUP_ROOT"
+  RUN_ID=run-20261026T000000Z-200-Curr00
+  mkdir -p "$STATE_ROOT/run-20250101T000000Z-100-First0" "$STATE_ROOT/$RUN_ID" "$BACKUP_ROOT/$RUN_ID"
+  for i in $(seq 1 21); do mkdir -p "$STATE_ROOT/run-20270101T000000Z-$i-Future"; done
+  run_records_prune
+  [[ -d "$STATE_ROOT/$RUN_ID" && -d "$BACKUP_ROOT/$RUN_ID" ]] || fail 'the current run was pruned'
+  [[ -d "$STATE_ROOT/run-20250101T000000Z-100-First0" ]] || fail 'the first run was pruned'
+)
 printf 'PASS: old run records and backups are pruned to the first run plus the newest 20.\n'
 
 # The lock holder note in /run is removed by the process that holds the lock.

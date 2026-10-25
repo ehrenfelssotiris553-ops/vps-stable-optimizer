@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.6.1 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.0 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.6.1
+SCRIPT_VERSION=2.7.0
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -15,6 +15,9 @@ LOG_DIR=/var/log/vps-stable-opt
 BBR_FILE=/etc/sysctl.d/99-vps-stable-bbr.conf
 MODULE_FILE=/etc/modules-load.d/99-vps-stable-bbr.conf
 ZRAM_FILE=/etc/systemd/zram-generator.conf
+# The zram-generator package's own default (creates zram0 when nothing overrides it).
+ZRAM_VENDOR_FILE=/usr/lib/systemd/zram-generator.conf
+UFW_CONF=/etc/ufw/ufw.conf
 JOURNAL_FILE=/etc/systemd/journald.conf.d/99-vps-stable.conf
 F2B_FILE=/etc/fail2ban/jail.d/99-vps-stable-sshd.local
 APT_FILE=/etc/apt/apt.conf.d/52-vps-stable-auto-upgrades
@@ -54,11 +57,11 @@ VNSTAT_CHOICE=''
 ZRAM_CHOICE=''
 HOSTS_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|reboot|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|setup|item|firewall|ssh|port|check|records|rollback|uninstall|reboot|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|setup|item|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V2.6.1 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+VPS 机器管家 V2.7.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps plan       给机器做体检（只检查）
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
@@ -74,6 +77,8 @@ VPS 机器管家 V2.6.1 — Debian 12/13、Ubuntu 22.04/24.04/26.04
   vps rollback   撤销本工具做过的设置（全部或只撤销某一项），可选卸载新装的软件包
   vps uninstall  卸载工具、记录和备份，保留软件与优化效果
   vps reboot     重启服务器（先说明是否需要重启；防失联确认或软件安装没结束时不重启）
+  vps update     检查更新：GitHub 上有新版本时直接更新本工具（不改动系统设置）
+  vps bans       查看 Fail2ban 封禁记录，可以解封某个 IP
 
 大多数问题用 y 或回车回答：[Y/n] 回车表示「做」，[y/N] 回车表示「不做」。
 只有三处要输入单词，提示里会写出要输入什么（区分大小写）：
@@ -876,13 +881,34 @@ swap_exists() {
   return 1
 }
 
+# A zram swap that only the zram-generator package's own default creates
+# (/usr/lib/systemd/zram-generator.conf): no administrator or tool configuration
+# and no other swap. After a rollback it comes back at every boot.
+zram_vendor_default_only() {
+  local f
+  [[ -f "$ZRAM_VENDOR_FILE" ]] || return 1
+  for f in "$ZRAM_FILE" /etc/systemd/zram-generator.conf.d /run/systemd/zram-generator.conf /run/systemd/zram-generator.conf.d \
+      /usr/local/lib/systemd/zram-generator.conf /usr/local/lib/systemd/zram-generator.conf.d /etc/default/zramswap; do
+    [[ ! -e "$f" ]] || return 1
+  done
+  if systemctl is-enabled zramswap.service >/dev/null 2>&1; then return 1; fi
+  if awk '$1 !~ /^#/ && $3=="swap" {found=1} END{exit !found}' /etc/fstab 2>/dev/null; then return 1; fi
+  ! swapon --noheadings --show=NAME 2>/dev/null | grep -qv '^/dev/zram'
+}
+
 zram_stage() {
   say '第4步：内存与 ZRAM（在系统升级前配置）'
+  local size='ram / 2' vendor=0
   if swap_exists; then
-    ok '已有 Swap/ZRAM，保持不变。'; swapon --show || true
-    module_result zram preserved 'existing swap/zram'; return 0
+    # Asked for explicitly: the package default is replaced by this tool's own file.
+    if [[ "${ZRAM_CHOICE:-}" == 1 ]] && zram_vendor_default_only; then
+      vendor=1
+      echo '现在的 ZRAM 来自 systemd-zram-generator 软件包自带的默认配置（约内存一半），改用本工具的配置。'
+    else
+      ok '已有 Swap/ZRAM，保持不变。'; swapon --show || true
+      module_result zram preserved 'existing swap/zram'; return 0
+    fi
   fi
-  local size='ram / 2'
   if ((MEM_MIB >= 2048)); then
     if [[ "${ZRAM_CHOICE:-}" != 1 ]]; then
       ok '内存不少于 2GiB：按你的选择不新增 ZRAM。'
@@ -898,7 +924,11 @@ zram_stage() {
   install_pkgs systemd-zram-generator
   if put_file "$ZRAM_FILE" "[zram0]"$'\n'"zram-size = $size"$'\n''swap-priority = 100'; then
     systemctl daemon-reload
-    if systemctl start dev-zram0.swap; then module_result zram applied "zram0 = $size"
+    if ((vendor)); then
+      # Resizing a zram swap in use is not safe: the new size applies from the next boot.
+      ok "已写入本工具的 ZRAM 配置（$size），重启后按这个大小生效；现在先保留正在使用的 ZRAM。"
+      module_result zram applied "zram0 = $size (from next boot)"
+    elif systemctl start dev-zram0.swap; then module_result zram applied "zram0 = $size"
     else warn 'ZRAM 没有启动，请检查服务。'; module_result zram failed 'dev-zram0.swap did not start'; fi
   else
     module_result zram preserved 'zram config conflict'
@@ -986,17 +1016,14 @@ updates_stage() {
   say '第10步：自动安全更新'
   if (( !AUTO_UPDATES )); then ok '自动更新策略保持不变。'; module_result updates declined 'not requested'; return 0; fi
   installed unattended-upgrades || { warn '没有安装 unattended-upgrades。'; module_result updates unsupported 'package missing'; return 0; }
-  local periodic file custom=0 result=applied
+  local periodic result=applied
   periodic="$(apt-config dump 2>/dev/null | grep -E '^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) ' || true)"
   if grep -Fq 'APT::Periodic::Update-Package-Lists "1";' <<< "$periodic" &&
      grep -Fq 'APT::Periodic::Unattended-Upgrade "1";' <<< "$periodic"; then ok '自动安全更新原本就已开启。'; result=present
-  else
-    for file in /etc/apt/apt.conf.d/*; do
-      [[ -f "$file" && "$file" != "$APT_FILE" ]] || continue
-      if grep -Eq '^[[:space:]]*APT::Periodic::(Update-Package-Lists|Unattended-Upgrade)' "$file"; then custom=1; break; fi
-    done
-    if ((custom)); then warn '已有自定义的定期更新策略，不覆盖。'; result=preserved
-    elif ! put_file "$APT_FILE" $'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'; then result=preserved; fi
+  elif [[ -n "$periodic" ]]; then
+    # APT's parsed configuration covers every syntax (including blocks) and file.
+    warn "已有自定义的定期更新策略（$(tr '\n' ' ' <<< "$periodic")），不覆盖。"; result=preserved
+  elif ! put_file "$APT_FILE" $'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'; then result=preserved
   fi
   if systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then module_result updates "$result" 'periodic updates'
   else warn '无法启用 APT 定时器。'; module_result updates failed 'timers not enabled'; fi
@@ -1005,15 +1032,17 @@ updates_stage() {
 # Optional reboot window for updates that need one (new kernels). An existing
 # Automatic-Reboot policy in any other APT file is kept.
 auto_reboot_configure() {
-  local file
+  local policy
   if [[ -z "${AUTO_REBOOT_TIME:-}" ]]; then module_result autoreboot declined 'no automatic reboot'; return 0; fi
   [[ "$AUTO_REBOOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { module_result autoreboot failed 'invalid time'; return 0; }
-  for file in /etc/apt/apt.conf.d/*; do
-    [[ -f "$file" && "$file" != "$APT_REBOOT_FILE" ]] || continue
-    if grep -Eq '^[[:space:]]*Unattended-Upgrade::Automatic-Reboot(-Time)?[[:space:]]' "$file"; then
-      warn "已有自动重启策略（$file），保持不变。"; module_result autoreboot preserved "$file"; return 0
+  # Without this tool's own file, any value APT reports was set by someone else
+  # (in any syntax); with it, put_file below keeps a differing file as it is.
+  if [[ ! -e "$APT_REBOOT_FILE" ]]; then
+    policy="$(apt-config dump 2>/dev/null | grep -E '^Unattended-Upgrade::Automatic-Reboot(-Time)? ' || true)"
+    if [[ -n "$policy" ]]; then
+      warn "已有自动重启策略（$(tr '\n' ' ' <<< "$policy")），保持不变。"; module_result autoreboot preserved 'existing policy'; return 0
     fi
-  done
+  fi
   if put_file "$APT_REBOOT_FILE" "Unattended-Upgrade::Automatic-Reboot \"true\";"$'\n'"Unattended-Upgrade::Automatic-Reboot-Time \"$AUTO_REBOOT_TIME\";"; then
     ok "需要重启的安全更新会在每天 $AUTO_REBOOT_TIME 自动重启生效。"
     module_result autoreboot applied "$AUTO_REBOOT_TIME"
@@ -1053,12 +1082,18 @@ sysctl_hardening_pairs() {
 
 # True when KEY is assigned in any sysctl configuration file other than ours.
 sysctl_key_configured() {
-  local key="$1" f
+  local key="$1" f line k
   while IFS= read -r f; do
     [[ -f "$f" && "$f" != "$SYSCTL_HARDENING_FILE" ]] || continue
-    if awk -v k="$key" '{line = $0; sub(/^[ \t-]+/, "", line); split(line, a, "="); gsub(/[ \t]/, "", a[1]); gsub("/", ".", a[1]); if (a[1] == k) {found = 1; exit}} END {exit !found}' "$f"; then
-      return 0
-    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line#"${line%%[![:space:]]*}"}"
+      case "$line" in ''|'#'*|';'*) continue ;; esac
+      k="${line%%=*}"; k="${k#-}"; k="${k//[[:space:]]/}"; k="${k//\//.}"
+      [[ -n "$k" ]] || continue
+      # Glob keys (net.ipv4.conf.*.accept_redirects) count as well.
+      # shellcheck disable=SC2053
+      if [[ "$key" == $k ]]; then return 0; fi
+    done < "$f"
   done < <(sysctl_config_files)
   return 1
 }
@@ -1355,7 +1390,8 @@ ufw_stored_rules_safe() {
       IFS=, read -r -a listed <<< "${BASH_REMATCH[4]}"
       allowed=1
       for port in "${listed[@]}"; do [[ " ${SSH_PORTS[*]} " == *" $port "* ]] || allowed=0; done
-      port_source_valid "$src" || allowed=0
+      # Fail2ban bans one address; a network may cover the admin's own address.
+      if [[ "$src" == */* ]] || ! port_source_valid "$src"; then allowed=0; fi
     fi
     if (( !allowed )); then
       warn "未开启的 UFW 里有需要人工核对的规则：$line。保持不变，不自动开启。"
@@ -1519,8 +1555,14 @@ ssh_password_disabled() {
 ufw_boot_enable() {
   local state
   state="$(systemctl is-enabled ufw.service 2>/dev/null || true)"
-  case "$state" in enabled|enabled-runtime|static|indirect|generated|alias) return 0 ;; esac
-  if systemctl enable ufw.service >/dev/null 2>&1; then ok '已设置防火墙开机自动加载（ufw.service）。'
+  [[ "$state" != enabled ]] || return 0
+  case "$state" in
+    static|indirect|generated|alias)
+      warn "ufw.service 的启用方式比较特殊（$state），无法确认开机时会不会加载防火墙，请人工检查。"; return 0 ;;
+  esac
+  # enabled-runtime lasts only until the next reboot; enable makes it persistent.
+  if systemctl enable ufw.service >/dev/null 2>&1 && [[ "$(systemctl is-enabled ufw.service 2>/dev/null || true)" == enabled ]]; then
+    ok '已设置防火墙开机自动加载（ufw.service）。'
   else warn '无法设置 ufw.service 开机启动：重启后防火墙可能不会加载，请手动运行 systemctl enable ufw。'; fi
 }
 
@@ -1689,12 +1731,15 @@ ssh_effective_value() {
   awk -v key="$2" 'tolower($1) == key {sub(/^[^ ]+ /, ""); print; exit}' <<< "$1"
 }
 
-# sudo logs "USER : TTY=... ; USER=root ; COMMAND=/usr/bin/true".
+# sudo's success record "USER : TTY=... ; USER=root ; COMMAND=/usr/bin/true",
+# written as root. Failed attempts put text before TTY= ("3 incorrect password
+# attempts", "user NOT in sudoers") and a line from `logger -t sudo` by a local
+# user is not written as root: neither counts.
 ssh_sudo_seen() {
   local user="$1" since="$2"
   command -v journalctl >/dev/null || return 1
-  journalctl -q --since "@$since" -t sudo -o cat --no-pager 2>/dev/null |
-    awk -v u="$user" '$1 == u && $2 == ":" && $0 ~ /USER=root ; COMMAND=(\/usr)?\/bin\/true$/ {found = 1} END {exit !found}'
+  journalctl -q --since "@$since" _UID=0 -t sudo -o cat --no-pager 2>/dev/null |
+    awk -v u="$user" '$1 == u && $2 == ":" && $3 ~ /^TTY=/ && $0 ~ /USER=root ; COMMAND=(\/usr)?\/bin\/true$/ {found = 1} END {exit !found}'
 }
 
 ssh_reload() {
@@ -2654,7 +2699,8 @@ run_records_prune() {
   mapfile -t ids < <(for dir in "$STATE_ROOT"/run-* "$BACKUP_ROOT"/run-*; do printf '%s\n' "${dir##*/}"; done |
     grep -E '^run-[0-9]{8}T[0-9]{6}Z-[0-9]+-[A-Za-z0-9]{6}$' | LC_ALL=C sort -u)
   ((${#ids[@]} > newest + 1)) || return 0
-  keep+="${ids[0]} "
+  # The current run always stays, even when wrong clocks left later names.
+  keep+="${ids[0]} ${RUN_ID:-} "
   for id in "${ids[@]: -newest}"; do keep+="$id "; done
   for id in "${ids[@]}"; do
     [[ "$keep" != *" $id "* ]] || continue
@@ -2853,7 +2899,7 @@ record_config_change() {
 # would suppress errexit inside that function; a separate /bin/bash avoids it.
 menu_action() {
   local self="$1" action="$2" code
-  case "$action" in plan|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot) ;; *) die '无效的菜单操作。' ;; esac
+  case "$action" in plan|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
   # The new interpreter keeps its own errexit even inside the parent's if.
   if /bin/bash -- "$self" "$action"; then
     echo '本项已结束；请查看上方结果、跳过项和注意事项。'
@@ -2870,7 +2916,7 @@ menu_action() {
 }
 
 menu() {
-  local self choice action
+  local self choice action before=''
   [[ -t 0 ]] || die '菜单需要交互终端；请登录 SSH 后输入 vps。'
   self="$(readlink -f -- "${BASH_SOURCE[0]}")" || die '无法确定本工具所在位置。'
   [[ -f "$self" && -r "$self" ]] || die '无法读取本工具的脚本文件。'
@@ -2889,6 +2935,8 @@ menu() {
    9. 撤销本工具的设置（全部或只撤销某一项）
   10. 卸载本工具，保留优化效果
   11. 重启服务器（先说明是否需要重启，确认后才重启）
+  12. 检查更新（有新版本时直接更新本工具）
+  13. 查看 Fail2ban 封禁记录（可以解封某个 IP）
    h. 查看使用说明
    0. 退出
 
@@ -2896,7 +2944,7 @@ menu() {
 撤销设置会保留已安装/升级的软件（可选卸载本工具新装的包），不会还原整台机器。
 卸载会删除工具、记录和备份；删除备份后无法可靠回退。
 MENU_TEXT
-    if ! read -r -p '请输入选项 [0-11 或 h]: ' choice; then printf '\n'; return 0; fi
+    if ! read -r -p '请输入选项 [0-13 或 h]: ' choice; then printf '\n'; return 0; fi
     case "$choice" in
       0) return 0 ;;
       1) action=plan ;;
@@ -2910,12 +2958,19 @@ MENU_TEXT
       9) action=rollback ;;
       10) action=uninstall ;;
       11) action=reboot ;;
+      12) action=update ;;
+      13) action=bans ;;
       h|H) /bin/bash -- "$self" help; action='' ;;
-      *) echo '无效选项，请输入 0 至 11 或 h。'; continue ;;
+      *) echo '无效选项，请输入 0 至 13 或 h。'; continue ;;
     esac
+    if [[ "$action" == update ]]; then before="$(sha256sum -- "$self" 2>/dev/null || true)"; fi
     if [[ -n "$action" ]]; then menu_action "$self" "$action"; fi
     # Uninstall may remove the installed source and launcher in its child.
     if [[ ! -f "$self" ]]; then echo '本工具已卸载，菜单退出。'; return 0; fi
+    # This menu is still the old version in memory: start the new one fresh.
+    if [[ "$action" == update && "$(sha256sum -- "$self" 2>/dev/null || true)" != "$before" ]]; then
+      echo '本工具已更新，菜单先退出；重新输入 vps 打开新版本。'; return 0
+    fi
     if [[ "$action" == uninstall ]]; then
       # Uploaded source copies are user files and are intentionally not removed.
       echo '卸载操作结束；如从上传的脚本副本运行，副本由你自行保留或删除。'
@@ -3198,7 +3253,7 @@ lock_holder_text() {
     case "$mode" in
       setup) name='一键开荒' ;; firewall) name='防火墙设置' ;; ssh) name='SSH 登录加固' ;;
       port) name='端口管理' ;; rollback) name='撤销设置' ;; uninstall) name='卸载' ;; check) name='Fail2ban 实弹测试' ;;
-      item) name='单项设置' ;; reboot) name='重启' ;;
+      item) name='单项设置' ;; reboot) name='重启' ;; bans) name='Fail2ban 解封' ;;
     esac
     printf '%s正在运行（PID %s）：请等它结束，或回到那个窗口退出后再试。' "$name" "$pid"
   else
@@ -3266,7 +3321,7 @@ tool_tree_safe() {
   local directory="$1" unsafe mounts mount
   tool_data_owned "$directory" || return 1
   command -v findmnt >/dev/null || return 1
-  mounts="$(findmnt --raw --noheadings --list --output TARGET)" || return 1
+  mounts="$(findmnt --raw --noheadings --output TARGET)" || return 1
   while IFS= read -r mount; do
     [[ "$mount" != "$directory" && "$mount" != "$directory/"* ]] || return 1
   done <<< "$mounts"
@@ -3771,6 +3826,15 @@ restore_apply_one() {
     qdisc) [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1; sysctl -w "net.core.default_qdisc=$value" ;;
     ntp) case "$value" in yes) timedatectl set-ntp true ;; no) timedatectl set-ntp false ;; *) return 1 ;; esac ;;
     tz) [[ "$value" =~ ^[A-Za-z0-9_+/-]+$ ]] || return 1; timedatectl set-timezone "$value" ;;
+    svc_ufw)
+      # Starting ufw.service loads the firewall when ufw.conf says ENABLED=yes;
+      # like the firewall switch, rollback never turns it on (now or at boot).
+      if [[ "$value" == enabled:* || "$value" == *:active ]] && ! ufw_active &&
+         grep -Eq '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*"?yes"?[[:space:]]*$' "$UFW_CONF" 2>/dev/null; then
+        warn '防火墙现在没有开启：回退不会重新启动 ufw.service，也不会把它设成开机启动（那样会重新打开防火墙）。如需要，请手动处理。'
+        return 1
+      fi
+      restore_service_apply "$id" ;;
     svc_*) restore_service_apply "$id" ;;
     ufw_policy_in|ufw_policy_out)
       [[ "$value" != absent ]] || return 0
@@ -3971,18 +4035,33 @@ restore_ssh_group() {
 }
 
 restore_zram_group() {
-  local file_needed=0 swap_needed=0
+  local file_needed=0 swap_needed=0 origin
   if restore_needed zram_file; then file_needed=1; fi
   if restore_needed zram_swap; then swap_needed=1; fi
   ((file_needed || swap_needed)) || return 0
+  origin="$(restore_read zram_swap origin_value 2>/dev/null || true)"
+  if ((swap_needed)) && [[ -n "$origin" && "$origin" != absent ]]; then
+    # A swap existed before (for example the package's own default): only the
+    # configuration goes back; the running swap returns to it at the next boot.
+    swap_needed=0
+    echo 'ZRAM 在本工具之前就有：只恢复配置文件，重启后按原来的设置生效。'
+  fi
   if ((swap_needed)) && ! restore_zram_safe; then RESTORE_PARTIAL=1; return 0; fi
-  restore_resource zram_swap
-  if [[ "$(restore_read zram_swap state 2>/dev/null || true)" == applied ]]; then return 0; fi
+  if ((swap_needed)); then
+    restore_resource zram_swap
+    if [[ "$(restore_read zram_swap state 2>/dev/null || true)" == applied ]]; then return 0; fi
+  fi
   restore_resource zram_file
   if ((file_needed)) && ! systemctl daemon-reload; then
     warn '无法重新加载 ZRAM 服务，留待下次重试。'
     restore_mark zram_file applied || die '无法记录待重试的 ZRAM 回退。'
     RESTORE_PARTIAL=1
+  fi
+  # The package's own default turns ZRAM on again at the next boot.
+  if [[ "$origin" == absent ]] && installed systemd-zram-generator && grep -q '^[[:space:]]*\[zram' "$ZRAM_VENDOR_FILE" 2>/dev/null; then
+    warn 'systemd-zram-generator 软件包自带默认配置：重启后会按约一半内存重新开启 ZRAM。要保持关闭，需要卸载这个本工具装的软件包。'
+    if [[ "${RESTORE_ALL:-0}" == 1 ]]; then echo '稍后询问是否卸载本工具新装的软件包时，把它一起卸载即可。'
+    else restore_packages_offer systemd-zram-generator; fi
   fi
 }
 
@@ -4103,6 +4182,8 @@ restore_group_pending() {
   local group="$1" id
   while IFS= read -r id; do
     if restore_needed "$id"; then return 0; fi
+    # "applied" while already at the original: a service reload is still due.
+    if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then return 0; fi
   done < <(restore_group_ids "$group")
   case "$group" in
     firewall) [[ -s "$RESTORE_ROOT/fw_rules" ]] && return 0 ;;
@@ -4112,7 +4193,8 @@ restore_group_pending() {
 }
 
 restore_group_apply() {
-  local group="$1" id pending was_pending=0
+  local group="$1" id pending was_pending=0 partial="${RESTORE_PARTIAL:-0}"
+  RESTORE_PARTIAL=0
   if restore_group_pending "$group"; then was_pending=1; fi
   case "$group" in
     firewall) restore_firewall_group ;;
@@ -4138,9 +4220,10 @@ restore_group_apply() {
       while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids "$group") ;;
   esac
   # Group names are module names: vps check then reports it as undone, not broken.
-  if ((was_pending)) && ! restore_group_pending "$group"; then
+  if ((was_pending && RESTORE_PARTIAL == 0)) && ! restore_group_pending "$group"; then
     module_result "$group" reverted '由撤销功能恢复'
   fi
+  if ((partial)); then RESTORE_PARTIAL=1; fi
 }
 
 # Records the current state as this tool's own latest change (used when the
@@ -4162,7 +4245,7 @@ restore_firewall_warning() {
 }
 
 restore_all_groups() {
-  local group firewall_before
+  local group firewall_before RESTORE_ALL=1
   firewall_before="$(restore_value ufw_runtime 2>/dev/null || true)"
   # Fail2ban first (its bans live in UFW), then the firewall itself.
   while IFS= read -r group; do restore_group_apply "$group"; done < <(restore_groups)
@@ -4208,7 +4291,8 @@ restore_main() {
     [[ -d "$RESTORE_ROOT/$id" ]] || continue
     status="$(restore_read "$id" state)" || die "无法读取回退记录：$id"
     case "$status" in clean|applied|restored) ;; *) die "回退记录格式异常：$id" ;; esac
-    if restore_needed "$id"; then printf '待恢复：%s\n' "$(restore_label "$id")"; count=$((count + 1)); fi
+    if restore_needed "$id"; then printf '待恢复：%s\n' "$(restore_label "$id")"; count=$((count + 1))
+    elif [[ "$status" == applied ]]; then printf '待重试（上次恢复后服务没能重新加载）：%s\n' "$(restore_label "$id")"; count=$((count + 1)); fi
   done < <(restore_all_ids)
   if [[ -f "$RESTORE_ROOT/fw_rules" ]]; then
     rules="$(grep -c . "$RESTORE_ROOT/fw_rules" || true)"
@@ -4407,25 +4491,67 @@ check_ssh() {
   fi
 }
 
+# How UFW treats new SSH connections to PORT, from `ufw status` (IPv4 rules in
+# order): the first rule for every source decides; an earlier allow for some
+# sources only (an admin address) makes it "restricted"; earlier denies for
+# single sources (Fail2ban bans) do not matter. Prints allow, restricted, deny
+# or missing.
+ufw_ssh_access() {
+  local status="$1" port="$2" line to action dir from spec proto item covered restricted=0
+  local -a list=()
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+(ALLOW|DENY|REJECT|LIMIT)(\ (IN|OUT|FWD))?[[:space:]]+(.*[^[:space:]])[[:space:]]*$ ]] || continue
+    to="${BASH_REMATCH[1]}" action="${BASH_REMATCH[2]}" dir="${BASH_REMATCH[4]}" from="${BASH_REMATCH[5]}"
+    [[ -z "$dir" || "$dir" == IN ]] || continue
+    if [[ "$to" == OpenSSH ]]; then spec=22 proto=tcp
+    elif [[ "$to" =~ ^([0-9:,]+)(/(tcp|udp))?$ ]]; then spec="${BASH_REMATCH[1]}" proto="${BASH_REMATCH[3]:-both}"
+    else continue; fi
+    [[ "$proto" != udp ]] || continue
+    covered=0
+    IFS=, read -r -a list <<< "$spec"
+    for item in "${list[@]}"; do if port_item_covers "$item" "$port"; then covered=1; fi; done
+    ((covered)) || continue
+    if [[ "$from" == Anywhere ]]; then
+      case "$action" in
+        ALLOW|LIMIT) echo allow ;;
+        *) if ((restricted)); then echo restricted; else echo deny; fi ;;
+      esac
+      return 0
+    fi
+    if [[ "$action" == ALLOW || "$action" == LIMIT ]]; then restricted=1; fi
+  done <<< "$status"
+  if ((restricted)); then echo restricted; else echo missing; fi
+}
+
 check_firewall() {
-  local status verbose p missing='' ipv6='UNKNOWN'
+  local status verbose p missing='' blocked='' limited='' boot ipv6='UNKNOWN'
   command -v ufw >/dev/null || { verify_set fail 'ufw 未安装'; return 0; }
   if ! ufw_active; then verify_set fail '防火墙没有开启（重启后未生效或被关闭）'; return 0; fi
   status="$(ufw status 2>/dev/null || true)"
   verbose="$(ufw status verbose 2>/dev/null || true)"
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
-    if grep -Eq "^$p(/tcp)?[[:space:]].*(ALLOW|LIMIT)" <<< "$status"; then continue; fi
-    # `ufw allow OpenSSH` (the application profile) covers port 22/tcp.
-    if [[ "$p" == 22 ]] && grep -Eq '^OpenSSH[[:space:]].*(ALLOW|LIMIT)' <<< "$status"; then continue; fi
-    missing+=" $p"
+    case "$(ufw_ssh_access "$status" "$p")" in
+      allow) ;;
+      restricted) limited+=" $p" ;;
+      deny) blocked+=" $p" ;;
+      *) missing+=" $p" ;;
+    esac
   done < <(ssh_candidates | sort -n -u)
   if [[ -r /etc/default/ufw ]]; then ipv6="$(audit_ufw_ipv6 < /etc/default/ufw)"; fi
-  if [[ -n "$missing" ]]; then verify_set fail "没有找到 SSH 端口${missing} 的放行规则"
+  boot="$(systemctl is-enabled ufw.service 2>/dev/null || true)"
+  if [[ -n "$blocked" ]]; then verify_set fail "SSH 端口${blocked} 被排在前面的拒绝规则挡住了（运行 ufw status numbered 查看顺序）"
+  elif [[ -n "$missing" ]]; then verify_set fail "没有找到 SSH 端口${missing} 的放行规则"
   elif ! grep -Eq 'Default: (deny|reject) \(incoming\)' <<< "$verbose"; then verify_set fail '入站默认策略不是拒绝'
-  elif [[ ! "$(systemctl is-enabled ufw.service 2>/dev/null || true)" =~ ^(enabled|enabled-runtime|static|indirect|generated|alias)$ ]]; then
+  elif [[ "$boot" == enabled-runtime ]]; then
+    verify_set fail 'ufw.service 只在本次开机期间设为启动（enabled-runtime），重启后不会加载（运行 systemctl enable ufw 修复）'
+  elif [[ "$boot" =~ ^(static|indirect|generated|alias)$ ]]; then
+    verify_set unknown "防火墙现在开着；ufw.service 的启用方式比较特殊（$boot），无法确认开机时会不会加载"
+  elif [[ "$boot" != enabled ]]; then
     verify_set fail '防火墙现在开着，但 ufw.service 没有设为开机启动，重启后不会加载（运行 systemctl enable ufw 修复）'
-  else verify_set pass "已开启，开机自动加载；SSH 端口已放行；入站默认拒绝；IPv6 管理：$ipv6"; fi
+  else
+    verify_set pass "已开启，开机自动加载；SSH 端口已放行${limited:+（端口${limited} 只允许指定来源连接）}；入站默认拒绝；IPv6 管理：$ipv6"
+  fi
 }
 
 check_fail2ban() {
@@ -4607,16 +4733,18 @@ verify_main() {
   else
     verify_summary
   fi
-  if ((VERIFY_FAIL)); then VERIFY_EXIT=3; fi
   if [[ -d "$STATE_ROOT" && ! -L "$STATE_ROOT" && -O "$STATE_ROOT" ]]; then
     printf '%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)" > "$STATE_ROOT/verified_boot" 2>/dev/null || true
   fi
-  [[ -t 0 ]] || return 0
-  if confirm_yes '显示详细状态吗？'; then details_report; fi
-  if active fail2ban && [[ -f "$F2B_FILE" ]] && grep -Fq vps-stable-ufw-sshd "$F2B_FILE" &&
-     confirm_yes '做一次 Fail2ban 实弹测试吗？（用测试保留地址模拟封禁再解封，约 30 秒）'; then
-    verify_f2b_live_test
+  if [[ -t 0 ]]; then
+    if confirm_yes '显示详细状态吗？'; then details_report; fi
+    if active fail2ban && [[ -f "$F2B_FILE" ]] && grep -Fq vps-stable-ufw-sshd "$F2B_FILE" &&
+       confirm_yes '做一次 Fail2ban 实弹测试吗？（用测试保留地址模拟封禁再解封，约 30 秒）'; then
+      verify_f2b_live_test
+    fi
   fi
+  # Last, so a failure in the optional live test counts too.
+  if ((VERIFY_FAIL)); then VERIFY_EXIT=3; fi
 }
 
 # Menu banner: a completed setup was followed by a reboot that is not verified yet.
@@ -4802,12 +4930,42 @@ port_rule_parse() {
   fi
 }
 
+# `ufw show added` lists rules in the order UFW applies them. A split appends
+# the kept protocol at the end, which is only equivalent when no rule after the
+# combined one could block it: prints the first later deny/reject/limit rule
+# that may match PORT for PROTO (a rule naming no port matches every port).
+port_split_blocker() {
+  local rules="$1" target="$2" port="$3" proto="$4" line body spec item after=0
+  local -a list=()
+  while IFS= read -r line; do
+    if ((after == 0)); then
+      if [[ "$line" == "$target" ]]; then after=1; fi
+      continue
+    fi
+    [[ "$line" == 'ufw '* ]] || continue
+    body="${line#ufw }"; body="${body#prepend }"
+    if [[ "$body" =~ ^insert\ [0-9]+\ (.*)$ ]]; then body="${BASH_REMATCH[1]}"; fi
+    [[ "$body" =~ ^(deny|reject|limit)\  ]] || continue
+    [[ " $body " != *' out '* ]] || continue
+    # A rule for the other protocol only cannot block the kept one.
+    if [[ "$body" =~ (/|proto\ )(tcp|udp)(\ |$) && "${BASH_REMATCH[2]}" != "$proto" ]]; then continue; fi
+    if [[ "$body" =~ \ port\ ([0-9:,]+) ]]; then spec="${BASH_REMATCH[1]}"
+    elif [[ "$body" =~ ^(deny|reject|limit)\ (in\ )?([0-9:,]+)(/(tcp|udp))?$ ]]; then spec="${BASH_REMATCH[3]}"
+    else printf '%s\n' "$line"; return 0; fi
+    IFS=, read -r -a list <<< "$spec"
+    for item in "${list[@]}"; do
+      if port_item_covers "$item" "$port"; then printf '%s\n' "$line"; return 0; fi
+    done
+  done <<< "$rules"
+  return 1
+}
+
 # A rule for TCP and UDP together (e.g. "ufw allow 22") closed for one protocol
 # is split: the other protocol is allowed on its own first, then the combined
 # rule goes, so nothing is ever briefly closed. No TCP access to an SSH port is
 # ever removed, checked against each rule that would actually be deleted.
 port_close() {
-  local spec="$1" proto_choice="${2:-both}" item rules line parsed r_item r_proto r_src p hit keep i
+  local spec="$1" proto_choice="${2:-both}" item rules line parsed r_item r_proto r_src p hit keep i blocker
   local -a items=() protos=() targets=() keeps=() srcs=() words=() ssh=()
   if ! mapfile -t items < <(port_parse_spec "$spec") || ((${#items[@]} == 0)) || ! port_parse_spec "$spec" >/dev/null; then
     warn "端口格式不对：$spec"; return 0
@@ -4833,6 +4991,11 @@ port_close() {
       keep='-'
       if [[ "$r_proto" == both && ${#protos[@]} == 1 ]]; then
         if [[ "${protos[0]}" == tcp ]]; then keep=udp; else keep=tcp; fi
+        if blocker="$(port_split_blocker "$rules" "$line" "$r_item" "$keep")"; then
+          warn "不能只关闭 $(port_item_text "$r_item")/${protos[0]}：${line#ufw } 同时放行 TCP 和 UDP，它后面还有可能挡住 $keep 的规则（${blocker#ufw }）。拆分后单独放行的 $keep 会排到那条规则后面，原来能连上的可能被挡住，所以没有改动。"
+          echo "可以先关闭两种协议（vps port close $(port_item_text "$r_item") both），再按需要重新放行 $keep；需要保持规则顺序时，用 ufw insert 手动调整。"
+          return 0
+        fi
       fi
       if [[ "$keep" != tcp && ( "$r_proto" == tcp || "$r_proto" == both ) ]]; then
         for p in "${ssh[@]}"; do
@@ -4920,20 +5083,37 @@ port_menu() {
   done
 }
 
+# vps port open SPEC [tcp|udp|both] [from IP] | close SPEC [tcp|udp|both] | list.
+# A missing, misspelt or extra argument stops with an error instead of falling
+# back to a wider default (such as "from" without an address meaning everyone).
 port_main() {
-  local action="${MODE_ARGS[0]:-}" spec="${MODE_ARGS[1]:-}" proto="${MODE_ARGS[2]:-}" src=''
+  local action="${MODE_ARGS[0]:-}" spec='' proto=both src='' usage
+  local -a rest=("${MODE_ARGS[@]:1}")
+  usage='用法：vps port open 端口 [tcp|udp|both] [from IP] ｜ vps port close 端口 [tcp|udp|both] ｜ vps port list'
   [[ $EUID -eq 0 ]] || die '端口管理需要 root：请用 sudo vps port。'
+  case "$action" in
+    open|close)
+      spec="${rest[0]:-}"
+      [[ -n "$spec" ]] || die "没有写端口。$usage"
+      rest=("${rest[@]:1}")
+      if [[ "${rest[0]:-}" =~ ^(tcp|udp|both)$ ]]; then proto="${rest[0]}"; rest=("${rest[@]:1}"); fi
+      if [[ "$action" == open && "${rest[0]:-}" == from ]]; then
+        src="${rest[1]:-}"
+        port_source_valid "$src" || die "from 后面要写一个 IP 地址或网段：${src:-（没有写）}"
+        rest=("${rest[@]:2}")
+      fi
+      ((${#rest[@]} == 0)) || die "看不懂的参数：${rest[*]}。$usage" ;;
+    ''|list) ((${#rest[@]} == 0)) || die "看不懂的参数：${rest[*]}。$usage" ;;
+    *) die "$usage" ;;
+  esac
   validate_vm
   command -v ufw >/dev/null || die '还没有安装 UFW：请先运行一键开荒或安装 ufw。'
   start_logging
-  if [[ "$proto" == from ]]; then src="${MODE_ARGS[3]:-}"; proto=''
-  elif [[ "${MODE_ARGS[3]:-}" == from ]]; then src="${MODE_ARGS[4]:-}"; fi
   case "$action" in
     '') port_menu ;;
-    open) [[ -n "$spec" ]] || die '用法：vps port open 端口 [tcp|udp|both] [from IP]'; port_open "$spec" "${proto:-both}" "$src" ;;
-    close) [[ -n "$spec" ]] || die '用法：vps port close 端口 [tcp|udp|both]'; port_close "$spec" "${proto:-both}" ;;
+    open) port_open "$spec" "$proto" "$src" ;;
+    close) port_close "$spec" "$proto" ;;
     list) port_list ;;
-    *) die '用法：vps port [open|close|list] ...' ;;
   esac
 }
 
@@ -5205,6 +5385,149 @@ reboot_main() {
   systemctl reboot
 }
 
+# ---- Update (menu 12 / vps update) -------------------------------------------------
+# Same source and checks as the one-line install in the README: install.sh and
+# the main script from the repository's main branch over HTTPS; the script must
+# match the hash pinned in that install.sh, which then installs it in place
+# (records, backups and rollback data stay). No system setting is changed.
+UPDATE_BASE_URL='https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main'
+
+update_fetch() {
+  local url="$1" out="$2"
+  if command -v curl >/dev/null; then
+    curl --fail --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 120 \
+      --silent --show-error --output "$out" "$url"
+  elif command -v wget >/dev/null && command -v timeout >/dev/null; then
+    # No redirects: wget's --https-only alone does not constrain every redirect.
+    timeout 120s wget --https-only --max-redirect=0 --timeout=15 --tries=2 --no-verbose --output-document="$out" "$url"
+  else
+    warn '缺少 curl 或 wget，无法下载更新。'; return 1
+  fi
+}
+
+# The SCRIPT_VERSION assigned in a script file, read without running it.
+script_version_of() {
+  awk -F= '$1 == "SCRIPT_VERSION" && $2 ~ /^[0-9]+(\.[0-9]+)+$/ {print $2; exit}' "$1"
+}
+
+# True when version A is newer than version B (2.6.10 is newer than 2.6.9).
+version_newer() {
+  [[ "$1" != "$2" && "$(printf '%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+}
+
+update_install() {
+  /bin/bash "$1" --local-file "$2" --no-run
+}
+
+update_main() {
+  local tmp latest expected actual rc=0
+  [[ $EUID -eq 0 ]] || die '检查更新需要 root：请用 sudo vps update。'
+  say '检查更新'
+  printf '本机版本：%s\n' "$SCRIPT_VERSION"
+  tmp="$(mktemp -d)" || die '无法创建临时目录。'
+  if ! update_fetch "$UPDATE_BASE_URL/install.sh" "$tmp/install.sh" ||
+     ! update_fetch "$UPDATE_BASE_URL/vps-stable-opt.sh" "$tmp/vps-stable-opt.sh"; then
+    rm -rf -- "$tmp"
+    warn '连不上 GitHub，暂时无法检查更新；稍后再试，或按 README 手动上传新版本。'; return 0
+  fi
+  expected="$(sed -n "s/^EXPECTED_SHA256='\([0-9a-f]\{64\}\)'$/\1/p" "$tmp/install.sh" | head -n 1)"
+  actual="$(sha256sum -- "$tmp/vps-stable-opt.sh")"; actual="${actual%% *}"
+  if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+    rm -rf -- "$tmp"
+    warn 'GitHub 上的安装器和主脚本对不上（可能刚发布、文件还在同步），这次没有更新；过几分钟再试。'; return 0
+  fi
+  latest="$(script_version_of "$tmp/vps-stable-opt.sh" || true)"
+  if [[ -z "$latest" ]]; then rm -rf -- "$tmp"; warn '读不出 GitHub 上的版本号，这次没有更新。'; return 0; fi
+  printf 'GitHub 上的最新版本：%s\n' "$latest"
+  if ! version_newer "$latest" "$SCRIPT_VERSION"; then
+    rm -rf -- "$tmp"
+    if [[ "$latest" == "$SCRIPT_VERSION" ]]; then ok '已经是最新版本，不需要更新。'
+    else ok '本机的版本比 GitHub 上的还新，不做改动。'; fi
+    return 0
+  fi
+  echo '更新只替换本工具自己的程序，不改动任何系统设置；运行记录、配置备份和回退资料都会保留。'
+  echo '各版本改了什么，见仓库里的「优化记录.md」：https://github.com/ehrenfelssotiris553-ops/vps-stable-optimizer'
+  if [[ ! -e /usr/local/bin/vps ]]; then echo '本机还没有安装 vps 命令：更新会把它安装到 /usr/local/bin/vps。'; fi
+  if ! confirm_default_yes "现在更新到 $latest 吗？"; then rm -rf -- "$tmp"; ok '没有更新。'; return 0; fi
+  update_install "$tmp/install.sh" "$tmp/vps-stable-opt.sh" || rc=$?
+  rm -rf -- "$tmp"
+  if ((rc)); then warn "更新没有完成（安装器退出码 $rc），本机仍是 $SCRIPT_VERSION，请看上面的提示。"; return 0; fi
+  ok "已更新到 $latest。重新输入 vps 打开新版本。"
+}
+
+# ---- Fail2ban ban records (menu 13 / vps bans) -------------------------------------
+# Recent sshd-jail ban and unban events from Fail2ban's log file (the current
+# and the previous one), or from the journal when Fail2ban logs there, oldest
+# first, as "time<TAB>event<TAB>address".
+f2b_ban_events() {
+  local log="${1:-/var/log/fail2ban.log}" limit="${2:-20}" f
+  local -a files=()
+  for f in "$log.1" "$log"; do
+    if [[ -f "$f" && -r "$f" ]]; then files+=("$f"); fi
+  done
+  {
+    if ((${#files[@]})); then cat -- "${files[@]}"
+    elif command -v journalctl >/dev/null; then journalctl -q -u fail2ban -o short-iso -n 5000 --no-pager 2>/dev/null || true
+    fi
+  } | awk '
+    / \[sshd\] (Restore )?Ban [0-9A-Fa-f:.]+$/ || / \[sshd\] Unban [0-9A-Fa-f:.]+$/ {
+      if ($1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/) t = $1 " " substr($2, 1, 8)
+      else { t = substr($1, 1, 19); sub(/T/, " ", t) }
+      if ($0 ~ / Unban /) e = "解封"; else if ($0 ~ / Restore Ban /) e = "重启后恢复封禁"; else e = "封禁"
+      print t "\t" e "\t" $NF
+    }' | tail -n "$limit"
+}
+
+bans_main() {
+  local status failed banned total list bantime times ignore me ip line
+  [[ $EUID -eq 0 ]] || die '查看封禁记录需要 root：请用 sudo vps bans。'
+  say 'Fail2ban 封禁记录'
+  if ! command -v fail2ban-client >/dev/null || ! active fail2ban; then
+    ok 'Fail2ban 没有运行，没有封禁记录可看（可以在单项设置里开启 Fail2ban）。'; return 0
+  fi
+  if ! status="$(fail2ban-client status sshd 2>/dev/null)"; then
+    warn '读不到 SSH 防爆破规则（sshd）的状态：可能没有启用这条规则。'; return 0
+  fi
+  failed="$(awk -F: '/Total failed/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
+  banned="$(awk -F: '/Currently banned/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
+  total="$(awk -F: '/Total banned/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
+  # IPv6 addresses contain ":", so the list is cut after its label instead.
+  list="$(awk '/Banned IP list:/ {sub(/^.*Banned IP list:[ \t]*/, ""); print}' <<< "$status")"
+  bantime="$(fail2ban-client get sshd bantime 2>/dev/null || true)"
+  printf '正在封禁：%s 个 IP' "${banned:-0}"
+  if [[ "$bantime" =~ ^[0-9]+$ ]] && ((bantime >= 3600)); then printf '（每次封 %s 小时）' "$((bantime / 3600))"
+  elif [[ "$bantime" =~ ^[0-9]+$ ]]; then printf '（每次封 %s 分钟）' "$((bantime / 60))"; fi
+  printf '\nFail2ban 这次启动以来：识别出 %s 次失败登录，封禁过 %s 次。\n' "${failed:-0}" "${total:-0}"
+  if [[ -n "$list" ]]; then
+    echo '当前被封禁的 IP：'
+    if times="$(fail2ban-client get sshd banip --with-time 2>/dev/null)" && [[ "$times" == *' + '* ]]; then
+      awk 'NF >= 8 {printf "  %-40s 封禁于 %s %s，到 %s %s 解封\n", $1, $2, $3, $7, $8}' <<< "$times"
+    else
+      tr ' ' '\n' <<< "$list" | sed '/^$/d; s/^/  /'
+    fi
+  fi
+  me="${SSH_CONNECTION:-}"; me="${me%% *}"
+  if [[ -n "$me" ]]; then
+    if [[ " $list " == *" $me "* ]]; then warn "你当前的 IP $me 在封禁列表里（已经连着的会话不受影响）。"
+    else echo "你当前的 IP $me 没有被封禁。"; fi
+  fi
+  ignore="$(fail2ban-client get sshd ignoreip 2>/dev/null | sed -n 's/^[|`]- *//p' | tr '\n' ' ' || true)"
+  if [[ -n "$ignore" ]]; then echo "白名单（不会被封）：$ignore"; fi
+  echo '最近的封禁和解封记录（最多 20 条，时间按服务器时区）：'
+  line="$(f2b_ban_events)"
+  if [[ -n "$line" ]]; then awk -F'\t' '{printf "  %s  %-14s %s\n", $1, $2, $3}' <<< "$line"
+  else echo '  没有找到记录（日志可能已经轮换或清理）。'; fi
+  [[ -n "$list" && -t 0 ]] || return 0
+  read -r -p '要解封某个 IP 吗？输入 IP（直接回车返回）: ' ip || ip=''
+  [[ -n "$ip" ]] || return 0
+  # One address, exactly as listed (no partial match, no several at once).
+  if [[ ! "$ip" =~ ^[0-9A-Fa-f:.]+$ || " $list " != *" $ip "* ]]; then warn "$ip 不在当前的封禁列表里，没有改动。"; return 0; fi
+  confirm_yes "解封 $ip 吗？（它可以马上重新尝试登录；再次输错达到次数还会被封）" || { ok '没有解封。'; return 0; }
+  tool_lifecycle_lock
+  if fail2ban-client set sshd unbanip "$ip" >/dev/null; then ok "已解封 $ip。"
+  else warn "解封 $ip 失败，请运行 fail2ban-client set sshd unbanip $ip 查看原因。"; fi
+}
+
 # A reboot happens only after the user agrees, once the run is recorded complete.
 offer_reboot() {
   if ((UPGRADE_APPROVED && KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; then
@@ -5233,6 +5556,8 @@ main() {
     port) port_main; return 0 ;;
     item) item_main; return 0 ;;
     reboot) reboot_main; return 0 ;;
+    update) update_main; return 0 ;;
+    bans) bans_main; return 0 ;;
   esac
   validate_vm
   plan

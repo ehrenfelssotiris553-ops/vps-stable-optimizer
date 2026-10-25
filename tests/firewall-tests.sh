@@ -286,4 +286,20 @@ firewall_stage < "$CASE_DIR/input"
 [[ "$FIREWALL_READY" == 1 ]] || fail 'failing boot enable turned a confirmed firewall off'
 grep -Fq 'systemctl enable ufw' "$CASE_DIR/messages" || fail 'failing boot enable not explained'
 
+# enabled-runtime ends at the next reboot: made persistent like "disabled".
+reset_case runtime_only_boot_enable
+printf 'enabled-runtime\n' > "$CASE_DIR/ufw-boot"
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input"
+grep -Fxq 'systemctl enable ufw.service' "$CASE_DIR/calls" || fail 'runtime-only enablement was not made persistent'
+[[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] || fail 'ufw.service not persistently enabled'
+
+# A static unit cannot be enabled: explained, not "fixed".
+reset_case static_boot_state
+printf 'static\n' > "$CASE_DIR/ufw-boot"
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input"
+if grep -q '^systemctl enable' "$CASE_DIR/calls"; then fail 'tried to enable a static ufw.service'; fi
+grep -Fq 'static' "$CASE_DIR/messages" || fail 'static ufw.service not explained'
+
 printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports, boot loading and conservative takeover.\n'
