@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions apt_source_records release_info ymd_days support_lifecycle_report preflight_gate
+load_optimizer_functions apt_source_records apt_mirror_list_hosts apt_host_official release_info ymd_days support_lifecycle_report preflight_gate
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -182,3 +182,22 @@ gate_rc=$?
 set -e
 [[ "$gate_rc" != 0 ]] || fail 'cached blocking findings were not enforced'
 printf '%s\n' 'PASS: cached plan findings are enforced without repeating probes.'
+
+# Debian 13 cloud images: deb822 sources point at mirror+file lists.
+printf 'Types: deb\nURIs: mirror+file:///etc/apt/mirrors/debian.list\nSuites: trixie trixie-updates\nComponents: main\n\nTypes: deb\nURIs: mirror+file:///etc/apt/mirrors/debian-security.list\nSuites: trixie-security\nComponents: main\n' > "$TEST_ROOT/cloud.sources"
+out="$(apt_source_records "$TEST_ROOT/cloud.sources" sources)"
+expected=$'mirror-file:/etc/apt/mirrors/debian.list\ttrixie\t0\t0\nmirror-file:/etc/apt/mirrors/debian.list\ttrixie-updates\t0\t0\nmirror-file:/etc/apt/mirrors/debian-security.list\ttrixie-security\t0\t0'
+[[ "$out" == "$expected" ]] || { printf '%s\n' "$out" >&2; fail 'mirror+file source not recognized'; }
+# Only the fixed mirror directory is accepted.
+printf 'deb mirror+file:///tmp/evil.list trixie main\ndeb mirror+file:///etc/apt/mirrors/../x.list trixie main\n' > "$TEST_ROOT/odd-mirror.list"
+out="$(apt_source_records "$TEST_ROOT/odd-mirror.list" list)"
+[[ "$out" == $'[non-http-source]\ttrixie\t0\t0\n[non-http-source]\ttrixie\t0\t0' ]] || fail 'mirror list outside /etc/apt/mirrors accepted'
+printf '# comment\nhttps://deb.debian.org/debian\thttps://x\nhttp://USER@Mirror.Example.COM:8080/debian priority:1\n\nftp://old.example/debian\n' > "$TEST_ROOT/mirrors.list"
+[[ "$(apt_mirror_list_hosts "$TEST_ROOT/mirrors.list")" == $'deb.debian.org\nmirror.example.com\n[non-http-source]' ]] || fail 'mirror list hosts'
+if apt_mirror_list_hosts "$TEST_ROOT/missing.list" >/dev/null; then fail 'missing mirror list accepted'; fi
+OS=debian
+apt_host_official deb.debian.org || fail 'deb.debian.org not official'
+if apt_host_official mirror.example.com; then fail 'third-party mirror counted as official'; fi
+OS=ubuntu
+apt_host_official security.ubuntu.com || fail 'Ubuntu security host not official'
+printf 'PASS: mirror+file sources (Debian cloud images) are read from their mirror lists.\n'

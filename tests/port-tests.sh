@@ -11,7 +11,7 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 say() { :; }
 ok() { printf 'OK %s\n' "$*" >> "$TEST_ROOT/messages"; }
 warn() { printf 'WARN %s\n' "$*" >> "$TEST_ROOT/messages"; }
-CONFIRM_YES=1 CONFIRM_CLOSE=1 UFW_ON=1 ADDED=''
+CONFIRM_YES=1 CONFIRM_CLOSE=1 UFW_ON=1 ADDED='' ALLOW_FAIL=0
 confirm_yes() {
   printf 'ask\n' >> "$TEST_ROOT/asks"
   case "$1" in *关闭*) ((CONFIRM_CLOSE)) ;; *) ((CONFIRM_YES)) ;; esac
@@ -24,11 +24,12 @@ docker_present() { ((DOCKER)); }
 ufw() {
   case "$*" in
     'show added') printf 'Added user rules:\n%s\n' "$ADDED" ;;
-    allow\ *|'--force delete '*) printf '%s\n' "$*" >> "$TEST_ROOT/calls" ;;
+    allow\ *) printf '%s\n' "$*" >> "$TEST_ROOT/calls"; ((ALLOW_FAIL == 0)) ;;
+    '--force delete '*) printf '%s\n' "$*" >> "$TEST_ROOT/calls" ;;
     *) fail "unexpected ufw $*" ;;
   esac
 }
-reset() { : > "$TEST_ROOT/calls"; : > "$TEST_ROOT/messages"; : > "$TEST_ROOT/asks"; CONFIRM_YES=1 CONFIRM_CLOSE=1 UFW_ON=1 ADDED=''; }
+reset() { : > "$TEST_ROOT/calls"; : > "$TEST_ROOT/messages"; : > "$TEST_ROOT/asks"; CONFIRM_YES=1 CONFIRM_CLOSE=1 UFW_ON=1 ADDED='' ALLOW_FAIL=0; }
 
 [[ "$(port_parse_spec 8080)" == 8080 ]] || fail 'single port'
 [[ "$(port_parse_spec 443-600)" == 443:600 ]] || fail 'range converted to UFW colon form'
@@ -44,7 +45,11 @@ port_item_covers 1:100 22 || fail 'range covering SSH port missed'
 if port_item_covers 8080 22; then fail 'single port wrongly covers SSH'; fi
 [[ "$(port_item_text 443:600)" == 443-600 ]] || fail 'display text'
 for good in 203.0.113.5 10.0.0.0/8 2001:db8::/32 2001:db8::1; do port_source_valid "$good" || fail "valid source rejected: $good"; done
-for bad in 256.1.1.1 1.2.3.4/33 any '1.2.3.4;id' 2001:db8::/129 ''; do
+for good in :: ::/0 ::1 fe80::1:2:3:4:5:6 1:2:3:4:5:6:7:8/128 1:2:3:4:5:6:7:: ABCD::ef; do
+  port_source_valid "$good" || fail "valid IPv6 source rejected: $good"
+done
+for bad in 256.1.1.1 1.2.3.4/33 any '1.2.3.4;id' 2001:db8::/129 '' ::: :::: 12345::1 1:2:3 1::2: :1::2 1::2::3 \
+           1:2:3:4:5:6:7:8:9 1:2:3:4:5:6:7::8 :1:2:3:4:5:6:7:8 1::g; do
   if port_source_valid "$bad"; then fail "invalid source accepted: $bad"; fi
 done
 printf 'PASS: port specs, ranges, counts and source addresses are validated strictly.\n'
@@ -139,7 +144,40 @@ ADDED='ufw allow 8080/tcp'
 CONFIRM_CLOSE=0
 port_close 8080 tcp > "$TEST_ROOT/out"
 [[ ! -s "$TEST_ROOT/calls" ]] || fail 'closing without CLOSE confirmation'
-printf 'PASS: closing ports protects SSH, matches exactly and explains ranges.\n'
+
+# A protocol-less rule allows TCP and UDP: closing one protocol re-allows the
+# other on its own first, then deletes the combined rule.
+reset
+ADDED='ufw allow 18081'
+port_close 18081 tcp > "$TEST_ROOT/out"
+[[ "$(cat "$TEST_ROOT/calls")" == $'allow 18081/udp\n--force delete allow 18081' ]] || fail 'combined rule not split when closing TCP'
+grep -Fq '先单独放行 udp' "$TEST_ROOT/out" || fail 'split not explained before confirming'
+
+# The SSH port in a combined rule: closing UDP keeps SSH's TCP open.
+reset
+ADDED='ufw allow 22'
+port_close 22 udp > "$TEST_ROOT/out"
+[[ "$(cat "$TEST_ROOT/calls")" == $'allow 22/tcp\n--force delete allow 22' ]] || fail 'UDP not closed on a combined SSH-port rule'
+
+reset
+ADDED='ufw allow from 203.0.113.5 to any port 8080'
+port_close 8080 udp > "$TEST_ROOT/out"
+[[ "$(cat "$TEST_ROOT/calls")" == $'allow proto tcp from 203.0.113.5 to any port 8080\n--force delete allow from 203.0.113.5 to any port 8080' ]] || fail 'source-restricted combined rule not split'
+
+# Re-allowing the kept protocol fails: the combined rule stays.
+reset
+ADDED='ufw allow 18081'
+ALLOW_FAIL=1
+port_close 18081 tcp > "$TEST_ROOT/out"
+[[ "$(cat "$TEST_ROOT/calls")" == 'allow 18081/udp' ]] || fail 'combined rule deleted although the kept protocol could not be re-allowed'
+grep -Fq '保持不变' "$TEST_ROOT/messages" || fail 'kept rule not reported'
+
+# Closing both protocols needs no split.
+reset
+ADDED='ufw allow 18081'
+port_close 18081 both > "$TEST_ROOT/out"
+[[ "$(cat "$TEST_ROOT/calls")" == '--force delete allow 18081' ]] || fail 'combined rule not deleted when closing both'
+printf 'PASS: closing ports protects SSH, matches exactly, explains ranges and splits combined TCP+UDP rules.\n'
 
 reset
 ADDED=$'ufw allow 22/tcp\nufw allow 443:600/udp\nufw allow from 203.0.113.5 to any port 3306 proto tcp\nufw deny from 198.51.100.7 to any port 22 proto tcp'

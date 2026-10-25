@@ -118,6 +118,14 @@ grep -Fq '本工具没有改过' "$TEST_ROOT/log" || fail 'untouched item not ex
 reset; STATE=([bbr_file]=applied)
 item_turn_off bbr
 grep -Fxq 'resource bbr_file' "$TEST_ROOT/trace" || fail 'item off did not undo the tool change'
+if grep -q '^result ' "$TEST_ROOT/trace"; then fail 'a group still pending was recorded as undone'; fi
+# Once undone, vps check must report the item as undone, not as broken.
+module_result() { record "result $1 $2"; }
+restore_resource() { record "resource $1"; if [[ -n "${STATE[$1]:-}" ]]; then STATE[$1]=restored; fi; }
+reset; STATE=([bbr_file]=applied)
+item_turn_off bbr
+grep -Fxq 'result bbr reverted' "$TEST_ROOT/trace" || fail 'undone item not recorded for vps check'
+restore_resource() { record "resource $1"; }
 reset; TOOLS_PACKAGES=(curl htop)
 item_turn_off tools
 grep -Fxq 'packages curl htop' "$TEST_ROOT/trace" || fail 'tools off did not offer removal of tool packages only'

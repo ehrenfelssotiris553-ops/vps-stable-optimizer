@@ -29,7 +29,8 @@ printf '%s\n' "$#" "$1" > "$CHILD_ARGS"
 case "$1" in
   plan) exit 23 ;;
   setup) false; printf 'errexit was suppressed\n' > "$CHILD_MARKER" ;;
-  firewall|ssh|port|check|records|uninstall) exit 0 ;;
+  check) exit "${CHECK_EXIT:-0}" ;;
+  firewall|ssh|port|records|uninstall) exit 0 ;;
   rollback) exit 2 ;;
   *) exit 99 ;;
 esac
@@ -46,6 +47,8 @@ menu_action "$CHILD_SCRIPT" setup > "$TEST_ROOT/errexit-output" 2>&1
 grep -Fq '退出码 1' "$TEST_ROOT/errexit-output" || fail 'child errexit status was not reported'
 menu_action "$CHILD_SCRIPT" rollback > "$TEST_ROOT/partial-output" 2>&1
 grep -Fq '撤销只完成了一部分' "$TEST_ROOT/partial-output" || fail 'partial rollback was reported as a generic failure'
+CHECK_EXIT=3 menu_action "$CHILD_SCRIPT" check > "$TEST_ROOT/check-output" 2>&1
+grep -Fq '验收发现有项目未生效' "$TEST_ROOT/check-output" || fail 'failed acceptance items reported as a generic failure'
 for action in firewall ssh port check records uninstall; do
   menu_action "$CHILD_SCRIPT" "$action" > "$TEST_ROOT/success-output" 2>&1
   [[ "$(cat "$CHILD_ARGS")" == "1"$'\n'"$action" ]] || fail 'allowed action was not passed unchanged'

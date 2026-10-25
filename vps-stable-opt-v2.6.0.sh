@@ -329,9 +329,10 @@ ssh_detect() {
   ((${#SSH_PORTS[@]}>0 && ${#SSH_PORTS[@]}<=8))
 }
 
-# iptables-nft and `ufw disable` leave empty base chains with an accept policy.
-# Those are inert and are ignored, as are "#" comment lines (newer nft prints
-# notes there); any rule, set, map or non-accept policy counts and is printed.
+# iptables-nft and `ufw disable` leave empty base chains with an accept policy,
+# empty ufw chains and plain jumps into them (seen on Debian 13). Those are
+# inert and ignored, as are "#" comment lines (newer nft prints notes there);
+# any other rule, set, map or non-accept policy counts and is printed.
 nft_ruleset_has_policy() {
   awk '
     {line=$0; sub(/^[ \t]+/,"",line); sub(/[ \t]+$/,"",line)}
@@ -339,7 +340,18 @@ nft_ruleset_has_policy() {
     line ~ /^table [a-z0-9]+ [A-Za-z0-9_.-]+ \{$/ {next}
     line ~ /^chain [A-Za-z0-9_.-]+ \{$/ {next}
     line ~ /^type [a-z]+ hook [a-z]+ (device "?[A-Za-z0-9_.-]+"? )?priority [A-Za-z0-9_+-]+; policy accept;$/ {next}
+    line ~ /^(counter( packets [0-9]+ bytes [0-9]+)? )?jump ufw6?-[a-z0-9-]+$/ {next}
     {print line; found=1; exit}
+    END {exit !found}'
+}
+
+# The same for iptables-save: what `ufw disable` leaves is empty ufw chains and
+# plain "-j ufw-..." jumps with ACCEPT policies. Any other rule (Docker, other
+# tools, a rule inside a ufw chain) or a DROP/REJECT policy counts and is printed.
+iptables_save_has_policy() {
+  awk '
+    /^-A [A-Za-z0-9_-]+ -j ufw6?-[a-z0-9-]+$/ {next}
+    /^-A[ \t]/ || /^:[^ \t]+[ \t]+(DROP|REJECT)/ {print; found=1; exit}
     END {exit !found}'
 }
 
@@ -363,7 +375,7 @@ firewall_conflict() {
     if ! rules="$("$bin" 2>/dev/null)"; then
       warn "无法读取 $bin 的规则，不自动接管防火墙。"; return 0
     fi
-    if offender="$(grep -m 1 -E '^(-A[[:space:]]|:[^[:space:]]+[[:space:]]+(DROP|REJECT))' <<< "$rules")"; then
+    if offender="$(iptables_save_has_policy <<< "$rules")"; then
       warn "$bin 里有其他防火墙规则：${offender:0:160}"; return 0
     fi
   done
@@ -938,10 +950,25 @@ journal_stage() {
   fi
 }
 
+# Fails only when the root device reports no discard support (DISC-MAX 0B);
+# anything unreadable counts as supported and fstrim decides.
+trim_support() {
+  local dev="${ROOT_DEV%%\[*}" max
+  [[ "$dev" == /dev/* ]] || return 0
+  command -v lsblk >/dev/null || return 0
+  max="$(lsblk -dn -o DISC-MAX "$dev" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "$max" != 0B && "$max" != 0 ]]
+}
+
 trim_stage() {
   say '第9步：TRIM 支持检测'
   case "$ROOT_FS" in ext4|xfs|btrfs) ;; *) ok "系统盘文件系统是 $ROOT_FS，跳过 TRIM。"; module_result trim skipped "filesystem $ROOT_FS"; return 0 ;; esac
   [[ "$ROOT_DEV" == /dev/* ]] || { ok '系统盘不是可直接识别的块设备，跳过 TRIM。'; module_result trim skipped 'not a block device'; return 0; }
+  # Checked before the timer: images often ship fstrim.timer enabled on disks without discard.
+  if ! trim_support; then
+    ok '系统盘不支持 TRIM（DISC-MAX 为 0），跳过；fstrim.timer 保持原样。'
+    module_result trim unsupported 'disk reports no discard support'; return 0
+  fi
   if systemctl is-enabled -q fstrim.timer 2>/dev/null; then ok '定期 TRIM 已经启用。'; module_result trim present 'fstrim.timer'; return 0; fi
   command -v fstrim >/dev/null || { warn '没有安装 fstrim。'; module_result trim unsupported 'fstrim missing'; return 0; }
   if fstrim -v /; then
@@ -1480,6 +1507,17 @@ ssh_password_disabled() {
   grep -Fxq 'passwordauthentication=no' <<< "$values" && grep -Fxq 'kbdinteractiveauthentication=no' <<< "$values"
 }
 
+# `ufw enable` does not touch ufw.service. After a rollback disabled it, the
+# firewall would stay off after the next reboot, so it is enabled whenever the
+# firewall is kept on (seen on a real Debian 13 VPS).
+ufw_boot_enable() {
+  local state
+  state="$(systemctl is-enabled ufw.service 2>/dev/null || true)"
+  case "$state" in enabled|enabled-runtime|static|indirect|generated|alias) return 0 ;; esac
+  if systemctl enable ufw.service >/dev/null 2>&1; then ok '已设置防火墙开机自动加载（ufw.service）。'
+  else warn '无法设置 ufw.service 开机启动：重启后防火墙可能不会加载，请手动运行 systemctl enable ufw。'; fi
+}
+
 # Existing UFW active: preserve current policies, no automatic edits except confirmed web ALLOW.
 firewall_stage() {
   say '第14步：防火墙（需要新 SSH 窗口确认）'
@@ -1505,6 +1543,7 @@ firewall_stage() {
       else ok '网站端口规则保持不变。'; fi
     fi
     ufw status numbered
+    ufw_boot_enable
     FIREWALL_READY=1
     module_result firewall present 'UFW already active'
     return 0
@@ -1579,6 +1618,7 @@ firewall_stage() {
   if guard_confirm "$unit" "$deadline" ssh_login_seen_since "$since"; then
     if ufw_active; then
       ok '防火墙已保留，自动撤销计时器已取消。'
+      ufw_boot_enable
       FIREWALL_READY=1
       ufw status verbose
       module_result firewall applied "SSH ${SSH_PORTS[*]} ($ssh_verb)"
@@ -1971,7 +2011,9 @@ apt_source_records() {
   awk -v style="$style" '
     function emit(uri, suite, insecure, replay, host) {
       host=uri
-      if (host !~ /^https?:\/\//) host="[non-http-source]"
+      # Debian cloud images: the mirrors are listed in a local file.
+      if (uri ~ /^mirror\+file:\/\/\/etc\/apt\/mirrors\/[A-Za-z0-9._-]+$/) host="mirror-file:" substr(uri,15)
+      else if (host !~ /^https?:\/\//) host="[non-http-source]"
       else {
         sub(/^https?:\/\//,"",host); sub(/[\/?#].*$/,"",host)
         sub(/^.*@/,"",host)
@@ -2029,8 +2071,35 @@ apt_source_records() {
   ' "$file"
 }
 
+# Hosts of the mirrors in an APT mirror list (the file behind a mirror+file source).
+apt_mirror_list_hosts() {
+  local file="$1"
+  [[ -f "$file" && -r "$file" ]] || return 1
+  awk '
+    {line=$0; sub(/#.*/,"",line); sub(/^[ \t]+/,"",line)}
+    line == "" {next}
+    {
+      split(line,a,/[ \t]+/); host=a[1]
+      if (host !~ /^https?:\/\//) {print "[non-http-source]"; next}
+      sub(/^https?:\/\//,"",host); sub(/[\/?#].*$/,"",host); sub(/^.*@/,"",host)
+      if (host ~ /^\[/) {sub(/^\[/,"",host); sub(/\].*$/,"",host)}
+      else sub(/:[0-9]+$/,"",host)
+      host=tolower(host)
+      if (host !~ /^[a-z0-9.:-]+$/) host="[unrecognized-host]"
+      print host
+    }' "$file"
+}
+
+apt_host_official() {
+  case "$OS:$1" in
+    debian:debian.org|debian:*.debian.org|ubuntu:archive.ubuntu.com|ubuntu:*.archive.ubuntu.com|ubuntu:security.ubuntu.com|ubuntu:ports.ubuntu.com) return 0 ;;
+  esac
+  return 1
+}
+
 apt_sources_report() {
   local f records host suite insecure replay base security expected official known=0 found_security=0
+  local mirrors mirror target
   local config config_path config_value hosts='' resolve_count=0 info
   if ! info="$(release_info)"; then preflight_block '无法确定本系统应使用的软件源版本代号。'; return 0; fi
   base="${info%%$'\t'*}"
@@ -2065,11 +2134,20 @@ apt_sources_report() {
     printf '软件源文件：%s\n' "$f"
     while IFS=$'\t' read -r host suite insecure replay; do
       [[ -n "$host" ]] || continue
-      known=$((known+1)); official=0
-      case "$OS:$host" in
-        debian:debian.org|debian:*.debian.org|ubuntu:archive.ubuntu.com|ubuntu:*.archive.ubuntu.com|ubuntu:security.ubuntu.com|ubuntu:ports.ubuntu.com) official=1 ;;
-      esac
+      known=$((known+1)); official=0; target="$host"
+      if [[ "$host" == mirror-file:* ]]; then
+        # Official only when every mirror in the list is official.
+        mirrors="$(apt_mirror_list_hosts "${host#mirror-file:}" || true)"
+        if [[ -n "$mirrors" ]]; then
+          official=1
+          while IFS= read -r mirror; do apt_host_official "$mirror" || official=0; done <<< "$mirrors"
+        fi
+        target="${mirrors%%$'\n'*}"
+      elif apt_host_official "$host"; then
+        official=1
+      fi
       printf '  host=%s suite=%s\n' "$host" "$suite"
+      if [[ "$host" == mirror-file:* ]]; then printf '    镜像列表中的地址：%s\n' "$(tr '\n' ' ' <<< "${mirrors:-（读不到）}")"; fi
       if [[ "$insecure" == 1 ]]; then preflight_block '有软件源关闭了签名校验（trusted 或 allow-insecure）。'; fi
       if [[ "$replay" == 1 ]]; then SOURCE_REVIEW_REQUIRED=1; warn '有软件源关闭了过期检查，需要人工核对。'; fi
       if ((official)); then
@@ -2083,12 +2161,12 @@ apt_sources_report() {
         warn '有镜像源或第三方源，无法自动判断：请确认来源可靠、签名密钥正确、版本代号一致。'
       fi
       [[ "$suite" != "$security" ]] || found_security=1
-      case "$host" in *'['*|*']'*|'') continue ;; esac
-      if [[ " $hosts " != *" $host "* ]] && ((resolve_count<3)); then
-        hosts+=" $host"; resolve_count=$((resolve_count+1))
+      case "$target" in *'['*|*']'*|'') continue ;; esac
+      if [[ " $hosts " != *" $target "* ]] && ((resolve_count<3)); then
+        hosts+=" $target"; resolve_count=$((resolve_count+1))
         if command -v timeout >/dev/null && command -v getent >/dev/null; then
-          if ! timeout 8s getent ahosts "$host" >/dev/null 2>&1; then
-            preflight_block "软件源域名无法解析或超时：$host"
+          if ! timeout 8s getent ahosts "$target" >/dev/null 2>&1; then
+            preflight_block "软件源域名无法解析或超时：$target"
           fi
         else warn '缺少 getent 或 timeout，没有检查软件源域名能否解析。'; fi
       fi
@@ -2759,6 +2837,8 @@ menu_action() {
     code=$?
     if [[ "$action" == rollback && "$code" == 2 ]]; then
       printf '撤销只完成了一部分（退出码 2）；请按上方提示处理没能恢复的项目后再重试。\n' >&2
+    elif [[ "$action" == check && "$code" == 3 ]]; then
+      printf '验收发现有项目未生效（退出码 3）；请按上方说明处理后再验收。\n' >&2
     else
       printf '本项已停止（退出码 %s）；请先查看错误和记录，再决定是否重试。\n' "$code" >&2
     fi
@@ -3042,9 +3122,12 @@ tool_path_safe() {
   done
 }
 
+# "/" is accepted here only as a parent whose owner and mode are checked;
+# tool_path_safe still never accepts it, so it can never be a removal target.
 tool_secure_dir() {
   local path="$1" owner mode
-  tool_path_safe "$path" && [[ -d "$path" ]] || return 1
+  if [[ "$path" != / ]]; then tool_path_safe "$path" || return 1; fi
+  [[ -d "$path" && ! -L "$path" ]] || return 1
   owner="$(stat -c '%u' -- "$path")" || return 1
   mode="$(stat -c '%a' -- "$path")" || return 1
   [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
@@ -3718,8 +3801,16 @@ restore_at_origin() {
   fp="$(restore_fingerprint "$id")" || return 1
   origin="$(restore_read "$id" origin_fp 2>/dev/null)" || return 1
   [[ "$fp" == "$origin" ]] && return 0
-  # A firewall that was not installed before and is off now is equivalent.
-  [[ "$id" == ufw_runtime && "$origin" == value:absent && "$fp" == value:inactive ]]
+  [[ "$origin" == value:absent ]] || return 1
+  # Not installed before: installed but switched off is equivalent (packages stay).
+  case "$id" in
+    ufw_runtime) [[ "$fp" == value:inactive ]] ;;
+    svc_*) [[ "$fp" =~ ^value:(disabled|static|indirect|generated|masked):(inactive|failed)$ ]] ;;
+    # UFW's defaults file only matters while the firewall runs.
+    ufw_policy_in|ufw_policy_out|ufw_ipv6)
+      case "$(restore_value ufw_runtime 2>/dev/null || true)" in inactive|absent) return 0 ;; *) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
 }
 
 # Returns a setting to its state before this tool's first run, also when it was
@@ -3936,8 +4027,23 @@ restore_packages_offer() {
   flags=()
   [[ "$chosen" == autoremove ]] && flags=(--autoremove)
   apt_wait_idle
-  if apt-get -y -q -o DPkg::Lock::Timeout=120 remove "${flags[@]}" "${ours[@]}"; then ok '已卸载本工具新装的软件包。'
+  if apt-get -y -q -o DPkg::Lock::Timeout=120 remove "${flags[@]}" "${ours[@]}"; then
+    ok '已卸载本工具新装的软件包。'
+    restore_packages_record
   else warn 'APT 卸载失败，请人工检查。'; RESTORE_PARTIAL=1; fi
+}
+
+# Removed tool packages would make vps check report "missing": record them as undone.
+restore_packages_record() {
+  local pkg
+  if module_expect tools >/dev/null; then
+    for pkg in "${TOOLS_PACKAGES[@]}"; do
+      if ! installed "$pkg"; then module_result tools reverted '卸载了本工具装的软件包'; break; fi
+    done
+  fi
+  if module_expect traffic >/dev/null && ! installed vnstat; then
+    module_result traffic reverted '卸载了本工具装的 vnStat'
+  fi
 }
 
 # Rollback groups, shared by the full rollback, per-item rollback and the
@@ -3991,7 +4097,8 @@ restore_group_pending() {
 }
 
 restore_group_apply() {
-  local group="$1" id pending
+  local group="$1" id pending was_pending=0
+  if restore_group_pending "$group"; then was_pending=1; fi
   case "$group" in
     firewall) restore_firewall_group ;;
     fail2ban) restore_fail2ban_group ;;
@@ -4015,6 +4122,10 @@ restore_group_apply() {
       # Restore NTP policy before its service state, timers after APT policy.
       while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids "$group") ;;
   esac
+  # Group names are module names: vps check then reports it as undone, not broken.
+  if ((was_pending)) && ! restore_group_pending "$group"; then
+    module_result "$group" reverted '由撤销功能恢复'
+  fi
 }
 
 # Records the current state as this tool's own latest change (used when the
@@ -4118,11 +4229,17 @@ restore_main() {
 module_result() {
   local module="$1" result="$2" detail="${3:-}" dir="$STATE_ROOT/modules" temp boot
   [[ "$module" =~ ^[a-z0-9_]+$ ]] || return 0
-  case "$result" in applied|present|preserved|unsupported|declined|skipped|failed) ;; *) return 0 ;; esac
-  [[ -n "${RUN_STATE_DIR:-}" && -d "$RUN_STATE_DIR" && ! -L "$RUN_STATE_DIR" ]] || return 0
+  case "$result" in applied|present|preserved|unsupported|declined|skipped|failed|reverted) ;; *) return 0 ;; esac
   detail="$(printf '%s' "$detail" | tr -d '\000-\037\177' | cut -c1-160)"
   boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
-  printf '%s\t%s\t%s\n' "$module" "$result" "$detail" >> "$RUN_STATE_DIR/modules.tsv" || return 0
+  if [[ -n "${RUN_STATE_DIR:-}" && -d "$RUN_STATE_DIR" && ! -L "$RUN_STATE_DIR" ]]; then
+    printf '%s\t%s\t%s\n' "$module" "$result" "$detail" >> "$RUN_STATE_DIR/modules.tsv" || return 0
+  elif [[ "$result" != reverted ]]; then
+    return 0
+  else
+    # Rollback runs outside a setup run: only the per-module record is updated.
+    [[ -d "$STATE_ROOT" && ! -L "$STATE_ROOT" && -O "$STATE_ROOT" ]] || return 0
+  fi
   state_secure_dir "$dir"
   temp="$(mktemp "$dir/.m.XXXXXX")" || return 0
   if ! printf '%s\t%s\t%s\t%s\n' "$result" "$(date -u +%FT%TZ)" "$boot" "$detail" > "$temp" ||
@@ -4137,7 +4254,7 @@ module_expect() {
   local file="$STATE_ROOT/modules/$1" result ts boot detail
   [[ "$1" =~ ^[a-z0-9_]+$ && -f "$file" && ! -L "$file" && -O "$file" ]] || return 1
   IFS=$'\t' read -r result ts boot detail < "$file" || return 1
-  case "$result" in applied|present|preserved|unsupported|declined|skipped|failed) ;; *) return 1 ;; esac
+  case "$result" in applied|present|preserved|unsupported|declined|skipped|failed|reverted) ;; *) return 1 ;; esac
   printf '%s\t%s\t%s\n' "$result" "$boot" "$detail"
 }
 
@@ -4145,12 +4262,13 @@ module_result_label() {
   case "$1" in
     applied) echo '已配置' ;; present) echo '原本就已配置好' ;; preserved) echo '保留了已有配置' ;;
     unsupported) echo '系统不支持' ;; declined) echo '你选择了不处理' ;; skipped) echo '按条件跳过' ;;
-    failed) echo '开荒时没有成功' ;; *) echo '未知' ;;
+    failed) echo '开荒时没有成功' ;; reverted) echo '已撤销，恢复成本工具运行前的样子' ;; *) echo '未知' ;;
   esac
 }
 
 VERIFY_PASS=0
 VERIFY_FAIL=0
+VERIFY_EXIT=0
 VERIFY_NA=0
 VERIFY_UNKNOWN=0
 verify_line() {
@@ -4224,13 +4342,14 @@ check_ntp() {
 check_journal() {
   local value usage
   value="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk -F= '$1 == "SystemMaxUse" {v = $2} END {print v}' || true)"
-  usage="$(journalctl --disk-usage 2>/dev/null | grep -Eo '[0-9.]+[KMGT]?B?' | tail -n 1 || true)"
+  usage="$(journalctl --disk-usage 2>/dev/null | grep -Eo '[0-9]+(\.[0-9]+)?[KMGT]?B?' | head -n 1 || true)"
   if [[ "$value" == 100M ]]; then verify_set pass "日志上限 100M 已生效，当前占用 ${usage:-未知}"
   else verify_set fail "当前生效的日志上限是 ${value:-默认值}，不是 100M"; fi
 }
 
 check_trim() {
   local next
+  if ! trim_support; then verify_set na '系统盘不支持 TRIM（DISC-MAX 为 0），定期 TRIM 不起作用'; return 0; fi
   if systemctl is-enabled -q fstrim.timer 2>/dev/null && active fstrim.timer; then
     next="$(systemctl show fstrim.timer -p NextElapseUSecRealtime --value 2>/dev/null || true)"
     verify_set pass "定期 TRIM 已启用${next:+，下次执行 $next}"
@@ -4286,12 +4405,16 @@ check_firewall() {
   if [[ -r /etc/default/ufw ]]; then ipv6="$(audit_ufw_ipv6 < /etc/default/ufw)"; fi
   if [[ -n "$missing" ]]; then verify_set fail "没有找到 SSH 端口${missing} 的放行规则"
   elif ! grep -Eq 'Default: (deny|reject) \(incoming\)' <<< "$verbose"; then verify_set fail '入站默认策略不是拒绝'
-  else verify_set pass "已开启；SSH 端口已放行；入站默认拒绝；IPv6 管理：$ipv6"; fi
+  elif [[ ! "$(systemctl is-enabled ufw.service 2>/dev/null || true)" =~ ^(enabled|enabled-runtime|static|indirect|generated|alias)$ ]]; then
+    verify_set fail '防火墙现在开着，但 ufw.service 没有设为开机启动，重启后不会加载（运行 systemctl enable ufw 修复）'
+  else verify_set pass "已开启，开机自动加载；SSH 端口已放行；入站默认拒绝；IPv6 管理：$ipv6"; fi
 }
 
 check_fail2ban() {
   local status failed banned actions
   if ! active fail2ban || ! command -v fail2ban-client >/dev/null; then verify_set fail 'Fail2ban 服务没有运行'; return 0; fi
+  # This tool's ban action is a UFW rule: without a running UFW nothing is blocked.
+  if ! ufw_active; then verify_set fail '防火墙没有运行：Fail2ban 的封禁要靠防火墙执行，现在封不住任何 IP'; return 0; fi
   if ! status="$(fail2ban-client status sshd 2>/dev/null)"; then verify_set fail 'sshd 规则没有加载'; return 0; fi
   failed="$(awk -F: '/Total failed/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
   banned="$(awk -F: '/Total banned/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
@@ -4305,16 +4428,20 @@ check_fail2ban() {
 }
 
 check_sysctl() {
-  local key value current bad=''
+  local key value current bad='' missing=''
   [[ -f "$SYSCTL_HARDENING_FILE" ]] || { verify_set fail "配置文件不在了：$SYSCTL_HARDENING_FILE"; return 0; }
   while IFS='=' read -r key value; do
     key="${key//[[:space:]]/}"; value="${value//[[:space:]]/}"
     [[ "$key" =~ ^[a-z0-9_.]+$ && -n "$value" ]] || continue
     current="$(sysctl -n "$key" 2>/dev/null || true)"
-    [[ -z "$current" || "$current" == "$value" ]] || bad+=" $key=$current"
+    # Whitespace inside multi-value keys (tabs vs spaces) is not a mismatch.
+    current="${current//[[:space:]]/}"
+    if [[ -z "$current" ]]; then missing+=" $key"
+    elif [[ "$current" != "$value" ]]; then bad+=" $key=$current"; fi
   done < "$SYSCTL_HARDENING_FILE"
-  if [[ -z "$bad" ]]; then verify_set pass "已生效（$1）"
-  else verify_set fail "这些参数的当前值和配置不一致：${bad# }"; fi
+  if [[ -n "$bad" ]]; then verify_set fail "这些参数的当前值和配置不一致：${bad# }"
+  elif [[ -n "$missing" ]]; then verify_set unknown "其余已生效；这些参数读不到（内核或容器不提供），无法确认：${missing# }"
+  else verify_set pass "已生效（$1）"; fi
 }
 
 check_autoreboot() {
@@ -4444,13 +4571,16 @@ verify_main() {
     log_rotate 'verify-*.txt' 10
     file="$LOG_DIR/verify-$(date -u +%Y%m%dT%H%M%SZ).txt"
   fi
+  # No pipe: the counters must survive in this shell for the exit code.
   if [[ -n "$file" ]]; then
-    verify_summary | tee "$file"
+    verify_summary > "$file"
     chmod 600 -- "$file" 2>/dev/null || true
+    cat -- "$file"
     printf '验收报告已保存：%s\n' "$file"
   else
     verify_summary
   fi
+  if ((VERIFY_FAIL)); then VERIFY_EXIT=3; fi
   if [[ -d "$STATE_ROOT" && ! -L "$STATE_ROOT" && -O "$STATE_ROOT" ]]; then
     printf '%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)" > "$STATE_ROOT/verified_boot" 2>/dev/null || true
   fi
@@ -4522,14 +4652,26 @@ port_protocols() {
 }
 
 port_source_valid() {
-  local src="$1" o
-  local -a octets=()
+  local src="$1" o addr parts
+  local -a octets=() groups=()
   if [[ "$src" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
     IFS=. read -r -a octets <<< "${src%%/*}"
     for o in "${octets[@]}"; do ((10#$o <= 255)) || return 1; done
     return 0
   fi
-  [[ "$src" == *:* && "$src" =~ ^[0-9A-Fa-f:]+(/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?$ ]]
+  [[ "$src" == *:* && "$src" =~ ^[0-9A-Fa-f:]+(/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?$ ]] || return 1
+  # IPv6: at most one "::", 1-4 hex digits per group, 8 groups unless "::"
+  # stands for the missing ones, no stray colon at either end.
+  addr="${src%%/*}"
+  [[ "$addr" != *:::* && "$addr" != *::*::* ]] || return 1
+  [[ "$addr" != :* || "$addr" == ::* ]] || return 1
+  [[ "$addr" != *: || "$addr" == *:: ]] || return 1
+  parts="${addr/::/:}"; parts="${parts#:}"; parts="${parts%:}"
+  if [[ -n "$parts" ]]; then
+    IFS=: read -r -a groups <<< "$parts"
+    for o in "${groups[@]}"; do [[ "$o" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1; done
+  fi
+  if [[ "$addr" == *::* ]]; then ((${#groups[@]} <= 7)); else ((${#groups[@]} == 8)); fi
 }
 
 port_ssh_ports() {
@@ -4633,9 +4775,13 @@ port_rule_parse() {
   fi
 }
 
+# A rule for TCP and UDP together (e.g. "ufw allow 22") closed for one protocol
+# is split: the other protocol is allowed on its own first, then the combined
+# rule goes, so nothing is ever briefly closed. No TCP access to an SSH port is
+# ever removed, checked against each rule that would actually be deleted.
 port_close() {
-  local spec="$1" proto_choice="${2:-both}" item rules line parsed r_item r_proto r_src p hit
-  local -a items=() protos=() targets=() words=() ssh=()
+  local spec="$1" proto_choice="${2:-both}" item rules line parsed r_item r_proto r_src p hit keep i
+  local -a items=() protos=() targets=() keeps=() srcs=() words=() ssh=()
   if ! mapfile -t items < <(port_parse_spec "$spec") || ((${#items[@]} == 0)) || ! port_parse_spec "$spec" >/dev/null; then
     warn "端口格式不对：$spec"; return 0
   fi
@@ -4657,7 +4803,18 @@ port_close() {
       IFS=$'\t' read -r r_item r_proto r_src <<< "$parsed"
       [[ "$r_item" == "$item" ]] || continue
       [[ "$r_proto" == both || " ${protos[*]} " == *" $r_proto "* ]] || continue
-      targets+=("$line"); hit=1
+      keep='-'
+      if [[ "$r_proto" == both && ${#protos[@]} == 1 ]]; then
+        if [[ "${protos[0]}" == tcp ]]; then keep=udp; else keep=tcp; fi
+      fi
+      if [[ "$keep" != tcp && ( "$r_proto" == tcp || "$r_proto" == both ) ]]; then
+        for p in "${ssh[@]}"; do
+          if port_item_covers "$r_item" "$p"; then
+            warn "拒绝关闭：${line#ufw } 放行着 SSH 端口 $p 的 TCP，删除会把你锁在外面。"; return 0
+          fi
+        done
+      fi
+      targets+=("$line"); keeps+=("$keep"); srcs+=("$r_src"); hit=1
     done <<< "$rules"
     if ((hit == 0)); then
       while IFS= read -r line; do
@@ -4672,9 +4829,20 @@ port_close() {
   done
   ((${#targets[@]})) || return 0
   echo '将删除以下放行规则：'
-  printf '  %s\n' "${targets[@]#ufw }"
+  for i in "${!targets[@]}"; do
+    if [[ "${keeps[i]}" == - ]]; then printf '  %s\n' "${targets[i]#ufw }"
+    else printf '  %s（这条同时放行 TCP 和 UDP：先单独放行 %s，再删除它，只关闭你要关的协议）\n' "${targets[i]#ufw }" "${keeps[i]}"; fi
+  done
   confirm_yes '确认关闭这些端口吗？' || { ok '已取消。'; return 0; }
-  for line in "${targets[@]}"; do
+  for i in "${!targets[@]}"; do
+    line="${targets[i]}"
+    parsed="$(port_rule_parse "$line")" || continue
+    IFS=$'\t' read -r r_item _ _ <<< "$parsed"
+    if [[ "${keeps[i]}" != - ]]; then
+      if [[ -z "${srcs[i]}" ]]; then ufw allow "$r_item/${keeps[i]}" >/dev/null || { warn "无法单独放行 $(port_item_text "$r_item")/${keeps[i]}，这条规则保持不变：${line#ufw }"; continue; }
+      else ufw allow proto "${keeps[i]}" from "${srcs[i]}" to any port "$r_item" >/dev/null || { warn "无法单独放行 $(port_item_text "$r_item")/${keeps[i]}，这条规则保持不变：${line#ufw }"; continue; }; fi
+      ok "已单独放行 $(port_item_text "$r_item")/${keeps[i]}${srcs[i]:+（仅 ${srcs[i]}）}"
+    fi
     read -r -a words <<< "${line#ufw }"
     if ufw --force delete "${words[@]}" >/dev/null; then ok "已关闭：${line#ufw }"
     else warn "关闭失败：${line#ufw }"; fi
@@ -4785,7 +4953,7 @@ item_status() {
       elif swapon --noheadings 2>/dev/null | grep -q .; then echo '已有其他 Swap'
       else echo '未开启'; fi ;;
     journal) if [[ -f "$JOURNAL_FILE" ]]; then echo '已限制（100M）'; else echo '默认设置'; fi ;;
-    trim) if systemctl is-enabled -q fstrim.timer 2>/dev/null; then echo '已开启'; else echo '未开启'; fi ;;
+    trim) if ! trim_support; then echo '系统盘不支持'; elif systemctl is-enabled -q fstrim.timer 2>/dev/null; then echo '已开启'; else echo '未开启'; fi ;;
     ntp) if ntp_synced; then echo '已同步'; else echo '未同步'; fi ;;
     timezone) timedatectl show -p Timezone --value 2>/dev/null || echo '未知' ;;
     hosts) if hostname_resolves; then echo '正常'; else echo '无法解析'; fi ;;
@@ -5037,7 +5205,7 @@ main() {
     uninstall) tool_uninstall; return 0 ;;
     rollback) restore_main; exit "$RESTORE_EXIT_CODE" ;;
     records) records_report; return 0 ;;
-    check) verify_main; return 0 ;;
+    check) verify_main; exit "$VERIFY_EXIT" ;;
     plan) plan; return 0 ;;
     port) port_main; return 0 ;;
     item) item_main; return 0 ;;

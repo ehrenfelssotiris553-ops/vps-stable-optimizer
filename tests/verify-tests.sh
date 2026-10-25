@@ -6,7 +6,8 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl verify_reboot_state upgrade_has_kernel
+load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl verify_reboot_state upgrade_has_kernel \
+  trim_support check_trim check_fail2ban check_firewall check_journal
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -39,6 +40,13 @@ IFS=$'\t' read -r result boot detail <<< "$(module_expect zram)"
 grep -c . "$RUN_STATE_DIR/modules.tsv" | grep -qx 3 || fail 'run log of module results'
 module_result bbr failed 'second run'
 [[ "$(module_expect bbr | cut -f1)" == failed ]] || fail 'latest result does not win'
+# Rollback runs outside a setup run, but its "reverted" record is still kept.
+saved_run="$RUN_STATE_DIR"; RUN_STATE_DIR=''
+module_result firewall reverted '由撤销功能恢复'
+module_result zram applied 'outside a run'
+RUN_STATE_DIR="$saved_run"
+[[ "$(module_expect firewall | cut -f1)" == reverted ]] || fail 'rollback outside a run not recorded'
+[[ "$(module_expect zram | cut -f1)" == skipped ]] || fail 'a non-rollback result was recorded outside a run'
 printf 'PASS: module results are sanitized, run-scoped and the latest result wins.\n'
 
 VERIFY_PASS=0 VERIFY_FAIL=0 VERIFY_NA=0 VERIFY_UNKNOWN=0
@@ -48,7 +56,8 @@ module_result bbr applied 'bbr + fq'
 module_result zram skipped 'RAM >= 2GiB'
 module_result journal failed 'journald restart failed'
 module_result trim present 'fstrim.timer'
-out="$( { verify_module bbr 'BBR' check_pass; verify_module trim 'TRIM' check_fail; verify_module zram 'ZRAM' check_pass; verify_module journal '日志' check_pass; verify_module ssh 'SSH' check_pass; } | sed $'s/\033\\[[0-9;]*m//g')"
+out="$( { verify_module bbr 'BBR' check_pass; verify_module trim 'TRIM' check_fail; verify_module zram 'ZRAM' check_pass; verify_module journal '日志' check_pass; verify_module ssh 'SSH' check_pass; verify_module firewall '防火墙' check_fail; } | sed $'s/\033\\[[0-9;]*m//g')"
+grep -Fq '[➖ 未处理] 防火墙：已撤销，恢复成本工具运行前的样子（由撤销功能恢复）' <<< "$out" || fail 'undone module reported as broken'
 grep -Fq '[✅ 生效]   BBR：checked with <bbr + fq>' <<< "$out" || fail 'applied module was not checked'
 grep -Fq 'TRIM：not effective' <<< "$out" || fail 'present module check result missing'
 grep -Fq 'ZRAM：按条件跳过（RAM >= 2GiB）' <<< "$out" || fail 'skipped module reported as checked'
@@ -115,8 +124,75 @@ KPTR=2; check_sysctl '2 keys'
 [[ "$VERIFY_STATUS" == pass ]] || fail 'matching sysctl values failed'
 KPTR=0; check_sysctl '2 keys'
 [[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *kernel.kptr_restrict=0* ]] || fail 'drifted sysctl value not reported'
+# A key the kernel (or container) does not offer cannot be confirmed: not a pass.
+KPTR=''; check_sysctl '2 keys'
+[[ "$VERIFY_STATUS" == unknown && "$VERIFY_TEXT" == *kernel.kptr_restrict* ]] || fail 'unreadable sysctl key passed'
+# Multi-value keys: tabs from the kernel against spaces in the file still match.
+printf 'net.ipv4.ip_local_port_range = 10000 65000\n' > "$SYSCTL_HARDENING_FILE"
+sysctl() { printf '10000\t65000\n'; }
+check_sysctl '1 key'
+[[ "$VERIFY_STATUS" == pass ]] || fail 'multi-value sysctl key reported as drifted'
 printf 'PASS: SSH (including root login) and sysctl checks compare live values.\n'
 
 upgrade_has_kernel $'Inst libc6 [2.36-9] (2.36-9+deb12u9 Debian:12.9/stable [amd64])\nInst linux-image-6.1.0-29-amd64 (6.1.123-1 Debian-Security:12/stable-security [amd64])' || fail 'new kernel ABI package missed'
 if upgrade_has_kernel $'Inst libc6 [2.36-9] (2.36-9+deb12u9)\nConf libc6 (2.36-9+deb12u9)'; then fail 'kernel reported without a kernel package'; fi
 printf 'PASS: upgrade simulation detects new kernels.\n'
+
+# TRIM: a root disk without discard support is "not handled", even with the timer on.
+ROOT_DEV='/dev/vda1[/@rootfs]' DISC='   0B'
+lsblk() { [[ "$*" == '-dn -o DISC-MAX /dev/vda1' ]] || fail "unexpected lsblk $*"; printf '%s\n' "$DISC"; }
+active() { [[ "$1" == fstrim.timer ]]; }
+systemctl() {
+  case "$*" in
+    'is-enabled -q fstrim.timer') return 0 ;;
+    'show fstrim.timer -p NextElapseUSecRealtime --value') echo 'Mon 2026-11-02 00:00:00 UTC' ;;
+    'is-enabled ufw.service') printf '%s\n' "$UFW_BOOT"; [[ "$UFW_BOOT" == enabled ]] ;;
+    *) fail "unexpected systemctl $*" ;;
+  esac
+}
+check_trim ''
+[[ "$VERIFY_STATUS" == na ]] || fail 'TRIM on a disk without discard support passed'
+trim_support && fail 'DISC-MAX 0B reported as supported'
+DISC='2G'
+check_trim ''
+[[ "$VERIFY_STATUS" == pass ]] || fail 'supported TRIM with an active timer failed'
+printf 'PASS: TRIM checks the disk discard support before the timer.\n'
+
+# Fail2ban bans are UFW rules: no running firewall, no protection.
+UFW_ON=0
+ufw_active() { ((UFW_ON)); }
+fail2ban-client() {
+  case "$*" in
+    'status sshd') printf 'Status for the jail: sshd\n|- Filter\n|  |- Total failed:\t3\n|- Actions\n   |- Total banned:\t1\n' ;;
+    'get sshd actions') echo vps-stable-ufw-sshd ;;
+  esac
+}
+active() { [[ "$1" == fail2ban ]]; }
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *防火墙没有运行* ]] || fail 'Fail2ban passed without a running firewall'
+UFW_ON=1
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == pass ]] || fail 'Fail2ban with a running firewall failed'
+
+# UFW running now but not enabled at boot: after a reboot it would be gone.
+ufw() {
+  case "$*" in
+    status) printf 'Status: active\n\nTo Action From\n22/tcp LIMIT Anywhere\n' ;;
+    'status verbose') printf 'Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' ;;
+  esac
+}
+ssh_candidates() { echo 22; }
+UFW_BOOT=disabled
+check_firewall ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *ufw.service* ]] || fail 'firewall not loaded at boot passed'
+UFW_BOOT=enabled
+check_firewall ''
+[[ "$VERIFY_STATUS" == pass ]] || fail 'firewall enabled at boot failed'
+printf 'PASS: Fail2ban needs a running UFW; the firewall must also load at boot.\n'
+
+# The usage sentence ends with ".", which must not be taken for the size.
+systemd-analyze() { printf '[Journal]\nSystemMaxUse=100M\n'; }
+journalctl() { echo 'Archived and active journals take up 24.0M in the file system.'; }
+check_journal ''
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'当前占用 24.0M' ]] || fail "journal usage misread: $VERIFY_TEXT"
+printf 'PASS: journal check reads the limit and the current usage.\n'

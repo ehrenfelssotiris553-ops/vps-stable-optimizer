@@ -14,7 +14,7 @@ ok() { :; }
 warn() { :; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
 plan() { record 'read plan'; }
-verify_main() { record 'read verify'; }
+verify_main() { record 'read verify'; VERIFY_EXIT="$CHECK_RESULT"; }
 port_main() { record 'port manager'; }
 validate_vm() { record 'read validate_vm'; }
 preflight_gate() { record 'read preflight_gate'; if ((GATE_FAIL)); then die 'mock preflight failure'; fi; }
@@ -53,6 +53,8 @@ run_case() {
   WARNINGS=0
   SCRIPT_VERSION=2.6.0
   RESTORE_EXIT_CODE=0
+  VERIFY_EXIT=0
+  CHECK_RESULT="${CHECK_RESULT:-0}"
   RUN_BACKUP_DIR="$CASE_DIR/backup"
   RUN_STATE_DIR="$CASE_DIR/state"
   # The outer call is deliberately not an if/!/&&/|| condition, as Bash would
@@ -77,6 +79,9 @@ run_case check_readonly check 1 0 0
 [[ "$CASE_STATUS" == 0 ]] || fail 'check mode failed'
 grep -Fxq 'read verify' "$CASE_DIR/calls" || fail 'check mode did not run the acceptance check'
 assert_no_writes 'check mode'
+# Something did not take effect: scripts and the menu see exit code 3.
+CHECK_RESULT=3 run_case check_failed_items check 1 0 0
+[[ "$CASE_STATUS" == 3 ]] || fail "check with failed items exited with $CASE_STATUS, not 3"
 
 run_case port_dispatch port 1 0 0
 [[ "$CASE_STATUS" == 0 ]] || fail 'port mode failed'

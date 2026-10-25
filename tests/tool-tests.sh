@@ -106,4 +106,20 @@ if tool_no_pending_firewall; then fail 'pending SSH revert timer accepted'; fi
 TIMER_OUTPUT='' SYSTEMCTL_STATUS=1
 if tool_no_pending_firewall; then fail 'unknown protection state accepted'; fi
 printf 'PASS: uninstall guard refuses firewall/SSH timers, active services and unknown status.\n'
+
+# Reported on a real VPS: uninstall stopped at "/" because it is not a tool
+# path. "/" is accepted as a parent; ownership and permissions still count.
+(
+  load_optimizer_functions tool_secure_dir
+  STAT_UID=0 STAT_MODE=755
+  stat() { case "$2" in %u) echo "$STAT_UID" ;; %a) echo "$STAT_MODE" ;; *) return 99 ;; esac; }
+  tool_secure_dir / || fail 'root directory rejected as a parent directory'
+  STAT_MODE=777
+  if tool_secure_dir /; then fail 'world-writable root directory accepted'; fi
+  STAT_MODE=755 STAT_UID=1000
+  if tool_secure_dir /; then fail 'root directory owned by a user accepted'; fi
+  STAT_UID=0
+  if tool_secure_dir '/var/../etc'; then fail 'unsafe path accepted'; fi
+)
+printf 'PASS: uninstall accepts "/" as a parent only when root-owned and not writable by others.\n'
 printf 'NOTE: privileged installation, flock concurrency, TTY confirmations and real deletion require isolated Linux VM validation.\n'

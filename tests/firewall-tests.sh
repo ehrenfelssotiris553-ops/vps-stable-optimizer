@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_arm guard_confirm web_ports_wanted firewall_stage fail2ban_stage
+load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_arm guard_confirm web_ports_wanted firewall_stage fail2ban_stage
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -37,7 +37,9 @@ reset_case() {
   printf '0\n' > "$CASE_DIR/service-started"
   printf '0\n' > "$CASE_DIR/service-queued"
   printf '0\n' > "$CASE_DIR/timer-stop-called"
+  printf 'disabled\n' > "$CASE_DIR/ufw-boot"
   ENABLE_FAIL=0
+  BOOT_ENABLE_FAIL=0
   LARGE_NFT=0
   ROLLBACK_FIRED=0
   QUEUE_DURING_CONFIRM=0
@@ -104,6 +106,15 @@ systemctl() {
     show)
       [[ "$*" == *ExecMainStartTimestampMonotonic* ]] || fail "unmocked systemctl property: $*"
       cat "$CASE_DIR/service-started" ;;
+    # `ufw enable` does not enable ufw.service; without it nothing loads at boot.
+    is-enabled)
+      [[ "${*: -1}" == ufw.service ]] || fail "unmocked systemctl is-enabled: $*"
+      cat "$CASE_DIR/ufw-boot"
+      [[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] ;;
+    enable)
+      [[ "$*" == 'enable ufw.service' ]] || fail "unmocked systemctl enable: $*"
+      if ((BOOT_ENABLE_FAIL)); then return 1; fi
+      printf 'enabled\n' > "$CASE_DIR/ufw-boot" ;;
     *) fail "unmocked systemctl command: $*" ;;
   esac
 }
@@ -149,6 +160,7 @@ firewall_stage < "$CASE_DIR/input"
 grep -Fxq 'ufw limit 22/tcp' "$CASE_DIR/rules" || fail 'password SSH did not use the rate-limited rule'
 grep -Fxq 'ufw allow 80/tcp' "$CASE_DIR/rules" || fail 'accepted web ports were not opened'
 grep -Fxq 'firewall applied' "$CASE_DIR/results" || fail 'applied firewall result missing'
+[[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] || fail 'confirmed firewall not enabled at boot (ufw.service)'
 
 reset_case key_only_ssh
 KEY_ONLY=1
@@ -192,6 +204,7 @@ firewall_stage < "$CASE_DIR/input"
 [[ "$(cat "$CASE_DIR/ufw-active")" == 0 ]] || fail 'unconfirmed firewall left active'
 grep -Fxq 'ufw --force disable' "$CASE_DIR/calls" || fail 'no immediate disable after missing confirmation'
 grep -Fxq 'firewall failed' "$CASE_DIR/results" || fail 'failed confirmation not recorded'
+[[ "$(cat "$CASE_DIR/ufw-boot")" == disabled ]] || fail 'unconfirmed firewall enabled at boot'
 
 reset_case enable_failure
 ENABLE_FAIL=1
@@ -250,4 +263,27 @@ firewall_stage < "$CASE_DIR/input"
 [[ "$FIREWALL_READY" == 1 && "$(cat "$CASE_DIR/timer-active")" == 0 ]] || fail 'a new SSH login did not confirm the firewall'
 grep -q '自动确认' "$CASE_DIR/messages" || fail 'automatic confirmation not reported'
 
-printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports and conservative takeover.\n'
+# Reported on a real VPS: UFW active but ufw.service disabled, so a reboot
+# came back without a firewall. An already running UFW gets it enabled too.
+reset_case already_active_not_at_boot
+printf '1\n' > "$CASE_DIR/ufw-active"
+WEB_YES=0
+firewall_stage < "$CASE_DIR/input"
+[[ "$FIREWALL_READY" == 1 ]] || fail 'already active firewall not marked ready'
+[[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] || fail 'already active firewall not enabled at boot'
+
+reset_case already_enabled_at_boot
+printf '1\n' > "$CASE_DIR/ufw-active"
+printf 'enabled\n' > "$CASE_DIR/ufw-boot"
+WEB_YES=0
+firewall_stage < "$CASE_DIR/input"
+if grep -q '^systemctl enable' "$CASE_DIR/calls"; then fail 'ufw.service enabled again although it already was'; fi
+
+reset_case boot_enable_failure
+BOOT_ENABLE_FAIL=1
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input"
+[[ "$FIREWALL_READY" == 1 ]] || fail 'failing boot enable turned a confirmed firewall off'
+grep -Fq 'systemctl enable ufw' "$CASE_DIR/messages" || fail 'failing boot enable not explained'
+
+printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports, boot loading and conservative takeover.\n'

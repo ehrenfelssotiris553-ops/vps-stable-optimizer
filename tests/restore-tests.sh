@@ -7,7 +7,8 @@ set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer
+load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
+  restore_packages_record restore_group_ids restore_group_pending restore_group_apply
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 WARNINGS=0
@@ -28,6 +29,8 @@ SSH_DROPIN="$TMP/ssh/01-vps-stable-keyonly.conf"
 SSH_PUBKEY_DROPIN="$TMP/ssh/00-vps-stable-pubkey.conf"
 mkdir -p "$RESTORE_ROOT"
 chmod 700 "$STATE_ROOT" "$RESTORE_ROOT"
+module_result() { :; }
+module_expect() { return 1; }
 ok() { printf '[OK] %s\n' "$*"; }
 warn() { WARNINGS=$((WARNINGS+1)); printf '[WARN] %s\n' "$*"; }
 say() { :; }
@@ -338,6 +341,44 @@ value_baseline() {
   expect "$(restore_read ufw_runtime state)" restored
   expect "$RESTORE_PARTIAL" 0
 )
+
+# UFW not installed before: once it is off, its defaults file and a stopped,
+# disabled ufw.service are the original state too, so a second rollback finds
+# nothing left, and the module is recorded as undone for vps check.
+(
+  value_fixture fw-absent-all
+  RUNTIME=inactive SVC='enabled:active'
+  restore_value() { case "$1" in ufw_runtime) echo "$RUNTIME" ;; ufw_policy_in) echo DROP ;; ufw_ipv6) echo yes ;; svc_ufw) echo "$SVC" ;; *) return 1 ;; esac; }
+  systemctl() {
+    case "$1" in
+      show) echo loaded ;;
+      is-enabled) echo "${SVC%%:*}" ;;
+      is-active) echo "${SVC##*:}" ;;
+      stop) printf 'stop\n' >> "$TRACE"; SVC="${SVC%%:*}:inactive" ;;
+      disable) printf 'disable\n' >> "$TRACE"; SVC="disabled:${SVC##*:}" ;;
+      *) die "unexpected systemctl $*" ;;
+    esac
+  }
+  ufw() { die "no UFW command is needed: $*"; }
+  module_result() { printf 'result %s %s\n' "$1" "$2" >> "$TRACE"; }
+  value_baseline ufw_policy_in absent DROP
+  value_baseline ufw_ipv6 absent yes
+  value_baseline svc_ufw absent enabled:active
+  restore_at_origin ufw_policy_in || die 'defaults of a switched-off UFW not counted as original'
+  restore_at_origin ufw_ipv6 || die 'IPv6 switch of a switched-off UFW not counted as original'
+  if restore_at_origin svc_ufw; then die 'a running ufw.service counted as never installed'; fi
+  RUNTIME=active
+  if restore_at_origin ufw_policy_in; then die 'live firewall defaults counted as never installed'; fi
+  RUNTIME=inactive
+  restore_group_apply firewall
+  expect "$(cat "$TRACE")" $'stop\ndisable\nresult firewall reverted'
+  expect "$SVC" disabled:inactive
+  expect "$RESTORE_PARTIAL" 0
+  if restore_group_pending firewall; then die 'firewall still pending after its rollback'; fi
+  : > "$TRACE"
+  restore_group_apply firewall
+  [[ ! -s "$TRACE" ]] || die 'second rollback changed something or recorded again'
+)
 printf 'PASS: rule-level firewall rollback, access-widening order and no re-enabling.\n'
 
 # Fail2ban: lift this tool's bans first, remove only its own files, and let a
@@ -460,6 +501,9 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
   printf 'bash\ncurl\niptables-old\n' > "$RESTORE_ROOT/packages/before"
   chmod 600 "$RESTORE_ROOT/packages/"*
   installed() { [[ " ufw fail2ban python3-systemd curl bash " == *" $1 "* ]]; }
+  TOOLS_PACKAGES=(curl wget)
+  module_expect() { [[ "$1" == tools ]]; }
+  module_result() { printf 'result %s %s\n' "$1" "$2" >> "$TMP/pkg/results"; }
   expect "$(restore_tool_packages | tr '\n' ' ')" 'ufw fail2ban python3-systemd '
   TRACE="$TMP/pkg/trace"; : > "$TRACE"
   confirm_yes() { [[ "$1" == *卸载* ]]; }
@@ -475,6 +519,8 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
   }
   restore_packages_offer
   expect "$(cat "$TRACE")" '-y -q -o DPkg::Lock::Timeout=120 remove --autoremove ufw fail2ban python3-systemd'
+  # A tool package is gone now: vps check reports the tools as undone, not broken.
+  expect "$(cat "$TMP/pkg/results")" 'result tools reverted'
   # Autoremove would take a package that existed before: fall back to plain remove.
   SIM_EXTRA=iptables-old; : > "$TRACE"
   restore_packages_offer
