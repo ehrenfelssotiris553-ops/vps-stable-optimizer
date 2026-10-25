@@ -52,7 +52,7 @@ VNSTAT_CHOICE=''
 ZRAM_CHOICE=''
 HOSTS_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt-v2.6.0.sh [menu|plan|setup|item|firewall|ssh|port|check|records|rollback|uninstall|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|reboot|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt-v2.6.0.sh [menu|plan|setup|item|firewall|ssh|port|check|records|rollback|uninstall|reboot|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
@@ -71,6 +71,7 @@ VPS 机器管家 V2.6.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
   vps records    查看操作记录和配置备份
   vps rollback   撤销本工具做过的设置（全部或只撤销某一项），可选卸载新装的软件包
   vps uninstall  卸载工具、记录和备份，保留软件与优化效果
+  vps reboot     重启服务器（先说明是否需要重启；防失联确认或软件安装没结束时不重启）
 
 大多数问题用 y 或回车回答：[Y/n] 回车表示「做」，[y/N] 回车表示「不做」。
 只有三处要输入单词，提示里会写出要输入什么（区分大小写）：
@@ -164,15 +165,21 @@ ufw_active() {
 }
 installed() { dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -qx installed; }
 available() { installed "$1" || apt-cache policy "$1" 2>/dev/null | awk '$1=="Candidate:" && $2!="(none)" {ok=1} END {exit !ok}'; }
+# True while another program holds an APT/dpkg lock (unknown without lslocks).
+apt_locks_held() {
+  local locks
+  command -v lslocks >/dev/null || return 1
+  locks="$(lslocks --noheadings --raw --output PATH 2>/dev/null || true)"
+  grep -Eq '^[[:space:]]*/var/(lib/(dpkg/(lock|lock-frontend)|apt/lists/lock)|cache/apt/archives/lock)([[:space:]]|$)' <<< "$locks"
+}
+
 # A fresh VPS usually runs its automatic update right after first boot. APT
 # does not wait for its locks (apt-get update never; dpkg only with
 # DPkg::Lock::Timeout), so every APT step waits here first, up to 10 minutes.
 apt_wait_idle() {
-  local i locks shown=0
-  command -v lslocks >/dev/null || return 0
+  local i shown=0
   for ((i = 0; i < 120; i++)); do
-    locks="$(lslocks --noheadings --raw --output PATH 2>/dev/null || true)"
-    if ! grep -Eq '^[[:space:]]*/var/(lib/(dpkg/(lock|lock-frontend)|apt/lists/lock)|cache/apt/archives/lock)([[:space:]]|$)' <<< "$locks"; then return 0; fi
+    if ! apt_locks_held; then return 0; fi
     if ((shown == 0)); then echo '其他程序（通常是开机后的自动更新）正在安装或更新软件：等它结束后继续，最多等 10 分钟……'; shown=1; fi
     sleep 5
   done
@@ -2641,7 +2648,7 @@ record_config_change() {
 # would suppress errexit inside that function; a separate /bin/bash avoids it.
 menu_action() {
   local self="$1" action="$2" code
-  case "$action" in plan|setup|item|firewall|ssh|port|check|records|uninstall|rollback) ;; *) die '无效的菜单操作。' ;; esac
+  case "$action" in plan|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot) ;; *) die '无效的菜单操作。' ;; esac
   # The new interpreter keeps its own errexit even inside the parent's if.
   if /bin/bash -- "$self" "$action"; then
     echo '本项已结束；请查看上方结果、跳过项和注意事项。'
@@ -2674,14 +2681,15 @@ menu() {
    8. 查看操作记录和配置备份
    9. 撤销本工具的设置（全部或只撤销某一项）
   10. 卸载本工具，保留优化效果
+  11. 重启服务器（先说明是否需要重启，确认后才重启）
    h. 查看使用说明
    0. 退出
 
-以后输入 vps 打开本菜单。建议先选 1，再选 2；重启后选 7 验收；以后想单独改哪一项选 3。
+以后输入 vps 打开本菜单。建议先选 1，再选 2；需要重启时选 11，重启后选 7 验收；以后想单独改哪一项选 3。
 撤销设置会保留已安装/升级的软件（可选卸载本工具新装的包），不会还原整台机器。
 卸载会删除工具、记录和备份；删除备份后无法可靠回退。
 MENU_TEXT
-    if ! read -r -p '请输入选项 [0-10 或 h]: ' choice; then printf '\n'; return 0; fi
+    if ! read -r -p '请输入选项 [0-11 或 h]: ' choice; then printf '\n'; return 0; fi
     case "$choice" in
       0) return 0 ;;
       1) action=plan ;;
@@ -2694,8 +2702,9 @@ MENU_TEXT
       8) action=records ;;
       9) action=rollback ;;
       10) action=uninstall ;;
+      11) action=reboot ;;
       h|H) /bin/bash -- "$self" help; action='' ;;
-      *) echo '无效选项，请输入 0 至 10 或 h。'; continue ;;
+      *) echo '无效选项，请输入 0 至 11 或 h。'; continue ;;
     esac
     if [[ -n "$action" ]]; then menu_action "$self" "$action"; fi
     # Uninstall may remove the installed source and launcher in its child.
@@ -2988,7 +2997,7 @@ lock_holder_text() {
     case "$mode" in
       setup) name='一键开荒' ;; firewall) name='防火墙设置' ;; ssh) name='SSH 登录加固' ;;
       port) name='端口管理' ;; rollback) name='撤销设置' ;; uninstall) name='卸载' ;; check) name='Fail2ban 实弹测试' ;;
-      item) name='单项设置' ;;
+      item) name='单项设置' ;; reboot) name='重启' ;;
     esac
     printf '%s正在运行（PID %s）：请等它结束，或回到那个窗口退出后再试。' "$name" "$pid"
   else
@@ -4852,6 +4861,41 @@ item_main() {
   elif [[ -e /var/run/reboot-required ]]; then echo '提示：系统之前的更新还在等待重启，方便时运行 systemctl reboot。'; fi
 }
 
+# Why a reboot is (or is not) needed: an installed kernel newer than the running
+# one, or the system's reboot-required flag. Arguments allow isolated tests.
+reboot_reason() {
+  local boot="${1:-/boot}" flag="${2:-/var/run/reboot-required}" running newest='' f
+  local -a kernels=()
+  running="$(uname -r)"
+  for f in "$boot"/vmlinuz-*; do
+    if [[ -f "$f" ]]; then kernels+=("${f##*/vmlinuz-}"); fi
+  done
+  if ((${#kernels[@]})); then newest="$(printf '%s\n' "${kernels[@]}" | sort -V | tail -n 1)"; fi
+  if [[ -n "$newest" && "$newest" != "$running" ]]; then echo "已安装新内核 $newest，正在运行的是 $running：重启后新内核才生效。"
+  elif [[ -e "$flag" ]]; then echo '系统提示需要重启，部分更新要重启后才完全生效。'
+  else echo '目前没有需要重启才能生效的更新，不重启也可以。'; fi
+}
+
+# Menu 11 / vps reboot. Refuses while an SSH protection timer is pending (a
+# reboot would drop the timer and keep an unconfirmed change) or APT is busy.
+reboot_main() {
+  [[ $EUID -eq 0 ]] || die '重启需要 root：请用 sudo vps reboot。'
+  [[ -t 0 ]] || die '需要在交互式 SSH 终端里运行。'
+  tool_lifecycle_lock
+  say '重启服务器'
+  reboot_reason
+  if ! tool_no_pending_firewall; then
+    die '防火墙或 SSH 加固的防失联确认还没结束（或无法确认它的状态）。现在重启会让保护计时器失效，没确认的修改会被永久保留；请先回到那个窗口完成确认，或等计时结束后再重启。'
+  fi
+  apt_wait_idle
+  if apt_locks_held; then die '仍有程序在安装或更新软件，现在重启可能损坏软件包；请等它结束后再重启。'; fi
+  echo '重启会断开所有 SSH 连接，通常一两分钟后可以重新登录。'
+  echo '重启后输入 vps 选 7「开荒验收」，确认各项设置在重启后仍然生效。'
+  if ! confirm_yes '现在重启服务器吗？'; then ok '已取消，没有重启。'; return 0; fi
+  sync
+  systemctl reboot
+}
+
 # A reboot happens only after the user agrees, once the run is recorded complete.
 offer_reboot() {
   if ((UPGRADE_APPROVED && KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; then
@@ -4879,6 +4923,7 @@ main() {
     plan) plan; return 0 ;;
     port) port_main; return 0 ;;
     item) item_main; return 0 ;;
+    reboot) reboot_main; return 0 ;;
   esac
   validate_vm
   plan

@@ -19,11 +19,12 @@
  8. 查看操作记录和配置备份
  9. 撤销本工具的设置（全部或只撤销某一项）
 10. 卸载本工具，保留优化效果
+11. 重启服务器（先说明是否需要重启，确认后才重启）
  h. 查看使用说明
  0. 退出
 ```
 
-每一项也可以直接用命令打开：`vps plan`、`vps setup`、`vps item`、`vps firewall`、`vps ssh`、`vps port`、`vps check`、`vps records`、`vps rollback`、`vps uninstall`。
+每一项也可以直接用命令打开：`vps plan`、`vps setup`、`vps item`、`vps firewall`、`vps ssh`、`vps port`、`vps check`、`vps records`、`vps rollback`、`vps uninstall`、`vps reboot`。
 
 ## 怎样开始
 
@@ -56,7 +57,7 @@ curl -fsSLO https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable
 2. 输入 `tmux new -s vps` 进入 tmux（没有就先装：`apt-get install tmux`）。这样 SSH 断线时脚本不会中断，重新登录后输入 `tmux attach -t vps` 就能回来。
 3. 输入 `vps`，选 1 体检，看处理计划。
 4. 选 2 一键开荒。不想逐项考虑时，在「使用推荐设置吗？」直接回车。
-5. 按提示重启。
+5. 按提示重启（以后需要重启时，也可以在菜单里选 11）。
 6. 重新登录后输入 `vps`，选 7 做开荒验收。
 7. 以后想单独开启或关闭某一项，选 3 单项设置，不用重跑整个开荒。
 
@@ -173,6 +174,16 @@ vps port list
 - **大范围确认**：一次放行超过 1000 个端口时会再确认一次。
 - **Docker**：检测到 Docker 时会提醒：用 `-p` 发布的容器端口会绕过 UFW。
 - **回退时保留**：用端口管理放行的业务端口，在撤销设置时会保留。
+
+## 重启服务器（`vps reboot`）
+
+菜单选 11，或者直接用命令 `vps reboot`：
+
+- **先说明需不需要重启**：装了新内核还没生效、系统提示需要重启，或者目前不需要重启。
+- **这两种情况下不会重启**：
+  - 防火墙或 SSH 加固的防失联确认还没结束：重启会让保护计时器失效，没确认的修改就会被永久保留。先回到那个窗口完成确认，或者等计时结束。
+  - 有程序正在安装或更新软件：会先等它结束（最多 10 分钟），还没结束就不重启，免得损坏软件包。
+- **回答 `y` 才重启**：所有 SSH 连接会断开，通常一两分钟后可以重新登录。重启后输入 `vps` 选 7 做开荒验收。
 
 ## 开荒验收（`vps check`）
 

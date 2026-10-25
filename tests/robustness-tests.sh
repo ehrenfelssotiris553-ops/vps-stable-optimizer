@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions restore_ids restore_before_stage preflight_block preflight_report audit_disk_risks coreutils_selfcheck admin_prepare item_main ssh_key_count apt_wait_idle
+load_optimizer_functions restore_ids restore_before_stage preflight_block preflight_report audit_disk_risks coreutils_selfcheck admin_prepare item_main ssh_key_count apt_locks_held apt_wait_idle reboot_reason reboot_main
 T="$(mktemp -d)"
 trap 'rm -rf -- "$T"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -142,3 +142,36 @@ reset; U=0 K=0
 item_main > /dev/null
 if grep -Fxq offer "$T/trace"; then fail 'reboot offered although nothing was upgraded in this session'; fi
 printf 'PASS: single-item menu offers a reboot only after its own upgrade.\n'
+
+# Menu 11 / vps reboot: says why a reboot is (not) needed, refuses while an SSH
+# protection timer or a package installation is still running, asks first.
+mkdir -p "$T/boot"; : > "$T/boot/vmlinuz-6.1.0-9-amd64"; : > "$T/boot/vmlinuz-6.1.0-10-amd64"
+uname() { echo 6.1.0-9-amd64; }
+[[ "$(reboot_reason "$T/boot" "$T/no-flag")" == *'新内核 6.1.0-10-amd64'* ]] || fail 'a newer installed kernel was not named'
+uname() { echo 6.1.0-10-amd64; }
+[[ "$(reboot_reason "$T/boot" "$T/no-flag")" == *'不重启也可以'* ]] || fail 'no reboot need was not explained'
+: > "$T/reboot-flag"
+[[ "$(reboot_reason "$T/boot" "$T/reboot-flag")" == *'系统提示需要重启'* ]] || fail 'reboot-required flag ignored'
+unset -f uname
+eval "$(declare -f reboot_main | sed '/EUID/d; /\[\[ -t 0 \]\]/d')"
+reboot_reason() { echo reason; }
+tool_lifecycle_lock() { :; }
+tool_no_pending_firewall() { ((NO_PENDING)); }
+apt_wait_idle() { record wait; }
+apt_locks_held() { ((LOCKED)); }
+confirm_yes() { record ask; ((YES)); }
+sync() { :; }
+systemctl() { record "systemctl $*"; }
+try_reboot() { ( die() { record "die $1"; exit 1; }; reboot_main ) > /dev/null || true; }
+reset; NO_PENDING=0 LOCKED=0 YES=1; try_reboot
+grep -q '^die .*防失联确认' "$T/trace" || fail 'reboot not refused while an SSH protection timer is pending'
+if grep -q 'systemctl reboot' "$T/trace"; then fail 'rebooted during a pending protection timer'; fi
+reset; NO_PENDING=1 LOCKED=1; try_reboot
+grep -q '^die .*安装或更新软件' "$T/trace" || fail 'reboot not refused while APT is busy'
+if grep -q 'systemctl reboot' "$T/trace"; then fail 'rebooted while APT was busy'; fi
+reset; LOCKED=0 YES=0; try_reboot
+grep -Fxq ask "$T/trace" || fail 'reboot did not ask first'
+if grep -q 'systemctl reboot' "$T/trace"; then fail 'rebooted after a no'; fi
+reset; YES=1; try_reboot
+grep -Fxq 'systemctl reboot' "$T/trace" || fail 'confirmed reboot did not run'
+printf 'PASS: reboot explains the need, waits for or refuses busy states, and asks before rebooting.\n'
