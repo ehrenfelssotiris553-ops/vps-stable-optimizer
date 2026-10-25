@@ -1,10 +1,10 @@
-# VPS 机器管家 V2.6.0
+# VPS 机器管家 V2.6.1
 
 给新 VPS 做体检、更新、基础优化和安全加固。所有修改都要你确认；做过的设置有记录，可以全部撤销，也可以只撤销某一项；改 SSH 和防火墙时有防失联保护。安装后输入 `vps` 打开菜单。
 
 支持 Debian 12/13、Ubuntu 22.04/24.04/26.04，独立 systemd 虚拟机，x86_64 / aarch64。请用 root 登录，或先执行 `sudo -i`。不重装系统，不清空机器，不安装 Docker。
 
-本版相对 V2.5.1 的全部改动见 `V2.6.0-优化记录.md`。
+2.6 版相对 V2.5.1 的全部改动见 `优化记录.md`；2.6.1 的改动见其中第十二至十四节。
 
 ## 菜单
 
@@ -42,10 +42,10 @@ curl -fsSLO https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable
   wget -qO install.sh https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main/install.sh && bash install.sh
   ```
 
-- **连不上 GitHub 时**（国内机房的 VPS 常见），手动上传：把 `install.sh` 和 `vps-stable-opt-v2.6.0.sh` 上传到 VPS 的同一个目录，在该目录运行：
+- **连不上 GitHub 时**（国内机房的 VPS 常见），手动上传：把 `install.sh` 和 `vps-stable-opt.sh` 上传到 VPS 的同一个目录，在该目录运行（从 2.6.1 起主脚本改为不带版本号的这个文件名，两个文件要从同一个版本里取）：
 
   ```bash
-  bash install.sh --local-file ./vps-stable-opt-v2.6.0.sh
+  bash install.sh --local-file ./vps-stable-opt.sh
   ```
 
 - **刚发布新版的几分钟内**，GitHub 的缓存可能让安装器报「SHA-256 校验失败」。这是校验在保护你，不会装上不一致的版本；等 5 分钟再装即可。
@@ -61,7 +61,7 @@ curl -fsSLO https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable
 6. 重新登录后输入 `vps`，选 7 做开荒验收。
 7. 以后想单独开启或关闭某一项，选 3 单项设置，不用重跑整个开荒。
 
-不想安装也可以直接运行 `bash vps-stable-opt-v2.6.0.sh`；这种情况下，你上传的副本不会被菜单里的卸载删除。
+不想安装也可以直接运行 `bash vps-stable-opt.sh`；这种情况下，你上传的副本不会被菜单里的卸载删除。
 
 ## 一键开荒的步骤
 
@@ -283,7 +283,7 @@ Ubuntu 26.04 LTS（resolute，标准维护到 2031 年 5 月）默认做了几�
 - **sudo-rs**：默认 sudo 换成了 Rust 实现。SSH 加固时，脚本会在系统日志里找 sudo 的记录；如果日志格式不同而找不到，会改为问你是否确定 sudo 可用。
 - **chrony**：默认用 chrony 做时间同步。已有可用的时间同步时，本工具保持不变，不会再装 systemd-timesyncd。
 
-这几处还需要在真实的 26.04 机器上确认，见 `V2.6.0-优化记录.md`。
+这几处还需要在真实的 26.04 机器上确认，见 `优化记录.md`。
 
 ## 固定目录
 
@@ -331,7 +331,7 @@ bash tests/run-all.sh
 
 这些测试只把主脚本里的函数单独提取出来，配合临时文件和模拟命令运行，不会执行真正的优化。通过后，再按「体检 → 开荒 → 重启 → 验收 → 单项设置 → 端口管理 → 只撤销某一项 → 全部撤销 → 卸载」的顺序做一遍真机验收。
 
-本版在一台 Debian 13 测试 VPS 上跑过两轮完整流程，发现的问题已修复（见 `V2.6.0-优化记录.md` 第十一、十二节）；其他系统还没有在真机上验证，具体见「验证状态」一节。
+本版在一台 Debian 13 测试 VPS 上跑过两轮完整流程，发现的问题已修复（见 `优化记录.md` 第十一、十二节）；其他系统还没有在真机上验证，具体见「验证状态」一节。
 
 ## 发布新版本
 
@@ -339,13 +339,15 @@ bash tests/run-all.sh
 
 `install.sh` 里的 `RELEASE_BASE_URL` 指向本仓库 `main` 分支的原始文件；换仓库或分支时要同步修改。已经装过的机器重新运行安装命令就会原地更新到新版本。
 
+版本号只写在主脚本的 `SCRIPT_VERSION` 一处（帮助和菜单标题会显示它），以及 README 标题和 `install.sh` 的说明文字；文件名不带版本号，发布新版本时不用改名。安装目录和数据目录里的归属标记（`:2.6`）表示 2.6 这一代的数据格式，小版本升级时不要改，否则已安装的机器会拒绝原地更新。
+
 安装器会用内嵌的 SHA-256 核对主脚本，所以每次修改主脚本后都要：
 
 1. 重新计算主脚本的 SHA-256，填进 `install.sh` 里的 `EXPECTED_SHA256`。
 2. 重新生成 `SHA256SUMS`：
 
    ```bash
-   sha256sum .gitattributes README.md V2.6.0-优化记录.md install.sh tests/*.sh vps-stable-opt-v2.6.0.sh > SHA256SUMS
+   sha256sum -b .gitattributes README.md 优化记录.md install.sh tests/*.sh vps-stable-opt.sh > SHA256SUMS
    ```
 
 3. 提交并推送。主脚本和 `install.sh` 必须在同一次推送里更新，否则新装的机器会校验失败（安装会停止，不会装错）。

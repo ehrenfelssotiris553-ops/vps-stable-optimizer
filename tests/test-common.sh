@@ -3,7 +3,7 @@
 # It reads function definitions from the deliverable. It never sources/runs
 # the complete optimizer, so its top-level system discovery/setup cannot run.
 TESTS_DIR="$HERE"
-TEST_SCRIPT="$TESTS_DIR/../vps-stable-opt-v2.6.0.sh"
+TEST_SCRIPT="$TESTS_DIR/../vps-stable-opt.sh"
 if [[ -v VPS_OPT_SCRIPT ]]; then TEST_SCRIPT="$VPS_OPT_SCRIPT"; fi
 [[ -r "$TEST_SCRIPT" ]] || { printf 'Unreadable optimizer: %s\n' "$TEST_SCRIPT" >&2; return 1; }
 load_optimizer_functions() {

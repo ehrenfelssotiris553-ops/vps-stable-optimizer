@@ -2,7 +2,7 @@
 # Only extracts function definitions. Never sources/runs the optimizer itself.
 set -Eeuo pipefail
 TEST_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE="${1:-$TEST_SCRIPT_DIR/../vps-stable-opt-v2.6.0.sh}"
+SOURCE="${1:-$TEST_SCRIPT_DIR/../vps-stable-opt.sh}"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 FUNCTIONS_FILE="$TEST_ROOT/functions.sh"
@@ -18,7 +18,7 @@ die() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
 say() { :; }
 ok() { :; }
 warn() { WARNINGS=$((WARNINGS+1)); printf 'WARN: %s\n' "$*"; }
-SCRIPT_VERSION=2.6.0
+SCRIPT_VERSION=2.6.1
 MODE=setup
 OS=debian
 OS_VERSION=12
@@ -37,7 +37,7 @@ prepare_run_state
 [[ "$(cat "$STATE_ROOT/latest")" == "$RUN_ID" && ! -L "$STATE_ROOT/latest" ]]
 [[ "$(stat -c %a "$RUN_STATE_DIR")" == 700 && "$(stat -c %a "$RUN_BACKUP_DIR")" == 700 ]]
 [[ "$(cat "$RUN_STATE_DIR/status")" == running ]]
-[[ "$(cat "$RUN_STATE_DIR/version")" == 2.6.0 ]]
+[[ "$(cat "$RUN_STATE_DIR/version")" == 2.6.1 ]]
 printf '%s\n' 'PASS: run metadata and private snapshot directories created'
 
 mkdir -m 700 -- "$TEST_ROOT/fixture"
@@ -88,7 +88,7 @@ die() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
 ok() { :; }
 say() { :; }
 warn() { :; }
-SCRIPT_VERSION=2.6.0 MODE=setup OS=debian OS_VERSION=12 WARNINGS=0
+SCRIPT_VERSION=2.6.1 MODE=setup OS=debian OS_VERSION=12 WARNINGS=0
 RUN_ID='' RUN_STATE_DIR='' RUN_BACKUP_DIR='' CURRENT_STAGE='' FAILURE_RECORDED=0 BACKUP_ITEM_COUNT=0
 declare -A BACKED_UP_PATHS=()
 trap 'code=$?; record_failure "$LINENO" "$code"; exit "$code"' ERR

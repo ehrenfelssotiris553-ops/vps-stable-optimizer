@@ -4,7 +4,7 @@
 # shellcheck disable=SC1007,SC2034,SC2218
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-TEST_SCRIPT="${1:-${VPS_OPT_SCRIPT:-$HERE/../vps-stable-opt-v2.6.0.sh}}"
+TEST_SCRIPT="${1:-${VPS_OPT_SCRIPT:-$HERE/../vps-stable-opt.sh}}"
 if [[ ! -r "$TEST_SCRIPT" && -r "$HERE/v25-plan.sh" ]]; then TEST_SCRIPT="$HERE/v25-plan.sh"; fi
 load_function() {
   local definition

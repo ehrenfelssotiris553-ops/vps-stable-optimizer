@@ -2,7 +2,7 @@
 # This runner never invokes plan/setup/firewall/check on the optimizer.
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-TEST_SCRIPT="$HERE/../vps-stable-opt-v2.6.0.sh"
+TEST_SCRIPT="$HERE/../vps-stable-opt.sh"
 if [[ -v VPS_OPT_SCRIPT ]]; then TEST_SCRIPT="$VPS_OPT_SCRIPT"; fi
 export VPS_OPT_SCRIPT="$TEST_SCRIPT"
 bash -n "$TEST_SCRIPT"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.6.0 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.6.1 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.6.0
+SCRIPT_VERSION=2.6.1
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -54,12 +54,12 @@ VNSTAT_CHOICE=''
 ZRAM_CHOICE=''
 HOSTS_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|reboot|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt-v2.6.0.sh [menu|plan|setup|item|firewall|ssh|port|check|records|rollback|uninstall|reboot|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|reboot|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|setup|item|firewall|ssh|port|check|records|rollback|uninstall|reboot|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V2.6.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
-安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt-v2.6.0.sh。
+VPS 机器管家 V2.6.1 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps plan       给机器做体检（只检查）
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
   vps item       单项设置：逐项开启或关闭某一项，不用重跑整个开荒

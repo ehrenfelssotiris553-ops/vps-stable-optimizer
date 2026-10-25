@@ -7,8 +7,8 @@ umask 077
 
 # Download location and the main script's hash; update the hash on every release.
 RELEASE_BASE_URL='https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main'
-EXPECTED_SHA256='2919d6088ab2ad197e2c02a649f542343c03a597077571cfce3597e94bf9591d'
-PAYLOAD_NAME='vps-stable-opt-v2.6.0.sh'
+EXPECTED_SHA256='8f3391aecfb2e37063041511da12403fccb4c9a3bb77fb7f8f3512e61c247372'
+PAYLOAD_NAME='vps-stable-opt.sh'
 INSTALL_DIR=/usr/local/lib/vps-stable-opt
 INSTALL_FILE="$INSTALL_DIR/vps-stable-opt.sh"
 MARKER_FILE="$INSTALL_DIR/.installer-owner"
@@ -34,11 +34,11 @@ die() { printf '安装已停止：%s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-VPS Stable Optimizer V2.6.0 安装入口
+VPS Stable Optimizer V2.6.1 安装入口
 
 用法：bash install.sh [--base-url HTTPS目录 | --local-file 脚本路径] [--no-run]
 
-  --base-url URL    从该 HTTPS 目录下载 vps-stable-opt-v2.6.0.sh。
+  --base-url URL    从该 HTTPS 目录下载 vps-stable-opt.sh。
   --local-file 文件 核验并安装已经下载的主脚本。
   --no-run          只安装，不打开菜单；允许没有交互终端。
   --help            显示此说明。

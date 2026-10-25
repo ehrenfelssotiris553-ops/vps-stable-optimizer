@@ -3,7 +3,7 @@
 # never source or run the optimizer's top-level setup. All service tools mocked.
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-TEST_SCRIPT="${VPS_OPT_SCRIPT:-$HERE/../vps-stable-opt-v2.6.0.sh}"
+TEST_SCRIPT="${VPS_OPT_SCRIPT:-$HERE/../vps-stable-opt.sh}"
 [[ -r "$TEST_SCRIPT" ]] || { printf 'Unreadable optimizer: %s\n' "$TEST_SCRIPT" >&2; exit 1; }
 load_audit_function() {
   local name="$1" definition
