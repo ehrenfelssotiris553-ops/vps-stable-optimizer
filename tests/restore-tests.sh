@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_current_matches restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer
+load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 WARNINGS=0
@@ -41,6 +41,7 @@ swapoff() { die "unexpected host command swapoff $*"; }
 apt-get() { die "unexpected host command apt-get $*"; }
 fail2ban-client() { die "unexpected host command fail2ban-client $*"; }
 active() { return 1; }
+apt_wait_idle() { :; }
 
 # A first baseline records absence. A second snapshot cannot replace it.
 restore_snapshot bbr_file
@@ -76,21 +77,25 @@ expect "$(cat "$APT_FILE")" 'original APT policy'
 expect "$(stat -c %a "$APT_FILE")" 640
 expect "$(restore_fingerprint apt_file)" "$original_fp"
 
-# A later administrator edit is a conflict; do not delete it or adopt its hash.
+# A later hand edit no longer blocks the step, and rollback still returns the
+# file to its state before this tool's first run (here: absent).
 restore_before_stage journal
 printf 'managed again\n' > "$JOURNAL_FILE"
 restore_after_stage journal
-managed_fp="$(restore_read journal_file last_fp)"
 printf 'administrator edit\n' > "$JOURNAL_FILE"
-if restore_before_stage journal; then die 'external edit should skip the stage'; fi
-expect "$RESTORE_STAGE" ''
-expect "$(restore_read journal_file last_fp)" "$managed_fp"
+restore_before_stage journal || die 'a hand edit blocked the step'
+expect "$RESTORE_STAGE" journal
+restore_after_stage journal
 RESTORE_PARTIAL=0
 restore_resource journal_file
-expect "$(cat "$JOURNAL_FILE")" 'administrator edit'
-expect "$RESTORE_PARTIAL" 1
+[[ ! -e "$JOURNAL_FILE" ]] || die 'hand-edited file was not returned to its original absence'
+expect "$(restore_read journal_file state)" restored
+expect "$RESTORE_PARTIAL" 0
 
 # A resource already undone by hand is simply recorded as restored.
+restore_before_stage journal
+printf 'managed once more\n' > "$JOURNAL_FILE"
+restore_after_stage journal
 rm -f "$JOURNAL_FILE"
 RESTORE_PARTIAL=0
 restore_resource journal_file
@@ -107,15 +112,12 @@ saved_fp="$(restore_read zram_file last_fp)"
 restore_capture_failure
 expect "$(restore_read zram_file last_fp)" "$saved_fp"
 
-# Metadata changes alone also constitute an administrator conflict.
+# A metadata-only difference from the original also needs restoring.
 printf 'managed module\n' > "$MODULE_FILE"
 restore_snapshot bbr_module
-restore_write "$RESTORE_ROOT/bbr_module" state applied
+if restore_needed bbr_module; then die 'an unchanged file was reported as changed'; fi
 chmod 600 "$MODULE_FILE"
-fp_before_mode="$(restore_fingerprint bbr_module)"
-restore_write "$RESTORE_ROOT/bbr_module" last_fp "$fp_before_mode"
-chmod 644 "$MODULE_FILE"
-if restore_current_matches bbr_module; then die 'mode-only edit should conflict'; fi
+restore_needed bbr_module || die 'mode-only edit should count as a change'
 
 # Refuse target and baseline symlinks; never follow a stored arbitrary path.
 printf 'precious\n' > "$TMP/precious"
@@ -194,7 +196,47 @@ chmod 600 "$RESTORE_ROOT/svc_trim/origin_value"
   expect "$(restore_fingerprint apt_auto_file)" "$original"
   expect "$(cat "$AUTO_FILE")" 'APT::Periodic::Unattended-Upgrade "0";'
 )
-printf 'PASS: baselines, conflicts, integrity, allowlisted values and APT policy recovery.\n'
+# A setting changed only by hand (the tool left it as it was) is also put back.
+(
+  RESTORE_ROOT="$TMP/tz-hand/restore-v2"
+  mkdir -p "$RESTORE_ROOT/tz"; chmod 700 "${RESTORE_ROOT%/*}" "$RESTORE_ROOT" "$RESTORE_ROOT/tz"
+  printf 'UTC\n' > "$RESTORE_ROOT/tz/origin_value"
+  printf 'value:UTC\n' | tee "$RESTORE_ROOT/tz/origin_fp" > "$RESTORE_ROOT/tz/last_fp"
+  printf 'clean\n' > "$RESTORE_ROOT/tz/state"
+  chmod 600 "$RESTORE_ROOT/tz/"*
+  TZ_NOW=Asia/Tokyo
+  restore_value() { [[ "$1" == tz ]] || return 1; echo "$TZ_NOW"; }
+  timedatectl() { [[ "$*" == 'set-timezone UTC' ]] || die "unexpected timedatectl $*"; TZ_NOW=UTC; }
+  restore_needed tz || die 'a hand-made timezone change was not listed for rollback'
+  RESTORE_PARTIAL=0
+  restore_resource tz
+  expect "$TZ_NOW" UTC
+  expect "$(restore_read tz state)" restored
+  expect "$RESTORE_PARTIAL" 0
+)
+
+# /etc/hosts is shared: only the line this tool appended is removed, later
+# lines from the administrator stay.
+(
+  RESTORE_ROOT="$TMP/hosts/restore-v2" HOSTS="$TMP/hosts/hosts"
+  mkdir -p "$RESTORE_ROOT"; chmod 700 "${RESTORE_ROOT%/*}" "$RESTORE_ROOT"
+  restore_path() { [[ "$1" == hosts_file ]] || return 1; printf '%s\n' "$HOSTS"; }
+  printf '127.0.0.1 localhost\n' > "$HOSTS"
+  restore_snapshot hosts_file
+  printf '127.0.1.1\tvps-1\n' >> "$HOSTS"
+  restore_record_hosts_line $'127.0.1.1\tvps-1' || die 'hosts line not recorded'
+  if restore_record_hosts_line '127.0.1.1 vps; rm -rf /'; then die 'unsafe hosts line recorded'; fi
+  restore_mark hosts_file applied
+  printf '10.0.0.5 db\n' >> "$HOSTS"
+  restore_needed hosts_file || die 'appended hosts line not listed for rollback'
+  RESTORE_PARTIAL=0
+  restore_resource hosts_file
+  expect "$(cat "$HOSTS")" $'127.0.0.1 localhost\n10.0.0.5 db'
+  expect "$(restore_read hosts_file state)" restored
+  if restore_needed hosts_file; then die 'hosts still listed after its line was removed'; fi
+  expect "$RESTORE_PARTIAL" 0
+)
+printf 'PASS: baselines, the back-to-original rule, integrity, allowlisted values, hosts lines and APT policy recovery.\n'
 
 # Value resources for the firewall are modelled by a private fixture.
 value_fixture() {
@@ -407,16 +449,16 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
     case "$*" in
       '-s remove --autoremove ufw fail2ban python3-systemd') printf 'Remv ufw [0.36]\nRemv fail2ban [1.0]\nRemv python3-systemd [235]\nRemv %s [1.8]\n' "$SIM_EXTRA" ;;
       '-s remove ufw fail2ban python3-systemd') printf 'Remv ufw [0.36]\nRemv fail2ban [1.0]\nRemv python3-systemd [235]\n' ;;
-      '-y -q remove '*) printf '%s\n' "$*" >> "$TRACE" ;;
+      '-y -q -o DPkg::Lock::Timeout=120 remove '*) printf '%s\n' "$*" >> "$TRACE" ;;
       *) die "unexpected apt-get $*" ;;
     esac
   }
   restore_packages_offer
-  expect "$(cat "$TRACE")" '-y -q remove --autoremove ufw fail2ban python3-systemd'
+  expect "$(cat "$TRACE")" '-y -q -o DPkg::Lock::Timeout=120 remove --autoremove ufw fail2ban python3-systemd'
   # Autoremove would take a package that existed before: fall back to plain remove.
   SIM_EXTRA=iptables-old; : > "$TRACE"
   restore_packages_offer
-  expect "$(cat "$TRACE")" '-y -q remove ufw fail2ban python3-systemd'
+  expect "$(cat "$TRACE")" '-y -q -o DPkg::Lock::Timeout=120 remove ufw fail2ban python3-systemd'
   # Even plain removal would take something else: nothing is removed.
   apt-get() {
     case "$*" in
@@ -449,7 +491,7 @@ printf 'PASS: package removal offer is limited, simulated first and never remove
 # A masked unit is a valid unchanged baseline, common on chrony VPS images.
 # Read the actual service-value function; no mock bypasses the LoadState parser.
 (
-  load_optimizer_functions restore_service_value restore_value restore_fingerprint restore_current_matches
+  load_optimizer_functions restore_service_value restore_value restore_fingerprint
   RESTORE_ROOT="$TMP/masked-service/restore-v2"
   mkdir -p "$RESTORE_ROOT"; chmod 700 "${RESTORE_ROOT%/*}" "$RESTORE_ROOT"
   TEST_MASK_LOAD=masked TEST_MASK_ENABLED=masked

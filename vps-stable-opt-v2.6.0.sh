@@ -164,11 +164,27 @@ ufw_active() {
 }
 installed() { dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -qx installed; }
 available() { installed "$1" || apt-cache policy "$1" 2>/dev/null | awk '$1=="Candidate:" && $2!="(none)" {ok=1} END {exit !ok}'; }
+# A fresh VPS usually runs its automatic update right after first boot. APT
+# does not wait for its locks (apt-get update never; dpkg only with
+# DPkg::Lock::Timeout), so every APT step waits here first, up to 10 minutes.
+apt_wait_idle() {
+  local i locks shown=0
+  command -v lslocks >/dev/null || return 0
+  for ((i = 0; i < 120; i++)); do
+    locks="$(lslocks --noheadings --raw --output PATH 2>/dev/null || true)"
+    if ! grep -Eq '^[[:space:]]*/var/(lib/(dpkg/(lock|lock-frontend)|apt/lists/lock)|cache/apt/archives/lock)([[:space:]]|$)' <<< "$locks"; then return 0; fi
+    if ((shown == 0)); then echo '其他程序（通常是开机后的自动更新）正在安装或更新软件：等它结束后继续，最多等 10 分钟……'; shown=1; fi
+    sleep 5
+  done
+  warn '等了 10 分钟，软件包锁仍被占用；接下来的软件操作可能失败。不要删除锁文件或强行结束它。'
+}
+
 # Packages absent before this call are recorded so rollback can offer removal.
 install_pkgs() {
   local pkg new=() rc=0
   for pkg in "$@"; do installed "$pkg" || new+=("$pkg"); done
-  apt-get -y -q install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" || rc=$?
+  apt_wait_idle
+  apt-get -y -q -o DPkg::Lock::Timeout=120 install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" || rc=$?
   if declare -F restore_record_packages >/dev/null && ((${#new[@]})); then
     restore_record_packages "${new[@]}" || warn '无法记录本次新装的软件包；回退时不会提供卸载它们的选项。'
   fi
@@ -394,8 +410,10 @@ apt_index_stage() {
   free_mb="$(df -Pm / | awk 'NR==2 {print $4}')"
   [[ "$free_mb" =~ ^[0-9]+$ ]] || die '无法确定磁盘剩余空间。'
   ((free_mb >= 650)) || die "磁盘只剩 ${free_mb}MiB，至少需要 650MiB。"
+  apt_wait_idle
   if ! apt-get update -o APT::Update::Error-Mode=any; then
     warn '软件索引更新失败，关闭增量下载后再试一次。'
+    apt_wait_idle
     apt-get update -o APT::Update::Error-Mode=any -o Acquire::PDiffs=false || die 'APT 软件索引更新失败：请检查软件源；如提示 "not valid yet"，说明系统时间不准，请先校准时间。'
   fi
   APT_INDEX_READY=1
@@ -579,7 +597,8 @@ kernel_cleanup() {
   done
   printf '将清理旧内核：%s\n' "${removed[*]}"
   if [[ "$ask" == --ask ]] && ! confirm_yes '确认删除这些旧内核吗？（删除后无法撤销）'; then ok '保留旧内核。'; return 0; fi
-  if apt-get -y -q autoremove --purge; then ok "已清理 ${#removed[@]} 个旧内核包。"
+  apt_wait_idle
+  if apt-get -y -q -o DPkg::Lock::Timeout=120 autoremove --purge; then ok "已清理 ${#removed[@]} 个旧内核包。"
   else warn '旧内核清理失败，请人工检查。'; fi
 }
 
@@ -587,7 +606,8 @@ apt_upgrade_stage() {
   say '第5步：系统升级与组件安装'
   local packages=() pkg tools=()
   if ((UPGRADE_APPROVED)); then
-    apt-get -y -q upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+    apt_wait_idle
+    apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
     if ((KERNEL_UPDATE)); then module_result upgrade applied 'upgraded; new kernel needs reboot'
     else module_result upgrade applied 'upgraded'; fi
     ok '系统软件已升级；服务和内核是否生效，可用 vps check 验收。'
@@ -661,7 +681,8 @@ upgrade_only_stage() {
   KERNEL_UPDATE=0
   if upgrade_has_kernel "$simulation"; then KERNEL_UPDATE=1; echo '本次升级包含新内核：重启后才生效，旧内核会保留。'; fi
   if ! confirm_default_yes "升级这 $count 个软件包吗？（可能重启部分服务）"; then ok '没有升级。'; return 0; fi
-  apt-get -y -q upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+  apt_wait_idle
+  apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
   UPGRADE_APPROVED=1
   if ((KERNEL_UPDATE)); then module_result upgrade applied 'upgraded; new kernel needs reboot'
   else module_result upgrade applied 'upgraded'; fi
@@ -673,6 +694,7 @@ upgrade_only_stage() {
 APT_INDEX_READY=0
 apt_index_ready() {
   if ((APT_INDEX_READY)); then return 0; fi
+  apt_wait_idle
   echo '正在更新软件索引……'
   if apt-get update -o APT::Update::Error-Mode=any >/dev/null; then APT_INDEX_READY=1; return 0; fi
   warn '软件索引更新失败：请检查网络和软件源；如提示 "not valid yet"，先校准系统时间。'
@@ -1027,6 +1049,7 @@ hosts_stage() {
   backup_config_path /etc/hosts || die '无法备份 /etc/hosts'
   if append_line_safely /etc/hosts "127.0.1.1"$'\t'"$name" && hostname_resolves; then
     record_config_change /etc/hosts line-appended || die '无法记录 /etc/hosts 变更。'
+    restore_record_hosts_line "127.0.1.1"$'\t'"$name" || warn '无法记录添加的主机名行；撤销时会把整个 /etc/hosts 恢复成原来的样子。'
     ok "已在 /etc/hosts 加入：127.0.1.1 $name"; module_result hosts applied "$name"
   else
     warn '修改 /etc/hosts 后主机名仍无法解析，请人工检查。'; module_result hosts failed 'still unresolved'
@@ -1526,10 +1549,12 @@ ssh_pubkey_valid() {
   return "$rc"
 }
 
+# ssh-keygen fails on a file without any valid key (an empty or comment-only
+# authorized_keys is common on VPS images); that simply counts as 0 keys.
 ssh_key_count() {
   local file="$1"
   [[ -f "$file" && ! -L "$file" ]] || { echo 0; return 0; }
-  ssh-keygen -l -f "$file" 2>/dev/null | awk 'NF >= 2 {n++} END {print n+0}'
+  ssh-keygen -l -f "$file" 2>/dev/null | awk 'NF >= 2 {n++} END {print n+0}' || true
 }
 
 # Effective settings for the target account, including Match blocks.
@@ -2004,7 +2029,7 @@ preflight_report() {
   if command -v lslocks >/dev/null; then
     if locks="$(lslocks --noheadings --raw --output PATH 2>/dev/null)"; then
       if grep -E '^[[:space:]]*/var/(lib/(dpkg/(lock|lock-frontend)|apt/lists/lock)|cache/apt/archives/lock)([[:space:]]|$)' <<< "$locks" >/dev/null; then
-        preflight_block '有其他程序正在安装或更新软件（常见于开机后的自动更新），请稍等几分钟再试；不要删除锁文件或强行结束它。'
+        warn '有其他程序正在安装或更新软件（常见于开机后的自动更新）：开始修改时会先等它结束（最多 10 分钟）；不要删除锁文件或强行结束它。'
       fi
     else warn '无法检查软件包锁，以 APT 自身的锁为准。'; fi
   else warn '缺少 lslocks，没有检查软件包锁。'; fi
@@ -2526,7 +2551,7 @@ stage_run() {
   state_event "$stage" running 0
   if ! restore_before_stage "$stage"; then
     state_event "$stage" skipped 0
-    warn "本模块的回退记录冲突或无法安全保存，已跳过：$stage"
+    warn "本模块的回退记录无法安全保存或读取，已跳过：$stage"
     CURRENT_STAGE=''
     state_write active_stage none
     return 0
@@ -2623,7 +2648,7 @@ menu_action() {
   else
     code=$?
     if [[ "$action" == rollback && "$code" == 2 ]]; then
-      printf '撤销只完成了一部分（退出码 2）；请按上方提示处理冲突项后再重试。\n' >&2
+      printf '撤销只完成了一部分（退出码 2）；请按上方提示处理没能恢复的项目后再重试。\n' >&2
     else
       printf '本项已停止（退出码 %s）；请先查看错误和记录，再决定是否重试。\n' "$code" >&2
     fi
@@ -3106,6 +3131,8 @@ tool_uninstall() {
 }
 
 # Persistent, allowlisted configuration recovery. Never source recovery data.
+# Rule (chosen by the owner): rollback returns every tracked setting to its
+# state before this tool's first run (origin_fp), also after hand-made changes.
 # Invariant: rollback only ever widens access (turns UFW off, deletes rules this
 # tool added, restores password login). It never enables UFW or removes an SSH
 # allowance while UFW stays on, so it needs no SSH anti-lockout timer.
@@ -3113,7 +3140,6 @@ RESTORE_ROOT=''
 RESTORE_READY=0
 RESTORE_STAGE=''
 RESTORE_PARTIAL=0
-RESTORE_ADOPT_DRIFT=0
 
 restore_ids() {
   case "$1" in
@@ -3389,20 +3415,10 @@ restore_before_stage() {
     last="$(restore_read "$id" last_fp)" || { bad=1; continue; }
     status="$(restore_read "$id" state)" || { bad=1; continue; }
     case "$status" in clean|applied|restored) ;; *) bad=1; continue ;; esac
+    # A hand-made change does not block the step: rollback always returns a
+    # setting to its state before this tool's first run (origin_fp).
     if [[ "$fp" != "$last" ]]; then
-      # An explicit request (single item, vps firewall/ssh) or the upgrade
-      # step, which tracks firewall/time settings only incidentally, takes the
-      # hand-made change as the new starting point; full setup skips the step.
-      if ((${RESTORE_ADOPT_DRIFT:-0})) || [[ "$stage" == apt_upgrade ]]; then
-        if restore_adopt "$id"; then
-          ok "$(restore_label "$id") 在本工具之后被手动改过：以现在的状态为准继续（撤销时仍恢复到本工具运行前的状态）。"
-        else
-          warn "无法更新 $(restore_label "$id") 的回退记录，跳过这一步：$stage。"; bad=1
-        fi
-      else
-        warn "$(restore_label "$id") 在本工具之后被修改过：保持不变，跳过这一步（$stage）。"
-        bad=1
-      fi
+      ok "$(restore_label "$id") 在本工具之后被手动改过：按这次的选择继续。"
     fi
   done < <(restore_ids "$stage")
   ((bad == 0)) || return 1
@@ -3437,11 +3453,43 @@ restore_capture_failure() {
   restore_after_stage "$RESTORE_STAGE"
 }
 
-restore_current_matches() {
-  local id="$1" fp last
-  fp="$(restore_fingerprint "$id")" || return 1
-  last="$(restore_read "$id" last_fp)" || return 1
-  [[ "$fp" == "$last" ]]
+# /etc/hosts is shared with the administrator and cloud-init, so only the lines
+# this tool appended are recorded and removed; nothing else in it is touched.
+restore_record_hosts_line() {
+  local line="$1" file="$RESTORE_ROOT/hosts_line" re=$'^127\\.0\\.1\\.1\t[A-Za-z0-9.-]+$'
+  [[ "$RESTORE_READY" == 1 ]] || return 0
+  [[ "$line" =~ $re ]] || return 1
+  [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
+  if [[ -f "$file" ]] && grep -Fxq -- "$line" "$file"; then return 0; fi
+  printf '%s\n' "$line" >> "$file" && chmod 600 -- "$file"
+}
+
+restore_hosts_line_present() {
+  local record="$RESTORE_ROOT/hosts_line" file
+  file="$(restore_path hosts_file)" || return 1
+  restore_data_safe "$record" && [[ -f "$file" ]] && grep -qxF -f "$record" -- "$file"
+}
+
+restore_hosts_lines_apply() {
+  local record="$RESTORE_ROOT/hosts_line" file temp rc=0
+  file="$(restore_path hosts_file)" || return 1
+  restore_data_safe "$record" && [[ -f "$file" && ! -L "$file" ]] || return 1
+  temp="$(mktemp "${file%/*}/.vps-restore.XXXXXX")" || return 1
+  # The copy keeps the original mode and owner; grep exits 1 when no line remains.
+  cp -p -- "$file" "$temp" || rc=1
+  if ((rc == 0)); then grep -vxF -f "$record" -- "$file" > "$temp" || (($? == 1)) || rc=1; fi
+  if ((rc == 0)); then mv -fT -- "$temp" "$file" || rc=1; fi
+  rm -f -- "$temp"
+  return "$rc"
+}
+
+# True when a tracked setting differs from its state before this tool's first
+# run, whoever changed it since (the agreed rollback rule).
+restore_needed() {
+  local id="$1"
+  [[ -d "$RESTORE_ROOT/$id" ]] || return 1
+  if [[ "$id" == hosts_file && -e "$RESTORE_ROOT/hosts_line" ]]; then restore_hosts_line_present; return; fi
+  ! restore_at_origin "$id"
 }
 
 restore_file_apply() {
@@ -3504,6 +3552,7 @@ restore_zram_safe() {
 
 restore_apply_one() {
   local id="$1" value verb
+  if [[ "$id" == hosts_file && -e "$RESTORE_ROOT/hosts_line" ]]; then restore_hosts_lines_apply; return "$?"; fi
   if restore_path "$id" >/dev/null; then restore_file_apply "$id"; return "$?"; fi
   value="$(restore_read "$id" origin_value)" || return 1
   case "$id" in
@@ -3560,18 +3609,19 @@ restore_at_origin() {
   [[ "$id" == ufw_runtime && "$origin" == value:absent && "$fp" == value:inactive ]]
 }
 
+# Returns a setting to its state before this tool's first run, also when it was
+# changed by hand since; the safety limits live in restore_apply_one.
 restore_resource() {
   local id="$1" status
   [[ -d "$RESTORE_ROOT/$id" ]] || return 0
   status="$(restore_read "$id" state)" || { RESTORE_PARTIAL=1; return 0; }
-  [[ "$status" == applied ]] || return 0
-  # Already back at its original state (for example undone by hand): just record it.
-  if restore_at_origin "$id"; then
-    restore_mark "$id" restored || die "无法记录回退结果：$id"
-    ok "已是原始状态：$(restore_label "$id")"; return 0
-  fi
-  if ! restore_current_matches "$id"; then
-    warn "回退冲突：$(restore_label "$id") 在本工具之后被修改过，已保留现状。"; RESTORE_PARTIAL=1; return 0
+  if ! restore_needed "$id"; then
+    # Already back at its original state (for example undone by hand): just record it.
+    if [[ "$status" == applied ]]; then
+      restore_mark "$id" restored || die "无法记录回退结果：$id"
+      ok "已是原始状态：$(restore_label "$id")"
+    fi
+    return 0
   fi
   if restore_apply_one "$id"; then
     restore_mark "$id" restored || die "无法记录回退结果：$id"
@@ -3596,20 +3646,14 @@ f2b_action_referenced_elsewhere() {
 # running with its own configuration; bans made through this tool's UFW action
 # are lifted first because the action has no stop hook that would clear them.
 restore_fail2ban_group() {
-  local id jail_state action_state svc_state ips ip
+  local id ips ip pending=0
   local -a banned=()
-  jail_state="$(restore_read f2b_jail state 2>/dev/null || true)"
-  action_state="$(restore_read f2b_action state 2>/dev/null || true)"
-  svc_state="$(restore_read svc_fail2ban state 2>/dev/null || true)"
-  [[ "$jail_state" == applied || "$action_state" == applied || "$svc_state" == applied ]] || return 0
   for id in f2b_jail f2b_action svc_fail2ban; do
-    [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]] || continue
-    if ! restore_current_matches "$id" && ! restore_at_origin "$id"; then
-      warn "回退冲突：$(restore_label "$id") 在本工具之后被修改过；Fail2ban 部分整体保留，请人工检查。"
-      RESTORE_PARTIAL=1; return 0
-    fi
+    if restore_needed "$id"; then pending=1; fi
   done
-  if [[ "$action_state" == applied ]] && f2b_action_referenced_elsewhere; then
+  ((pending)) || return 0
+  # Deleting an action another jail still uses would break that jail.
+  if restore_needed f2b_action && f2b_action_referenced_elsewhere; then
     warn '其他 Fail2ban 规则也在使用本工具的封禁动作；Fail2ban 部分整体保留，请人工检查。'
     RESTORE_PARTIAL=1; return 0
   fi
@@ -3625,10 +3669,11 @@ restore_fail2ban_group() {
       warn '无法读取当前封禁列表，UFW 中的封禁规则可能残留。'; RESTORE_PARTIAL=1
     fi
   fi
-  if [[ "$svc_state" == applied ]]; then restore_resource svc_fail2ban; fi
+  restore_resource svc_fail2ban
   restore_resource f2b_jail
   restore_resource f2b_action
-  if [[ "$svc_state" != applied ]] && active fail2ban; then
+  # Still running after its service state was restored: it ran before this tool.
+  if active fail2ban; then
     if systemctl restart fail2ban; then ok '原有 Fail2ban 已按它自己的配置重新加载。'
     else warn 'Fail2ban 重新加载失败，请人工检查。'; RESTORE_PARTIAL=1; fi
   fi
@@ -3677,7 +3722,11 @@ restore_firewall_group() {
 }
 
 restore_ssh_group() {
-  [[ "$(restore_read ssh_dropin state 2>/dev/null || true)" == applied ]] || return 0
+  local pending=0
+  if restore_needed ssh_dropin; then pending=1; fi
+  # "applied" with the drop-in already gone: an earlier sshd reload failed.
+  if [[ "$(restore_read ssh_dropin state 2>/dev/null || true)" == applied ]]; then pending=1; fi
+  ((pending)) || return 0
   restore_resource ssh_dropin
   [[ "$(restore_read ssh_dropin state 2>/dev/null || true)" == restored ]] || return 0
   if ssh_reload; then ok '已恢复 SSH 密码登录；已导入的公钥保留。'
@@ -3689,19 +3738,17 @@ restore_ssh_group() {
 }
 
 restore_zram_group() {
-  local file_state swap_state
-  file_state="$(restore_read zram_file state 2>/dev/null || true)"
-  swap_state="$(restore_read zram_swap state 2>/dev/null || true)"
-  [[ "$file_state" == applied || "$swap_state" == applied ]] || return 0
-  if [[ "$file_state" == applied ]] && ! restore_current_matches zram_file; then warn 'ZRAM 配置在本工具之后被修改过，保持不变。'; RESTORE_PARTIAL=1; return 0; fi
-  if [[ "$swap_state" == applied ]] && ! restore_current_matches zram_swap; then warn 'ZRAM 交换空间在本工具之后被修改过，保持不变。'; RESTORE_PARTIAL=1; return 0; fi
-  if [[ "$swap_state" == applied ]] && ! restore_zram_safe; then RESTORE_PARTIAL=1; return 0; fi
+  local file_needed=0 swap_needed=0
+  if restore_needed zram_file; then file_needed=1; fi
+  if restore_needed zram_swap; then swap_needed=1; fi
+  ((file_needed || swap_needed)) || return 0
+  if ((swap_needed)) && ! restore_zram_safe; then RESTORE_PARTIAL=1; return 0; fi
   restore_resource zram_swap
   if [[ "$(restore_read zram_swap state 2>/dev/null || true)" == applied ]]; then return 0; fi
   restore_resource zram_file
-  if ! systemctl daemon-reload; then
+  if ((file_needed)) && ! systemctl daemon-reload; then
     warn '无法重新加载 ZRAM 服务，留待下次重试。'
-    if [[ "$file_state" == applied ]]; then restore_mark zram_file applied || die '无法记录待重试的 ZRAM 回退。'; fi
+    restore_mark zram_file applied || die '无法记录待重试的 ZRAM 回退。'
     RESTORE_PARTIAL=1
   fi
 }
@@ -3761,7 +3808,8 @@ restore_packages_offer() {
   if ! confirm_yes '确认卸载上述软件包吗？'; then ok '保留这些软件包。'; return 0; fi
   flags=()
   [[ "$chosen" == autoremove ]] && flags=(--autoremove)
-  if apt-get -y -q remove "${flags[@]}" "${ours[@]}"; then ok '已卸载本工具新装的软件包。'
+  apt_wait_idle
+  if apt-get -y -q -o DPkg::Lock::Timeout=120 remove "${flags[@]}" "${ours[@]}"; then ok '已卸载本工具新装的软件包。'
   else warn 'APT 卸载失败，请人工检查。'; RESTORE_PARTIAL=1; fi
 }
 
@@ -3801,11 +3849,12 @@ restore_group_ids() {
   esac
 }
 
-# True when the group has something this tool changed and can still undo.
+# True when something in the group differs from its state before this tool's
+# first run, or this tool's firewall rules / sysctl originals are still recorded.
 restore_group_pending() {
   local group="$1" id
   while IFS= read -r id; do
-    [[ -d "$RESTORE_ROOT/$id" && "$(restore_read "$id" state 2>/dev/null || true)" == applied ]] && return 0
+    if restore_needed "$id"; then return 0; fi
   done < <(restore_group_ids "$group")
   case "$group" in
     firewall) [[ -s "$RESTORE_ROOT/fw_rules" ]] && return 0 ;;
@@ -3825,9 +3874,11 @@ restore_group_apply() {
       restore_resource sysctl_file
       if [[ "$(restore_read sysctl_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime; fi ;;
     journal)
-      pending="$(restore_read journal_file state 2>/dev/null || true)"
+      # "applied" while already at the original: an earlier journald restart failed.
+      pending=0
+      if restore_needed journal_file || [[ "$(restore_read journal_file state 2>/dev/null || true)" == applied ]]; then pending=1; fi
       restore_resource journal_file
-      if [[ "$pending" == applied && "$(restore_read journal_file state 2>/dev/null || true)" == restored ]] &&
+      if ((pending)) && [[ "$(restore_read journal_file state 2>/dev/null || true)" == restored ]] &&
          ! systemctl restart systemd-journald; then
         warn '日志配置已恢复，但日志服务重启失败，留待下次重试。'
         restore_mark journal_file applied || die '无法记录待重试的日志回退。'
@@ -3903,7 +3954,8 @@ restore_main() {
   while IFS= read -r id; do
     [[ -d "$RESTORE_ROOT/$id" ]] || continue
     status="$(restore_read "$id" state)" || die "无法读取回退记录：$id"
-    case "$status" in applied) printf '待恢复：%s\n' "$(restore_label "$id")"; count=$((count + 1)) ;; clean|restored) ;; *) die "回退记录格式异常：$id" ;; esac
+    case "$status" in clean|applied|restored) ;; *) die "回退记录格式异常：$id" ;; esac
+    if restore_needed "$id"; then printf '待恢复：%s\n' "$(restore_label "$id")"; count=$((count + 1)); fi
   done < <(restore_all_ids)
   if [[ -f "$RESTORE_ROOT/fw_rules" ]]; then
     rules="$(grep -c . "$RESTORE_ROOT/fw_rules" || true)"
@@ -3912,10 +3964,10 @@ restore_main() {
   mapfile -t pkgs < <(restore_tool_packages)
   if ((${#pkgs[@]})); then printf '可选卸载：本工具新装的 %s 个软件包\n' "${#pkgs[@]}"; fi
   ((count + rules + ${#pkgs[@]})) || { ok '没有待撤销的已记录设置。'; return 0; }
-  echo '会恢复首次由本工具记录的修改前配置、运行参数和服务开关，并删除本工具添加的防火墙规则。'
-  echo '保留：你后来自己放行的端口、导入的 SSH 公钥、新建的管理员账户、系统升级和新内核、已执行过的 TRIM 和时间校准、已清理的旧内核。'
-  echo '回退只会放宽访问（关闭防火墙、恢复密码和 root 登录），不会把你锁在外面。'
-  echo '你后来自己改过的项目会保留并报告冲突；需要整机还原请使用服务商快照。'
+  echo '会把本工具记录过的配置、运行参数和服务开关恢复成本工具第一次运行前的样子（你后来手动改过的也一样），并删除本工具添加的防火墙规则。'
+  echo '保留：你用端口管理放行的端口、导入的 SSH 公钥、新建的管理员账户、系统升级和新内核、已执行过的 TRIM 和时间校准、已清理的旧内核。'
+  echo '回退只会放宽访问（关闭防火墙、恢复密码和 root 登录），不会把你锁在外面，也不会自动重新开启防火墙。'
+  echo '需要整机还原请使用服务商快照。'
   read -r -p '1) 全部撤销   2) 只撤销某一项   回车取消: ' choice || choice=''
   RESTORE_PARTIAL=0
   case "$choice" in
@@ -3926,7 +3978,7 @@ restore_main() {
     *) ok '已取消撤销。'; return 0 ;;
   esac
   if ((RESTORE_PARTIAL)); then
-    warn "撤销只完成了一部分；冲突或失败的项目及恢复基线保留在 $RESTORE_ROOT。请处理后重试，勿先卸载工具。"
+    warn "撤销只完成了一部分；没能恢复的项目及恢复基线保留在 $RESTORE_ROOT。请按上方提示处理后重试，勿先卸载工具。"
     RESTORE_EXIT_CODE=2
     return 0
   fi
@@ -4792,8 +4844,6 @@ item_main() {
   prepare_run_state
   stage_run backup backup_configs
   restore_prepare
-  # Each item is an explicit request, so a hand-made change is the new baseline.
-  RESTORE_ADOPT_DRIFT=1
   item_menu
   finish_run_state
   # Offer a reboot only for an upgrade made in this session; an older pending
@@ -4845,8 +4895,6 @@ main() {
   prepare_run_state
   stage_run backup backup_configs
   restore_prepare
-  # Menu 4/5 are explicit requests for one feature, like the single-item menu.
-  if [[ "$MODE" == ssh || "$MODE" == firewall ]]; then RESTORE_ADOPT_DRIFT=1; fi
   if [[ "$MODE" == ssh ]]; then
     stage_run ssh ssh_harden_stage
   elif [[ "$MODE" == firewall ]]; then

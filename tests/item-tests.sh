@@ -38,6 +38,7 @@ apt-get() {
   esac
 }
 ANSWERS=()
+apt_wait_idle() { :; }
 confirm_default_yes() { record "ask $1"; local a="${ANSWERS[0]:-y}"; ANSWERS=("${ANSWERS[@]:1}"); [[ "$a" == y ]]; }
 reset; ANSWERS=(y) RECOMMENDED=0 UPGRADE_APPROVED=0 AUTO_UPDATES=0
 apt_index_stage > "$TEST_ROOT/out"
@@ -77,6 +78,8 @@ printf 'PASS: recommended mode sets only the low-risk items and still asks about
 RESTORE_ROOT="$TEST_ROOT/restore-v2"; mkdir -p "$RESTORE_ROOT"
 declare -A STATE=()
 restore_read() { [[ "$2" == state && -n "${STATE[$1]:-}" ]] || return 1; echo "${STATE[$1]}"; }
+# The tracked setting differs from its original state: modelled by "applied".
+restore_needed() { [[ -d "$RESTORE_ROOT/$1" && "${STATE[$1]:-}" == applied ]]; }
 for id in bbr_file f2b_jail ufw_runtime; do mkdir -p "$RESTORE_ROOT/$id"; done
 STATE=([bbr_file]=applied [f2b_jail]=restored [ufw_runtime]=clean)
 restore_group_pending bbr || fail 'applied BBR not pending'

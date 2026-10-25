@@ -7,7 +7,7 @@ umask 077
 
 # Download location and the main script's hash; update the hash on every release.
 RELEASE_BASE_URL='https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main'
-EXPECTED_SHA256='d12a212b1f1b08ce54813a421db01c6d8188d5f58973786c624df2b46b37ed98'
+EXPECTED_SHA256='55498f152da6d35aa844624d3d4f9cd464ea7a37502fffb6f51e365fae888538'
 PAYLOAD_NAME='vps-stable-opt-v2.6.0.sh'
 INSTALL_DIR=/usr/local/lib/vps-stable-opt
 INSTALL_FILE="$INSTALL_DIR/vps-stable-opt.sh"
@@ -150,6 +150,18 @@ install_existing_action() {
   else echo refuse; fi
 }
 
+# Staging files are published with ln/mv and cleaned on exit; only a power loss
+# leaves them behind. Remove those (fixed mktemp names, owned by this user); a
+# directory left with nothing else and no launcher is removed for a fresh install.
+install_clean_staging() {
+  local dir="$1" bindir="$2" stale
+  for stale in "$dir"/.main.???????? "$dir"/.owner.???????? "$dir"/.sha256.???????? "$bindir"/.vps.????????; do
+    [[ -f "$stale" && ! -L "$stale" && "$(stat -c '%u' -- "$stale")" == "$EUID" ]] || continue
+    rm -f -- "$stale"
+  done
+  if [[ -d "$dir" && ! -L "$dir" && ! -e "$bindir/vps" && ! -L "$bindir/vps" ]]; then rmdir -- "$dir" 2>/dev/null || true; fi
+}
+
 for directory in / /usr /usr/local /usr/local/lib /usr/local/bin /var /var/lib; do secure_dir "$directory"; done
 # Share the stable directory lock used by setup/rollback/uninstall. Acquiring
 # it before publishing any file also prevents install/uninstall races.
@@ -201,6 +213,10 @@ EOF
 printf '%s\n' 'vps-stable-opt-installer:2.6' > "$TMP_DIR/marker"
 printf '%s\n' "$EXPECTED_SHA256" > "$TMP_DIR/sha256"
 
+if [[ -d "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]]; then
+  secure_dir "$INSTALL_DIR"
+  install_clean_staging "$INSTALL_DIR" /usr/local/bin
+fi
 if [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" || -e "$LAUNCHER_FILE" || -L "$LAUNCHER_FILE" ]]; then
   secure_dir "$INSTALL_DIR"
   for existing in "$MARKER_FILE" "$HASH_FILE" "$INSTALL_FILE" "$LAUNCHER_FILE"; do secure_file "$existing"; done

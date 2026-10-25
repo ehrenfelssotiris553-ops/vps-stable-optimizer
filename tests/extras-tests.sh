@@ -20,16 +20,18 @@ record() { printf '%s\n' "$*" >> "$TEST_ROOT/trace"; }
 module_result() { record "result $1 $2 ${3:-}"; }
 backup_config_path() { :; }
 record_config_change() { :; }
+restore_record_hosts_line() { :; }
 put_file() { [[ ! -e "$1" ]] || return 1; mkdir -p -- "$(dirname -- "$1")"; printf '%s\n' "$2" > "$1"; }
 reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 
 # Old kernels: only kernel packages, never the running one, else skipped.
 uname() { echo 6.1.0-28-amd64; }
 SIM=''
+apt_wait_idle() { :; }
 apt-get() {
   case "$*" in
     '-s autoremove --purge') printf '%s\n' "$SIM" ;;
-    '-y -q autoremove --purge') record 'autoremove' ;;
+    '-y -q -o DPkg::Lock::Timeout=120 autoremove --purge') record 'autoremove' ;;
     *) fail "unexpected apt-get $*" ;;
   esac
 }
