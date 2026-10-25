@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure sysctl_hardening_pairs sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -100,8 +100,8 @@ printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys and records
 (
   load_optimizer_functions sysctl_key_configured
   printf 'net/ipv4/tcp_syncookies = 0\n' > "$TEST_ROOT/fixture.conf"
-  # Redirect the scan by shadowing the glob through a temporary function copy.
-  eval "$(declare -f sysctl_key_configured | sed "s#/etc/sysctl.conf /etc/sysctl.d/\*.conf /run/sysctl.d/\*.conf /usr/local/lib/sysctl.d/\*.conf /usr/lib/sysctl.d/\*.conf /lib/sysctl.d/\*.conf#$TEST_ROOT/fixture.conf#")"
+  # The scan reads its file list from sysctl_config_files.
+  sysctl_config_files() { printf '%s\n' "$TEST_ROOT/fixture.conf" /nonexistent/sysctl.d/*.conf; }
   sysctl_key_configured net.ipv4.tcp_syncookies || fail 'slash-notation key not detected'
   if sysctl_key_configured kernel.kptr_restrict; then fail 'unrelated key detected'; fi
 )

@@ -188,6 +188,18 @@ check_firewall ''
 UFW_BOOT=enabled
 check_firewall ''
 [[ "$VERIFY_STATUS" == pass ]] || fail 'firewall enabled at boot failed'
+# SSH allowed through the OpenSSH application profile (port 22/tcp).
+ufw() {
+  case "$*" in
+    status) printf 'Status: active\n\nTo Action From\nOpenSSH LIMIT Anywhere\nOpenSSH (v6) LIMIT Anywhere (v6)\n' ;;
+    'status verbose') printf 'Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' ;;
+  esac
+}
+check_firewall ''
+[[ "$VERIFY_STATUS" == pass ]] || fail "SSH allowed by the OpenSSH profile reported missing: $VERIFY_TEXT"
+ssh_candidates() { echo 2222; }
+check_firewall ''
+[[ "$VERIFY_STATUS" == fail ]] || fail 'the OpenSSH profile (port 22) counted for SSH on port 2222'
 printf 'PASS: Fail2ban needs a running UFW; the firewall must also load at boot.\n'
 
 # The usage sentence ends with ".", which must not be taken for the size.

@@ -26,7 +26,7 @@ audit_ufw_ipv6() { echo yes; }
 # Models the user accepting IPv6 protection before UFW is enabled.
 ufw_ipv6_check() { if ((FLIP_IPV6)); then IPV6_FLIPPED=1; fi; }
 # A new SSH login seen in the journal confirms without typing.
-ssh_login_seen_since() { ((LOGIN_SEEN)); }
+ssh_login_seen() { ((LOGIN_SEEN)); }
 
 reset_case() {
   CASE_DIR="$TEST_ROOT/$1"

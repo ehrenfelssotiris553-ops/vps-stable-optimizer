@@ -107,6 +107,8 @@ on_exit() {
   local code="$1"
   if declare -F restore_capture_failure >/dev/null; then restore_capture_failure || true; fi
   if declare -F record_exit >/dev/null; then record_exit "$code" || true; fi
+  # The lock holder note in /run only means something while this process runs.
+  if [[ -n "${TOOL_LIFECYCLE_PID:-}" && "$TOOL_LIFECYCLE_PID" == "$BASHPID" ]]; then rm -f -- "$LOCK_OWNER_FILE" 2>/dev/null || true; fi
 }
 
 trap 'on_error "$?" "$LINENO"' ERR
@@ -168,12 +170,17 @@ ufw_active() {
 }
 installed() { dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -qx installed; }
 available() { installed "$1" || apt-cache policy "$1" 2>/dev/null | awk '$1=="Candidate:" && $2!="(none)" {ok=1} END {exit !ok}'; }
+# True when lslocks output (stdin) lists an APT/dpkg lock.
+apt_lock_listed() {
+  grep -Eq '^[[:space:]]*/var/(lib/(dpkg/(lock|lock-frontend)|apt/lists/lock)|cache/apt/archives/lock)([[:space:]]|$)'
+}
+
 # True while another program holds an APT/dpkg lock (unknown without lslocks).
 apt_locks_held() {
   local locks
   command -v lslocks >/dev/null || return 1
   locks="$(lslocks --noheadings --raw --output PATH 2>/dev/null || true)"
-  grep -Eq '^[[:space:]]*/var/(lib/(dpkg/(lock|lock-frontend)|apt/lists/lock)|cache/apt/archives/lock)([[:space:]]|$)' <<< "$locks"
+  apt_lock_listed <<< "$locks"
 }
 
 # A fresh VPS usually runs its automatic update right after first boot. APT
@@ -748,6 +755,13 @@ apt_index_ready() {
 # causes a skip. All '/' separators normalize to dots here only for detection;
 # ambiguous mixed notation may cause an extra skip, never an override.
 # Distribution defaults are not an administrator policy (see sysctl_vendor_default).
+# Every sysctl configuration location systemd-sysctl reads (glob patterns that
+# match nothing stay literal; callers skip anything that is not a file).
+sysctl_config_files() {
+  printf '%s\n' /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf \
+    /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf
+}
+
 bbr_config_conflict() {
   local f line k v has_value
   for f in "$@"; do
@@ -806,9 +820,9 @@ sysctl_vendor_default() {
 bbr_stage() {
   say '第6步：BBR 与默认 fq 队列配置'
   local was_present=0
-  if bbr_config_conflict /etc/sysctl.conf /etc/sysctl.d/*.conf \
-      /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf \
-      /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; then
+  local -a files=()
+  mapfile -t files < <(sysctl_config_files)
+  if bbr_config_conflict "${files[@]}"; then
     module_result bbr preserved 'existing TCP/qdisc policy'; return 0
   fi
   if ! modprobe tcp_bbr >/dev/null 2>&1 &&
@@ -852,15 +866,6 @@ bbr_report() {
     tc -s qdisc show 2>/dev/null || warn '无法读取网卡队列。'
   else warn '缺少 tc 命令，没有检查网卡实际队列。'; fi
   echo 'default_qdisc=fq 不会替换网卡已有的队列；本工具不修改 tc 配置。'
-}
-
-bbr_quick_status() {
-  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == bbr ]]; then
-    ok 'TCP 默认拥塞算法是 bbr（已有连接未检查）。'
-  else warn 'TCP 默认拥塞算法不是 bbr（不支持，或按原设置保留）。'; fi
-  if [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" == fq ]]; then
-    ok '默认队列算法是 fq；网卡实际队列见上方 tc 输出。'
-  else warn '默认队列算法不是 fq（不支持，或按原设置保留）。'; fi
 }
 
 swap_exists() {
@@ -1049,12 +1054,12 @@ sysctl_hardening_pairs() {
 # True when KEY is assigned in any sysctl configuration file other than ours.
 sysctl_key_configured() {
   local key="$1" f
-  for f in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
+  while IFS= read -r f; do
     [[ -f "$f" && "$f" != "$SYSCTL_HARDENING_FILE" ]] || continue
     if awk -v k="$key" '{line = $0; sub(/^[ \t-]+/, "", line); split(line, a, "="); gsub(/[ \t]/, "", a[1]); gsub("/", ".", a[1]); if (a[1] == k) {found = 1; exit}} END {exit !found}' "$f"; then
       return 0
     fi
-  done
+  done < <(sysctl_config_files)
   return 1
 }
 
@@ -1384,13 +1389,14 @@ guard_arm() {
   active "$unit.timer"
 }
 
-# Any SSH login accepted since SINCE (epoch seconds), optionally for USER: a new
-# connection got through, which is what the firewall guard needs to see.
-ssh_login_seen_since() {
-  local since="$1" user="${2:-}"
+# An SSH login accepted since SINCE (epoch seconds), optionally only for USER
+# and only by METHOD (publickey). Only entries written by sshd as root count:
+# any local user can log a fake "sshd" line with logger, but not as root.
+ssh_login_seen() {
+  local since="$1" user="${2:-}" method="${3:-}"
   command -v journalctl >/dev/null || return 1
-  journalctl -q --since "@$since" -t sshd -t sshd-session -o cat --no-pager 2>/dev/null |
-    awk -v u="$user" '$1 == "Accepted" && $3 == "for" && (u == "" || $4 == u) {found = 1} END {exit !found}'
+  journalctl -q --since "@$since" _UID=0 -t sshd -t sshd-session -o cat --no-pager 2>/dev/null |
+    awk -v u="$user" -v m="$method" '$1 == "Accepted" && (m == "" || $2 == m) && $3 == "for" && (u == "" || $4 == u) {found = 1} END {exit !found}'
 }
 
 # Success means the confirmation arrived in time and the still-pending guard
@@ -1615,7 +1621,7 @@ firewall_stage() {
   ufw status numbered
   echo '请保留这个窗口不要关。现在新开一个 SSH 窗口登录服务器：登录成功后，这里通常几秒内就会自动确认，新窗口里什么都不用输入。'
   echo '如果没有自动确认，就回到这个窗口输入 CONNECTED；180 秒内没有确认，会自动关闭防火墙恢复原样。'
-  if guard_confirm "$unit" "$deadline" ssh_login_seen_since "$since"; then
+  if guard_confirm "$unit" "$deadline" ssh_login_seen "$since"; then
     if ufw_active; then
       ok '防火墙已保留，自动撤销计时器已取消。'
       ufw_boot_enable
@@ -1681,13 +1687,6 @@ ssh_effective() {
 
 ssh_effective_value() {
   awk -v key="$2" 'tolower($1) == key {sub(/^[^ ]+ /, ""); print; exit}' <<< "$1"
-}
-
-ssh_key_login_seen() {
-  local user="$1" since="$2"
-  command -v journalctl >/dev/null || return 1
-  journalctl -q --since "@$since" -t sshd -t sshd-session -o cat --no-pager 2>/dev/null |
-    awk -v u="$user" '$1 == "Accepted" && $2 == "publickey" && $3 == "for" && $4 == u {found = 1} END {exit !found}'
 }
 
 # sudo logs "USER : TTY=... ; USER=root ; COMMAND=/usr/bin/true".
@@ -1899,7 +1898,7 @@ ssh_harden_stage() {
   echo "请保持当前窗口不要关闭，新开一个终端，用密钥登录：ssh $user@服务器IP"
   if ((want_admin)); then echo "登录后在新窗口里运行一次：sudo true（输入 $user 的密码），确认 sudo 可用。"; fi
   read -r -p '完成后回到这里按回车继续: ' answer || true
-  if ssh_key_login_seen "$user" "$since"; then
+  if ssh_login_seen "$since" "$user" publickey; then
     ok "系统日志确认 $user 已用密钥登录成功。"
   elif ! confirm_yes "系统日志里没有找到 $user 的密钥登录记录。你确定已经用密钥登录成功了吗？"; then
     ok '保留密码登录；SSH 设置没有改动。'; module_result ssh declined 'key login not confirmed'; return 0
@@ -1939,7 +1938,7 @@ ssh_harden_stage() {
   if ((want_admin)); then echo '现在 root 直接登录应该被拒绝，这是正常的。'; fi
   echo "用密钥登录成功后，这里通常几秒内就会自动确认，新窗口里什么都不用输入。"
   echo '如果没有自动确认，就回到这个窗口输入 CONNECTED；180 秒内没有确认，会自动恢复原来的设置。'
-  if guard_confirm "$unit" "$deadline" ssh_key_login_seen "$user" "$since"; then
+  if guard_confirm "$unit" "$deadline" ssh_login_seen "$since" "$user" publickey; then
     if [[ -f "$SSH_DROPIN" ]]; then
       detail="key-only user=$user"
       if ((want_admin)); then detail+=' root-ssh=off'; fi
@@ -1951,8 +1950,9 @@ ssh_harden_stage() {
   fi
   warn '这次没有确认成功：正在恢复原来的 SSH 设置；可以稍后重试。'
   rm -f -- "$SSH_DROPIN"
-  ssh_reload || warn 'sshd 重新加载失败；如果计时器仍在，它会再试一次。'
-  systemctl stop "$unit.timer" 2>/dev/null || true
+  # The guard reloads sshd again when it fires: keep it unless this reload worked.
+  if ssh_reload; then systemctl stop "$unit.timer" 2>/dev/null || true
+  else warn 'sshd 重新加载失败：自动撤销计时器保留，到期时会再重新加载一次。'; fi
   module_result ssh failed 'second login not confirmed; reverted'
 }
 
@@ -2216,7 +2216,7 @@ preflight_report() {
   else ok '软件包状态正常。'; fi
   if command -v lslocks >/dev/null; then
     if locks="$(lslocks --noheadings --raw --output PATH 2>/dev/null)"; then
-      if grep -E '^[[:space:]]*/var/(lib/(dpkg/(lock|lock-frontend)|apt/lists/lock)|cache/apt/archives/lock)([[:space:]]|$)' <<< "$locks" >/dev/null; then
+      if apt_lock_listed <<< "$locks"; then
         warn '有其他程序正在安装或更新软件（常见于开机后的自动更新）：开始修改时会先等它结束（最多 10 分钟）；不要删除锁文件或强行结束它。'
       fi
     else warn '无法检查软件包锁，以 APT 自身的锁为准。'; fi
@@ -2252,7 +2252,7 @@ restart_report() {
   echo '本项只列出状态，不重启服务或整机；现有更新工具仍遵循其自身策略。'
 }
 
-# V2.3 read-only audit functions. Safe to source: no top-level commands.
+# Read-only audit functions. Safe to source: no top-level commands.
 # Depends on the caller's say/ok/warn functions; warn may increment WARNINGS.
 # Never source configuration files, inspect shadow/private keys, or change services.
 
@@ -2642,6 +2642,30 @@ prepare_run_state() {
   mv -fT -- "$temp" "$latest"
   ok "运行记录：$RUN_STATE_DIR"
   ok "配置备份目录：$RUN_BACKUP_DIR"
+  run_records_prune
+}
+
+# Every run adds a run record and a configuration backup. The first run (the
+# configuration before this tool) and the newest 20 runs are kept; the
+# rollback baseline lives in restore-v2 and is never touched here.
+run_records_prune() {
+  local dir id root pruned=0 newest=20 keep=' '
+  local -a ids=()
+  mapfile -t ids < <(for dir in "$STATE_ROOT"/run-* "$BACKUP_ROOT"/run-*; do printf '%s\n' "${dir##*/}"; done |
+    grep -E '^run-[0-9]{8}T[0-9]{6}Z-[0-9]+-[A-Za-z0-9]{6}$' | LC_ALL=C sort -u)
+  ((${#ids[@]} > newest + 1)) || return 0
+  keep+="${ids[0]} "
+  for id in "${ids[@]: -newest}"; do keep+="$id "; done
+  for id in "${ids[@]}"; do
+    [[ "$keep" != *" $id "* ]] || continue
+    for root in "$STATE_ROOT" "$BACKUP_ROOT"; do
+      dir="$root/$id"
+      [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || continue
+      rm -rf --one-file-system -- "$dir" || { warn "无法清理旧记录：$dir"; continue; }
+    done
+    pruned=$((pruned + 1))
+  done
+  ok "已清理 $pruned 次较早的运行记录和配置备份（保留第一次和最近 $newest 次）。"
 }
 
 backup_config_path() {
@@ -2977,6 +3001,7 @@ decision_journal_state() {
 decision_report() {
   local blockers="${1:-unknown}" sources="${2:-unknown}" current available_cc file_state module_state
   local synchronized provider='' pkg state
+  local -a files=()
   say '根据本次体检，接下来准备怎么做'
   echo '以下是下一次优化的处理计划；此处只检查。开始执行时会重新检测，并保留升级和防火墙等确认。'
   if [[ "$blockers" =~ ^[0-9]+$ ]]; then
@@ -2996,7 +3021,8 @@ decision_report() {
 
   # bbr_config_conflict can warn/increment WARNINGS. The subshell keeps those
   # effects local, and suppresses raw administrator configuration in this view.
-  if ( bbr_config_conflict /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf ) >/dev/null 2>&1; then
+  mapfile -t files < <(sysctl_config_files)
+  if ( bbr_config_conflict "${files[@]}" ) >/dev/null 2>&1; then
     decision_line '保留现状' 'BBR 网络优化' '发现已有或无法读取的 TCP/队列策略，按现有规则跳过 BBR 配置，避免覆盖。'
   else
     file_state="$(decision_file_state "$BBR_FILE" $'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr')"
@@ -3068,6 +3094,8 @@ decision_report() {
     ext4|xfs|btrfs)
       if [[ "${ROOT_DEV:-unknown}" != /dev/* ]]; then
         decision_line '保留现状' '磁盘 TRIM' '系统盘不是可直接识别的块设备路径，跳过。'
+      elif ! trim_support; then
+        decision_line '保留现状' '磁盘 TRIM' '系统盘不支持 TRIM（DISC-MAX 为 0），跳过；定时任务保持原样。'
       elif systemctl is-enabled -q fstrim.timer >/dev/null 2>&1; then
         decision_line '保留现状' '磁盘 TRIM' '定期 TRIM 已启用。'
       elif command -v fstrim >/dev/null; then
@@ -3109,24 +3137,11 @@ decision_report() {
 
 # Tool lifecycle helpers. They remove only the V2.6-owned tool/data, never /etc
 # configuration, APT packages, system journal/APT history, or uploaded copies.
-tool_path_safe() {
-  local path="$1" part current=''
-  local -a parts=()
-  [[ "$path" == /* && "$path" != / && "$path" != */ && "$path" != *'//'* && "$path" != *$'\n'* && "$path" != *$'\t'* ]] || return 1
-  IFS=/ read -r -a parts <<< "$path"
-  for part in "${parts[@]}"; do
-    [[ -n "$part" ]] || continue
-    [[ "$part" != . && "$part" != .. ]] || return 1
-    current="$current/$part"
-    [[ ! -L "$current" ]] || return 1
-  done
-}
-
 # "/" is accepted here only as a parent whose owner and mode are checked;
-# tool_path_safe still never accepts it, so it can never be a removal target.
+# state_path_safe never accepts it, so it can never be a removal target.
 tool_secure_dir() {
   local path="$1" owner mode
-  if [[ "$path" != / ]]; then tool_path_safe "$path" || return 1; fi
+  if [[ "$path" != / ]]; then state_path_safe "$path" || return 1; fi
   [[ -d "$path" && ! -L "$path" ]] || return 1
   owner="$(stat -c '%u' -- "$path")" || return 1
   mode="$(stat -c '%a' -- "$path")" || return 1
@@ -3136,7 +3151,7 @@ tool_secure_dir() {
 
 tool_secure_file() {
   local path="$1" owner mode
-  tool_path_safe "$path" && [[ -f "$path" ]] || return 1
+  state_path_safe "$path" && [[ -f "$path" ]] || return 1
   owner="$(stat -c '%u' -- "$path")" || return 1
   mode="$(stat -c '%a' -- "$path")" || return 1
   [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
@@ -4400,7 +4415,10 @@ check_firewall() {
   verbose="$(ufw status verbose 2>/dev/null || true)"
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
-    grep -Eq "^$p(/tcp)?[[:space:]].*(ALLOW|LIMIT)" <<< "$status" || missing+=" $p"
+    if grep -Eq "^$p(/tcp)?[[:space:]].*(ALLOW|LIMIT)" <<< "$status"; then continue; fi
+    # `ufw allow OpenSSH` (the application profile) covers port 22/tcp.
+    if [[ "$p" == 22 ]] && grep -Eq '^OpenSSH[[:space:]].*(ALLOW|LIMIT)' <<< "$status"; then continue; fi
+    missing+=" $p"
   done < <(ssh_candidates | sort -n -u)
   if [[ -r /etc/default/ufw ]]; then ipv6="$(audit_ufw_ipv6 < /etc/default/ufw)"; fi
   if [[ -n "$missing" ]]; then verify_set fail "没有找到 SSH 端口${missing} 的放行规则"
@@ -4463,13 +4481,21 @@ check_hosts() {
   else verify_set fail "主机名 $(hostname) 仍无法解析"; fi
 }
 
+# Installed kernel versions from /boot (or DIR), oldest first.
+boot_kernels() {
+  local f
+  for f in "${1:-/boot}"/vmlinuz-*; do
+    if [[ -f "$f" ]]; then printf '%s\n' "${f##*/vmlinuz-}"; fi
+  done | sort -V
+}
+
 verify_kernel() {
-  local running newest f
+  local running newest
   local -a kernels=()
   running="$(uname -r)"
-  for f in /boot/vmlinuz-*; do [[ -f "$f" ]] && kernels+=("${f#/boot/vmlinuz-}"); done
+  mapfile -t kernels < <(boot_kernels)
   if ((${#kernels[@]} == 0)); then verify_line unknown '内核' "正在运行 $running；/boot 中没有内核文件（服务商可能使用外部内核）"; return 0; fi
-  newest="$(printf '%s\n' "${kernels[@]}" | sort -V | tail -n 1)"
+  newest="${kernels[-1]}"
   if [[ "$running" != "$newest" ]]; then
     verify_line fail '内核' "已安装更新的内核 $newest，但正在运行 $running：需要重启（已重启仍如此，可能是服务商外部内核或开机默认项不同）"
   elif [[ -e /var/run/reboot-required ]]; then
@@ -4573,6 +4599,7 @@ verify_main() {
   fi
   # No pipe: the counters must survive in this shell for the exit code.
   if [[ -n "$file" ]]; then
+    echo '正在逐项检查，大约需要几秒……'
     verify_summary > "$file"
     chmod 600 -- "$file" 2>/dev/null || true
     cat -- "$file"
@@ -4963,7 +4990,7 @@ item_status() {
     vnstat)
       if active vnstat; then echo '已开启'; elif installed vnstat; then echo '已安装，未运行'; else echo '未安装'; fi ;;
     kernel)
-      for pkg in /boot/vmlinuz-*; do if [[ -f "$pkg" ]]; then count=$((count + 1)); fi; done
+      count="$(boot_kernels | grep -c . || true)"
       echo "已安装 $count 个内核" ;;
     firewall)
       if ! command -v ufw >/dev/null; then echo '未安装'; elif ufw_active; then echo '已开启'; else echo '未开启'; fi ;;
@@ -5150,13 +5177,9 @@ item_main() {
 # Why a reboot is (or is not) needed: an installed kernel newer than the running
 # one, or the system's reboot-required flag. Arguments allow isolated tests.
 reboot_reason() {
-  local boot="${1:-/boot}" flag="${2:-/var/run/reboot-required}" running newest='' f
-  local -a kernels=()
+  local boot="${1:-/boot}" flag="${2:-/var/run/reboot-required}" running newest
   running="$(uname -r)"
-  for f in "$boot"/vmlinuz-*; do
-    if [[ -f "$f" ]]; then kernels+=("${f##*/vmlinuz-}"); fi
-  done
-  if ((${#kernels[@]})); then newest="$(printf '%s\n' "${kernels[@]}" | sort -V | tail -n 1)"; fi
+  newest="$(boot_kernels "$boot" | tail -n 1)"
   if [[ -n "$newest" && "$newest" != "$running" ]]; then echo "已安装新内核 $newest，正在运行的是 $running：重启后新内核才生效。"
   elif [[ -e "$flag" ]]; then echo '系统提示需要重启，部分更新要重启后才完全生效。'
   else echo '目前没有需要重启才能生效的更新，不重启也可以。'; fi

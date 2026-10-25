@@ -7,7 +7,7 @@ TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 FUNCTIONS_FILE="$TEST_ROOT/functions.sh"
 : > "$FUNCTIONS_FILE"
-for function in state_path_safe state_secure_dir state_write state_event prepare_run_state backup_config_path backup_config_group backup_configs stage_run record_failure record_exit finish_run_state state_report record_config_change; do
+for function in state_path_safe state_secure_dir state_write state_event prepare_run_state run_records_prune backup_config_path backup_config_group backup_configs stage_run record_failure record_exit finish_run_state state_report record_config_change; do
   grep -Fqx "$function() {" "$SOURCE" || { printf 'Missing function: %s\n' "$function" >&2; exit 1; }
   awk -v fn="$function" '$0==fn"() {" {capture=1} capture {print} capture && $0=="}" {exit}' "$SOURCE" >> "$FUNCTIONS_FILE"
 done

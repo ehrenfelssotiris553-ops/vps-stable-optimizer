@@ -9,7 +9,8 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions restore_ids restore_before_stage preflight_block preflight_report audit_disk_risks coreutils_selfcheck admin_prepare item_main ssh_key_count apt_locks_held apt_wait_idle reboot_reason reboot_main
+load_optimizer_functions restore_ids restore_before_stage preflight_block preflight_report audit_disk_risks coreutils_selfcheck admin_prepare item_main ssh_key_count apt_lock_listed apt_locks_held apt_wait_idle boot_kernels reboot_reason reboot_main \
+  run_records_prune on_exit
 T="$(mktemp -d)"
 trap 'rm -rf -- "$T"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -175,3 +176,49 @@ if grep -q 'systemctl reboot' "$T/trace"; then fail 'rebooted after a no'; fi
 reset; YES=1; try_reboot
 grep -Fxq 'systemctl reboot' "$T/trace" || fail 'confirmed reboot did not run'
 printf 'PASS: reboot explains the need, waits for or refuses busy states, and asks before rebooting.\n'
+
+# Old run records and configuration backups: the first run (the configuration
+# before this tool) and the newest 20 stay; the rollback baseline is untouched.
+(
+  STATE_ROOT="$T/prune/state" BACKUP_ROOT="$T/prune/backups"
+  mkdir -p "$STATE_ROOT/restore-v2" "$BACKUP_ROOT"
+  for i in $(seq -w 1 21); do
+    mkdir -p "$STATE_ROOT/run-202610${i}T000000Z-1-abcdef" "$BACKUP_ROOT/run-202610${i}T000000Z-1-abcdef"
+  done
+  run_records_prune
+  [[ "$(find "$STATE_ROOT" -maxdepth 1 -name 'run-*' | grep -c .)" == 21 ]] || fail 'runs pruned below the limit'
+  for i in 22 23 24 25; do
+    mkdir -p "$STATE_ROOT/run-202610${i}T000000Z-1-abcdef" "$BACKUP_ROOT/run-202610${i}T000000Z-1-abcdef"
+  done
+  # A backup whose run record is already gone follows the same rule.
+  rm -rf "$STATE_ROOT/run-20261002T000000Z-1-abcdef"
+  mkdir -p "$BACKUP_ROOT/not-a-run"
+  run_records_prune
+  [[ "$(find "$STATE_ROOT" -maxdepth 1 -name 'run-*' | grep -c .)" == 21 ]] || fail 'run records not pruned to the first plus the newest 20'
+  [[ "$(find "$BACKUP_ROOT" -maxdepth 1 -name 'run-*' | grep -c .)" == 21 ]] || fail 'backups not pruned to the first plus the newest 20'
+  [[ -d "$STATE_ROOT/run-20261001T000000Z-1-abcdef" && -d "$BACKUP_ROOT/run-20261001T000000Z-1-abcdef" ]] || fail 'the first run (original configuration) was pruned'
+  [[ ! -e "$BACKUP_ROOT/run-20261002T000000Z-1-abcdef" && ! -e "$STATE_ROOT/run-20261005T000000Z-1-abcdef" ]] || fail 'old runs kept'
+  [[ -d "$STATE_ROOT/run-20261006T000000Z-1-abcdef" && -d "$STATE_ROOT/run-20261025T000000Z-1-abcdef" ]] || fail 'recent runs pruned'
+  [[ -d "$STATE_ROOT/restore-v2" && -d "$BACKUP_ROOT/not-a-run" ]] || fail 'something other than run records was removed'
+  grep -Fq '已清理 4 次' "$T/log" || fail 'pruning not reported'
+)
+printf 'PASS: old run records and backups are pruned to the first run plus the newest 20.\n'
+
+# The lock holder note in /run is removed by the process that holds the lock.
+(
+  LOCK_OWNER_FILE="$T/owner"
+  : > "$LOCK_OWNER_FILE"
+  TOOL_LIFECYCLE_PID=1
+  on_exit 0
+  [[ -e "$LOCK_OWNER_FILE" ]] || fail 'another process removed the lock holder note'
+  TOOL_LIFECYCLE_PID="$BASHPID"
+  on_exit 0
+  [[ ! -e "$LOCK_OWNER_FILE" ]] || fail 'lock holder note left in /run after exit'
+)
+mkdir -p "$T/kernels"
+: > "$T/kernels/vmlinuz-6.1.0-9-amd64"; : > "$T/kernels/vmlinuz-6.1.0-10-amd64"
+[[ "$(boot_kernels "$T/kernels" | tr '\n' ' ')" == '6.1.0-9-amd64 6.1.0-10-amd64 ' ]] || fail 'kernels not listed oldest first'
+[[ -z "$(boot_kernels "$T/no-such-dir")" ]] || fail 'missing /boot listed kernels'
+apt_lock_listed <<< '/var/lib/dpkg/lock-frontend' || fail 'dpkg lock not recognised'
+if apt_lock_listed <<< '/var/lib/dpkg/lock-frontend.bak'; then fail 'unrelated path taken for a dpkg lock'; fi
+printf 'PASS: lock holder note cleanup, kernel listing and APT lock pattern.\n'

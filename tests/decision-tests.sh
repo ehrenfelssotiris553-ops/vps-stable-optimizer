@@ -16,7 +16,7 @@ load_function() {
   ' "$TEST_SCRIPT")"
   eval "$definition"
 }
-for name in journal_policy_paths decision_line decision_file_state decision_journal_state decision_report; do load_function "$name"; done
+for name in journal_policy_paths sysctl_config_files trim_support decision_line decision_file_state decision_journal_state decision_report; do load_function "$name"; done
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -80,6 +80,8 @@ systemctl() {
   ((TRIM_ENABLED))
 }
 fstrim() { fail 'read-only report executed TRIM'; }
+DISC_MAX=2G
+lsblk() { [[ "$*" == '-dn -o DISC-MAX /dev/vda1' ]] || fail "unexpected lsblk $*"; printf '%s\n' "$DISC_MAX"; }
 modprobe() { fail 'read-only report loaded a module'; }
 apt-get() { fail 'read-only report executed APT'; }
 install_pkgs() { fail 'read-only report installed a package'; }
@@ -121,6 +123,13 @@ assert_contains '系统时间已经同步'
 assert_contains '系统盘大于 20GiB'
 assert_contains 'UFW 已开启，保留已有规则'
 assert_contains '已有其他 Fail2ban 管理配置'
+assert_contains '定期 TRIM 已启用'
+# Disk without discard support: not reported as an enabled TRIM.
+DISC_MAX='   0B'
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '系统盘不支持 TRIM'
+assert_absent '定期 TRIM 已启用'
+DISC_MAX=2G
 [[ "$WARNINGS" == 0 ]] || fail 'BBR conflict warning escaped its subshell'
 
 BBR_CONFLICT=0 SWAP_PRESENT=0 MEM_MIB=2048 ROOT_GIB=20 JOURNAL_STATE=custom FIREWALL_ACTIVE=0 FIREWALL_CONFLICT=1

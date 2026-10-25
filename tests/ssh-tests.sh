@@ -6,7 +6,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_key_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey ssh_harden_stage
+load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey ssh_harden_stage
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -25,16 +25,22 @@ for setting in 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'Ma
 done
 effective=$'passwordauthentication yes\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2'
 [[ "$(ssh_effective_value "$effective" authorizedkeysfile)" == '.ssh/authorized_keys .ssh/authorized_keys2' ]] || fail 'multi-word sshd value'
+ROOT_LINES=$'Accepted password for alice from 203.0.113.9 port 1 ssh2\nAccepted publickey for alice2 from 203.0.113.9 port 2 ssh2: ED25519 SHA256:x'
 journalctl() {
   if [[ " $* " == *' -t sudo '* ]]; then
     printf '%s\n' 'alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id' "${SUDO_LINE:-}"
   else
-    printf '%s\n' 'Accepted password for alice from 203.0.113.9 port 1 ssh2' 'Accepted publickey for alice2 from 203.0.113.9 port 2 ssh2: ED25519 SHA256:x' "${JOURNAL_LINE:-}"
+    printf '%s\n' "$ROOT_LINES" "${JOURNAL_LINE:-}"
+    # `logger -t sshd` by a local user: not written as root, so _UID=0 hides it.
+    if [[ " $* " != *' _UID=0 '* ]]; then echo 'Accepted publickey for alice from 198.51.100.7 port 5 ssh2: forged'; fi
   fi
 }
-if ssh_key_login_seen alice 1; then fail 'password or other-user login counted as a key login'; fi
+if ssh_login_seen 1 alice publickey; then fail 'password, other-user or forged login counted as a key login'; fi
+ssh_login_seen 1 || fail 'an accepted SSH login was missed'
+ROOT_LINES=''
+if ssh_login_seen 1; then fail 'a line a local user logged as "sshd" counted as an SSH login'; fi
 JOURNAL_LINE='Accepted publickey for alice from 203.0.113.9 port 3 ssh2: ED25519 SHA256:x'
-ssh_key_login_seen alice 1 || fail 'key login in the journal was missed'
+ssh_login_seen 1 alice publickey || fail 'key login in the journal was missed'
 if ssh_sudo_seen alice 1; then fail 'a different sudo command counted as the sudo test'; fi
 SUDO_LINE='alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true'
 ssh_sudo_seen alice 1 || fail 'sudo true in the journal was missed'
@@ -216,6 +222,18 @@ ssh_harden_stage < "$CASE/input"
 [[ "$(grep -c '^reload$' "$CASE/trace")" == 2 ]] || fail 'password login not reloaded back'
 grep -q '^result ssh failed' "$CASE/trace" || fail 'reverted SSH change not recorded as failed'
 [[ -e "$(auth_file)" ]] || fail 'imported key must be kept even when reverting'
+grep -q '^systemctl stop vps-stable-ssh-revert-.*\.timer$' "$CASE/trace" || fail 'guard timer kept although the revert worked'
+
+# The revert reload fails: sshd still runs key-only, so the guard (which
+# reloads again when it fires) must stay armed.
+new_case revert_reload_fails
+GUARD_OK=0 RELOADS=0
+ssh_reload() { record reload; RELOADS=$((RELOADS + 1)); ((RELOADS == 1)); }
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+[[ ! -e "$SSH_DROPIN" ]] || fail 'unconfirmed key-only login was kept'
+if grep -q '^systemctl stop vps-stable-ssh-revert-' "$CASE/trace"; then fail 'guard timer cancelled although the revert reload failed'; fi
+grep -q '^result ssh failed' "$CASE/trace" || fail 'failed revert not recorded'
+ssh_reload() { record reload; }
 
 new_case earlier_setting_wins
 DROPIN_WINS=0

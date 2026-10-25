@@ -7,15 +7,15 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions tool_path_safe tool_fixed_paths tool_data_owned tool_expected_launcher tool_install_owned tool_tree_safe tool_no_pending_firewall
+load_optimizer_functions state_path_safe tool_fixed_paths tool_data_owned tool_expected_launcher tool_install_owned tool_tree_safe tool_no_pending_firewall
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 mkdir -p -- "$TEST_ROOT/real/nested"
 ln -s -- "$TEST_ROOT/real" "$TEST_ROOT/link"
-tool_path_safe "$TEST_ROOT/real/nested/missing" || fail 'safe absent leaf rejected'
+state_path_safe "$TEST_ROOT/real/nested/missing" || fail 'safe absent leaf rejected'
 for path in / relative /tmp/../etc /tmp//a /tmp/a/ "$TEST_ROOT/link/file" "$TEST_ROOT/real/../other" $'/tmp/new\nline' $'/tmp/tab\tname'; do
-  if tool_path_safe "$path"; then fail "unsafe path accepted: $path"; fi
+  if state_path_safe "$path"; then fail "unsafe path accepted: $path"; fi
 done
 printf 'PASS: lifecycle path validator rejects symlink components and traversal.\n'
 

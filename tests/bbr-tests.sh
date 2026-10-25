@@ -5,7 +5,7 @@ set -Eeuo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 HERE="$PWD"
 source ./test-common.sh
-load_optimizer_functions sysctl_vendor_default bbr_config_conflict bbr_stage bbr_report bbr_quick_status
+load_optimizer_functions sysctl_vendor_default sysctl_config_files bbr_config_conflict bbr_stage bbr_report
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 BBR_FILE="$TEST_ROOT/99-vps-stable-bbr.conf"
@@ -114,7 +114,6 @@ AVAILABLE_CC='reno cubic' MODPROBE_FAIL=1 bbr_stage
 if command grep -Eq '^(put|write) ' "$CALLS"; then fail 'unsupported kernel changed settings'; fi
 
 bbr_report > "$TEST_ROOT/report"
-bbr_quick_status
 command grep -q 'fq_codel' "$TEST_ROOT/report" || fail 'actual tc queues missing'
 if command grep -q 'BBR + fq currently active' "$TEST_ROOT/report" "$LOG"; then fail 'false active claim'; fi
 printf 'PASS: BBR parser, persistence gating, all scan directories, and honest reporting.\n'
