@@ -84,6 +84,16 @@ port_open 8080 icmp '' > "$TEST_ROOT/out"
 [[ ! -s "$TEST_ROOT/calls" ]] || fail 'invalid protocol reached UFW'
 port_open 8080 tcp 'any' > "$TEST_ROOT/out"
 [[ ! -s "$TEST_ROOT/calls" ]] || fail 'invalid source reached UFW'
+# Found on a real VPS: "vps port open 70000" first printed the error trap's
+# "[出错] line=… 不要盲目重跑" before the plain format hint. A typo is no crash.
+(
+  trap 'printf "trap\n" >> "$TEST_ROOT/err-trap"' ERR
+  port_open 70000 tcp '' > /dev/null 2>&1
+  port_open 8080 icmp '' > /dev/null 2>&1
+  port_close 70000 tcp > /dev/null 2>&1
+  port_close 8080 icmp > /dev/null 2>&1
+)
+[[ ! -s "$TEST_ROOT/err-trap" ]] || fail 'a mistyped port or protocol set off the error trap'
 
 reset
 CONFIRM_YES=0

@@ -27,6 +27,7 @@ JOURNAL_FILE="$TEST_ROOT/managed-journal.conf"
 JOURNAL_LIMIT_GB=20
 BBR_FILE="$TEST_ROOT/bbr.conf"
 MODULE_FILE="$TEST_ROOT/module.conf"
+F2B_FILE="$TEST_ROOT/99-vps-stable-sshd.local"
 printf '%s\n' '[Journal]' 'SystemMaxUse=100M' 'RuntimeMaxUse=50M' 'MaxRetentionSec=14day' > "$TEST_ROOT/exact.conf"
 [[ "$(decision_file_state "$TEST_ROOT/missing" text)" == missing ]] || fail 'missing file not classified'
 printf '%s\n' text > "$TEST_ROOT/file"
@@ -53,6 +54,7 @@ MEM_MIB=1024 ROOT_GIB=10 ROOT_FS=ext4 ROOT_DEV=/dev/vda1
 bbr_config_conflict() { warn 'mock confidential config line'; ((BBR_CONFLICT)); }
 bbr_set_elsewhere() { ((${BBR_ELSEWHERE:-0})); }
 zram_module_available() { ((${ZRAM_MODULE:-1})); }
+active() { [[ "$1" == fail2ban ]] && ((${F2B_RUNNING:-0})); }
 swap_exists() { ((SWAP_PRESENT)); }
 available() { ((PKG_AVAILABLE)); }
 installed() { [[ "$1" == chrony ]] && ((PROVIDER_PRESENT)); }
@@ -104,6 +106,14 @@ assert_contains '内存低于 2GiB，未发现 Swap/ZRAM'
 ZRAM_MODULE=0
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '这个内核没有 zram 模块'
+# Found on a real VPS: a machine already set up still showed Fail2ban as
+# "准备调整". This tool's jail in place and running is kept as it is.
+assert_contains '配置 SSH 防爆破'
+: > "$F2B_FILE"; F2B_RUNNING=1
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '本工具的 Fail2ban 规则已经在运行'
+assert_absent '配置 SSH 防爆破'
+rm -f "$F2B_FILE"; F2B_RUNNING=0
 assert_absent '计划配置约内存一半大小的 ZRAM'
 ZRAM_MODULE=1
 decision_report 0 0 > "$TEST_ROOT/report"

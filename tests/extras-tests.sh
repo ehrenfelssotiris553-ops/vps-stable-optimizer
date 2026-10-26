@@ -24,36 +24,50 @@ restore_record_hosts_line() { :; }
 put_file() { [[ ! -e "$1" ]] || return 1; mkdir -p -- "$(dirname -- "$1")"; printf '%s\n' "$2" > "$1"; }
 reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 
-# Old kernels: only kernel packages, never the running one, else skipped.
+# Old kernels: the ones APT would autoremove, purged by name, never the running
+# one; other leftovers neither get removed nor block the cleanup (found on a real
+# Ubuntu 24.04 VPS: libfwupd2 left by an upgrade stopped every kernel cleanup).
 uname() { echo 6.1.0-28-amd64; }
-SIM=''
+SIM='' PURGE_SIM=''
 apt_wait_idle() { :; }
 apt-get() {
   case "$*" in
     '-s autoremove --purge') printf '%s\n' "$SIM" ;;
-    '-y -q -o DPkg::Lock::Timeout=120 autoremove --purge') record 'autoremove' ;;
+    '-s purge '*) printf '%s\n' "${PURGE_SIM:-$(for p in "${@:3}"; do printf 'Purg %s [1]\n' "$p"; done)}" ;;
+    '-y -q -o DPkg::Lock::Timeout=120 purge '*) record "purge ${*:6}" ;;
     *) fail "unexpected apt-get $*" ;;
   esac
 }
 reset; SIM=$'Purg linux-image-6.1.0-18-amd64 [6.1.76-1]\nPurg linux-headers-6.1.0-18-common [6.1.76-1]'
 kernel_cleanup
-grep -Fxq autoremove "$TEST_ROOT/trace" || fail 'old kernels not removed'
-reset; SIM=$'Purg linux-image-6.1.0-18-amd64 [6.1.76-1]\nPurg libfoo1 [1.0]'
-kernel_cleanup
-if grep -Fxq autoremove "$TEST_ROOT/trace"; then fail 'cleanup removed a non-kernel package'; fi
+grep -Fxq 'purge linux-headers-6.1.0-18-common linux-image-6.1.0-18-amd64' "$TEST_ROOT/trace" || fail "old kernels not removed: $(cat "$TEST_ROOT/trace")"
+reset; SIM=$'Purg linux-image-6.1.0-18-amd64 [6.1.76-1]\nPurg libfwupd2 [1.9]'
+kernel_cleanup > "$TEST_ROOT/out"
+grep -Fxq 'purge linux-image-6.1.0-18-amd64' "$TEST_ROOT/trace" || fail 'a leftover library blocked the kernel cleanup'
+if grep -q 'libfwupd2' "$TEST_ROOT/trace"; then fail 'cleanup removed a non-kernel package'; fi
+grep -q 'libfwupd2' "$TEST_ROOT/out" || fail 'leftover packages not mentioned'
+reset; SIM='Purg libfwupd2 [1.9]'
+kernel_cleanup > "$TEST_ROOT/out"
+if grep -q '^purge' "$TEST_ROOT/trace"; then fail 'cleanup ran without an old kernel'; fi
+grep -q '没有需要清理的旧内核' "$TEST_ROOT/log" || fail 'no old kernel not reported as such'
 reset; SIM='Purg linux-image-6.1.0-28-amd64 [6.1.119-1]'
 kernel_cleanup
-if grep -Fxq autoremove "$TEST_ROOT/trace"; then fail 'cleanup removed the running kernel'; fi
+if grep -q '^purge' "$TEST_ROOT/trace"; then fail 'cleanup removed the running kernel'; fi
 reset; SIM='Reading package lists...'
 kernel_cleanup
-if grep -Fxq autoremove "$TEST_ROOT/trace"; then fail 'cleanup ran with nothing to remove'; fi
+if grep -q '^purge' "$TEST_ROOT/trace"; then fail 'cleanup ran with nothing to remove'; fi
+# The purge itself would take something else along: nothing is removed.
+reset; SIM='Purg linux-image-6.1.0-18-amd64 [6.1.76-1]' PURGE_SIM=$'Purg linux-image-6.1.0-18-amd64 [1]\nPurg important-tool [2]'
+kernel_cleanup
+if grep -q '^purge' "$TEST_ROOT/trace"; then fail 'kernel purge that removes more than kernels was run'; fi
+PURGE_SIM=''
 SIM='Purg linux-image-6.1.0-18-amd64 [6.1.76-1]'
 confirm_yes() { record "ask $1"; ((KEEP_ANSWER)); }
 reset; KEEP_ANSWER=0; kernel_cleanup --ask
 grep -q '^ask ' "$TEST_ROOT/trace" || fail 'single-item cleanup did not ask before removing kernels'
-if grep -Fxq autoremove "$TEST_ROOT/trace"; then fail 'declined cleanup still removed kernels'; fi
+if grep -q '^purge' "$TEST_ROOT/trace"; then fail 'declined cleanup still removed kernels'; fi
 reset; KEEP_ANSWER=1; kernel_cleanup --ask
-grep -Fxq autoremove "$TEST_ROOT/trace" || fail 'confirmed cleanup did not remove kernels'
+grep -q '^purge ' "$TEST_ROOT/trace" || fail 'confirmed cleanup did not remove kernels'
 reset; kernel_cleanup
 if grep -q '^ask ' "$TEST_ROOT/trace"; then fail 'setup cleanup asked again after the up-front question'; fi
 unset -f confirm_yes

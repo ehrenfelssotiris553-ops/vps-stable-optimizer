@@ -175,6 +175,28 @@ grep -Fxq 'runuser alice' "$CASE/trace" || fail 'key not written as the target a
 [[ "$(grep -n '^arm ' "$CASE/trace" | cut -d: -f1)" -lt "$(grep -n '^reload$' "$CASE/trace" | cut -d: -f1)" ]] || fail 'sshd reloaded before the guard was armed'
 grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail 'applied SSH result missing'
 
+# Found on a real VPS: one mistyped paste ended the whole hardening and left
+# vps check showing a red "failed" although nothing had changed. Now a bad key
+# is asked for again, and giving none is "not handled", not a failure.
+new_case bad_key_then_good
+printf '\nnot-a-key hello\n%s\n\n' "$KEY" > "$CASE/input"
+ssh_harden_stage < "$CASE/input"
+[[ "$(cat "$(auth_file)")" == "$KEY" ]] || fail 'a valid key after a bad paste was not imported'
+grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail 'hardening did not finish after a corrected paste'
+
+new_case no_key_given
+printf '\n\n\n' > "$CASE/input"
+ssh_harden_stage < "$CASE/input"
+[[ ! -e "$SSH_DROPIN" ]] || fail 'password login disabled without any key'
+grep -Fxq 'result ssh declined no public key given' "$CASE/trace" || fail 'missing key not recorded as declined'
+if grep -q '^result ssh failed' "$CASE/trace"; then fail 'missing key recorded as a failure'; fi
+
+new_case three_bad_keys
+printf '\nbad one\nbad two\nbad three\n\n' > "$CASE/input"
+ssh_harden_stage < "$CASE/input"
+[[ ! -e "$SSH_DROPIN" ]] || fail 'password login disabled after three invalid keys'
+grep -Fxq 'result ssh declined no public key given' "$CASE/trace" || fail 'three invalid keys not handled as no key'
+
 new_case sudo_user_disables_root
 ADMIN_CHOICE=1
 printf '%s\n\n' "$KEY" > "$CASE/input"

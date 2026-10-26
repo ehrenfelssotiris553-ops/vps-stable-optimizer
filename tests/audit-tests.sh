@@ -135,6 +135,7 @@ passed 'sshd empty/failure results remain unknown'
 # Found on a real IPv4-only VPS: an empty IPv6 answer was reported twice as
 # "query failed, state unknown". No address is a fact; a failed query is not.
 SSHD_RC=0
+# shellcheck disable=SC2329 # called by security_audit, then replaced below
 ip() {
   case "$*" in
     '-br -4 address show') printf 'eth0 UP 192.0.2.1/24\n' ;;
@@ -151,6 +152,21 @@ assert_not "$out" 'IPv6 查询未返回默认路由'
 IP6_RC=1
 out="$(security_audit 2>&1)" || true
 assert_has "$out" 'IPv6 地址查询失败，状态未知'
+# Found on a real Ubuntu VPS: only fe80:: on eth0 and ::1 on lo still asked for
+# an IPv6 default route. Without a public address there is none to expect.
+IP6_RC=0
+ip() {
+  case "$*" in
+    '-br -4 address show') printf 'eth0 UP 192.0.2.1/24\n' ;;
+    '-br -6 address show') printf 'lo UNKNOWN ::1/128\neth0 UP fe80::dad5:d8ff:fe00:1dac/64\n' ;;
+    '-4 route show default') printf 'default via 192.0.2.254 dev eth0\n' ;;
+    '-6 route show default') fail 'IPv6 route asked with link-local addresses only' ;;
+    *) fail 'unexpected ip call' ;;
+  esac
+}
+out="$(security_audit)"
+assert_has "$out" '没有公网 IPv6 地址'
+assert_not "$out" 'IPv6 查询未返回默认路由'
 passed 'an IPv4-only machine is reported as such; a failed query stays unknown'
 
 df() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.4 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.5 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.4
+SCRIPT_VERSION=2.7.5
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -651,26 +651,36 @@ attention_banner() {
   echo '接下来会请你新开一个 SSH 窗口登录，证明修改后仍能登录：登录成功后会自动确认；没有自动确认时，回到这个窗口输入 CONNECTED。每次确认有 180 秒，超时会自动撤销对应的修改。'
 }
 
-# Removes old kernels only when APT's simulation removes nothing else and
-# never the running kernel; the newest installed kernel stays as well.
-# With --ask the simulated list is confirmed first (setup asks up front).
+# Removes the old kernels APT itself would autoremove, by name, never the
+# running one (APT also keeps the newest and the previous kernel). Other
+# leftovers of an upgrade (Ubuntu's libfwupd2, say) are not this step's
+# business and no longer block it; the purge is simulated first and must remove
+# exactly those kernel packages. With --ask the list is confirmed first.
 kernel_cleanup() {
   local ask="${1:-}" sim pkg running
-  local -a removed=()
+  local -a removed=() kernels=() others=() purged=()
   running="$(uname -r)"
   sim="$(apt-get -s autoremove --purge 2>&1)" || { warn '旧内核清理模拟失败，跳过。'; return 0; }
   mapfile -t removed < <(awk '$1 == "Purg" || $1 == "Remv" {sub(/:.*/, "", $2); print $2}' <<< "$sim" | sort -u)
-  if ((${#removed[@]} == 0)); then ok '没有需要清理的旧内核：系统会保留正在用的内核和上一个版本备用（新内核启动不了时还能选回），更旧的才会清理。'; return 0; fi
   for pkg in "${removed[@]}"; do
-    if [[ ! "$pkg" =~ ^linux-(image|modules|modules-extra|headers)-[0-9] || "$pkg" == *"$running"* ]]; then
-      warn "自动清理还会删除其他软件包（$pkg），为安全起见跳过；可以以后手动运行 apt autoremove。"
-      return 0
-    fi
+    if [[ "$pkg" =~ ^linux-(image|modules|modules-extra|headers)-[0-9] && "$pkg" != *"$running"* ]]; then kernels+=("$pkg")
+    elif [[ -n "$pkg" ]]; then others+=("$pkg"); fi
   done
-  printf '将清理旧内核：%s\n' "${removed[*]}"
+  if ((${#kernels[@]} == 0)); then
+    ok '没有需要清理的旧内核：系统会保留正在用的内核和上一个版本备用（新内核启动不了时还能选回），更旧的才会清理。'
+    if ((${#others[@]})); then echo "（另有不再需要的软件包：${others[*]}，不属于内核，本工具不动，需要时可以手动运行 apt autoremove。）"; fi
+    return 0
+  fi
+  sim="$(apt-get -s purge "${kernels[@]}" 2>&1)" || { warn '旧内核清理模拟失败，跳过。'; return 0; }
+  mapfile -t purged < <(awk '$1 == "Purg" || $1 == "Remv" {sub(/:.*/, "", $2); print $2}' <<< "$sim" | sort -u)
+  if [[ "$(printf '%s\n' "${purged[@]}")" != "$(printf '%s\n' "${kernels[@]}")" ]]; then
+    warn '删除这些旧内核还会连带删除其他软件包，为安全起见跳过；需要时请人工处理。'; return 0
+  fi
+  printf '将清理旧内核：%s\n' "${kernels[*]}"
+  if ((${#others[@]})); then echo "（另有不再需要的软件包：${others[*]}，不属于内核，这一步不动。）"; fi
   if [[ "$ask" == --ask ]] && ! confirm_yes '确认删除这些旧内核吗？（删除后无法撤销）'; then ok '保留旧内核。'; return 0; fi
   apt_wait_idle
-  if apt-get -y -q -o DPkg::Lock::Timeout=120 autoremove --purge; then ok "已清理 ${#removed[@]} 个旧内核包。"
+  if apt-get -y -q -o DPkg::Lock::Timeout=120 purge "${kernels[@]}"; then ok "已清理 ${#kernels[@]} 个旧内核包。"
   else warn '旧内核清理失败，请人工检查。'; fi
 }
 
@@ -2171,14 +2181,29 @@ ssh_harden_stage() {
   if ((count == 0)) || confirm_yes '要再添加一个公钥吗？'; then
     echo '还没有密钥？在你自己的电脑上运行 ssh-keygen -t ed25519（Windows 10/11 的 PowerShell、macOS、Linux 都自带），'
     echo '然后打开生成的 .pub 文件（默认在用户目录的 .ssh 文件夹里），复制整行内容粘贴到这里。私钥不要发给任何人。'
-    read -r -p '公钥: ' key || true
-    if ! ssh_pubkey_valid "$key"; then warn '这不是有效的 OpenSSH 公钥；SSH 设置保持不变。'; module_result ssh failed 'invalid public key'; return 0; fi
-    backup_config_path "$auth_file" || die "无法备份 $auth_file"
-    if ! ssh_append_key "$user" "$home" "$key"; then
-      warn "写入 $auth_file 失败（可能是符号链接或权限问题）；SSH 设置保持不变。"; module_result ssh failed 'key import failed'; return 0
+    # A long key pasted incompletely is common: ask again instead of ending
+    # the whole hardening, and an empty answer skips adding a key.
+    local tries
+    for tries in 1 2 3; do
+      read -r -p '公钥（直接回车跳过）: ' key || key=''
+      if [[ -z "$key" ]] || ssh_pubkey_valid "$key"; then break; fi
+      warn '这不是有效的 OpenSSH 公钥：要粘贴 .pub 文件里以 ssh-ed25519、ssh-rsa 等开头的一整行。'
+      key=''
+    done
+    if [[ -n "$key" ]]; then
+      backup_config_path "$auth_file" || die "无法备份 $auth_file"
+      if ! ssh_append_key "$user" "$home" "$key"; then
+        warn "写入 $auth_file 失败（可能是符号链接或权限问题）；SSH 设置保持不变。"; module_result ssh failed 'key import failed'; return 0
+      fi
+      record_config_change "$auth_file" key-appended || die '无法记录公钥变更。'
+      ok "公钥已就绪：$auth_file（回退时也会保留）"
+    elif ((count == 0)); then
+      # Nothing changed: not a failure, just no key to log in with.
+      ok '没有添加公钥；没有公钥就不能只用密钥登录，SSH 设置保持不变。'
+      module_result ssh declined 'no public key given'; return 0
+    else
+      ok "不添加新的公钥，继续使用已有的 $count 个。"
     fi
-    record_config_change "$auth_file" key-appended || die '无法记录公钥变更。'
-    ok "公钥已就绪：$auth_file（回退时也会保留）"
   fi
   since="$(date +%s)"
   echo "请保持当前窗口不要关闭，新开一个终端，用密钥登录：ssh $user@服务器IP"
@@ -2736,7 +2761,12 @@ audit_network() {
     for family in 4 6; do
       printf 'IPv%s 地址：\n' "$family"
       if ! data="$(ip -br "-$family" address show 2>/dev/null)"; then warn "IPv$family 地址查询失败，状态未知。"
-      elif [[ -n "$data" ]]; then audit_bounded_lines 30 <<< "$data"
+      elif [[ -n "$data" ]]; then
+        audit_bounded_lines 30 <<< "$data"
+        # Link-local (fe80::) and ::1 alone do not reach the internet: no route to ask about.
+        if [[ "$family" == 6 ]] && ! awk '{for (i = 3; i <= NF; i++) if ($i !~ /^(fe80:|::1\/)/) found = 1} END {exit !found}' <<< "$data"; then
+          echo '上面只有本机或链路本地地址，没有公网 IPv6 地址（只用 IPv4）。'; continue
+        fi
       # Many VPSs are IPv4-only: an empty answer is a fact, not an unknown.
       elif [[ "$family" == 6 ]]; then echo '本机没有 IPv6 地址（只用 IPv4）。'; continue
       else warn 'IPv4 查询没有返回地址，状态未知。'; fi
@@ -3438,6 +3468,8 @@ decision_report() {
   fi
   if ( foreign_f2b_config ) >/dev/null 2>&1; then
     decision_line '保留现状' 'SSH 防爆破' '已有其他 Fail2ban 管理配置，保留并提示，不接管。'
+  elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && active fail2ban; then
+    decision_line '保留现状' 'SSH 防爆破' '本工具的 Fail2ban 规则已经在运行，执行时仍会核验。'
   else
     decision_line '准备调整' 'SSH 防爆破' '仅在防火墙生效并确认后，再检查组件和配置，配置 SSH 防爆破；不改变密码登录方式。'
   fi
@@ -5227,17 +5259,20 @@ port_risky_names() {
 }
 
 port_open() {
-  local spec="$1" proto_choice="${2:-}" src="${3:-}" item proto rule total=0 added=0 rules risky
+  local spec="$1" proto_choice="${2:-}" src="${3:-}" item proto rule total=0 added=0 rules risky list
   local -a items=() protos=()
-  if ! mapfile -t items < <(port_parse_spec "$spec") || ((${#items[@]} == 0)) || ! port_parse_spec "$spec" >/dev/null; then
+  # Parsed through "$(...)": a failing function inside "< <(...)" runs outside
+  # this condition and set off the error trap ("[出错] line=…") on a mere typo.
+  if ! list="$(port_parse_spec "$spec")" || [[ -z "$list" ]]; then
     warn "端口格式不对：$spec（例：8080、443-600、8080,9000-9100；范围 1-65535，且不能一次放行全部端口）"; return 0
   fi
+  mapfile -t items <<< "$list"
   if [[ -z "$proto_choice" && -t 0 ]]; then
     read -r -p '协议：1) TCP  2) UDP  3) TCP+UDP  [回车默认 3]: ' proto_choice || true
     case "$proto_choice" in 1) proto_choice=tcp ;; 2) proto_choice=udp ;; *) proto_choice=both ;; esac
   fi
-  mapfile -t protos < <(port_protocols "${proto_choice:-both}") || true
-  ((${#protos[@]})) || { warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; }
+  if ! list="$(port_protocols "${proto_choice:-both}")" || [[ -z "$list" ]]; then warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; fi
+  mapfile -t protos <<< "$list"
   if [[ -n "$src" ]] && ! port_source_valid "$src"; then warn "来源地址格式不对：$src"; return 0; fi
   for item in "${items[@]}"; do total=$((total + $(port_item_count "$item") * ${#protos[@]})); done
   echo '即将放行：'
@@ -5324,13 +5359,14 @@ port_split_blocker() {
 # rule goes, so nothing is ever briefly closed. No TCP access to an SSH port is
 # ever removed, checked against each rule that would actually be deleted.
 port_close() {
-  local spec="$1" proto_choice="${2:-both}" item rules line parsed r_item r_proto r_src p hit keep i blocker
+  local spec="$1" proto_choice="${2:-both}" item rules line parsed r_item r_proto r_src p hit keep i blocker list
   local -a items=() protos=() targets=() keeps=() srcs=() words=() ssh=()
-  if ! mapfile -t items < <(port_parse_spec "$spec") || ((${#items[@]} == 0)) || ! port_parse_spec "$spec" >/dev/null; then
+  if ! list="$(port_parse_spec "$spec")" || [[ -z "$list" ]]; then
     warn "端口格式不对：$spec"; return 0
   fi
-  mapfile -t protos < <(port_protocols "$proto_choice") || true
-  ((${#protos[@]})) || { warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; }
+  mapfile -t items <<< "$list"
+  if ! list="$(port_protocols "$proto_choice")" || [[ -z "$list" ]]; then warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; fi
+  mapfile -t protos <<< "$list"
   mapfile -t ssh < <(port_ssh_ports)
   for item in "${items[@]}"; do
     for p in "${ssh[@]}"; do
@@ -5519,6 +5555,7 @@ item_status() {
       value="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
       if [[ -n "$value" ]]; then echo "已开启，约 ${value} MiB"
       elif swapon --noheadings 2>/dev/null | grep -q .; then echo '已有其他 Swap'
+      elif ! zram_module_available; then echo '内核不支持（没有 zram 模块）'
       else echo '未开启'; fi ;;
     journal) if [[ -f "$JOURNAL_FILE" ]]; then echo '已限制（100M）'; else echo '默认设置'; fi ;;
     trim) if ! trim_support; then echo '系统盘不支持'; elif systemctl is-enabled -q fstrim.timer 2>/dev/null; then echo '已开启'; else echo '未开启'; fi ;;
@@ -5590,7 +5627,8 @@ item_turn_on() {
     sysctl) SYSCTL_CHOICE=1
       stage_run sysctl sysctl_hardening_stage ;;
     zram) ZRAM_CHOICE=1
-      apt_index_ready || return 0
+      # Without the kernel module the stage only explains why: no index update.
+      if zram_module_available; then apt_index_ready || return 0; fi
       stage_run zram zram_stage ;;
     journal) JOURNAL_FORCE=1
       stage_run journal journal_stage ;;
