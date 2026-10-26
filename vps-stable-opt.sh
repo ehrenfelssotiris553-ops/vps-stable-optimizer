@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.0 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.1 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.0
+SCRIPT_VERSION=2.7.1
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -61,24 +61,24 @@ case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|po
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V2.7.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+VPS 机器管家 V2.7.1 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps plan       给机器做体检（只检查）
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
-  vps item       单项设置：逐项开启或关闭某一项，不用重跑整个开荒
-  vps firewall   设置防火墙与 SSH 防爆破（需已有 UFW）
-  vps ssh        SSH 登录加固（只允许密钥登录，可选新建管理员并禁止 root 直接登录）
+  vps check      开荒验收：逐项检查优化是否真的生效（适合重启后运行）
   vps port       端口管理；也可直接用：
                    vps port open 8080 | 443-600 | 8080,9000-9100 [tcp|udp|both] [from IP]
                    vps port close 8080 [tcp|udp|both]
                    vps port list
-  vps check      开荒验收：逐项检查优化是否真的生效（适合重启后运行）
+  vps item       单项设置：逐项开启或关闭某一项，不用重跑整个开荒
+  vps bans       查看 Fail2ban 封禁记录，可以解封某个 IP
+  vps reboot     重启服务器（先说明是否需要重启；防失联确认或软件安装没结束时不重启）
+  vps firewall   设置防火墙与 SSH 防爆破（需已有 UFW）
+  vps ssh        SSH 登录加固（只允许密钥登录，可选新建管理员并禁止 root 直接登录）
   vps records    查看操作记录和配置备份
   vps rollback   撤销本工具做过的设置（全部或只撤销某一项），可选卸载新装的软件包
   vps uninstall  卸载工具、记录和备份，保留软件与优化效果
-  vps reboot     重启服务器（先说明是否需要重启；防失联确认或软件安装没结束时不重启）
   vps update     检查更新：GitHub 上有新版本时直接更新本工具（不改动系统设置）
-  vps bans       查看 Fail2ban 封禁记录，可以解封某个 IP
 
 大多数问题用 y 或回车回答：[Y/n] 回车表示「做」，[y/N] 回车表示「不做」。
 只有三处要输入单词，提示里会写出要输入什么（区分大小写）：
@@ -2924,23 +2924,28 @@ menu() {
     say "VPS 机器管家 V$SCRIPT_VERSION"
     menu_reboot_hint
     cat <<'MENU_TEXT'
+ 开荒
    1. 给机器做体检（只检查，不修改）
    2. 一键开荒（更新系统并优化机器）
-   3. 单项设置（逐项开启或关闭某一项）
-   4. 设置防火墙和 SSH 防爆破
-   5. SSH 登录加固（只允许密钥登录，可选新建管理员并禁止 root 直接登录）
-   6. 端口管理（放行 / 关闭端口）
-   7. 开荒验收（检查优化是否真的生效，适合重启后）
-   8. 查看操作记录和配置备份
-   9. 撤销本工具的设置（全部或只撤销某一项）
-  10. 卸载本工具，保留优化效果
-  11. 重启服务器（先说明是否需要重启，确认后才重启）
-  12. 检查更新（有新版本时直接更新本工具）
-  13. 查看 Fail2ban 封禁记录（可以解封某个 IP）
+   3. 开荒验收（检查优化是否真的生效，适合重启后）
+ 日常管理
+   4. 端口管理（放行 / 关闭端口）
+   5. 单项设置（逐项开启或关闭某一项）
+   6. 查看 Fail2ban 封禁记录（可以解封某个 IP）
+   7. 重启服务器（先说明是否需要重启，确认后才重启）
+ 安全加固（一键开荒里已经包含，这里可以单独再做）
+   8. 设置防火墙和 SSH 防爆破
+   9. SSH 登录加固（只允许密钥登录，可选新建管理员并禁止 root 直接登录）
+ 记录与撤销
+  10. 查看操作记录和配置备份
+  11. 撤销本工具的设置（全部或只撤销某一项）
+ 本工具
+  12. 卸载本工具，保留优化效果
+  13. 检查更新（有新版本时直接更新本工具）
    h. 查看使用说明
    0. 退出
 
-以后输入 vps 打开本菜单。建议先选 1，再选 2；需要重启时选 11，重启后选 7 验收；以后想单独改哪一项选 3。
+第一次用：先选 1 体检，再选 2 一键开荒；重启后选 3 验收。以后想单独改哪一项选 5，需要重启选 7。
 撤销设置会保留已安装/升级的软件（可选卸载本工具新装的包），不会还原整台机器。
 卸载会删除工具、记录和备份；删除备份后无法可靠回退。
 MENU_TEXT
@@ -2949,17 +2954,17 @@ MENU_TEXT
       0) return 0 ;;
       1) action=plan ;;
       2) action=setup ;;
-      3) action=item ;;
-      4) action=firewall ;;
-      5) action=ssh ;;
-      6) action=port ;;
-      7) action=check ;;
-      8) action=records ;;
-      9) action=rollback ;;
-      10) action=uninstall ;;
-      11) action=reboot ;;
-      12) action=update ;;
-      13) action=bans ;;
+      3) action=check ;;
+      4) action=port ;;
+      5) action=item ;;
+      6) action=bans ;;
+      7) action=reboot ;;
+      8) action=firewall ;;
+      9) action=ssh ;;
+      10) action=records ;;
+      11) action=rollback ;;
+      12) action=uninstall ;;
+      13) action=update ;;
       h|H) /bin/bash -- "$self" help; action='' ;;
       *) echo '无效选项，请输入 0 至 13 或 h。'; continue ;;
     esac
@@ -4292,7 +4297,7 @@ restore_main() {
     status="$(restore_read "$id" state)" || die "无法读取回退记录：$id"
     case "$status" in clean|applied|restored) ;; *) die "回退记录格式异常：$id" ;; esac
     if restore_needed "$id"; then printf '待恢复：%s\n' "$(restore_label "$id")"; count=$((count + 1))
-    elif [[ "$status" == applied ]]; then printf '待重试（上次恢复后服务没能重新加载）：%s\n' "$(restore_label "$id")"; count=$((count + 1)); fi
+    elif [[ "$status" == applied ]]; then printf '待收尾（已经是原来的设置，撤销时只更新记录；上次服务没能重新加载的会再加载一次）：%s\n' "$(restore_label "$id")"; count=$((count + 1)); fi
   done < <(restore_all_ids)
   if [[ -f "$RESTORE_ROOT/fw_rules" ]]; then
     rules="$(grep -c . "$RESTORE_ROOT/fw_rules" || true)"
@@ -4503,6 +4508,9 @@ ufw_ssh_access() {
     [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+(ALLOW|DENY|REJECT|LIMIT)(\ (IN|OUT|FWD))?[[:space:]]+(.*[^[:space:]])[[:space:]]*$ ]] || continue
     to="${BASH_REMATCH[1]}" action="${BASH_REMATCH[2]}" dir="${BASH_REMATCH[4]}" from="${BASH_REMATCH[5]}"
     [[ -z "$dir" || "$dir" == IN ]] || continue
+    # A rule comment (ufw ... comment 'x') is shown after the source as "# x".
+    from="${from%%#*}"; from="${from%"${from##*[![:space:]]}"}"
+
     if [[ "$to" == OpenSSH ]]; then spec=22 proto=tcp
     elif [[ "$to" =~ ^([0-9:,]+)(/(tcp|udp))?$ ]]; then spec="${BASH_REMATCH[1]}" proto="${BASH_REMATCH[3]:-both}"
     else continue; fi
@@ -4763,7 +4771,7 @@ menu_reboot_hint() {
   ((seen)) || return 0
   if [[ -f "$STATE_ROOT/verified_boot" ]]; then verified="$(cat "$STATE_ROOT/verified_boot" 2>/dev/null || true)"; fi
   [[ "$verified" != "$current" ]] || return 0
-  printf '\033[1;33m检测到开荒后已经重启，建议选 7 做开荒验收，确认优化真的生效。\033[0m\n'
+  printf '\033[1;33m检测到开荒后已经重启，建议选 3 做开荒验收，确认优化真的生效。\033[0m\n'
 }
 
 # ---- Port management ------------------------------------------------------
@@ -5379,7 +5387,7 @@ reboot_main() {
   apt_wait_idle
   if apt_locks_held; then die '仍有程序在安装或更新软件，现在重启可能损坏软件包；请等它结束后再重启。'; fi
   echo '重启会断开所有 SSH 连接，通常一两分钟后可以重新登录。'
-  echo '重启后输入 vps 选 7「开荒验收」，确认各项设置在重启后仍然生效。'
+  echo '重启后输入 vps 选 3「开荒验收」，确认各项设置在重启后仍然生效。'
   if ! confirm_yes '现在重启服务器吗？'; then ok '已取消，没有重启。'; return 0; fi
   sync
   systemctl reboot
@@ -5533,7 +5541,7 @@ offer_reboot() {
   if ((UPGRADE_APPROVED && KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; then
     if ((UPGRADE_APPROVED && KERNEL_UPDATE)); then echo '本次更新包含新内核，需要重启才能生效。'
     else echo '系统提示需要重启，更新才能完全生效（可能来自本次或之前的更新）。'; fi
-    echo '重启后重新登录，输入 vps 选 7「开荒验收」，确认各项优化真的生效。'
+    echo '重启后重新登录，输入 vps 选 3「开荒验收」，确认各项优化真的生效。'
     if confirm_yes '现在重启吗？'; then
       sync
       systemctl reboot

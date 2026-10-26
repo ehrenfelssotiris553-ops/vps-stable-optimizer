@@ -220,6 +220,14 @@ check_firewall ''
 UFW_STATUS=$'22/tcp DENY 176.53.159.198\n22/tcp DENY OUT Anywhere\n22/tcp LIMIT Anywhere\n22/tcp (v6) LIMIT Anywhere (v6)'
 check_firewall ''
 [[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" != *指定来源* ]] || fail "bans before the SSH rule changed the result: $VERIFY_TEXT"
+# A rule comment ("ufw ... comment 'SSH'") is not part of the source column.
+UFW_STATUS=$'22/tcp                     LIMIT       Anywhere                   # SSH'
+check_firewall ''
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" != *指定来源* ]] || fail "commented allow for everyone misread: $VERIFY_TEXT"
+UFW_STATUS=$'22/tcp                     DENY        Anywhere                   # maintenance\n22/tcp                     ALLOW       Anywhere'
+check_firewall ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *挡住* ]] || fail "commented deny for everyone ignored: $VERIFY_TEXT"
+UFW_STATUS=$'22/tcp LIMIT Anywhere'
 # Only a persistent "enabled" loads UFW at boot.
 UFW_BOOT=enabled-runtime
 check_firewall ''

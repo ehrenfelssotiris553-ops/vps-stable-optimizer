@@ -6,7 +6,7 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions menu_action records_report state_path_safe
+load_optimizer_functions menu_action records_report state_path_safe menu
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -64,6 +64,25 @@ set -e
 [[ "$invalid_status" != 0 ]] || fail 'invalid action was accepted'
 [[ ! -e "$CHILD_ARGS" && ! -e "$CHILD_MARKER" ]] || fail 'invalid action reached a child or continued past die'
 printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
+
+# The menu numbers, grouped by how often each item is used (update last).
+(
+  eval "$(declare -f menu | sed 's/\[\[ -t 0 \]\] || die/true || die/')"
+  # shellcheck disable=SC2034
+  SCRIPT_VERSION=9.9.9
+  menu_reboot_hint() { :; }
+  menu_action() { printf '%s\n' "$2" >> "$TEST_ROOT/menu-actions"; }
+  : > "$TEST_ROOT/menu-actions"
+  for n in $(seq 1 13) 14; do printf '%s\n\n' "$n"; done > "$TEST_ROOT/menu-input"
+  printf '0\n' >> "$TEST_ROOT/menu-input"
+  menu < "$TEST_ROOT/menu-input" > "$TEST_ROOT/menu-out"
+  expected='plan setup check port item bans reboot firewall ssh records rollback uninstall update '
+  [[ "$(tr '\n' ' ' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' ' ' < "$TEST_ROOT/menu-actions")"
+  grep -Fq '无效选项，请输入 0 至 13 或 h' "$TEST_ROOT/menu-out" || fail 'number 14 not rejected'
+  grep -Fq '13. 检查更新' "$TEST_ROOT/menu-out" || fail 'update is not the last item'
+  grep -Fq '3. 开荒验收' "$TEST_ROOT/menu-out" || fail 'acceptance check does not follow setup'
+)
+printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
 
 LOG_DIR="$TEST_ROOT/logs"
 STATE_ROOT="$TEST_ROOT/state"
