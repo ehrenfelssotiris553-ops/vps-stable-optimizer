@@ -8,7 +8,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
-  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle
+  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 WARNINGS=0
@@ -474,6 +474,12 @@ value_baseline() {
   active() { [[ "$1" == dev-zram0.swap && "$SWAP" != absent ]]; }
   systemctl() { [[ "$*" == 'stop dev-zram0.swap' ]] || die "unexpected systemctl $*"; printf 'stop swap\n' >> "$TRACE"; SWAP=absent; }
   zram_reset_idle() { printf 'reset\n' >> "$TRACE"; }
+  # Without the package removed in this run, a running ZRAM is not touched
+  # (it may be one the user set up later, with zram-tools for example).
+  ZRAM_PACKAGE_REMOVED=0
+  restore_zram_settle > /dev/null
+  [[ ! -s "$TRACE" ]] || die "ZRAM switched off although the package was not removed now: $(cat "$TRACE")"
+  ZRAM_PACKAGE_REMOVED=1
   restore_zram_settle > /dev/null
   [[ "$(head -n 2 "$TRACE")" == $'stop swap\nreset' ]] || die "ZRAM brought back by the package default not switched off: $(cat "$TRACE")"
   expect "$(restore_read zram_swap state)" restored
@@ -707,6 +713,22 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
   : > "$TRACE"
   restore_packages_offer
   [[ ! -s "$TRACE" ]] || die 'unsafe package removal executed'
+  expect "${ZRAM_PACKAGE_REMOVED:-0}" 0
+  # Removing the zram package is remembered for restore_zram_settle.
+  printf 'systemd-zram-generator\n' >> "$RESTORE_ROOT/packages/installed"
+  installed() { [[ " ufw fail2ban python3-systemd curl bash systemd-zram-generator " == *" $1 "* ]]; }
+  apt-get() {
+    case "$*" in
+      '-s remove --autoremove systemd-zram-generator') printf 'Remv systemd-zram-generator [1.2]\n' ;;
+      '-y -q -o DPkg::Lock::Timeout=120 remove --autoremove systemd-zram-generator') printf '%s\n' "$*" >> "$TRACE" ;;
+      *) die "unexpected apt-get $*" ;;
+    esac
+  }
+  restore_packages_offer systemd-zram-generator > /dev/null
+  expect "$ZRAM_PACKAGE_REMOVED" 1
+  # The membership check reads the whole list (no early exit under pipefail).
+  restore_tool_package systemd-zram-generator || die 'tool package not found'
+  if restore_tool_package curl; then die 'a package present before the tool counted as its own'; fi
 )
 
 # The first package inventory is kept; records accept only real package names.

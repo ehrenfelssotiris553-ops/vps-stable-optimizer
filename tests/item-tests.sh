@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action item_firewall_pause item_ask_reboot_time reboot_time_normalize item_menu guard_confirm coreutils_selfcheck release_info
+load_optimizer_functions confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action item_firewall_pause item_ask_reboot_time reboot_time_normalize restore_tool_package item_menu guard_confirm coreutils_selfcheck release_info
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -130,9 +130,15 @@ item_turn_off bbr
 grep -Fxq 'result bbr reverted' "$TEST_ROOT/trace" || fail 'undone item not recorded for vps check'
 if grep -q '^packages' "$TEST_ROOT/trace"; then fail 'BBR off offered a package removal'; fi
 # Automatic updates off: the package this tool installed for them is offered too.
+restore_tool_packages() { printf '%s\n' htop unattended-upgrades tmux; }
 reset; STATE=([apt_file]=applied)
 item_turn_off updates
 grep -Fxq 'packages unattended-upgrades' "$TEST_ROOT/trace" || fail 'updates off did not offer removing unattended-upgrades'
+# Ubuntu ships it preinstalled: then nothing is offered.
+restore_tool_packages() { :; }
+reset; STATE=([apt_file]=applied)
+item_turn_off updates
+if grep -q '^packages' "$TEST_ROOT/trace"; then fail 'a preinstalled unattended-upgrades was offered for removal'; fi
 restore_resource() { record "resource $1"; }
 reset; TOOLS_PACKAGES=(curl htop)
 item_turn_off tools

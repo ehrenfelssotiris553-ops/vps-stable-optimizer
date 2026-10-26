@@ -935,13 +935,13 @@ zram_start() {
   systemctl start dev-zram0.swap
 }
 
-# The ZRAM configuration is still exactly what this tool wrote.
-zram_file_ours() {
-  local fp
+# The file of tracked resource ID is still exactly what this tool last wrote.
+restore_file_ours() {
+  local id="$1" fp
   [[ "$RESTORE_READY" == 1 ]] || return 1
-  [[ "$(restore_read zram_file state 2>/dev/null || true)" == applied ]] || return 1
-  fp="$(restore_fingerprint zram_file 2>/dev/null)" || return 1
-  [[ "$fp" == "$(restore_read zram_file last_fp 2>/dev/null || true)" ]]
+  [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]] || return 1
+  fp="$(restore_fingerprint "$id" 2>/dev/null)" || return 1
+  [[ "$fp" == "$(restore_read "$id" last_fp 2>/dev/null || true)" ]]
 }
 
 # For a swap that lives only in compressed RAM: reading neighbouring pages
@@ -987,7 +987,7 @@ zram_stage() {
     if [[ "${ZRAM_CHOICE:-}" == 1 ]] && zram_vendor_default_only; then
       vendor=1
       echo '现在的 ZRAM 来自 systemd-zram-generator 软件包自带的默认配置（约内存一半），改用本工具的配置。'
-    elif zram_file_ours && ! swapon --noheadings 2>/dev/null | grep -q .; then
+    elif restore_file_ours zram_file && ! swapon --noheadings 2>/dev/null | grep -q .; then
       echo '本工具的 ZRAM 配置还在，但 ZRAM 没有运行（可能上次启动失败）：重新启动它。'
       if zram_start; then zram_tune; module_result zram applied 'zram0 restarted'
       else warn 'ZRAM 仍然没有启动，请运行 systemctl status systemd-zram-setup@zram0 查看原因。'; module_result zram failed 'dev-zram0.swap did not start'; fi
@@ -996,7 +996,7 @@ zram_stage() {
     else
       ok '已有 Swap/ZRAM，保持不变。'; swapon --show || true
       # A ZRAM this tool set up earlier also gets the tuning added later.
-      if zram_file_ours && zram_swap_active; then
+      if restore_file_ours zram_file && zram_swap_active; then
         zram_tune; module_result zram present 'zram0 (this tool)'
       else module_result zram preserved 'existing swap/zram'; fi
       return 0
@@ -1211,7 +1211,7 @@ sysctl_ipv6_iface_redirects() {
 
 sysctl_hardening_stage() {
   say '第7步：内核网络安全参数（可选）'
-  local pair key value current text=''
+  local pair key value current text='' content
   local -a kept=() originals=() ifaces=()
   if [[ "${SYSCTL_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改内核网络参数。'; module_result sysctl declined 'not requested'; return 0; fi
   while IFS= read -r pair; do
@@ -1233,7 +1233,14 @@ sysctl_hardening_stage() {
   fi
   if ((${#kept[@]})); then ok "已有其他配置的参数保持不变：${kept[*]}"; fi
   if [[ -z "$text" ]]; then module_result sysctl preserved 'all keys configured elsewhere'; return 0; fi
-  if ! put_file "$SYSCTL_HARDENING_FILE" "# VPS Stable Optimizer v2.6: network hardening"$'\n'"${text%$'\n'}"; then
+  content="# VPS Stable Optimizer v2.6: network hardening"$'\n'"${text%$'\n'}"
+  # The file an earlier version of this tool wrote (without the IPv6 glob line)
+  # is replaced; anything else in its place is still left alone by put_file.
+  if [[ -f "$SYSCTL_HARDENING_FILE" && "$(cat -- "$SYSCTL_HARDENING_FILE" 2>/dev/null || true)" != "$content" ]] &&
+     restore_file_ours sysctl_file; then
+    rm -f -- "$SYSCTL_HARDENING_FILE"
+  fi
+  if ! put_file "$SYSCTL_HARDENING_FILE" "$content"; then
     module_result sysctl preserved 'sysctl file conflict'; return 0
   fi
   for pair in "${originals[@]}"; do
@@ -3539,6 +3546,8 @@ RESTORE_ROOT=''
 RESTORE_READY=0
 RESTORE_STAGE=''
 RESTORE_PARTIAL=0
+# Set once this run removed systemd-zram-generator (see restore_zram_settle).
+ZRAM_PACKAGE_REMOVED=0
 
 restore_ids() {
   case "$1" in
@@ -4220,13 +4229,16 @@ restore_zram_settle() {
   if installed systemd-zram-generator; then
     grep -q '^[[:space:]]*\[zram' "$ZRAM_VENDOR_FILE" 2>/dev/null || return 0
     # Only a package this tool installed; an administrator's own stays as it is.
-    restore_tool_packages | grep -Fxq systemd-zram-generator || return 0
+    restore_tool_package systemd-zram-generator || return 0
     if zram_swap_active || systemctl start dev-zram0.swap >/dev/null 2>&1; then
       warn '保留了 systemd-zram-generator：ZRAM 按它自带的默认配置（约内存一半）继续开启。要彻底关闭，以后在撤销里选「卸载本工具新装的软件包」。'
       module_result zram present 'package default'
     fi
     return 0
   fi
+  # Only right after this run removed the package: a ZRAM set up some other way
+  # later (zram-tools, for example) is not this step's business.
+  [[ "${ZRAM_PACKAGE_REMOVED:-0}" == 1 ]] || return 0
   if restore_needed zram_swap; then restore_resource zram_swap; fi
   zram_reset_idle || true
 }
@@ -4242,6 +4254,16 @@ restore_tool_packages() {
     grep -Fxq -- "$pkg" "$dir/before" && continue
     printf '%s\n' "$pkg"
   done < "$dir/installed"
+}
+
+# True when PKG is in that list. Read to the end on purpose: "| grep -q" would
+# stop reading early, and under pipefail the writer's SIGPIPE makes a match fail.
+restore_tool_package() {
+  local pkg found=1
+  while IFS= read -r pkg; do
+    if [[ "$pkg" == "$1" ]]; then found=0; fi
+  done < <(restore_tool_packages)
+  return "$found"
 }
 
 # Simulates first. Removal (never purge) proceeds only when APT would remove
@@ -4289,6 +4311,7 @@ restore_packages_offer() {
   apt_wait_idle
   if apt-get -y -q -o DPkg::Lock::Timeout=120 remove "${flags[@]}" "${ours[@]}"; then
     ok '已卸载本工具新装的软件包。'
+    if [[ " ${ours[*]} " == *' systemd-zram-generator '* ]]; then ZRAM_PACKAGE_REMOVED=1; fi
     restore_packages_record
   else warn 'APT 卸载失败，请人工检查。'; RESTORE_PARTIAL=1; fi
 }
@@ -5504,7 +5527,10 @@ item_turn_off() {
   else
     ok "已撤销本工具对「$(item_label "$key")」的修改。"
     # Without the policy the package only keeps a shutdown helper running.
-    if [[ "$key" == updates ]]; then restore_packages_offer unattended-upgrades; fi
+    # Asked only when this tool installed it (Ubuntu ships it preinstalled).
+    if [[ "$key" == updates ]] && restore_tool_package unattended-upgrades; then
+      restore_packages_offer unattended-upgrades
+    fi
   fi
 }
 

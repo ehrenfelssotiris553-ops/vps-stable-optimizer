@@ -109,6 +109,8 @@ sysctl() {
 CONFIGURED=kernel.dmesg_restrict
 sysctl_key_configured() { [[ "$1" == "$CONFIGURED" ]]; }
 restore_record_sysctl() { record "orig $1=$2"; }
+OURS=0
+restore_file_ours() { [[ "$1" == sysctl_file ]] && ((OURS)); }
 reset; SYSCTL_CHOICE=1
 sysctl_hardening_stage
 grep -Fxq 'kernel.kptr_restrict = 2' "$SYSCTL_HARDENING_FILE" || fail 'hardening value not written'
@@ -143,6 +145,19 @@ sysctl_hardening_stage
 if grep -Fq 'conf.*' "$SYSCTL_HARDENING_FILE"; then fail 'glob written although IPv6 redirects are configured elsewhere'; fi
 if grep -q 'sysctl -w' "$TEST_ROOT/trace"; then fail 'interfaces changed although IPv6 redirects are configured elsewhere'; fi
 CONFIGURED=kernel.dmesg_restrict
+# Upgraded from 2.7.1: this tool's own older file (no glob line) is replaced,
+# not reported as a conflict; a file that is not ours is still left alone.
+printf '# VPS Stable Optimizer v2.6: network hardening\nkernel.kptr_restrict = 2\n' > "$SYSCTL_HARDENING_FILE"
+reset; OURS=1
+sysctl_hardening_stage
+grep -Fxq 'net.ipv6.conf.*.accept_redirects = 0' "$SYSCTL_HARDENING_FILE" || fail "this tool's older file not brought up to date"
+grep -q '^result sysctl applied' "$TEST_ROOT/trace" || fail 'updated own file not recorded as applied'
+printf 'kernel.kptr_restrict = 1\n' > "$SYSCTL_HARDENING_FILE"
+reset; OURS=0
+sysctl_hardening_stage
+[[ "$(cat "$SYSCTL_HARDENING_FILE")" == 'kernel.kptr_restrict = 1' ]] || fail 'a file that is not ours was replaced'
+grep -q '^result sysctl preserved' "$TEST_ROOT/trace" || fail 'foreign file not reported as kept'
+rm -f "$SYSCTL_HARDENING_FILE"
 unset 'SYSVAL[net.ipv6.conf.all.accept_redirects]' 'SYSVAL[net.ipv6.conf.default.accept_redirects]'
 unset -f sysctl_ipv6_iface_redirects
 (
