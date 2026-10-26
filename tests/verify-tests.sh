@@ -7,7 +7,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
-  trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main
+  trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -292,3 +292,24 @@ printf 'PASS: journal check reads the limit and the current usage.\n'
   [[ "$VERIFY_EXIT" == 3 ]] || fail 'a failed live test left the exit code at 0'
 )
 printf 'PASS: the acceptance exit code is set after the optional live test.\n'
+
+# Failed services are named, so the user knows which one to look at.
+(
+  getent() { return 0; }
+  OS=debian
+  FAILED_UNITS=''
+  systemctl() {
+    [[ "$*" == 'list-units --state=failed --type=service --no-legend --no-pager --plain' ]] || fail "unexpected systemctl $*"
+    printf '%s' "$FAILED_UNITS"
+  }
+  out="$(verify_health)"
+  grep -Fq '本次启动没有失败的服务' <<< "$out" || fail "no failed service not reported: $out"
+  FAILED_UNITS='systemd-networkd-wait-online.service loaded failed failed Wait for Network to be Configured
+'
+  out="$(verify_health)"
+  grep -Fq '有 1 个失败的服务：systemd-networkd-wait-online.service。' <<< "$out" || fail "failed service not named: $out"
+  FAILED_UNITS="$(printf 'u%s.service loaded failed failed x\n' 1 2 3 4)"
+  out="$(verify_health)"
+  grep -Fq '有 4 个失败的服务：u1.service u2.service u3.service 等。' <<< "$out" || fail "long list not shortened: $out"
+)
+printf 'PASS: failed services are named in the health check.\n'

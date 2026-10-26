@@ -117,6 +117,7 @@ assert_absent '配置 SSH 防爆破'
 printf '%s\n' 'action = vps-stable-ufw-sshd[port="%(port)s"]' 'bantime = 43200' > "$F2B_FILE"
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '改为首次 1 小时、同一 IP 再犯加倍'
+assert_contains '已有的白名单保持不变，没有的会问你'
 assert_absent '本工具的 Fail2ban 规则已经在运行'
 rm -f "$F2B_FILE"; F2B_RUNNING=0
 assert_absent '计划配置约内存一半大小的 ZRAM'

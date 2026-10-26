@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.6 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.7 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.6
+SCRIPT_VERSION=2.7.7
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -70,7 +70,7 @@ case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|po
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V2.7.6 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+VPS 机器管家 V2.7.7 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps plan       给机器做体检（只检查）
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
@@ -499,7 +499,7 @@ apt_index_stage() {
   echo '只在当前大版本内升级（不会升到新的系统大版本，例如 Debian 12 → 13、Ubuntu 24.04 → 26.04），也不会删除任何已安装的软件包。'
   echo
   echo '推荐设置：升级系统、开启自动安全更新、安装常用工具、启用内核网络安全参数、升级后清理旧内核、主机名无法解析时补上。'
-  echo '（SSH 加固和防火墙不在推荐设置里，后面会单独问你。）'
+  echo '（SSH 加固、防火墙和 Fail2ban 白名单不在推荐设置里，后面会单独问你。）'
   if confirm_default_yes '使用推荐设置吗？'; then
     RECOMMENDED=1
     if ((count > 0)); then UPGRADE_APPROVED=1; fi
@@ -3602,7 +3602,7 @@ decision_report() {
   if ( foreign_f2b_config ) >/dev/null 2>&1; then
     decision_line '保留现状' 'SSH 防爆破' '已有其他 Fail2ban 管理配置，保留并提示，不接管。'
   elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && grep -Fxq 'bantime = 43200' "$F2B_FILE" && grep -Fq 'vps-stable-ufw-sshd' "$F2B_FILE"; then
-    decision_line '准备调整' 'SSH 防爆破' '本工具旧版的 Fail2ban 规则每次封 12 小时：改为首次 1 小时、同一 IP 再犯加倍（最长 7 天），白名单保持不变。'
+    decision_line '准备调整' 'SSH 防爆破' '本工具旧版的 Fail2ban 规则每次封 12 小时：改为首次 1 小时、同一 IP 再犯加倍（最长 7 天）；已有的白名单保持不变，没有的会问你。'
   elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && active fail2ban; then
     decision_line '保留现状' 'SSH 防爆破' '本工具的 Fail2ban 规则已经在运行，执行时仍会核验。'
   else
@@ -5175,11 +5175,18 @@ verify_kernel() {
   fi
 }
 
+# Failed services are named (found on a real VPS: a system upgrade restarted
+# systemd-networkd and its wait-online unit timed out until the next boot).
 verify_health() {
-  local failed host
-  failed="$(systemctl list-units --state=failed --type=service --no-legend --no-pager --plain 2>/dev/null | grep -c . || true)"
+  local failed host units names
+  units="$(systemctl list-units --state=failed --type=service --no-legend --no-pager --plain 2>/dev/null | awk '{print $1}' || true)"
+  failed="$(grep -c . <<< "$units" || true)"
   if [[ "$failed" == 0 ]]; then verify_line healthy '系统服务' '本次启动没有失败的服务'
-  else verify_line fail '系统服务' "有 ${failed} 个失败的服务，运行 systemctl --failed 查看"; fi
+  else
+    names="$(head -n 3 <<< "$units" | tr '\n' ' ')"; names="${names% }"
+    if ((failed > 3)); then names+=' 等'; fi
+    verify_line fail '系统服务' "有 ${failed} 个失败的服务：${names}。用 systemctl status 加服务名查看原因；系统升级时被重启过的服务偶尔会这样，重启服务器后再验收一次"
+  fi
   if [[ "$OS" == ubuntu ]]; then host=archive.ubuntu.com; else host=deb.debian.org; fi
   if command -v timeout >/dev/null && timeout 6s getent ahosts "$host" >/dev/null 2>&1; then
     verify_line healthy '网络与 DNS' "可以解析 $host"
