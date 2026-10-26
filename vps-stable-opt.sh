@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.2 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.3 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.2
+SCRIPT_VERSION=2.7.3
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -480,7 +480,8 @@ apt_index_stage() {
   # Only the package names on screen; APT's raw Inst/Conf lines run to hundreds.
   mapfile -t names < <(awk '$1 == "Inst" {print $2}' <<< "$simulation")
   if ((${#names[@]})); then
-    printf '%s\n' "${names[@]:0:60}" | paste -sd ' ' - | fold -s -w 76 | sed 's/^/  /'
+    # fold -s breaks after a space and leaves it at the end of the line.
+    printf '%s\n' "${names[@]:0:60}" | paste -sd ' ' - | fold -s -w 76 | sed 's/^/  /; s/[[:space:]]*$//'
     if ((${#names[@]} > 60)); then echo "  ……共 ${#names[@]} 个，其余见备份目录里的 upgrade-simulation.txt"; fi
   fi
   KERNEL_UPDATE=0
@@ -838,6 +839,50 @@ sysctl_vendor_default() {
   [[ "${file##*/}" < "${BBR_FILE##*/}" ]]
 }
 
+# The value systemd-sysctl gives KEY at the next boot from files other than
+# this tool's: files run in name order and the last assignment wins; a name in
+# /etc masks the same name further down (a /dev/null link masks it entirely).
+# /run is left out (gone after a reboot), and so is /etc/sysctl.conf unless a
+# sysctl.d file links to it: Debian 13 no longer reads it, while Debian 12 and
+# Ubuntu do through /etc/sysctl.d/99-sysctl.conf. ROOT is for isolated tests.
+sysctl_boot_value() {
+  local key="$1" root="${2:-}" dir f name line k v value=''
+  local -A listed=()
+  local -a entries=()
+  for dir in /etc/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+    for f in "$root$dir"/*.conf; do
+      [[ -e "$f" || -L "$f" ]] || continue
+      name="${f##*/}"
+      [[ -z "${listed[$name]:-}" ]] || continue
+      listed[$name]=1
+      entries+=("$name"$'\t'"$f")
+    done
+  done
+  ((${#entries[@]})) || return 0
+  while IFS=$'\t' read -r name f; do
+    [[ "$f" != "$BBR_FILE" && -f "$f" && -r "$f" ]] || continue
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line#"${line%%[![:space:]]*}"}"
+      case "$line" in ''|'#'*|';'*) continue ;; esac
+      [[ "$line" == *=* ]] || continue
+      k="${line%%=*}"; v="${line#*=}"
+      k="${k#-}"; k="${k//[[:space:]]/}"; k="${k//\//.}"
+      v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+      if [[ "$k" == "$key" ]]; then value="$v"; fi
+    done < "$f"
+  done < <(printf '%s\n' "${entries[@]}" | sort -t $'\t' -k1,1)
+  printf '%s\n' "$value"
+}
+
+# BBR and fq are in force now and another file sets them at every boot (a
+# provider image, for example): this tool's own copy would only duplicate it.
+bbr_set_elsewhere() {
+  [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == bbr &&
+     "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" == fq &&
+     "$(sysctl_boot_value net.ipv4.tcp_congestion_control "${1:-}")" == bbr &&
+     "$(sysctl_boot_value net.core.default_qdisc "${1:-}")" == fq ]]
+}
+
 bbr_stage() {
   say '第6步：BBR 与默认 fq 队列配置'
   local was_present=0
@@ -855,6 +900,17 @@ bbr_stage() {
     warn '加载模块后 BBR 仍不可用。'
     module_result bbr unsupported 'BBR unavailable after modprobe'; return 0
   fi
+  if [[ ! -e "$BBR_FILE" ]]; then
+    # Setting the algorithm loads tcp_bbr by itself, so no module file either.
+    if bbr_set_elsewhere; then
+      ok '系统已经开启 BBR 和 fq，开机时也会由别的配置文件设置，不再重复写入。'
+      module_result bbr present 'set at boot by another sysctl.d file'; return 0
+    fi
+    if grep -Eqs '^[[:space:]]*-?net[./]ipv4[./]tcp_congestion_control[[:space:]]*=[[:space:]]*bbr[[:space:]]*$' /etc/sysctl.conf &&
+       [[ "$(sysctl_boot_value net.ipv4.tcp_congestion_control)" != bbr ]]; then
+      echo '/etc/sysctl.conf 里已有 BBR 设置，但这个系统开机时不会读取它（Debian 13 起不再读取），所以写入本工具的配置，保证重启后仍然生效。'
+    fi
+  fi
   if [[ -f "$BBR_FILE" && "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == bbr ]]; then was_present=1; fi
   if ! grep -RqsE '^[[:space:]]*tcp_bbr([[:space:]]|$)' /etc/modules-load.d/ 2>/dev/null; then
     if ! put_file "$MODULE_FILE" 'tcp_bbr'; then
@@ -862,10 +918,10 @@ bbr_stage() {
       module_result bbr preserved 'module file conflict'; return 0
     fi
   fi
-  # Always verify this complete persistent file, rather than assuming that a
-  # matching line elsewhere survives name masking, ordering, or a reboot.
-  # In particular, /run/sysctl.d and /etc/sysctl.conf are not boot persistence
-  # evidence for systemd-sysctl. put_file never overwrites an existing file.
+  # Unless sysctl_boot_value showed that another file wins at boot (masking and
+  # order included), this tool's own complete file is written: /run/sysctl.d
+  # and an unlinked /etc/sysctl.conf are no boot persistence for systemd-sysctl.
+  # put_file never overwrites an existing file.
   if ! put_file "$BBR_FILE" $'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr'; then
     warn 'BBR 的持久配置没有写成功，运行参数保持不变。'
     module_result bbr preserved 'sysctl file conflict'; return 0
@@ -3232,6 +3288,8 @@ decision_report() {
       available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
       if [[ "$current" == bbr && "$file_state" == match && "$module_state" == match && "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" == fq ]]; then
         decision_line '保留现状' 'BBR 网络优化' '当前默认算法和本工具的持久配置已经匹配，执行时仍会核验。'
+      elif [[ "$file_state" == missing ]] && bbr_set_elsewhere; then
+        decision_line '保留现状' 'BBR 网络优化' '系统已经开启 BBR 和 fq，开机时也会由别的配置文件设置，不再重复写入。'
       elif [[ " $available_cc " == *' bbr '* ]]; then
         decision_line '准备调整' 'BBR 网络优化' '内核当前提供 BBR，执行时核验持久配置后设置 BBR 和默认 fq 队列。'
       else

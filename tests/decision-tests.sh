@@ -51,6 +51,7 @@ TRIM_ENABLED=0 FIREWALL_ACTIVE=0 FIREWALL_CONFLICT=0 SSH_VERIFIED=1 RULES_SAFE=1
 BBR_CURRENT=cubic BBR_AVAILABLE='reno cubic' QDISC_CURRENT=pfifo_fast
 MEM_MIB=1024 ROOT_GIB=10 ROOT_FS=ext4 ROOT_DEV=/dev/vda1
 bbr_config_conflict() { warn 'mock confidential config line'; ((BBR_CONFLICT)); }
+bbr_set_elsewhere() { ((${BBR_ELSEWHERE:-0})); }
 swap_exists() { ((SWAP_PRESENT)); }
 available() { ((PKG_AVAILABLE)); }
 installed() { [[ "$1" == chrony ]] && ((PROVIDER_PRESENT)); }
@@ -91,7 +92,12 @@ decision_journal_state() { printf '%s\n' "${JOURNAL_STATE:-missing}"; }
 assert_contains() { grep -Fq -- "$1" "$TEST_ROOT/report" || fail "missing report text: $1"; }
 assert_absent() { if grep -Fq -- "$1" "$TEST_ROOT/report"; then fail "unexpected report text: $1"; fi; }
 
+BBR_ELSEWHERE=1 BBR_AVAILABLE='reno cubic bbr'
 decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '开机时也会由别的配置文件设置，不再重复写入'
+BBR_ELSEWHERE=0 BBR_AVAILABLE='reno cubic'
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_absent '不再重复写入'
 assert_contains '内存低于 2GiB，未发现 Swap/ZRAM'
 assert_contains '当前未确认 BBR 可用'
 assert_absent '内核不支持'

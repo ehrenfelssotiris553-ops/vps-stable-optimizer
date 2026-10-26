@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Pure Bash regression tests. Only actual deliverable functions are loaded;
 # never source or execute the complete VPS setup script.
+# The sysctl mock is called indirectly; BBR_FILE changes inside ( ) on purpose.
+# shellcheck disable=SC2030,SC2031,SC2329
 set -Eeuo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 HERE="$PWD"
 source ./test-common.sh
-load_optimizer_functions sysctl_vendor_default sysctl_config_files bbr_config_conflict bbr_stage bbr_report
+load_optimizer_functions sysctl_vendor_default sysctl_config_files bbr_config_conflict bbr_stage bbr_report sysctl_boot_value bbr_set_elsewhere
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 BBR_FILE="$TEST_ROOT/99-vps-stable-bbr.conf"
@@ -60,6 +62,48 @@ cp "$TEST_ROOT/vendor/50-default.conf" "$TEST_ROOT/admin.conf"
 bbr_config_conflict "$TEST_ROOT/admin.conf" || fail 'the same line from an administrator file no longer blocks BBR'
 eval "$(declare -f real_vendor_default | sed '1s/real_vendor_default/sysctl_vendor_default/')"
 
+# The value systemd-sysctl sets at the next boot: name order, last assignment
+# wins, an /etc name masks the same name further down, /run and an unlinked
+# /etc/sysctl.conf do not count (Debian 13 stopped reading it), and this
+# tool's own file is left out. Found on a real VPS: the provider's BBR lived
+# only in /etc/sysctl.conf, which Debian 13 no longer applies at boot.
+(
+  R="$TEST_ROOT/sysroot"
+  mkdir -p "$R/etc/sysctl.d" "$R/usr/lib/sysctl.d" "$R/run/sysctl.d"
+  boot() { sysctl_boot_value "$1" "$R"; }
+  [[ -z "$(boot net.core.default_qdisc)" ]] || fail 'empty sysctl.d gave a value'
+  printf -- '-net.core.default_qdisc = fq_codel\n' > "$R/usr/lib/sysctl.d/50-default.conf"
+  printf 'net/core/default_qdisc=fq\n net.ipv4.tcp_congestion_control = bbr \n' > "$R/etc/sysctl.d/90-provider.conf"
+  [[ "$(boot net.core.default_qdisc)" == fq && "$(boot net.ipv4.tcp_congestion_control)" == bbr ]] || fail 'a later provider file did not win over the packaged default'
+  mv "$R/etc/sysctl.d/90-provider.conf" "$R/etc/sysctl.d/10-provider.conf"
+  [[ "$(boot net.core.default_qdisc)" == fq_codel ]] || fail 'name order ignored: 50-default runs after 10-provider'
+  # A same-named file in /etc masks the packaged one entirely.
+  rm "$R/etc/sysctl.d/10-provider.conf"
+  printf 'net.ipv4.tcp_congestion_control = bbr\n' > "$R/usr/lib/sysctl.d/60-bbr.conf"
+  [[ "$(boot net.ipv4.tcp_congestion_control)" == bbr ]] || fail 'packaged file not read'
+  : > "$R/etc/sysctl.d/60-bbr.conf"
+  [[ -z "$(boot net.ipv4.tcp_congestion_control)" ]] || fail 'masked packaged file still counted'
+  rm "$R/etc/sysctl.d/60-bbr.conf" "$R/usr/lib/sysctl.d/60-bbr.conf"
+  # /run is gone after a reboot; /etc/sysctl.conf counts only through a link.
+  printf 'net.ipv4.tcp_congestion_control = bbr\n' > "$R/run/sysctl.d/90-runtime.conf"
+  printf 'net.ipv4.tcp_congestion_control=bbr\nnet.core.default_qdisc=fq\n' > "$R/etc/sysctl.conf"
+  [[ -z "$(boot net.ipv4.tcp_congestion_control)" ]] || fail '/run or an unlinked /etc/sysctl.conf counted as boot configuration'
+  cp "$R/etc/sysctl.conf" "$R/etc/sysctl.d/99-sysctl.conf"   # Debian 12/Ubuntu link it here
+  [[ "$(boot net.ipv4.tcp_congestion_control)" == bbr ]] || fail 'linked /etc/sysctl.conf not read'
+  # This tool's own file never counts as "set elsewhere".
+  rm "$R/etc/sysctl.d/99-sysctl.conf"
+  printf 'net.ipv4.tcp_congestion_control = bbr\n' > "$R/etc/sysctl.d/99-vps-stable-bbr.conf"
+  BBR_FILE="$R/etc/sysctl.d/99-vps-stable-bbr.conf"
+  [[ -z "$(boot net.ipv4.tcp_congestion_control)" ]] || fail "this tool's own file counted"
+  # Set elsewhere only while also running now.
+  printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$R/etc/sysctl.d/90-provider.conf"
+  RUNNING=bbr
+  sysctl() { case "$*" in '-n net.ipv4.tcp_congestion_control') echo "$RUNNING" ;; '-n net.core.default_qdisc') echo fq ;; esac; }
+  bbr_set_elsewhere "$R" || fail 'BBR set at boot and running not recognised'
+  RUNNING=cubic
+  if bbr_set_elsewhere "$R"; then fail 'BBR not running counted as set'; fi
+)
+
 # Retain real parser under another name; redirect the stage scan to temporary
 # files and record arguments to verify all system config locations are covered.
 eval "$(declare -f bbr_config_conflict | sed '1s/bbr_config_conflict/bbr_real_conflict/')"
@@ -88,6 +132,13 @@ put_file() {
   printf '%s\n' "$2" > "$1"
 }
 tc() { printf '%s\n' 'qdisc fq_codel 0: dev eth0 root refcnt 2'; }
+bbr_set_elsewhere() { ((${ELSEWHERE:-0})); }
+
+# Already set at boot by another file and running: no duplicate files.
+: > "$CALLS"
+ELSEWHERE=1 bbr_stage
+if command grep -Eq '^(put|write) ' "$CALLS"; then fail 'BBR already set at boot elsewhere was written again'; fi
+command grep -qx 'result bbr present' "$CALLS" || fail 'BBR set elsewhere not recorded as present'
 
 : > "$CALLS"
 PERSIST_FAIL=1 bbr_stage

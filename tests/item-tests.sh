@@ -50,6 +50,16 @@ apt_index_stage > "$TEST_ROOT/out"
 reset; SIM='' ANSWERS=(y) UPGRADE_APPROVED=0
 apt_index_stage > "$TEST_ROOT/out"
 [[ "$UPGRADE_APPROVED" == 0 ]] || fail 'upgrade approved with nothing to upgrade'
+# Only package names, at most 60, wrapped without trailing spaces (a real VPS
+# printed 120 raw APT lines before, then names with a space left at each end).
+SIM="$(for i in $(seq 1 70); do printf 'Inst pkg%02d [1] (2 Debian:13/stable [amd64])\n' "$i"; done)"
+reset; ANSWERS=(y)
+apt_index_stage > "$TEST_ROOT/out"
+if grep -q '^Inst ' "$TEST_ROOT/out"; then fail 'raw APT simulation lines printed'; fi
+grep -q '^  pkg01 pkg02 ' "$TEST_ROOT/out" || fail 'package names not listed'
+if grep -q 'pkg61' "$TEST_ROOT/out"; then fail 'more than 60 names listed'; fi
+grep -q '共 70 个' "$TEST_ROOT/out" || fail 'total of a long list not shown'
+if grep -qE '^  pkg.*[[:space:]]$' "$TEST_ROOT/out"; then fail 'package list lines end with a space'; fi
 printf 'PASS: the recommended set is one question and still respects an empty upgrade.\n'
 
 (
