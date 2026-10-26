@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage tcp_buffer_max tcp_buffer_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -184,6 +184,53 @@ unset -f sysctl_ipv6_iface_redirects
 )
 printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys, records originals and reaches every IPv6 interface.\n'
 
+# TCP buffer ceilings: sized by RAM, only ever raised, a key set elsewhere kept,
+# min and default of the three-number keys kept, originals recorded once.
+TCP_BUFFER_FILE="$TEST_ROOT/sysctl/99-vps-stable-tcp.conf"
+for pair in 1023:16777216 1024:33554432 4095:33554432 4096:67108864; do
+  MEM_MIB="${pair%%:*}"; [[ "$(tcp_buffer_max)" == "${pair#*:}" ]] || fail "buffer ceiling for $MEM_MIB MiB: $(tcp_buffer_max)"
+done
+SYSVAL[net.core.rmem_max]=212992 SYSVAL[net.core.wmem_max]=212992
+SYSVAL[net.ipv4.tcp_rmem]=$'4096\t131072\t6291456' SYSVAL[net.ipv4.tcp_wmem]=$'4096\t16384\t4194304'
+restore_file_ours() { [[ "$1" == tcp_file ]] && ((OURS)); }
+reset; TCP_BUFFER_CHOICE=1 MEM_MIB=2048 OURS=0 CONFIGURED=net.core.wmem_max
+tcp_buffer_stage
+grep -Fxq 'net.core.rmem_max = 33554432' "$TCP_BUFFER_FILE" || fail '2 GiB RAM did not get a 32 MiB ceiling'
+grep -Fxq 'net.ipv4.tcp_rmem = 4096 131072 33554432' "$TCP_BUFFER_FILE" || fail 'tcp_rmem min/default not kept'
+grep -Fxq 'net.ipv4.tcp_wmem = 4096 16384 33554432' "$TCP_BUFFER_FILE" || fail 'tcp_wmem not raised'
+if grep -Fq wmem_max "$TCP_BUFFER_FILE"; then fail 'a key configured elsewhere was overridden'; fi
+grep -Fxq 'orig net.ipv4.tcp_rmem=4096 131072 6291456' "$TEST_ROOT/trace" || fail 'three-number original not recorded'
+grep -Fxq "sysctl -e -p $TCP_BUFFER_FILE" "$TEST_ROOT/trace" || fail 'buffer file not applied'
+grep -q '^result tcp applied 32 MiB' "$TEST_ROOT/trace" || fail 'buffer result not recorded'
+# Never lowered: a larger kernel default (32 MiB on newer kernels) stays.
+reset; rm -f "$TCP_BUFFER_FILE"; MEM_MIB=512 CONFIGURED=none
+SYSVAL[net.ipv4.tcp_rmem]=$'4096\t131072\t33554432'
+tcp_buffer_stage
+grep -Fxq 'net.core.rmem_max = 16777216' "$TCP_BUFFER_FILE" || fail '512 MiB RAM did not get a 16 MiB ceiling'
+if grep -Fq tcp_rmem "$TCP_BUFFER_FILE"; then fail 'a larger value was lowered'; fi
+# Run again: this tool's own file is applied again; its values are not originals.
+reset; OURS=1
+tcp_buffer_stage
+if grep -q '^orig ' "$TEST_ROOT/trace"; then fail "values of this tool's own file recorded as originals"; fi
+grep -q '^result tcp applied 16 MiB' "$TEST_ROOT/trace" || fail 'own buffer file not re-applied'
+reset; OURS=0
+tcp_buffer_stage
+grep -q '^result tcp preserved' "$TEST_ROOT/trace" || fail 'a buffer file that is not ours was not kept'
+# Not chosen (the recommended set): nothing written.
+reset; rm -f "$TCP_BUFFER_FILE"; TCP_BUFFER_CHOICE=0
+tcp_buffer_stage
+[[ ! -e "$TCP_BUFFER_FILE" ]] || fail 'buffers changed without consent'
+grep -q '^result tcp declined' "$TEST_ROOT/trace" || fail 'declined buffers not recorded'
+# Everything already large enough: nothing to write.
+reset; TCP_BUFFER_CHOICE=1 MEM_MIB=2048
+SYSVAL[net.core.rmem_max]=67108864 SYSVAL[net.core.wmem_max]=67108864
+SYSVAL[net.ipv4.tcp_rmem]=$'4096\t131072\t67108864' SYSVAL[net.ipv4.tcp_wmem]=$'4096\t16384\t67108864'
+tcp_buffer_stage
+[[ ! -e "$TCP_BUFFER_FILE" ]] || fail 'large enough buffers were rewritten'
+grep -q '^result tcp preserved' "$TEST_ROOT/trace" || fail 'large enough buffers not reported as kept'
+unset 'SYSVAL[net.core.rmem_max]' 'SYSVAL[net.core.wmem_max]' 'SYSVAL[net.ipv4.tcp_rmem]' 'SYSVAL[net.ipv4.tcp_wmem]'
+printf 'PASS: TCP buffer ceilings follow RAM, are only raised and keep foreign keys.\n'
+
 # Real sysctl_key_configured against fixture files.
 (
   load_optimizer_functions sysctl_key_configured
@@ -237,6 +284,9 @@ jail="$(f2b_jail_text 22 203.0.113.9)"
 grep -Fxq 'ignoreip = 127.0.0.1/8 ::1 203.0.113.9' <<< "$jail" || fail 'allowlist line missing'
 f2b_jail_is_ours "$jail" 22 || fail 'managed jail with allowlist not recognised'
 f2b_jail_is_ours "$(f2b_jail_text 22)" 22 || fail 'managed jail without allowlist not recognised'
+f2b_jail_is_ours "$(f2b_jail_legacy_text 22; echo 'ignoreip = 127.0.0.1/8 ::1 203.0.113.9')" 22 || fail "an earlier version's jail not recognised"
+grep -Fxq 'bantime.increment = true' <<< "$jail" || fail 'bans do not grow for repeat offenders'
+grep -Fxq 'bantime.maxtime = 604800' <<< "$jail" || fail 'growing bans have no upper limit'
 if f2b_jail_is_ours "$(f2b_jail_text 2222)" 22; then fail 'jail for other ports treated as current'; fi
 SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22'
 F2B_IGNORE_CHOICE=none; [[ -z "$(f2b_ignore_address)" ]] || fail 'declined allowlist still returned an address'
@@ -312,6 +362,7 @@ printf 'PASS: terminal multiplexer detection.\n'
   confirm_yes() {
     case "$1" in
       *常用工具*|*SSH\ 登录*|*管理员*|*内核网络安全*) return 0 ;;
+      *TCP\ 缓冲区*) printf '%s\n' "$1" > "$TEST_ROOT/tcp-question"; return 1 ;;
       *) return 1 ;;
     esac
   }
@@ -330,6 +381,8 @@ printf 'PASS: terminal multiplexer detection.\n'
   [[ "$AUTO_REBOOT_TIME" == 04:00 && "$ZRAM_CHOICE" == 0 && "$SYSCTL_CHOICE" == 1 ]] || fail 'reboot/zram/sysctl choices'
   [[ "$SSH_CHOICE" == 1 && "$ADMIN_CHOICE" == 1 && "$ADMIN_NAME" == ops ]] || fail 'SSH/admin choices'
   [[ "$WEB_CHOICE" == 0 && "$F2B_IGNORE_CHOICE" == none && "$TZ_CHOICE" == Asia/Shanghai && "$TZ_ASKED" == 1 ]] || fail 'web/allowlist/timezone choices'
+  [[ "$TCP_BUFFER_CHOICE" == 0 ]] || fail 'TCP buffers chosen without a yes'
+  grep -Fq '64 MiB' "$TEST_ROOT/tcp-question" || fail 'TCP buffer question does not name the ceiling for this RAM'
   grep -Fq '需要你在场' "$TEST_ROOT/q-out" || fail 'user not told the end needs them'
 )
 printf 'PASS: setup questions are asked once and stored.\n'

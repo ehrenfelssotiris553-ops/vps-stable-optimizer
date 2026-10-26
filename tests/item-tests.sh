@@ -70,7 +70,8 @@ printf 'PASS: the recommended set is one question and still respects an empty up
       *) fail "recommended mode asked: $1" ;;
     esac
   }
-  confirm_default_yes() { fail "recommended mode asked: $1"; }
+  # Since 2.7.6 the Fail2ban allowlist is asked in the recommended set as well.
+  confirm_default_yes() { case "$1" in *Fail2ban\ 白名单*) return 0 ;; *) fail "recommended mode asked: $1" ;; esac; }
   timezone_ask() { fail 'recommended mode asked for the timezone'; }
   hostname_resolves() { return 1; }
   swap_exists() { return 1; }
@@ -78,10 +79,11 @@ printf 'PASS: the recommended set is one question and still respects an empty up
   TOOLS_PACKAGES=(curl)
   setup_questions < /dev/null > "$TEST_ROOT/q-out"
   [[ "$INSTALL_TOOLS" == 1 && "$SYSCTL_CHOICE" == 1 && "$KERNEL_CLEAN_CHOICE" == 1 && "$HOSTS_CHOICE" == 1 ]] || fail 'recommended items not set'
-  [[ "$VNSTAT_CHOICE" == 0 && "$ZRAM_CHOICE" == 0 && -z "$AUTO_REBOOT_TIME" && -z "$TZ_CHOICE" && "$F2B_IGNORE_CHOICE" == none ]] || fail 'non-recommended items were switched on'
+  [[ "$VNSTAT_CHOICE" == 0 && "$ZRAM_CHOICE" == 0 && "$TCP_BUFFER_CHOICE" == 0 && -z "$AUTO_REBOOT_TIME" && -z "$TZ_CHOICE" ]] || fail 'non-recommended items were switched on'
   [[ "$SSH_CHOICE" == 0 && "$WEB_CHOICE" == 0 ]] || fail 'SSH/web questions were not asked separately'
+  [[ "$F2B_IGNORE_CHOICE" == 203.0.113.9 ]] || fail "recommended mode did not offer the Fail2ban allowlist: $F2B_IGNORE_CHOICE"
 )
-printf 'PASS: recommended mode sets only the low-risk items and still asks about SSH and web ports.\n'
+printf 'PASS: recommended mode sets only the low-risk items and still asks about SSH, web ports and the Fail2ban allowlist.\n'
 
 # Rollback groups: Fail2ban before the firewall, pending detection, per-item pick.
 [[ "$(restore_groups | head -n 2 | tr '\n' ' ')" == 'fail2ban firewall ' ]] || fail 'Fail2ban must be undone before the firewall'
@@ -139,6 +141,10 @@ reset; STATE=([bbr_file]=applied)
 item_turn_off bbr
 grep -Fxq 'result bbr reverted' "$TEST_ROOT/trace" || fail 'undone item not recorded for vps check'
 if grep -q '^packages' "$TEST_ROOT/trace"; then fail 'BBR off offered a package removal'; fi
+# TCP buffers: the file first, then the recorded running values.
+reset; STATE=([tcp_file]=applied)
+item_turn_off tcp
+[[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'resource tcp_file sysctl runtime result tcp reverted ' ]] || fail "TCP buffer undo: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
 # Automatic updates off: the package this tool installed for them is offered too.
 restore_tool_packages() { printf '%s\n' htop unattended-upgrades tmux; }
 reset; STATE=([apt_file]=applied)
@@ -171,7 +177,9 @@ item_action ports < /dev/null > /dev/null
 reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-[[ "$(item_keys | wc -l | tr -d ' ')" == 18 ]] || fail 'item count'
+[[ "$(item_keys | wc -l | tr -d ' ')" == 19 ]] || fail 'item count'
+# New items are appended: the numbers the user knows stay the same.
+[[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

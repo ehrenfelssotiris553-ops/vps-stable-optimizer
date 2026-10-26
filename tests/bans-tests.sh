@@ -6,7 +6,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions f2b_ban_events bans_main
+load_optimizer_functions f2b_ban_events f2b_duration_text bans_main
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -43,7 +43,10 @@ fail2ban-client() {
   case "$*" in
     'status sshd') printf '%s\n' 'Status for the jail: sshd' '|- Filter' $'|  |- Currently failed:\t1' $'|  |- Total failed:\t15' \
       $'\x60- Actions' $'   |- Currently banned:\t2' $'   |- Total banned:\t3' $'   \x60- Banned IP list:\t198.51.100.7 2001:db8::7' ;;
-    'get sshd bantime') echo 43200 ;;
+    'get sshd bantime') echo "$BANTIME" ;;
+    # A jail without increment (up to 2.7.5) answers False; maxtime is then unused.
+    'get sshd bantime.increment') if ((INCREMENT)); then echo True; else echo False; fi ;;
+    'get sshd bantime.maxtime') echo 604800 ;;
     'get sshd banip --with-time') printf '%s\n' $'198.51.100.7 \t2026-10-26 10:00:00 + 43200 = 2026-10-26 22:00:00' \
       $'2001:db8::7 \t2026-10-26 10:30:00 + 43200 = 2026-10-26 22:30:00' ;;
     'get sshd ignoreip') printf '%s\n' 'These IP addresses/networks are ignored:' '|- 127.0.0.1/8' $'\x60- ::1' ;;
@@ -54,7 +57,7 @@ fail2ban-client() {
 f2b_ban_events() { printf '2026-10-26 10:00:00\t封禁\t198.51.100.7\n'; }
 confirm_yes() { printf 'ask %s\n' "$1" >> "$TEST_ROOT/log"; ((YES)); }
 tool_lifecycle_lock() { printf 'lock\n' >> "$TEST_ROOT/calls"; }
-reset() { : > "$TEST_ROOT/log"; : > "$TEST_ROOT/calls"; YES=1; }
+reset() { : > "$TEST_ROOT/log"; : > "$TEST_ROOT/calls"; YES=1; BANTIME=43200 INCREMENT=0; }
 
 reset
 bans_main < /dev/null > "$TEST_ROOT/out"
@@ -67,6 +70,12 @@ bans_main < /dev/null > "$TEST_ROOT/out"
 grep -Fq '你当前的 IP 203.0.113.20 没有被封禁' "$TEST_ROOT/out" || fail 'own address not checked'
 unset SSH_CONNECTION
 printf 'PASS: ban records show counts, current bans with times, the allowlist and recent events.\n'
+
+# Since 2.7.6 bans start at one hour and double for an address banned again.
+reset; BANTIME=3600 INCREMENT=1
+bans_main < /dev/null > "$TEST_ROOT/out"
+grep -Fq '正在封禁：2 个 IP（首次封 1 小时，同一 IP 再犯时间加倍，最长 7 天）' "$TEST_ROOT/out" || fail "incremental bans not described: $(head -n 1 "$TEST_ROOT/out")"
+printf 'PASS: incremental ban times are described as such.\n'
 
 reset
 printf '2001:db8::7\n' > "$TEST_ROOT/in"

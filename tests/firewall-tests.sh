@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_arm guard_confirm web_ports_wanted firewall_stage fail2ban_stage
+load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners firewall_stage fail2ban_stage
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -27,6 +27,10 @@ audit_ufw_ipv6() { echo yes; }
 ufw_ipv6_check() { if ((FLIP_IPV6)); then IPV6_FLIPPED=1; fi; }
 # A new SSH login seen in the journal confirms without typing.
 ssh_login_seen() { ((LOGIN_SEEN)); }
+# Listening sockets as `ss -H -lntup` prints them; a case sets LISTEN.
+ss() { printf '%s' "$LISTEN"; }
+# The only [Y/n] question of the firewall step: allow the listed services too.
+confirm_default_yes() { record "ask $1"; ((LISTEN_YES)); }
 
 reset_case() {
   CASE_DIR="$TEST_ROOT/$1"
@@ -54,6 +58,8 @@ reset_case() {
   FIREWALL_READY=0
   SSH_CONNECTION=''
   SSH_PORTS=()
+  LISTEN=''
+  LISTEN_YES=1
   SECONDS=0
 }
 record() { printf '%s\n' "$*" >> "$CASE_DIR/calls"; }
@@ -67,7 +73,7 @@ ufw() {
       if [[ "$(cat "$CASE_DIR/ufw-active")" == 1 ]]; then printf 'Status: active\n'
       else printf 'Status: inactive\n'; fi ;;
     'show added') printf 'Added user rules:\n'; cat "$CASE_DIR/rules" ;;
-    'limit 22/tcp'|'allow 22/tcp'|'allow 80/tcp'|'allow 443/tcp') printf 'ufw %s\n' "$*" >> "$CASE_DIR/rules" ;;
+    'limit 22/tcp'|'allow '[0-9]*/tcp|'allow '[0-9]*/udp) printf 'ufw %s\n' "$*" >> "$CASE_DIR/rules" ;;
     'default deny incoming'|'default allow outgoing') : ;;
     '--force enable')
       if ((ENABLE_FAIL)); then return 1; fi
@@ -167,6 +173,7 @@ firewall_stage < "$CASE_DIR/input"
 grep -Fxq 'ufw limit 22/tcp' "$CASE_DIR/rules" || fail 'password SSH did not use the rate-limited rule'
 grep -Fxq 'ufw allow 80/tcp' "$CASE_DIR/rules" || fail 'accepted web ports were not opened'
 grep -Fxq 'firewall applied' "$CASE_DIR/results" || fail 'applied firewall result missing'
+if grep -q '^ask ' "$CASE_DIR/calls"; then fail 'asked about other services although nothing else listens'; fi
 [[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] || fail 'confirmed firewall not enabled at boot (ufw.service)'
 # Started too, so the next run does not take the reboot for an outside change.
 [[ "$(cat "$CASE_DIR/ufw-service")" == active ]] || fail 'ufw.service left inactive after the firewall was confirmed'
@@ -193,11 +200,59 @@ if grep -Eq 'ufw allow (80|443)/tcp' "$CASE_DIR/rules"; then fail 'setup choice 
 
 reset_case ipv6_enabled_before_activation
 FLIP_IPV6=1
+LISTEN='tcp   LISTEN 0      511          0.0.0.0:8080       0.0.0.0:*    users:(("nginx",pid=10,fd=6))
+'
 printf 'CONNECTED\n' > "$CASE_DIR/input"
-firewall_stage < "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > /dev/null
 # ufw_rule adds the rule once; the explicit re-add lets UFW create the IPv6 copy.
 [[ "$(grep -c '^ufw limit 22/tcp$' "$CASE_DIR/calls")" == 2 ]] || fail 'SSH rule not re-added after enabling IPv6 protection'
+[[ "$(grep -c '^ufw allow 8080/tcp$' "$CASE_DIR/calls")" == 2 ]] || fail 'listed service not re-added after enabling IPv6 protection'
 [[ "$FIREWALL_READY" == 1 ]] || fail 'IPv6 protection blocked activation'
+
+# Services reachable now would be cut off by the firewall: listed before it is
+# turned on and, on Enter, allowed as well. Left out: SSH, TCP 80/443 (asked
+# separately), loopback and link-local addresses, system helpers (LLMNR),
+# Docker's proxy (it bypasses UFW) and a port a stored rule already mentions
+# (a source-limited rule must stay limited).
+reset_case listeners_allowed
+LISTEN='tcp   LISTEN 0      511          0.0.0.0:8080       0.0.0.0:*    users:(("nginx",pid=10,fd=6),("nginx",pid=11,fd=6))
+tcp   LISTEN 0      511             [::]:8080          [::]:*    users:(("nginx",pid=10,fd=7))
+tcp   LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=5,fd=3))
+tcp   LISTEN 0      511          0.0.0.0:80         0.0.0.0:*    users:(("nginx",pid=10,fd=5))
+tcp   LISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=6,fd=14))
+tcp   LISTEN 0      4096       127.0.0.1:6379       0.0.0.0:*    users:(("redis-server",pid=7,fd=6))
+tcp   LISTEN 0      4096         0.0.0.0:5355       0.0.0.0:*    users:(("systemd-resolve",pid=6,fd=12))
+tcp   LISTEN 0      4096         0.0.0.0:9000       0.0.0.0:*    users:(("docker-proxy",pid=9,fd=4))
+tcp   LISTEN 0      151          0.0.0.0:3306       0.0.0.0:*    users:(("mysqld",pid=12,fd=20))
+udp   UNCONN 0      0     [fe80::1]%eth0:546           [::]:*    users:(("dhcp6c",pid=8,fd=4))
+udp   UNCONN 0      0            0.0.0.0:51820      0.0.0.0:*
+udp   UNCONN 0      0                  *:443              *:*    users:(("hysteria",pid=13,fd=3))
+'
+printf 'ufw allow from 192.0.2.7 to any port 3306\n' > "$CASE_DIR/rules"
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > "$CASE_DIR/stdout"
+[[ "$FIREWALL_READY" == 1 ]] || fail 'listing other services blocked the firewall'
+[[ "$(grep -c '^ask ' "$CASE_DIR/calls")" == 1 ]] || fail 'the services were not offered exactly once'
+for text in '8080/tcp     nginx' '51820/udp    （程序未知）' '443/udp      hysteria'; do
+  grep -Fq -- "$text" "$CASE_DIR/stdout" || fail "listing lacks: $text"
+done
+if grep -Eq '^  (22|80|53|6379|5355|9000|3306|546)/' "$CASE_DIR/stdout"; then fail "listed a port that must be left out: $(grep '^  ' "$CASE_DIR/stdout" | tr '\n' ' ')"; fi
+for rule in 'ufw allow 8080/tcp' 'ufw allow 51820/udp' 'ufw allow 443/udp'; do
+  grep -Fxq "$rule" "$CASE_DIR/rules" || fail "listed service not allowed: $rule"
+done
+if grep -Fxq 'ufw allow 3306/tcp' "$CASE_DIR/rules"; then fail 'a source-limited rule was widened'; fi
+
+reset_case listeners_declined
+WEB_YES=0 LISTEN_YES=0
+LISTEN='tcp   LISTEN 0      511          0.0.0.0:8080       0.0.0.0:*    users:(("nginx",pid=10,fd=6))
+tcp   LISTEN 0      511          0.0.0.0:80         0.0.0.0:*    users:(("nginx",pid=10,fd=5))
+'
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > "$CASE_DIR/stdout"
+[[ "$FIREWALL_READY" == 1 ]] || fail 'declining the listed services blocked the firewall'
+if grep -Eq 'ufw allow (8080|80)/tcp' "$CASE_DIR/rules"; then fail 'listed services allowed without consent'; fi
+grep -q '^  8080/tcp ' "$CASE_DIR/stdout" || fail 'declined services were not listed first'
+if grep -q '^  80/tcp ' "$CASE_DIR/stdout"; then fail 'port 80 listed although the web question decides it'; fi
 
 reset_case leftover_timer
 LEFTOVER_TIMER=1
@@ -313,4 +368,4 @@ firewall_stage < "$CASE_DIR/input"
 if grep -q '^systemctl enable' "$CASE_DIR/calls"; then fail 'tried to enable a static ufw.service'; fi
 grep -Fq 'static' "$CASE_DIR/messages" || fail 'static ufw.service not explained'
 
-printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports, boot loading and conservative takeover.\n'
+printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports, services that would be blocked, boot loading and conservative takeover.\n'

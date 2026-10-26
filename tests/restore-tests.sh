@@ -274,18 +274,21 @@ value_baseline() {
   restore_record_fw_rule 'ufw limit 22/tcp'
   restore_record_fw_rule 'ufw allow 80/tcp'
   restore_record_fw_rule 'ufw allow 80/tcp'
+  # A listed UDP service (WireGuard) allowed when the firewall was turned on.
+  restore_record_fw_rule 'ufw allow 51820/udp'
   if restore_record_fw_rule 'ufw deny 22/tcp; rm -rf /'; then die 'unsafe rule text recorded'; fi
-  expect "$(cat "$RESTORE_ROOT/fw_rules")" $'ufw limit 22/tcp\nufw allow 80/tcp'
-  ADDED=$'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 8080/tcp\nufw deny from 198.51.100.7 to any port 22 proto tcp'
+  if restore_record_fw_rule 'ufw allow 53/icmp'; then die 'unknown protocol recorded'; fi
+  expect "$(cat "$RESTORE_ROOT/fw_rules")" $'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 51820/udp'
+  ADDED=$'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 51820/udp\nufw allow 8080/tcp\nufw deny from 198.51.100.7 to any port 22 proto tcp'
   ufw() {
     case "$*" in
       'show added') printf 'Added user rules:\n%s\n' "$ADDED" ;;
-      '--force delete allow 80/tcp'|'--force delete limit 22/tcp') printf '%s\n' "$*" >> "$TRACE" ;;
+      '--force delete allow 80/tcp'|'--force delete limit 22/tcp'|'--force delete allow 51820/udp') printf '%s\n' "$*" >> "$TRACE" ;;
       *) die "unexpected fixture UFW: $*" ;;
     esac
   }
   restore_fw_rules_apply
-  expect "$(cat "$TRACE")" '--force delete allow 80/tcp'
+  expect "$(cat "$TRACE")" $'--force delete allow 80/tcp\n--force delete allow 51820/udp'
   expect "$RESTORE_PARTIAL" 1
   expect "$(cat "$RESTORE_ROOT/fw_rules")" 'ufw limit 22/tcp'
   RUNTIME=inactive RESTORE_PARTIAL=0; : > "$TRACE"
@@ -701,6 +704,15 @@ printf 'PASS: SSH drop-in rollback (key-only and key-login switch) reloads sshd 
   expect "$(cat "$TMP/sysctl/trace")" 'kernel.dmesg_restrict=0'
   expect "$RESTORE_PARTIAL" 0
   [[ ! -e "$RESTORE_ROOT/sysctl_runtime" ]] || die 'a vanished interface left the sysctl rollback unfinished'
+  # TCP buffer keys hold three numbers; their own record is restored as a whole.
+  : > "$TMP/sysctl/trace"
+  restore_record_sysctl net.ipv4.tcp_rmem '4096 131072 6291456' tcp_sysctl_runtime
+  restore_record_sysctl net.core.rmem_max 212992 tcp_sysctl_runtime
+  if restore_record_sysctl net.ipv4.tcp_wmem '4096 16384 $(id)' tcp_sysctl_runtime; then die 'non-numeric buffer value recorded'; fi
+  restore_sysctl_runtime tcp_sysctl_runtime
+  expect "$(cat "$TMP/sysctl/trace")" $'net.ipv4.tcp_rmem=4096 131072 6291456\nnet.core.rmem_max=212992'
+  [[ ! -e "$RESTORE_ROOT/tcp_sysctl_runtime" ]] || die 'applied buffer originals kept'
+  expect "$RESTORE_PARTIAL" 0
 )
 
 # UFW IPv6 switch: tracked as a value and switched back with the real helper.

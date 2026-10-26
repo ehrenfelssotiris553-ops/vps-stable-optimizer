@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.5 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.6 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.5
+SCRIPT_VERSION=2.7.6
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -29,6 +29,8 @@ F2B_FILE=/etc/fail2ban/jail.d/99-vps-stable-sshd.local
 APT_FILE=/etc/apt/apt.conf.d/52-vps-stable-auto-upgrades
 APT_REBOOT_FILE=/etc/apt/apt.conf.d/53-vps-stable-auto-reboot
 SYSCTL_HARDENING_FILE=/etc/sysctl.d/98-vps-stable-hardening.conf
+# Larger socket buffer ceilings for fast long-distance flows (optional).
+TCP_BUFFER_FILE=/etc/sysctl.d/99-vps-stable-tcp.conf
 F2B_ACTION_FILE=/etc/fail2ban/action.d/vps-stable-ufw-sshd.conf
 # sshd keeps the FIRST value it reads; 01- sorts before cloud-init's 50- file.
 SSH_DROPIN=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
@@ -57,6 +59,7 @@ TZ_ASKED=0
 WEB_CHOICE=''
 F2B_IGNORE_CHOICE=''
 SYSCTL_CHOICE=''
+TCP_BUFFER_CHOICE=''
 AUTO_REBOOT_TIME=''
 KERNEL_CLEAN_CHOICE=''
 VNSTAT_CHOICE=''
@@ -67,7 +70,7 @@ case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|po
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V2.7.1 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+VPS 机器管家 V2.7.6 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps plan       给机器做体检（只检查）
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
@@ -565,8 +568,8 @@ setup_questions() {
   if [[ "${RECOMMENDED:-0}" == 1 ]]; then
     # Recommended set: low-risk items only. Everything else stays off and can
     # be turned on later from the single-item menu.
-    INSTALL_TOOLS=1 SYSCTL_CHOICE=1 VNSTAT_CHOICE=0 ZRAM_CHOICE=0 AUTO_REBOOT_TIME=''
-    KERNEL_CLEAN_CHOICE="$UPGRADE_APPROVED" HOSTS_CHOICE=1 TZ_CHOICE='' TZ_ASKED=1 F2B_IGNORE_CHOICE=none
+    INSTALL_TOOLS=1 SYSCTL_CHOICE=1 TCP_BUFFER_CHOICE=0 VNSTAT_CHOICE=0 ZRAM_CHOICE=0 AUTO_REBOOT_TIME=''
+    KERNEL_CLEAN_CHOICE="$UPGRADE_APPROVED" HOSTS_CHOICE=1 TZ_CHOICE='' TZ_ASKED=1
     echo '已按推荐设置记下：安装常用工具、启用内核网络安全参数、升级后清理旧内核、需要时修复主机名；时区保持不变。'
   else
     if confirm_yes "安装常用工具（${TOOLS_PACKAGES[*]}）吗？"; then INSTALL_TOOLS=1; fi
@@ -584,6 +587,7 @@ setup_questions() {
       if confirm_yes '没有 Swap：要配一个约 1/4 内存大小的 ZRAM 作为应急缓冲吗？（防止内存突然用尽时进程被杀）'; then ZRAM_CHOICE=1; else ZRAM_CHOICE=0; fi
     fi
     if confirm_default_yes '启用内核网络安全参数吗？（不接受 ICMP 重定向和源路由、开启 SYN Cookies 等；不影响代理和 Docker）'; then SYSCTL_CHOICE=1; else SYSCTL_CHOICE=0; fi
+    if confirm_yes "把 TCP 缓冲区上限加大到 $(($(tcp_buffer_max) / 1048576)) MiB 吗？（跨洲代理、远距离传大文件时单个连接更快；只提高上限，空闲连接不会多占内存）"; then TCP_BUFFER_CHOICE=1; else TCP_BUFFER_CHOICE=0; fi
     if ! hostname_resolves; then
       if confirm_default_yes "主机名 $(hostname) 无法解析（sudo 会提示 unable to resolve host）。在 /etc/hosts 里补上吗？"; then HOSTS_CHOICE=1; else HOSTS_CHOICE=0; fi
     fi
@@ -609,8 +613,10 @@ setup_questions() {
   if confirm_yes '防火墙同时放行网站端口 TCP 80、443 吗？（只做代理或跳板可以不开，以后可用端口管理再放行）'; then WEB_CHOICE=1; else WEB_CHOICE=0; fi
   F2B_IGNORE_CHOICE=none
   ip="${SSH_CONNECTION:-}"; ip="${ip%% *}"
-  if [[ "${RECOMMENDED:-0}" != 1 && -n "$ip" ]] && port_source_valid "$ip" &&
-     confirm_yes "把你当前的 IP $ip 加入 Fail2ban 白名单，避免输错几次就把自己封掉吗？（家庭宽带 IP 常会变化，换了就失效）"; then
+  # Asked in the recommended set too: a mistyped password must not lock the
+  # administrator out (bans start at one hour and double on repeat).
+  if [[ -n "$ip" ]] && port_source_valid "$ip" &&
+     confirm_default_yes "把你当前的 IP $ip 加入 Fail2ban 白名单，避免输错几次就把自己封掉吗？（家庭宽带 IP 常会变化，换了就失效）"; then
     F2B_IGNORE_CHOICE="$ip"
   fi
   echo
@@ -1369,6 +1375,67 @@ sysctl_hardening_stage() {
   else warn '部分内核参数没有生效，请查看日志。'; module_result sysctl failed 'sysctl -p failed'; fi
 }
 
+# Socket buffer ceiling by RAM. A fast long-distance single flow (a proxy
+# across continents) needs a window of bandwidth x round trip, e.g. 1 Gbit/s
+# x 200 ms = 25 MB, while the kernels of Debian 12/13 and Ubuntu 22.04/24.04
+# stop at 6 MiB (receive) and 4 MiB (send). Kernels from mid-2025 on allow
+# 32 MiB for receiving.
+tcp_buffer_max() {
+  if ((MEM_MIB < 1024)); then echo 16777216
+  elif ((MEM_MIB < 4096)); then echo 33554432
+  else echo 67108864; fi
+}
+
+# Only the maxima grow, never shrink: buffers are still allocated on demand and
+# the kernel's total TCP memory limit (tcp_mem) is left alone, so idle
+# connections cost nothing more. A key set in any other file keeps its value.
+tcp_buffer_stage() {
+  say '第7步（续）：TCP 缓冲区上限（可选）'
+  local max key current text='' min def top
+  local -a kept=() originals=()
+  if [[ "${TCP_BUFFER_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改 TCP 缓冲区。'; module_result tcp declined 'not requested'; return 0; fi
+  max="$(tcp_buffer_max)"
+  # Values read while the file is in force are not originals: re-apply only.
+  if [[ -e "$TCP_BUFFER_FILE" || -L "$TCP_BUFFER_FILE" ]]; then
+    if ! restore_file_ours tcp_file; then
+      warn "$TCP_BUFFER_FILE 已经存在，不是本工具上次写入的内容，保持不变。"; module_result tcp preserved 'file differs'; return 0
+    fi
+    top="$(awk '/ = / {print $NF}' "$TCP_BUFFER_FILE" | sort -n | tail -n 1)"
+    if sysctl -e -p "$TCP_BUFFER_FILE" >/dev/null; then
+      ok 'TCP 缓冲区上限已经是本工具的设置，已重新加载。'; module_result tcp applied "$((${top:-0} / 1048576)) MiB"
+    else warn 'TCP 缓冲区参数没有生效，请查看日志。'; module_result tcp failed 'sysctl -p failed'; fi
+    return 0
+  fi
+  for key in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+    read -r min def top <<< "$(sysctl -n "$key" 2>/dev/null || true)"
+    if sysctl_key_configured "$key" "$TCP_BUFFER_FILE"; then kept+=("$key"); continue; fi
+    if [[ "$key" == net.core.* ]]; then
+      [[ "$min" =~ ^[0-9]+$ && -z "$def" ]] || continue
+      ((min < max)) || continue
+      text+="$key = $max"$'\n'; current="$min"
+    else
+      [[ "$min" =~ ^[0-9]+$ && "$def" =~ ^[0-9]+$ && "$top" =~ ^[0-9]+$ ]] || continue
+      ((top < max)) || continue
+      text+="$key = $min $def $max"$'\n'; current="$min $def $top"
+    fi
+    originals+=("$key=$current")
+  done
+  if ((${#kept[@]})); then ok "已有其他配置的参数保持不变：${kept[*]}"; fi
+  if [[ -z "$text" ]]; then
+    if ((${#kept[@]} == 0)); then ok "TCP 缓冲区上限已经不小于 $((max / 1048576)) MiB，不用修改。"; fi
+    module_result tcp preserved 'already large enough or set elsewhere'; return 0
+  fi
+  if ! put_file "$TCP_BUFFER_FILE" "# VPS Stable Optimizer v2.7: larger socket buffer ceilings"$'\n'"${text%$'\n'}"; then
+    module_result tcp preserved 'sysctl file conflict'; return 0
+  fi
+  for key in "${originals[@]}"; do
+    restore_record_sysctl "${key%%=*}" "${key#*=}" tcp_sysctl_runtime || warn "无法记录 ${key%%=*} 的原值；回退后要重启才会恢复默认。"
+  done
+  if sysctl -e -p "$TCP_BUFFER_FILE" >/dev/null; then
+    ok "TCP 缓冲区上限已加大到 $((max / 1048576)) MiB（内存 ${MEM_MIB} MiB）。"; module_result tcp applied "$((max / 1048576)) MiB"
+  else warn 'TCP 缓冲区参数没有生效，请查看日志。'; module_result tcp failed 'sysctl -p failed'; fi
+}
+
 # Appends LINE to FILE; an unterminated last line is ended first, so the two
 # never merge into one.
 append_line_safely() {
@@ -1433,17 +1500,32 @@ f2b_bootstrap_text() {
     '[sshd]' 'enabled = false'
 }
 
+# Bans start at one hour and double for an address banned again (Fail2ban
+# 0.11+ looks up earlier bans in its database), up to one week. A mistyped
+# password costs the administrator an hour; persistent scanners stay out.
 f2b_jail_text() {
   printf '%s\n' '# VPS Stable Optimizer v2.6 managed SSH jail' \
     '[sshd]' 'enabled = true' "port = $1" 'backend = systemd' \
     'action = vps-stable-ufw-sshd[port="%(port)s"]' \
-    'maxretry = 5' 'findtime = 600' 'bantime = 43200'
+    'maxretry = 5' 'findtime = 600' 'bantime = 3600' \
+    'bantime.increment = true' 'bantime.maxtime = 604800'
   if [[ -n "${2:-}" ]]; then printf 'ignoreip = 127.0.0.1/8 ::1 %s\n' "$2"; fi
 }
 
-# The managed jail with or without an ignoreip line still belongs to this tool.
+# Up to 2.7.5 every ban lasted 12 hours. Such a jail is upgraded in place.
+f2b_jail_legacy_text() {
+  printf '%s\n' '# VPS Stable Optimizer v2.6 managed SSH jail' \
+    '[sshd]' 'enabled = true' "port = $1" 'backend = systemd' \
+    'action = vps-stable-ufw-sshd[port="%(port)s"]' \
+    'maxretry = 5' 'findtime = 600' 'bantime = 43200'
+}
+
+# The managed jail (current or earlier) with or without an ignoreip line
+# still belongs to this tool.
 f2b_jail_is_ours() {
-  [[ "$(grep -v '^ignoreip = ' <<< "$1")" == "$(f2b_jail_text "$2")" ]]
+  local body
+  body="$(grep -v '^ignoreip = ' <<< "$1" || true)"
+  [[ "$body" == "$(f2b_jail_text "$2")" || "$body" == "$(f2b_jail_legacy_text "$2")" ]]
 }
 
 # '' = ask now, none = no allowlist entry, otherwise the address to allow.
@@ -1453,7 +1535,7 @@ f2b_ignore_address() {
   case "${F2B_IGNORE_CHOICE:-}" in
     none) return 0 ;;
     '') [[ -n "$ip" ]] && port_source_valid "$ip" || return 0
-        confirm_yes "把你当前的 IP $ip 加入 Fail2ban 白名单，避免输错几次就把自己封掉吗？（家庭宽带 IP 常会变化，换了就失效）" || return 0
+        confirm_default_yes "把你当前的 IP $ip 加入 Fail2ban 白名单，避免输错几次就把自己封掉吗？（家庭宽带 IP 常会变化，换了就失效）" || return 0
         printf '%s\n' "$ip" ;;
     *) port_source_valid "$F2B_IGNORE_CHOICE" && printf '%s\n' "$F2B_IGNORE_CHOICE" ;;
   esac
@@ -1525,7 +1607,7 @@ fail2ban_stage() {
   fi
   # Every early return below leaves Fail2ban unconfigured.
   module_result fail2ban failed 'setup incomplete; see run log'
-  local joined guard jail action current='' transitioned=0 pkg
+  local joined guard jail action current='' previous='' ignore='' pkg
   local needed=()
   joined="$(IFS=,; echo "${SSH_PORTS[*]}")"
   guard="$(f2b_bootstrap_text)"
@@ -1540,8 +1622,10 @@ fail2ban_stage() {
       module_result fail2ban preserved 'jail file differs'; return 0
     fi
   fi
-  # An existing managed jail keeps its allowlist choice.
-  if [[ -n "$current" && "$current" != "$guard" ]]; then jail="$current"
+  # An existing managed jail keeps its allowlist line (also when an earlier
+  # version's jail is upgraded); without one, the allowlist choice applies.
+  if [[ "$current" != "$guard" ]]; then ignore="$(grep '^ignoreip = ' <<< "$current" || true)"; fi
+  if [[ -n "$ignore" ]]; then jail="$(f2b_jail_text "$joined")"$'\n'"$ignore"
   else jail="$(f2b_jail_text "$joined" "$(f2b_ignore_address)")"; fi
   for pkg in fail2ban python3-systemd; do
     installed "$pkg" && continue
@@ -1570,19 +1654,20 @@ fail2ban_stage() {
   if foreign_f2b_config; then
     warn '安装过程中出现了其他 Fail2ban 配置，保持不变，规则保持停用。'; return 0
   fi
-  if [[ "$current" == "$guard" ]]; then
-    if ! f2b_replace_owned_file "$F2B_FILE" "$guard" "$jail"; then
+  # The disabled guard, or an earlier version's jail, becomes the current jail.
+  if [[ "$current" != "$jail" ]]; then
+    if ! f2b_replace_owned_file "$F2B_FILE" "$current" "$jail"; then
       warn '规则文件在安装时被改动，没有替换。'; return 0
     fi
-    transitioned=1
+    previous="$current"
   fi
   if [[ -L "$F2B_FILE" || "$(cat "$F2B_FILE" 2>/dev/null)" != "$jail" ||
         -L "$F2B_ACTION_FILE" || "$(cat "$F2B_ACTION_FILE" 2>/dev/null)" != "$action" ]]; then
     warn 'Fail2ban 配置在设置过程中被改动，不启动服务。'; return 0
   fi
   if ! fail2ban-client -t; then
-    if ((transitioned)); then
-      f2b_replace_owned_file "$F2B_FILE" "$jail" "$guard" || warn '无法恢复停用状态的规则文件，重启前请检查。'
+    if [[ -n "$previous" ]]; then
+      f2b_replace_owned_file "$F2B_FILE" "$jail" "$previous" || warn '无法恢复原来的规则文件，重启前请检查。'
     fi
     warn 'Fail2ban 配置检查没通过，不启用服务。'; return 0
   fi
@@ -1593,7 +1678,7 @@ fail2ban_stage() {
     if ! systemctl start fail2ban; then warn '无法启动 Fail2ban。'; return 0; fi
   fi
   if f2b_jail_ready; then
-    ok "Fail2ban 已就绪：只封禁 SSH 端口 $joined 的 TCP 连接，每次封 12 小时。"
+    ok "Fail2ban 已就绪：只封禁 SSH 端口 $joined 的 TCP 连接；首次封 1 小时，同一 IP 再犯时间加倍，最长 7 天。"
     module_result fail2ban applied "sshd jail on $joined"
   else
     warn 'Fail2ban 已启动，但 SSH 规则没有加载，请查看状态和日志。'
@@ -1604,11 +1689,11 @@ fail2ban_stage() {
 # Only `ufw add`-style rules this tool created are recorded; rollback deletes
 # exactly those and never touches later port rules or Fail2ban bans.
 ufw_rule() {
-  local verb="$1" port="$2" expected rules
-  expected="ufw $verb $port/tcp"
+  local verb="$1" port="$2" proto="${3:-tcp}" expected rules
+  expected="ufw $verb $port/$proto"
   rules="$(ufw show added)" || return 1
   grep -Fxq "$expected" <<< "$rules" && return 0
-  ufw "$verb" "$port/tcp" || return 1
+  ufw "$verb" "$port/$proto" || return 1
   if declare -F restore_record_fw_rule >/dev/null; then
     restore_record_fw_rule "$expected" || warn "无法记录规则 $expected，回退时它会被保留。"
   fi
@@ -1753,6 +1838,36 @@ docker_firewall_note() {
   echo '对策：只在本机使用的容器端口绑定到 127.0.0.1（例如 -p 127.0.0.1:8080:80）；需要对外的，在服务商安全组限制来源，或使用 DOCKER-USER 链（例如 ufw-docker）。'
 }
 
+# Services reachable from outside right now that turning UFW on would block,
+# one "port/proto<TAB>program" per line (IPv4 and IPv6 may repeat: sort -u).
+# Left out: SSH, TCP 80/443 (the web-port question decides those), ports a
+# stored rule already mentions (also source-limited ones, which must stay
+# limited), loopback and link-local listeners, Docker's published ports
+# (they bypass UFW anyway) and system helpers that should not face the
+# internet (LLMNR/mDNS, DHCP, rpcbind, time sync, libvirt's dnsmasq).
+firewall_blocked_listeners() {
+  local rules netid local_addr proc port addr p skip
+  command -v ss >/dev/null || return 0
+  rules="$(ufw show added 2>/dev/null || true)"
+  while read -r netid _ _ _ local_addr _ proc; do
+    [[ "$netid" == tcp || "$netid" == udp ]] || continue
+    port="${local_addr##*:}"; addr="${local_addr%:*}"
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || continue
+    case "$addr" in 127.*|'[::1]'|::1|*%lo|'[::ffff:127.'*|'[fe80:'*|fe80:*) continue ;; esac
+    proc="$(sed -n 's/^users:(("\([^"]*\)".*/\1/p' <<< "${proc:-}")"
+    case "$proc" in
+      sshd|systemd-resolve*|systemd-network*|systemd-timesyn*|dhclient|dhcpcd|avahi-daemon|rpcbind|rpc.statd|chronyd|ntpd|cupsd|docker-proxy|dnsmasq|NetworkManager) continue ;;
+    esac
+    skip=0
+    if [[ "$netid" == tcp ]]; then
+      for p in "${SSH_PORTS[@]}"; do if [[ "$p" == "$port" ]]; then skip=1; fi; done
+      if [[ "$port" == 80 || "$port" == 443 ]]; then skip=1; fi
+    fi
+    if grep -Eq "^ufw (allow|limit) (.* )?${port}(/${netid})?( .*)?$" <<< "$rules"; then skip=1; fi
+    if ((skip == 0)); then printf '%s/%s\t%s\n' "$port" "$netid" "$proc"; fi
+  done < <(ss -H -lntup 2>/dev/null || true)
+}
+
 host_has_global_ipv6() {
   command -v ip >/dev/null && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
 }
@@ -1822,7 +1937,8 @@ firewall_stage() {
   say '第14步：防火墙（需要新 SSH 窗口确认）'
   FIREWALL_READY=0
   command -v ufw >/dev/null || { warn '还没有安装 ufw，请先运行一键开荒。'; module_result firewall skipped 'ufw missing'; return 0; }
-  local state rules p ip unit deadline since ssh_verb=limit web=0
+  local state rules p ip unit deadline since ssh_verb=limit web=0 line
+  local -a listeners=() extra=()
   if ! state="$(ufw status 2>/dev/null)"; then
     warn '无法确定防火墙状态，跳过。'; module_result firewall failed 'UFW state unknown'; return 0
   fi
@@ -1878,6 +1994,19 @@ firewall_stage() {
   fi
   if web_ports_wanted '同时放行网站端口 TCP 80、443 吗？（只做代理或跳板可以不开）'; then web=1; fi
   docker_firewall_note
+  mapfile -t listeners < <(firewall_blocked_listeners | sort -u)
+  if ((${#listeners[@]})); then
+    warn '下面这些服务现在能从外网访问，开启防火墙后会被挡住：'
+    for line in "${listeners[@]}"; do
+      p="${line#*$'\t'}"
+      printf '  %-12s %s\n' "${line%%$'\t'*}" "${p:-（程序未知）}"
+    done
+    if confirm_default_yes '一并放行这些端口，让它们照常能访问吗？（不认识或只在本机用的，输入 n）'; then
+      for line in "${listeners[@]}"; do extra+=("${line%%$'\t'*}"); done
+    else
+      ok '这些端口不放行；以后需要时可用「端口管理」放行。'
+    fi
+  fi
   echo '其他入站默认拒绝；以后需要的端口可用菜单里的「端口管理」放行。'
   echo '请确保商家 Console/VNC/救援可用，并保留原 SSH 窗口。'
   if ! confirm_yes '已确认服务商的控制台（Console/VNC）可以登录，正式开启防火墙吗？'; then
@@ -1889,11 +2018,15 @@ firewall_stage() {
   ufw_ipv6_check
   for p in "${SSH_PORTS[@]}"; do ufw_rule "$ssh_verb" "$p"; done
   if ((web)); then ufw_rule allow 80; ufw_rule allow 443; fi
+  for p in "${extra[@]}"; do
+    ufw_rule allow "${p%/*}" "${p#*/}" || warn "放行 $p 失败，开启后它会被挡住。"
+  done
   # Rules stored while IPV6=no exist for IPv4 only; re-adding lets UFW add the
   # missing IPv6 copies (it skips the existing IPv4 ones).
   if ((IPV6_FLIPPED)); then
     for p in "${SSH_PORTS[@]}"; do ufw "$ssh_verb" "$p/tcp" >/dev/null; done
     if ((web)); then ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; fi
+    for p in "${extra[@]}"; do ufw allow "$p" >/dev/null || true; done
   fi
   ufw default deny incoming
   ufw default allow outgoing
@@ -3048,7 +3181,7 @@ backup_configs() {
   backup_config_group /etc/apt/sources.list.d '*.list' '*.sources'
   backup_config_group /etc/apt/apt.conf.d '*'
   backup_config_group /etc/fail2ban/jail.d '*.conf' '*.local'
-  sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc > "$RUN_BACKUP_DIR/runtime-sysctl.txt" 2>&1 || true
+  sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem > "$RUN_BACKUP_DIR/runtime-sysctl.txt" 2>&1 || true
   if command -v ufw >/dev/null; then
     ufw status verbose > "$RUN_BACKUP_DIR/runtime-ufw.txt" 2>&1 || true
     ufw show added > "$RUN_BACKUP_DIR/stored-ufw-rules.txt" 2>&1 || true
@@ -3468,6 +3601,8 @@ decision_report() {
   fi
   if ( foreign_f2b_config ) >/dev/null 2>&1; then
     decision_line '保留现状' 'SSH 防爆破' '已有其他 Fail2ban 管理配置，保留并提示，不接管。'
+  elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && grep -Fxq 'bantime = 43200' "$F2B_FILE" && grep -Fq 'vps-stable-ufw-sshd' "$F2B_FILE"; then
+    decision_line '准备调整' 'SSH 防爆破' '本工具旧版的 Fail2ban 规则每次封 12 小时：改为首次 1 小时、同一 IP 再犯加倍（最长 7 天），白名单保持不变。'
   elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && active fail2ban; then
     decision_line '保留现状' 'SSH 防爆破' '本工具的 Fail2ban 规则已经在运行，执行时仍会核验。'
   else
@@ -3712,6 +3847,7 @@ restore_ids() {
     autoreboot) printf '%s\n' apt_reboot_file ;;
     timezone) printf '%s\n' tz ;;
     sysctl) printf '%s\n' sysctl_file ;;
+    tcp) printf '%s\n' tcp_file ;;
     hosts) printf '%s\n' hosts_file ;;
     ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     firewall) printf '%s\n' ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw ;;
@@ -3721,7 +3857,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file zram_file zram_swap zram_sysctl_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
 }
 
 restore_label() {
@@ -3738,6 +3874,7 @@ restore_label() {
     ufw_runtime) echo '防火墙开关' ;; svc_ufw) echo '防火墙服务' ;;
     f2b_jail) echo 'Fail2ban SSH 规则' ;; f2b_action) echo 'Fail2ban 封禁动作' ;;
     svc_fail2ban) echo 'Fail2ban 服务' ;; sysctl_file) echo '内核网络安全参数' ;;
+    tcp_file) echo 'TCP 缓冲区上限' ;;
     apt_reboot_file) echo '自动更新的重启时间' ;; hosts_file) echo '/etc/hosts 主机名' ;;
     ufw_ipv6) echo '防火墙 IPv6 防护开关' ;; *) printf '%s\n' "$1" ;;
   esac
@@ -3754,6 +3891,7 @@ restore_path() {
     ssh_dropin) printf '%s\n' "$SSH_DROPIN" ;;
     ssh_pubkey_dropin) printf '%s\n' "$SSH_PUBKEY_DROPIN" ;;
     sysctl_file) printf '%s\n' "$SYSCTL_HARDENING_FILE" ;;
+    tcp_file) printf '%s\n' "$TCP_BUFFER_FILE" ;;
     apt_reboot_file) printf '%s\n' "$APT_REBOOT_FILE" ;;
     hosts_file) echo /etc/hosts ;;
     *) return 1 ;;
@@ -3935,18 +4073,19 @@ restore_record_packages() {
 restore_record_fw_rule() {
   local rule="$1" file="$RESTORE_ROOT/fw_rules"
   [[ "$RESTORE_READY" == 1 ]] || return 0
-  [[ "$rule" =~ ^ufw\ (allow|limit)\ [0-9]{1,5}/tcp$ ]] || return 1
+  [[ "$rule" =~ ^ufw\ (allow|limit)\ [0-9]{1,5}/(tcp|udp)$ ]] || return 1
   [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
   if [[ -f "$file" ]] && grep -Fxq -- "$rule" "$file"; then return 0; fi
   printf '%s\n' "$rule" >> "$file" && chmod 600 -- "$file"
 }
 
 # Running sysctl values before this tool first changed them (first value wins).
-# NAME is the record (sysctl_runtime for the hardening, zram_sysctl_runtime for ZRAM).
+# NAME is the record (sysctl_runtime for the hardening, zram_sysctl_runtime for
+# ZRAM, tcp_sysctl_runtime for the buffers). tcp_rmem holds three numbers.
 restore_record_sysctl() {
   local key="$1" value="$2" file="$RESTORE_ROOT/${3:-sysctl_runtime}"
   [[ "$RESTORE_READY" == 1 ]] || return 0
-  [[ "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ && "$value" =~ ^-?[0-9]+$ ]] || return 1
+  [[ "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ && "$value" =~ ^-?[0-9]+(\ [0-9]+)*$ ]] || return 1
   [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
   if [[ -f "$file" ]] && awk -F= -v k="$key" '$1 == k {found = 1} END {exit !found}' "$file"; then return 0; fi
   printf '%s=%s\n' "$key" "$value" >> "$file" && chmod 600 -- "$file"
@@ -3960,7 +4099,7 @@ restore_sysctl_runtime() {
   restore_data_safe "$file" || { warn '内核参数原值记录不安全，跳过。'; RESTORE_PARTIAL=1; return 0; }
   while IFS= read -r line; do
     key="${line%%=*}"; value="${line#*=}"
-    if [[ ! "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ || ! "$value" =~ ^-?[0-9]+$ ]]; then warn "忽略格式异常的记录：$line"; failed=1; continue; fi
+    if [[ ! "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ || ! "$value" =~ ^-?[0-9]+(\ [0-9]+)*$ ]]; then warn "忽略格式异常的记录：$line"; failed=1; continue; fi
     if [[ "$key" =~ ^net\.ipv6\.conf\.([^.]+)\.accept_redirects$ && "${BASH_REMATCH[1]}" != all && "${BASH_REMATCH[1]}" != default &&
           ! -d "/proc/sys/net/ipv6/conf/${BASH_REMATCH[1]}" ]]; then continue; fi
     sysctl -w "$key=$value" >/dev/null || { warn "无法恢复 $key=$value"; failed=1; }
@@ -4265,7 +4404,7 @@ restore_fail2ban_group() {
 # Deletes exactly the rules this tool added. While UFW stays on, an SSH
 # allowance is never removed, so rollback cannot lock the session out.
 restore_fw_rules_apply() {
-  local file="$RESTORE_ROOT/fw_rules" rule verb port current ufw_on=0 ssh_ports temp
+  local file="$RESTORE_ROOT/fw_rules" rule verb port proto current ufw_on=0 ssh_ports temp
   local -a remaining=()
   [[ -e "$file" || -L "$file" ]] || return 0
   restore_data_safe "$file" || { warn '防火墙规则记录不安全，已跳过。'; RESTORE_PARTIAL=1; return 0; }
@@ -4275,15 +4414,15 @@ restore_fw_rules_apply() {
   ssh_ports=" 22 $(ssh_candidates | sort -n -u | tr '\n' ' ') "
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    if [[ ! "$rule" =~ ^ufw\ (allow|limit)\ ([0-9]{1,5})/tcp$ ]]; then
+    if [[ ! "$rule" =~ ^ufw\ (allow|limit)\ ([0-9]{1,5})/(tcp|udp)$ ]]; then
       warn "忽略格式异常的规则记录：$rule"; RESTORE_PARTIAL=1; continue
     fi
-    verb="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    verb="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; proto="${BASH_REMATCH[3]}"
     if ! grep -Fxq -- "$rule" <<< "$current"; then ok "规则已不存在：$rule"; continue; fi
-    if ((ufw_on)) && [[ "$ssh_ports" == *" $port "* ]]; then
+    if ((ufw_on)) && [[ "$proto" == tcp && "$ssh_ports" == *" $port "* ]]; then
       warn "防火墙仍处于开启状态，保留 SSH 端口规则：$rule"; remaining+=("$rule"); RESTORE_PARTIAL=1; continue
     fi
-    if ufw --force delete "$verb" "$port/tcp" >/dev/null; then ok "已删除本工具添加的规则：$rule"
+    if ufw --force delete "$verb" "$port/$proto" >/dev/null; then ok "已删除本工具添加的规则：$rule"
     else warn "删除规则失败：$rule"; remaining+=("$rule"); RESTORE_PARTIAL=1; fi
   done < "$file"
   if ((${#remaining[@]})); then
@@ -4489,14 +4628,15 @@ restore_packages_record() {
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
 restore_groups() {
-  printf '%s\n' fail2ban firewall ssh zram bbr sysctl journal updates autoreboot ntp trim timezone hosts
+  printf '%s\n' fail2ban firewall ssh zram bbr sysctl tcp journal updates autoreboot ntp trim timezone hosts
 }
 
 restore_group_label() {
   case "$1" in
     firewall) echo '防火墙（本工具加的规则、默认策略、开关）' ;; fail2ban) echo 'Fail2ban 防爆破' ;;
     ssh) echo 'SSH 登录加固（恢复密码和 root 登录）' ;; zram) echo 'ZRAM 内存缓冲' ;;
-    bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; journal) echo '日志空间限制' ;;
+    bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; tcp) echo 'TCP 缓冲区上限' ;;
+    journal) echo '日志空间限制' ;;
     updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
     trim) echo '定期 TRIM' ;; timezone) echo '时区' ;; hosts) echo '/etc/hosts 主机名' ;;
     *) printf '%s\n' "$1" ;;
@@ -4511,6 +4651,7 @@ restore_group_ids() {
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
+    tcp) printf '%s\n' tcp_file ;;
     journal) printf '%s\n' journal_file ;;
     updates) printf '%s\n' apt_auto_file apt_file svc_apt_daily svc_apt_upgrade ;;
     autoreboot) printf '%s\n' apt_reboot_file ;;
@@ -4533,6 +4674,7 @@ restore_group_pending() {
   case "$group" in
     firewall) [[ -s "$RESTORE_ROOT/fw_rules" ]] && return 0 ;;
     sysctl) [[ -s "$RESTORE_ROOT/sysctl_runtime" ]] && return 0 ;;
+    tcp) [[ -s "$RESTORE_ROOT/tcp_sysctl_runtime" ]] && return 0 ;;
     zram) [[ -s "$RESTORE_ROOT/zram_sysctl_runtime" ]] && return 0 ;;
   esac
   return 1
@@ -4550,6 +4692,9 @@ restore_group_apply() {
     sysctl)
       restore_resource sysctl_file
       if [[ "$(restore_read sysctl_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime; fi ;;
+    tcp)
+      restore_resource tcp_file
+      if [[ "$(restore_read tcp_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime tcp_sysctl_runtime; fi ;;
     journal)
       # "applied" while already at the original: an earlier journald restart failed.
       pending=0
@@ -4967,6 +5112,17 @@ check_sysctl() {
   else verify_set pass "已生效（$1）"; fi
 }
 
+check_tcp() {
+  local line bad='' missing=''
+  [[ -f "$TCP_BUFFER_FILE" ]] || { verify_set fail "配置文件不在了：$TCP_BUFFER_FILE"; return 0; }
+  while IFS= read -r line; do
+    case "$line" in 'bad '*) bad+=" ${line#bad }" ;; 'missing '*) missing+=" ${line#missing }" ;; esac
+  done < <(sysctl_file_mismatch "$TCP_BUFFER_FILE")
+  if [[ -n "$bad" ]]; then verify_set fail "这些参数的当前值和配置不一致：${bad# }"
+  elif [[ -n "$missing" ]]; then verify_set unknown "其余已生效；这些参数读不到，无法确认：${missing# }"
+  else verify_set pass "已生效（上限 $1）"; fi
+}
+
 check_autoreboot() {
   local dump
   dump="$(apt-config dump 2>/dev/null || true)"
@@ -5052,6 +5208,7 @@ verify_summary() {
   verify_kernel
   verify_module bbr 'BBR 网络优化' check_bbr
   verify_module sysctl '内核网络安全参数' check_sysctl
+  verify_module tcp 'TCP 缓冲区上限' check_tcp
   verify_module zram 'ZRAM 内存缓冲' check_zram
   verify_module ntp '时间同步' check_ntp
   verify_module journal '日志限制' check_journal
@@ -5519,7 +5676,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports
+  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp
 }
 
 item_label() {
@@ -5529,6 +5686,7 @@ item_label() {
     journal) echo '日志空间限制' ;; trim) echo '定期 TRIM' ;; ntp) echo '时间同步' ;; timezone) echo '时区' ;;
     hosts) echo '主机名解析' ;; tools) echo '常用工具' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
+    tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -5551,6 +5709,9 @@ item_status() {
       value="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
       if [[ "$value" == bbr ]]; then echo '已开启'; else echo "未开启（当前 ${value:-未知}）"; fi ;;
     sysctl) if [[ -f "$SYSCTL_HARDENING_FILE" ]]; then echo '已开启'; else echo '未开启'; fi ;;
+    tcp)
+      value="$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{printf "%d", $3 / 1048576}' || true)"
+      if [[ -f "$TCP_BUFFER_FILE" ]]; then echo "已开启（接收上限 ${value:-?} MiB）"; else echo "未开启（系统接收上限 ${value:-?} MiB）"; fi ;;
     zram)
       value="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
       if [[ -n "$value" ]]; then echo "已开启，约 ${value} MiB"
@@ -5626,6 +5787,8 @@ item_turn_on() {
     bbr) stage_run bbr bbr_stage ;;
     sysctl) SYSCTL_CHOICE=1
       stage_run sysctl sysctl_hardening_stage ;;
+    tcp) TCP_BUFFER_CHOICE=1
+      stage_run tcp tcp_buffer_stage ;;
     zram) ZRAM_CHOICE=1
       # Without the kernel module the stage only explains why: no index update.
       if zram_module_available; then apt_index_ready || return 0; fi
@@ -5894,8 +6057,16 @@ f2b_ban_events() {
     }' | tail -n "$limit"
 }
 
+# Whole days, hours or minutes for a ban length in seconds.
+f2b_duration_text() {
+  local s="$1"
+  if ((s >= 86400 && s % 86400 == 0)); then printf '%s 天' "$((s / 86400))"
+  elif ((s >= 3600)); then printf '%s 小时' "$((s / 3600))"
+  else printf '%s 分钟' "$((s / 60))"; fi
+}
+
 bans_main() {
-  local status failed banned total list bantime times ignore me ip line
+  local status failed banned total list bantime increment maxtime times ignore me ip line
   [[ $EUID -eq 0 ]] || die '查看封禁记录需要 root：请用 sudo vps bans。'
   say 'Fail2ban 封禁记录'
   if ! command -v fail2ban-client >/dev/null || ! active fail2ban; then
@@ -5910,9 +6081,14 @@ bans_main() {
   # IPv6 addresses contain ":", so the list is cut after its label instead.
   list="$(awk '/Banned IP list:/ {sub(/^.*Banned IP list:[ \t]*/, ""); print}' <<< "$status")"
   bantime="$(fail2ban-client get sshd bantime 2>/dev/null || true)"
+  increment="$(fail2ban-client get sshd bantime.increment 2>/dev/null || true)"
+  maxtime="$(fail2ban-client get sshd bantime.maxtime 2>/dev/null || true)"
   printf '正在封禁：%s 个 IP' "${banned:-0}"
-  if [[ "$bantime" =~ ^[0-9]+$ ]] && ((bantime >= 3600)); then printf '（每次封 %s 小时）' "$((bantime / 3600))"
-  elif [[ "$bantime" =~ ^[0-9]+$ ]]; then printf '（每次封 %s 分钟）' "$((bantime / 60))"; fi
+  if [[ "$bantime" =~ ^[0-9]+$ && "$increment" =~ ^[Tt]rue$ ]]; then
+    printf '（首次封 %s，同一 IP 再犯时间加倍' "$(f2b_duration_text "$bantime")"
+    if [[ "$maxtime" =~ ^[0-9]+$ ]]; then printf '，最长 %s' "$(f2b_duration_text "$maxtime")"; fi
+    printf '）'
+  elif [[ "$bantime" =~ ^[0-9]+$ ]]; then printf '（每次封 %s）' "$(f2b_duration_text "$bantime")"; fi
   printf '\nFail2ban 这次启动以来：识别出 %s 次失败登录，封禁过 %s 次。\n' "${failed:-0}" "${total:-0}"
   if [[ -n "$list" ]]; then
     echo '当前被封禁的 IP：'
@@ -6010,6 +6186,7 @@ main() {
     stage_run apt_upgrade apt_upgrade_stage
     stage_run bbr bbr_stage
     stage_run sysctl sysctl_hardening_stage
+    stage_run tcp tcp_buffer_stage
     stage_run journal journal_stage
     stage_run trim trim_stage
     stage_run updates updates_stage

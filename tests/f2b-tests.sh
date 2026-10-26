@@ -5,7 +5,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test-common.sh
 source "$HERE/test-common.sh"
-load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_replace_owned_file f2b_jail_ready fail2ban_stage
+load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_replace_owned_file f2b_jail_ready fail2ban_stage
 # Backup policy is exercised by backup-tests.sh and entry-tests.sh. This test
 # replaces only that dependency while testing the actual Fail2ban transition.
 backup_config_path() { :; }
@@ -25,7 +25,10 @@ new_case() {
   F2B_ACTION_FILE="$F2B_DIR/action.d/vps-stable-ufw-sshd.conf"
   : > "$CASE_DIR/conffiles"; : > "$CASE_DIR/events"; : > "$CASE_DIR/ok"; : > "$CASE_DIR/warn"; : > "$CASE_DIR/results"
   FIREWALL_READY=1 UFW_ACTIVE=1 SSH_OK=1 PKG_FAIL2BAN=0 PKG_SYSTEMD=0 SERVICE_ACTIVE=0 TEST_STATUS=0 JAIL_STATUS=0
+  EXPECT_JAIL="$(f2b_jail_text '22,2222')" F2B_IGNORE_CHOICE='' ALLOW_YES=0 SSH_CONNECTION=''
 }
+# The allowlist question (only when a jail has no allowlist line yet).
+confirm_default_yes() { printf 'ask\n' >> "$CASE_DIR/events"; ((ALLOW_YES)); }
 default_file() {
   local file="$1" text="$2" checksum
   printf '%s\n' "$text" > "$file"
@@ -67,7 +70,7 @@ fail2ban-client() {
   case "$*" in
     -t)
       printf 'test\n' >> "$CASE_DIR/events"
-      [[ "$(cat "$F2B_FILE")" == "$(f2b_jail_text '22,2222')" ]] || fail 'testing unexpected jail'
+      [[ "$(cat "$F2B_FILE")" == "$EXPECT_JAIL" ]] || fail 'testing unexpected jail'
       return "$TEST_STATUS";;
     'status sshd') printf 'status\n' >> "$CASE_DIR/events"
       # Status runs inside $(...): the remaining slow answers live in a file.
@@ -161,5 +164,39 @@ fail2ban_stage
 [[ "$(head -n 2 "$CASE_DIR/events" | tr '\n' ' ')" == 'refresh install:guard ' ]] || fail "package index not refreshed first: $(tr '\n' ' ' < "$CASE_DIR/events")"
 grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'Fail2ban not configured after refreshing the index'
 passed 'an empty package index is refreshed before Fail2ban is reported missing'
+
+# Upgraded from 2.7.5: its fixed 12-hour jail becomes the incremental one
+# (first ban 1 hour, doubled on repeat, at most a week), keeps its allowlist
+# line without asking again, and Fail2ban is restarted with it.
+new_case legacy_upgrade
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 SSH_CONNECTION='203.0.113.50 50000 192.0.2.1 22'
+{ f2b_jail_legacy_text '22,2222'; printf 'ignoreip = 127.0.0.1/8 ::1 203.0.113.9\n'; } > "$F2B_FILE"
+EXPECT_JAIL="$(f2b_jail_text '22,2222' 203.0.113.9)"
+fail2ban_stage
+[[ "$(cat "$F2B_FILE")" == "$EXPECT_JAIL" ]] || fail "earlier jail not upgraded: $(cat "$F2B_FILE")"
+grep -Fxq 'bantime.increment = true' "$F2B_FILE" || fail 'incremental bans missing'
+grep -Fxq 'bantime = 3600' "$F2B_FILE" || fail 'first ban is not one hour'
+[[ "$(cat "$CASE_DIR/events")" == $'test\nenable\nrestart\nstatus' ]] || fail "upgrade sequence: $(tr '\n' ' ' < "$CASE_DIR/events")"
+grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'upgraded jail not recorded as applied'
+passed 'an earlier fixed-ban jail is upgraded in place and keeps its allowlist'
+
+# An earlier jail without an allowlist: the question is asked now (Enter = yes).
+new_case legacy_upgrade_allowlist
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 SSH_CONNECTION='203.0.113.50 50000 192.0.2.1 22' ALLOW_YES=1
+f2b_jail_legacy_text '22,2222' > "$F2B_FILE"
+EXPECT_JAIL="$(f2b_jail_text '22,2222' 203.0.113.50)"
+fail2ban_stage
+[[ "$(cat "$F2B_FILE")" == "$EXPECT_JAIL" ]] || fail "allowlist answer not applied on upgrade: $(cat "$F2B_FILE")"
+passed 'upgrading a jail without allowlist asks for the current address'
+
+# A failed configuration test puts the earlier jail back.
+new_case legacy_upgrade_bad_test
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 TEST_STATUS=1 F2B_IGNORE_CHOICE=none
+f2b_jail_legacy_text '22,2222' > "$F2B_FILE"
+legacy="$(cat "$F2B_FILE")"
+fail2ban_stage
+[[ "$(cat "$F2B_FILE")" == "$legacy" ]] || fail 'failed test did not restore the earlier jail'
+[[ "$(cat "$CASE_DIR/events")" == 'test' ]] || fail 'service restarted after a failed test'
+passed 'a failed test after the upgrade restores the earlier jail'
 
 printf '%s Fail2ban mock cases passed.\n' "$PASS"
