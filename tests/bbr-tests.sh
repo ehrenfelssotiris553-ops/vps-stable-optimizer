@@ -7,7 +7,7 @@ set -Eeuo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 HERE="$PWD"
 source ./test-common.sh
-load_optimizer_functions sysctl_vendor_default sysctl_config_files bbr_config_conflict bbr_stage bbr_report sysctl_boot_value bbr_set_elsewhere
+load_optimizer_functions sysctl_vendor_default sysctl_config_files bbr_config_conflict bbr_stage bbr_report sysctl_boot_value bbr_set_elsewhere conffile_unchanged
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 BBR_FILE="$TEST_ROOT/99-vps-stable-bbr.conf"
@@ -61,6 +61,28 @@ if bbr_config_conflict "$TEST_ROOT/vendor/50-default.conf"; then fail 'distribut
 cp "$TEST_ROOT/vendor/50-default.conf" "$TEST_ROOT/admin.conf"
 bbr_config_conflict "$TEST_ROOT/admin.conf" || fail 'the same line from an administrator file no longer blocks BBR'
 eval "$(declare -f real_vendor_default | sed '1s/real_vendor_default/sysctl_vendor_default/')"
+
+# Found on a real Ubuntu 24.04 VPS: procps ships the fq_codel line as
+# /etc/sysctl.d/10-bufferbloat.conf, and BBR was skipped as "already set".
+# An unchanged packaged file is a distribution default; an edited one is not.
+(
+  PKG_SUM=421a31e1c9eff34f39986fe122d9a583 FILE_SUM=421a31e1c9eff34f39986fe122d9a583
+  dpkg-query() {
+    case "$1" in
+      -S) [[ "$3" == /etc/sysctl.d/10-bufferbloat.conf ]] || return 1; echo 'procps: /etc/sysctl.d/10-bufferbloat.conf' ;;
+      -W) printf ' /etc/sysctl.conf 72b7c827a9636cda7b3b371091ff2dce\n /etc/sysctl.d/10-bufferbloat.conf %s\n' "$PKG_SUM" ;;
+      *) return 1 ;;
+    esac
+  }
+  md5sum() { printf '%s  %s\n' "$FILE_SUM" "$2"; }
+  sysctl_vendor_default /etc/sysctl.d/10-bufferbloat.conf || fail 'unchanged Ubuntu 24.04 bufferbloat default treated as administrator policy'
+  FILE_SUM=00000000000000000000000000000000
+  if sysctl_vendor_default /etc/sysctl.d/10-bufferbloat.conf; then fail 'an edited packaged file treated as a distribution default'; fi
+  FILE_SUM="$PKG_SUM"
+  if sysctl_vendor_default /etc/sysctl.d/10-local.conf; then fail 'a file no package owns treated as a default'; fi
+  dpkg-query() { case "$1" in -S) echo 'a, b: /etc/sysctl.d/10-bufferbloat.conf' ;; *) printf ' /etc/sysctl.d/10-bufferbloat.conf %s\n' "$PKG_SUM" ;; esac; }
+  if sysctl_vendor_default /etc/sysctl.d/10-bufferbloat.conf; then fail 'a file of several packages treated as a default'; fi
+)
 
 # The value systemd-sysctl sets at the next boot: name order, last assignment
 # wins, an /etc name masks the same name further down, /run and an unlinked

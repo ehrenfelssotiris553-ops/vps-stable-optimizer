@@ -97,6 +97,7 @@ passwd() {
   else printf '%s P 2026-01-01 0 99999 7 -1\n' "$2"; fi
 }
 ss() { [[ "$*" == '-H -lntup' ]] || fail 'unexpected socket call'; printf 'tcp LISTEN 0 128 [::]:443 [::]:*\n'; }
+# shellcheck disable=SC2329 # called by security_audit, then replaced below
 ip() {
   case "$*" in
     '-br -4 address show') printf 'eth0 UP 192.0.2.1/24\n' ;;
@@ -130,6 +131,27 @@ out="$(security_audit)"
 assert_has "$out" 'sshd -t 未通过或权限不足'
 assert_has "$out" 'sshd -T 失败或返回空结果'
 passed 'sshd empty/failure results remain unknown'
+
+# Found on a real IPv4-only VPS: an empty IPv6 answer was reported twice as
+# "query failed, state unknown". No address is a fact; a failed query is not.
+SSHD_RC=0
+ip() {
+  case "$*" in
+    '-br -4 address show') printf 'eth0 UP 192.0.2.1/24\n' ;;
+    '-br -6 address show') return "${IP6_RC:-0}" ;;
+    '-4 route show default') printf 'default via 192.0.2.254 dev eth0\n' ;;
+    '-6 route show default') fail 'IPv6 route asked although there is no IPv6 address' ;;
+    *) fail 'unexpected ip call' ;;
+  esac
+}
+out="$(security_audit)"
+assert_has "$out" '本机没有 IPv6 地址'
+assert_not "$out" 'IPv6 地址查询失败'
+assert_not "$out" 'IPv6 查询未返回默认路由'
+IP6_RC=1
+out="$(security_audit 2>&1)" || true
+assert_has "$out" 'IPv6 地址查询失败，状态未知'
+passed 'an IPv4-only machine is reported as such; a failed query stays unknown'
 
 df() {
   case "$*" in '-Pk / /boot'|'-Pi / /boot') ;;

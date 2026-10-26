@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.3 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.4 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,11 +7,15 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.3
+SCRIPT_VERSION=2.7.4
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
-LOG_DIR=/var/log/vps-stable-opt
+# Inside the root-only state directory: Ubuntu's /var/log is group-writable
+# (root:syslog 775), which no root-written path may sit under.
+LOG_DIR=/var/lib/vps-stable-opt/logs
+# Where versions before 2.7.4 kept their logs; only removed on uninstall.
+LEGACY_LOG_DIR=/var/log/vps-stable-opt
 BBR_FILE=/etc/sysctl.d/99-vps-stable-bbr.conf
 MODULE_FILE=/etc/modules-load.d/99-vps-stable-bbr.conf
 ZRAM_FILE=/etc/systemd/zram-generator.conf
@@ -489,7 +493,7 @@ apt_index_stage() {
     KERNEL_UPDATE=1
     echo '本次升级包含新内核：需要重启后才生效；旧内核会保留，开机菜单里仍可选回。'
   fi
-  echo '只在当前大版本内升级（不会从 Debian 12 升到 13），也不会删除任何已安装的软件包。'
+  echo '只在当前大版本内升级（不会升到新的系统大版本，例如 Debian 12 → 13、Ubuntu 24.04 → 26.04），也不会删除任何已安装的软件包。'
   echo
   echo '推荐设置：升级系统、开启自动安全更新、安装常用工具、启用内核网络安全参数、升级后清理旧内核、主机名无法解析时补上。'
   echo '（SSH 加固和防火墙不在推荐设置里，后面会单独问你。）'
@@ -830,13 +834,33 @@ bbr_config_conflict() {
   return 1
 }
 
-# A packaged file in /usr/lib or /lib that systemd-sysctl applies before this
-# tool's file (files run in name order, so ours wins). Ubuntu 22.04 ships
-# 50-default.conf with "-net.core.default_qdisc = fq_codel" there.
+# A packaged file that systemd-sysctl applies before this tool's file (files
+# run in name order, so ours wins). Ubuntu 22.04 ships 50-default.conf with
+# "-net.core.default_qdisc = fq_codel" in /usr/lib/sysctl.d; Ubuntu 24.04 ships
+# the same line as /etc/sysctl.d/10-bufferbloat.conf (procps), which counts
+# only while it is unchanged: an edited copy is the administrator's policy.
 sysctl_vendor_default() {
   local file="$1"
-  case "${file%/*}" in /usr/lib/sysctl.d|/lib/sysctl.d) ;; *) return 1 ;; esac
-  [[ "${file##*/}" < "${BBR_FILE##*/}" ]]
+  [[ "${file##*/}" < "${BBR_FILE##*/}" ]] || return 1
+  case "${file%/*}" in
+    /usr/lib/sysctl.d|/lib/sysctl.d) return 0 ;;
+    /etc/sysctl.d) conffile_unchanged "$file" ;;
+    *) return 1 ;;
+  esac
+}
+
+# FILE is one package's configuration file and still matches the checksum
+# dpkg recorded when it was installed.
+conffile_unchanged() {
+  local file="$1" owner expected sum
+  owner="$(dpkg-query -S -- "$file" 2>/dev/null)" || return 1
+  owner="${owner%%: /*}"
+  # Exactly one owning package ("a, b: path" means several).
+  [[ "$owner" =~ ^[a-z0-9][a-z0-9+.:-]*$ ]] || return 1
+  expected="$(dpkg-query -W -f='${Conffiles}\n' "$owner" 2>/dev/null | awk -v f="$file" '$1 == f {print $2}')" || return 1
+  [[ "$expected" =~ ^[0-9a-f]{32}$ ]] || return 1
+  sum="$(md5sum -- "$file" 2>/dev/null)" || return 1
+  [[ "${sum%% *}" == "$expected" ]]
 }
 
 # The value systemd-sysctl gives KEY at the next boot from files other than
@@ -953,19 +977,33 @@ swap_exists() {
   return 1
 }
 
+# The default "[zram0]" that Debian 12 and Ubuntu's zram-generator install as
+# ZRAM_FILE itself, still unchanged (Debian 13 ships it in /usr/lib instead).
+zram_file_packaged() {
+  [[ -f "$ZRAM_FILE" && ! -L "$ZRAM_FILE" ]] && conffile_unchanged "$ZRAM_FILE"
+}
+
 # A zram swap that only the zram-generator package's own default creates
-# (/usr/lib/systemd/zram-generator.conf): no administrator or tool configuration
-# and no other swap. After a rollback it comes back at every boot.
+# (/usr/lib/systemd/zram-generator.conf, or the packaged ZRAM_FILE above): no
+# administrator or tool configuration and no other swap. After a rollback it
+# comes back at every boot.
 zram_vendor_default_only() {
   local f
-  [[ -f "$ZRAM_VENDOR_FILE" ]] || return 1
+  [[ -f "$ZRAM_VENDOR_FILE" ]] || zram_file_packaged || return 1
   for f in "$ZRAM_FILE" /etc/systemd/zram-generator.conf.d /run/systemd/zram-generator.conf /run/systemd/zram-generator.conf.d \
       /usr/local/lib/systemd/zram-generator.conf /usr/local/lib/systemd/zram-generator.conf.d /etc/default/zramswap; do
+    if [[ "$f" == "$ZRAM_FILE" ]] && zram_file_packaged; then continue; fi
     [[ ! -e "$f" ]] || return 1
   done
   if systemctl is-enabled zramswap.service >/dev/null 2>&1; then return 1; fi
   if awk '$1 !~ /^#/ && $3=="swap" {found=1} END{exit !found}' /etc/fstab 2>/dev/null; then return 1; fi
   ! swapon --noheadings --show=NAME 2>/dev/null | grep -qv '^/dev/zram'
+}
+
+# Ubuntu's cloud kernels leave zram out (it is in linux-modules-extra); every
+# Debian kernel, the cloud one included, has it.
+zram_module_available() {
+  [[ -d /sys/module/zram || -d /sys/block/zram0 ]] || modinfo zram >/dev/null 2>&1
 }
 
 zram_swap_active() {
@@ -1039,11 +1077,16 @@ zram_stage() {
   say '第4步：内存与 ZRAM（在系统升级前配置）'
   local size='ram / 2' vendor=0
   if swap_exists; then
-    # Asked for explicitly: the package default is replaced by this tool's own file.
-    if [[ "${ZRAM_CHOICE:-}" == 1 ]] && zram_vendor_default_only; then
+    # The package default is replaced by this tool's own file when asked for
+    # explicitly, or when it runs no swap at all (Ubuntu installs it unstarted).
+    if zram_vendor_default_only && { [[ "${ZRAM_CHOICE:-}" == 1 ]] || ! swapon --noheadings 2>/dev/null | grep -q .; }; then
       vendor=1
-      echo '现在的 ZRAM 来自 systemd-zram-generator 软件包自带的默认配置（约内存一半），改用本工具的配置。'
+      echo '现在只有 systemd-zram-generator 软件包自带的默认 ZRAM 配置（约内存一半），改用本工具的配置。'
     elif restore_file_ours zram_file && ! swapon --noheadings 2>/dev/null | grep -q .; then
+      if ! zram_module_available; then
+        warn '本工具的 ZRAM 配置还在，但这个内核没有 zram 模块，ZRAM 无法启动；可以在撤销里撤销 ZRAM。'
+        module_result zram unsupported 'kernel has no zram module'; return 0
+      fi
       echo '本工具的 ZRAM 配置还在，但 ZRAM 没有运行（可能上次启动失败）：重新启动它。'
       if zram_start; then zram_tune; module_result zram applied 'zram0 restarted'
       else warn 'ZRAM 仍然没有启动，请运行 systemctl status systemd-zram-setup@zram0 查看原因。'; module_result zram failed 'dev-zram0.swap did not start'; fi
@@ -1066,15 +1109,22 @@ zram_stage() {
     # Larger machines get a smaller emergency buffer.
     size='ram / 4'
   fi
+  if ! zram_module_available; then
+    warn '这个内核没有 zram 模块，跳过 ZRAM（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里，占几百 MB，且每次升级内核都要跟着装，本工具不自动安装）。'
+    module_result zram unsupported 'kernel has no zram module'; return 0
+  fi
   if ! available systemd-zram-generator; then
     warn '软件源里没有 systemd-zram-generator，跳过 ZRAM。'
     module_result zram unsupported 'package unavailable'; return 0
   fi
   install_pkgs systemd-zram-generator
+  # Debian 12 and Ubuntu install their default "[zram0]" right at ZRAM_FILE; an
+  # unchanged copy is replaced (Debian 13 keeps that default in /usr/lib).
+  if zram_file_packaged; then rm -f -- "$ZRAM_FILE"; fi
   # zstd packs about a third more into the same RAM than the kernel default;
   # zram-generator only warns and keeps the default if the kernel lacks it.
   if put_file "$ZRAM_FILE" "[zram0]"$'\n'"zram-size = $size"$'\n''compression-algorithm = zstd'$'\n''swap-priority = 100'; then
-    if ((vendor)); then
+    if ((vendor)) && zram_swap_active; then
       systemctl daemon-reload
       # Resizing a zram swap in use is not safe: the new size applies from the next boot.
       ok "已写入本工具的 ZRAM 配置（$size），重启后按这个大小生效；现在先保留正在使用的 ZRAM。"
@@ -2685,8 +2735,11 @@ audit_network() {
   if command -v ip >/dev/null; then
     for family in 4 6; do
       printf 'IPv%s 地址：\n' "$family"
-      if data="$(ip -br "-$family" address show 2>/dev/null)" && [[ -n "$data" ]]; then audit_bounded_lines 30 <<< "$data"
-      else warn "IPv$family 地址查询失败或空结果，状态未知。"; fi
+      if ! data="$(ip -br "-$family" address show 2>/dev/null)"; then warn "IPv$family 地址查询失败，状态未知。"
+      elif [[ -n "$data" ]]; then audit_bounded_lines 30 <<< "$data"
+      # Many VPSs are IPv4-only: an empty answer is a fact, not an unknown.
+      elif [[ "$family" == 6 ]]; then echo '本机没有 IPv6 地址（只用 IPv4）。'; continue
+      else warn 'IPv4 查询没有返回地址，状态未知。'; fi
       printf 'IPv%s 默认路由：\n' "$family"
       if data="$(ip "-$family" route show default 2>/dev/null)"; then
         if [[ -n "$data" ]]; then audit_bounded_lines 12 <<< "$data"
@@ -3183,6 +3236,7 @@ records_report() {
   [[ $EUID -eq 0 ]] || { warn '配置备份属于 root，请用 sudo vps records 查看。'; return 0; }
   state_report
   printf '操作日志目录：%s（如已运行，含优化/回退输出）\n' "$LOG_DIR"
+  if [[ -d "$LEGACY_LOG_DIR" ]]; then printf '旧版本的操作日志：%s（卸载本工具时一起删除）\n' "$LEGACY_LOG_DIR"; fi
   printf '本版回退资料：%s/restore-v2（如存在，回退前逐项核验）\n' "$STATE_ROOT"
   printf '开荒结果记录：%s/modules（开荒验收据此逐项核对）\n' "$STATE_ROOT"
   if [[ ! -e "$BACKUP_ROOT" && ! -L "$BACKUP_ROOT" ]]; then
@@ -3304,6 +3358,8 @@ decision_report() {
     decision_line '需要先处理' '内存缓冲（ZRAM）' '内存容量未知，请重新检查，不能据此确定方案。'
   elif ((MEM_MIB>=2048)); then
     decision_line '保留现状' '内存缓冲（ZRAM）' '内存不少于 2GiB，默认不新增 ZRAM。'
+  elif ! zram_module_available; then
+    decision_line '保留现状' '内存缓冲（ZRAM）' '这个内核没有 zram 模块（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里），不配置 ZRAM。'
   elif available systemd-zram-generator; then
     decision_line '准备调整' '内存缓冲（ZRAM）' '内存低于 2GiB，未发现 Swap/ZRAM；计划配置约内存一半大小的 ZRAM（zstd 压缩，并配好适合 ZRAM 的 swappiness 和 page-cluster），不创建硬盘 Swap。'
   else
@@ -3423,7 +3479,8 @@ LAUNCHER
 }
 
 tool_fixed_paths() {
-  [[ "$STATE_ROOT" == /var/lib/vps-stable-opt && "$BACKUP_ROOT" == /var/backups/vps-stable-opt && "$LOG_DIR" == /var/log/vps-stable-opt ]]
+  [[ "$STATE_ROOT" == /var/lib/vps-stable-opt && "$BACKUP_ROOT" == /var/backups/vps-stable-opt &&
+     "$LOG_DIR" == /var/lib/vps-stable-opt/logs && "$LEGACY_LOG_DIR" == /var/log/vps-stable-opt ]]
 }
 
 tool_lifecycle_lock() {
@@ -3462,7 +3519,7 @@ lock_holder_text() {
 
 tool_data_owned() {
   local directory="$1" marker actual
-  case "$directory" in /var/lib/vps-stable-opt|/var/backups/vps-stable-opt|/var/log/vps-stable-opt) ;; *) return 1 ;; esac
+  case "$directory" in /var/lib/vps-stable-opt|/var/lib/vps-stable-opt/logs|/var/backups/vps-stable-opt|/var/log/vps-stable-opt) ;; *) return 1 ;; esac
   tool_secure_dir "$directory" || return 1
   marker="$directory/.tool-owner"
   tool_secure_file "$marker" || return 1
@@ -3473,7 +3530,8 @@ tool_data_owned() {
 tool_prepare_data() {
   local directory parent stage
   tool_lifecycle_lock
-  for parent in /var /var/lib /var/log /var/backups; do
+  # LOG_DIR lives in STATE_ROOT, so /var/log is not a parent of anything written.
+  for parent in /var /var/lib /var/backups; do
     if [[ "$parent" == /var/backups && ! -e "$parent" && ! -L "$parent" ]]; then continue; fi
     tool_secure_dir "$parent" || die "工具数据父目录不安全：$parent"
   done
@@ -3543,12 +3601,14 @@ tool_uninstall_validate() {
   tool_fixed_paths || die '数据路径不是预定固定目录，拒绝卸载。'
   for directory in / /usr /usr/local /usr/local/lib /usr/local/bin /var /var/lib /var/backups /var/log; do
     if [[ "$directory" == /var/backups && ! -e "$directory" && ! -L "$directory" ]]; then continue; fi
+    # /var/log matters only for an older version's log directory in it.
+    if [[ "$directory" == /var/log && ! -e "$LEGACY_LOG_DIR" && ! -L "$LEGACY_LOG_DIR" ]]; then continue; fi
     tool_secure_dir "$directory" || die "父目录归属或权限不安全：$directory"
   done
   if [[ -e /usr/local/lib/vps-stable-opt || -L /usr/local/lib/vps-stable-opt || -e /usr/local/bin/vps || -L /usr/local/bin/vps ]]; then
     tool_install_owned || die '已有程序或 vps 命令归属、校验值、内容异常，未删除。'
   fi
-  for directory in "$STATE_ROOT" "$BACKUP_ROOT" "$LOG_DIR"; do
+  for directory in "$STATE_ROOT" "$BACKUP_ROOT" "$LOG_DIR" "$LEGACY_LOG_DIR"; do
     if [[ -e "$directory" || -L "$directory" ]]; then
       tool_tree_safe "$directory" || die "数据目录归属、内容或挂载状态不安全：$directory。旧版无标记数据不会删除。"
     fi
@@ -4266,6 +4326,8 @@ restore_zram_group() {
     restore_mark zram_file applied || die '无法记录待重试的 ZRAM 回退。'
     RESTORE_PARTIAL=1
   fi
+  # A start that failed earlier would stay listed as a failed service until reboot.
+  systemctl reset-failed systemd-zram-setup@zram0.service dev-zram0.swap >/dev/null 2>&1 || true
   restore_resource zram_sysctl_file
   if [[ "$(restore_read zram_sysctl_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime zram_sysctl_runtime; fi
   # The package's own default turns ZRAM on again (see restore_zram_settle).
@@ -4273,6 +4335,10 @@ restore_zram_group() {
     warn 'systemd-zram-generator 软件包自带默认配置：它会让 ZRAM 按约一半内存重新开启（不用等重启，系统下次启动任何服务时就会开启）。要保持关闭，需要卸载这个本工具装的软件包。'
     if [[ "${RESTORE_ALL:-0}" == 1 ]]; then echo '稍后询问是否卸载本工具新装的软件包时，把它一起卸载即可。'
     else restore_packages_offer systemd-zram-generator; restore_zram_settle; fi
+  elif [[ "$origin" == absent && "${RESTORE_ALL:-0}" != 1 ]] && restore_tool_package systemd-zram-generator; then
+    # Without any configuration left (Debian 12, Ubuntu) the package does
+    # nothing: offered for removal like vnStat.
+    restore_packages_offer systemd-zram-generator
   fi
 }
 

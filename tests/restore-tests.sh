@@ -447,13 +447,20 @@ value_baseline() {
   restore_mark zram_file applied
   printf '[zram0]\n' > "$ZRAM_VENDOR_FILE"
   installed() { [[ "$1" == systemd-zram-generator ]]; }
-  systemctl() { [[ "$*" == daemon-reload ]] || die "unexpected systemctl $*"; }
+  systemctl() {
+    case "$*" in
+      daemon-reload) ;;
+      'reset-failed systemd-zram-setup@zram0.service dev-zram0.swap') printf 'reset-failed\n' >> "$TRACE" ;;
+      *) die "unexpected systemctl $*" ;;
+    esac
+  }
   restore_packages_offer() { printf 'offer %s\n' "$*" >> "$TRACE"; }
   warn() { printf 'WARN %s\n' "$*" >> "$TRACE"; }
   restore_zram_group
   [[ ! -e "$ZRAM_FILE" ]] || die 'ZRAM configuration not removed'
   grep -q '^WARN systemd-zram-generator' "$TRACE" || die 'package default turning ZRAM back on not explained'
   grep -Fxq 'offer systemd-zram-generator' "$TRACE" || die 'removal of the package not offered'
+  grep -Fxq reset-failed "$TRACE" || die 'a failed earlier ZRAM start stays listed after the rollback'
   # Full rollback: the package step at the end asks once for all packages.
   : > "$TRACE"; printf '[zram0]\nzram-size = ram / 4\n' > "$ZRAM_FILE"; restore_mark zram_file applied
   RESTORE_ALL=1 restore_zram_group > /dev/null
@@ -536,11 +543,51 @@ value_baseline() {
   restore_group_pending zram || die 'ZRAM tuning not pending'
   installed() { return 1; }
   sysctl() { [[ "$1" == -w ]] || die "unexpected sysctl $*"; printf '%s\n' "$2" >> "$TRACE"; }
+  systemctl() {
+    case "$*" in
+      daemon-reload) ;;
+      'reset-failed systemd-zram-setup@zram0.service dev-zram0.swap') printf 'reset-failed\n' >> "$TRACE.units" ;;
+      *) die "unexpected systemctl $*" ;;
+    esac
+  }
   restore_zram_group > /dev/null
   [[ ! -e "$ZRAM_SYSCTL_FILE" ]] || die 'ZRAM tuning file kept'
   expect "$(cat "$TRACE")" $'vm.swappiness=60\nvm.page-cluster=3'
   [[ ! -e "$RESTORE_ROOT/zram_sysctl_runtime" && ! -e "$RESTORE_ROOT/sysctl_runtime" ]] || die 'ZRAM originals kept or mixed with the hardening record'
   if restore_group_pending zram; then die 'ZRAM group still pending after its rollback'; fi
+)
+# Debian 12 and Ubuntu keep no default in /usr/lib: once this tool's config is
+# gone the package does nothing, so it is offered for removal like vnStat (found
+# on a real Ubuntu 24.04 VPS, where the unused package was left installed).
+(
+  value_fixture zram-no-vendor
+  ZRAM_FILE="$TMP/zram-no-vendor/zram-generator.conf"
+  ZRAM_VENDOR_FILE="$TMP/zram-no-vendor/absent-vendor.conf"
+  restore_value() { case "$1" in zram_swap) echo absent ;; *) return 1 ;; esac; }
+  value_baseline zram_swap absent absent
+  restore_snapshot zram_file
+  printf '[zram0]\nzram-size = ram / 2\n' > "$ZRAM_FILE"
+  restore_mark zram_file applied
+  installed() { [[ "$1" == systemd-zram-generator ]]; }
+  restore_tool_packages() { echo systemd-zram-generator; }
+  systemctl() {
+    case "$*" in
+      daemon-reload) ;;
+      'reset-failed systemd-zram-setup@zram0.service dev-zram0.swap') printf 'reset-failed\n' >> "$TRACE" ;;
+      *) die "unexpected systemctl $*" ;;
+    esac
+  }
+  restore_packages_offer() { printf 'offer %s\n' "$*" >> "$TRACE"; }
+  warn() { printf 'WARN %s\n' "$*" >> "$TRACE"; }
+  restore_zram_group > /dev/null
+  [[ ! -e "$ZRAM_FILE" ]] || die 'ZRAM configuration not removed'
+  grep -Fxq 'offer systemd-zram-generator' "$TRACE" || die 'unused tool package not offered for removal'
+  if grep -q '^WARN systemd-zram-generator' "$TRACE"; then die 'warned about a package default that does not exist'; fi
+  # A package that was there before this tool is never offered.
+  : > "$TRACE"; printf '[zram0]\n' > "$ZRAM_FILE"; restore_mark zram_file applied
+  restore_tool_packages() { :; }
+  restore_zram_group > /dev/null
+  if grep -q '^offer' "$TRACE"; then die "an administrator's zram-generator was offered for removal"; fi
 )
 printf 'PASS: ZRAM rollback survives the package default, releases zram0 and restores its tuning.\n'
 printf 'PASS: rule-level firewall rollback, access-widening order and no re-enabling.\n'

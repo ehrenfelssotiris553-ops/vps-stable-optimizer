@@ -52,6 +52,7 @@ BBR_CURRENT=cubic BBR_AVAILABLE='reno cubic' QDISC_CURRENT=pfifo_fast
 MEM_MIB=1024 ROOT_GIB=10 ROOT_FS=ext4 ROOT_DEV=/dev/vda1
 bbr_config_conflict() { warn 'mock confidential config line'; ((BBR_CONFLICT)); }
 bbr_set_elsewhere() { ((${BBR_ELSEWHERE:-0})); }
+zram_module_available() { ((${ZRAM_MODULE:-1})); }
 swap_exists() { ((SWAP_PRESENT)); }
 available() { ((PKG_AVAILABLE)); }
 installed() { [[ "$1" == chrony ]] && ((PROVIDER_PRESENT)); }
@@ -99,6 +100,13 @@ BBR_ELSEWHERE=0 BBR_AVAILABLE='reno cubic'
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_absent '不再重复写入'
 assert_contains '内存低于 2GiB，未发现 Swap/ZRAM'
+# Ubuntu cloud kernels have no zram module: the plan says so up front.
+ZRAM_MODULE=0
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '这个内核没有 zram 模块'
+assert_absent '计划配置约内存一半大小的 ZRAM'
+ZRAM_MODULE=1
+decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '当前未确认 BBR 可用'
 assert_absent '内核不支持'
 assert_contains '系统盘不大于 20GiB'

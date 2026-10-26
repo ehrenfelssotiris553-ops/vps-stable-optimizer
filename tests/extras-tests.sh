@@ -319,3 +319,61 @@ printf 'PASS: terminal multiplexer detection.\n'
   grep -Fq '需要你在场' "$TEST_ROOT/q-out" || fail 'user not told the end needs them'
 )
 printf 'PASS: setup questions are asked once and stored.\n'
+
+# ZRAM on Ubuntu, found on a real Ubuntu 24.04 VPS: the cloud kernel has no zram
+# module, and its zram-generator package installs the default "[zram0]" right at
+# /etc/systemd/zram-generator.conf (Debian 13 keeps it in /usr/lib), which this
+# tool then refused to overwrite.
+(
+  load_optimizer_functions zram_stage zram_file_packaged
+  ZRAM_FILE="$TEST_ROOT/zram/zram-generator.conf"
+  ZRAM_VENDOR_FILE="$TEST_ROOT/zram/no-vendor-file"
+  mkdir -p "$TEST_ROOT/zram"
+  MEM_MIB=1024 ZRAM_CHOICE=0 MODULE=1 SWAP_ON=0 VENDOR_ONLY=0 OURS=0
+  zram_module_available() { ((MODULE)); }
+  swap_exists() { [[ -e "$ZRAM_FILE" ]] || ((SWAP_ON)); }
+  swapon() { if ((SWAP_ON)); then echo /dev/zram0; fi; }
+  zram_swap_active() { ((SWAP_ON)); }
+  zram_vendor_default_only() { ((VENDOR_ONLY)); }
+  restore_file_ours() { ((OURS)); }
+  available() { return 0; }
+  # The Ubuntu package brings its own default config with it.
+  install_pkgs() { record "install $*"; [[ -e "$ZRAM_FILE" ]] || printf '[zram0]\n' > "$ZRAM_FILE"; }
+  conffile_unchanged() { [[ "$(cat -- "$1")" == '[zram0]' ]]; }
+  zram_start() { record 'zram start'; }
+  zram_tune() { record 'zram tune'; }
+  systemctl() { record "systemctl $*"; }
+  # No zram module: nothing installed, nothing written, reported as unsupported.
+  reset; MODULE=0
+  zram_stage > /dev/null
+  grep -q '^result zram unsupported' "$TEST_ROOT/trace" || fail 'missing zram module not reported as unsupported'
+  if grep -q '^install' "$TEST_ROOT/trace" || [[ -e "$ZRAM_FILE" ]]; then fail 'ZRAM set up on a kernel without zram'; fi
+  # The packaged default that appears with the package is replaced and started.
+  reset; MODULE=1
+  zram_stage > /dev/null
+  grep -Fxq 'compression-algorithm = zstd' "$ZRAM_FILE" || fail "the package's default file was not replaced by this tool's config"
+  grep -Fxq 'zram start' "$TEST_ROOT/trace" || fail 'ZRAM not started after replacing the packaged default'
+  grep -q '^result zram applied' "$TEST_ROOT/trace" || fail 'ZRAM not recorded as applied'
+  # The packaged default left behind with no swap running (a run before this
+  # fix): taken over even without an explicit request, and started now.
+  reset; printf '[zram0]\n' > "$ZRAM_FILE"; VENDOR_ONLY=1
+  zram_stage > /dev/null
+  grep -Fxq 'compression-algorithm = zstd' "$ZRAM_FILE" || fail 'packaged default without a running swap not taken over'
+  grep -Fxq 'zram start' "$TEST_ROOT/trace" || fail 'taken-over ZRAM not started'
+  # A packaged default that is running stays unless ZRAM was asked for.
+  reset; printf '[zram0]\n' > "$ZRAM_FILE"; SWAP_ON=1
+  zram_stage > /dev/null
+  [[ "$(cat "$ZRAM_FILE")" == '[zram0]' ]] || fail 'a running packaged default was replaced without being asked'
+  # This tool's own config whose ZRAM cannot start: told why, not retried.
+  reset; SWAP_ON=0 VENDOR_ONLY=0 OURS=1 MODULE=0
+  printf '[zram0]\nzram-size = ram / 2\n' > "$ZRAM_FILE"
+  zram_stage > /dev/null
+  grep -q '^result zram unsupported' "$TEST_ROOT/trace" || fail 'own config on a kernel without zram not explained'
+  if grep -Fxq 'zram start' "$TEST_ROOT/trace"; then fail 'tried to start ZRAM without the module'; fi
+  # zram_file_packaged: only the unchanged packaged file counts.
+  printf '[zram0]\n' > "$ZRAM_FILE"
+  zram_file_packaged || fail 'unchanged packaged default not recognised'
+  printf '[zram0]\nzram-size = 512\n' > "$ZRAM_FILE"
+  if zram_file_packaged; then fail 'an edited ZRAM config counted as the package default'; fi
+)
+printf 'PASS: ZRAM is skipped without a zram module and replaces only an unchanged packaged default.\n'

@@ -19,8 +19,12 @@ for path in / relative /tmp/../etc /tmp//a /tmp/a/ "$TEST_ROOT/link/file" "$TEST
 done
 printf 'PASS: lifecycle path validator rejects symlink components and traversal.\n'
 
-STATE_ROOT=/var/lib/vps-stable-opt BACKUP_ROOT=/var/backups/vps-stable-opt LOG_DIR=/var/log/vps-stable-opt
+STATE_ROOT=/var/lib/vps-stable-opt BACKUP_ROOT=/var/backups/vps-stable-opt LOG_DIR=/var/lib/vps-stable-opt/logs LEGACY_LOG_DIR=/var/log/vps-stable-opt
 tool_fixed_paths || fail 'fixed data paths rejected'
+# Logs no longer go under /var/log (root:syslog 775 on Ubuntu).
+LOG_DIR=/var/log/vps-stable-opt
+if tool_fixed_paths; then fail 'log directory under /var/log accepted'; fi
+LOG_DIR=/var/lib/vps-stable-opt/logs
 STATE_ROOT="$TEST_ROOT/alternate"
 if tool_fixed_paths; then fail 'override of cleanup target accepted'; fi
 STATE_ROOT=/var/lib/vps-stable-opt
@@ -126,4 +130,22 @@ printf 'PASS: uninstall guard refuses firewall/SSH timers, active services and u
   if tool_secure_dir '/var/../etc'; then fail 'unsafe path accepted'; fi
 )
 printf 'PASS: uninstall accepts "/" as a parent only when root-owned and not writable by others.\n'
+
+# Found on a real Ubuntu 24.04 VPS: /var/log is root:syslog 775, and setup
+# and uninstall both stopped at it. Logs now live in /var/lib; uninstall still
+# checks /var/log, but only when an older version left its log directory there.
+(
+  load_optimizer_functions tool_uninstall_validate
+  tool_fixed_paths() { return 0; }
+  tool_secure_dir() { [[ "$1" != /var/log ]]; }
+  tool_install_owned() { return 0; }
+  tool_tree_safe() { return 0; }
+  tool_no_pending_firewall() { return 0; }
+  die() { printf 'STOP: %s\n' "$*"; exit 3; }
+  STATE_ROOT="$TEST_ROOT/no-state" BACKUP_ROOT="$TEST_ROOT/no-backup" LOG_DIR="$TEST_ROOT/no-log" LEGACY_LOG_DIR="$TEST_ROOT/legacy-log"
+  ( tool_uninstall_validate ) > /dev/null || fail 'uninstall stopped at a group-writable /var/log without old logs in it'
+  mkdir -p "$LEGACY_LOG_DIR"
+  if ( tool_uninstall_validate ) > /dev/null; then fail 'old logs under an unsafe /var/log were accepted'; fi
+)
+printf 'PASS: uninstall looks at /var/log only when old logs are still there.\n'
 printf 'NOTE: privileged installation, flock concurrency, TTY confirmations and real deletion require isolated Linux VM validation.\n'
