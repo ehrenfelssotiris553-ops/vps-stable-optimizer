@@ -6,7 +6,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl verify_reboot_state upgrade_has_kernel \
+load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
   trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -132,7 +132,39 @@ printf 'net.ipv4.ip_local_port_range = 10000 65000\n' > "$SYSCTL_HARDENING_FILE"
 sysctl() { printf '10000\t65000\n'; }
 check_sysctl '1 key'
 [[ "$VERIFY_STATUS" == pass ]] || fail 'multi-value sysctl key reported as drifted'
+# A glob key is checked on every interface it covers (found on a real VPS:
+# eth0 kept accepting IPv6 redirects while all/default said 0).
+P="$TEST_ROOT/proc"
+for d in all default eth0 lo; do mkdir -p "$P/net/ipv6/conf/$d"; printf '0\n' > "$P/net/ipv6/conf/$d/accept_redirects"; done
+printf 'net.ipv6.conf.*.accept_redirects = 0\n' > "$TEST_ROOT/glob.conf"
+[[ -z "$(sysctl_file_mismatch "$TEST_ROOT/glob.conf" "$P")" ]] || fail 'matching interfaces reported as drifted'
+printf '1\n' > "$P/net/ipv6/conf/eth0/accept_redirects"
+[[ "$(sysctl_file_mismatch "$TEST_ROOT/glob.conf" "$P")" == 'bad net.ipv6.conf.eth0.accept_redirects=1' ]] || fail 'interface still accepting redirects not reported'
+# Keys with a dash (vm.page-cluster) are compared like any other.
+printf 'vm.page-cluster = 0\n' > "$TEST_ROOT/zram.conf"
+sysctl() { [[ "$2" == vm.page-cluster ]] && echo 3; }
+[[ "$(sysctl_file_mismatch "$TEST_ROOT/zram.conf")" == 'bad vm.page-cluster=3' ]] || fail 'dashed sysctl key not compared'
 printf 'PASS: SSH (including root login) and sysctl checks compare live values.\n'
+
+# A kernel installed after this boot waits for the reboot: not a failure
+# (found on a real VPS: the check right after setup showed it as broken).
+(
+  VERIFY_PASS=0 VERIFY_FAIL=0 VERIFY_NA=0 VERIFY_UNKNOWN=0 VERIFY_REBOOT=0
+  uname() { echo 6.1.0-28-amd64; }
+  mkdir -p "$TEST_ROOT/boot"; : > "$TEST_ROOT/boot/vmlinuz-6.1.0-28-amd64"; : > "$TEST_ROOT/boot/vmlinuz-6.1.0-29-amd64"
+  out="$(verify_kernel "$TEST_ROOT/boot" "$TEST_ROOT/no-flag"; echo "fail=$VERIFY_FAIL reboot=$VERIFY_REBOOT")"
+  [[ "$out" == *待重启* && "$out" == *'fail=0 reboot=1'* ]] || fail "kernel installed in this boot reported as: $out"
+  # Installed before this boot and still not running: a real problem.
+  stat() { echo 1; }
+  out="$(verify_kernel "$TEST_ROOT/boot" "$TEST_ROOT/no-flag"; echo "fail=$VERIFY_FAIL")"
+  [[ "$out" == *'fail=1'* ]] || fail "newer kernel ignored at boot not reported: $out"
+  unset -f stat
+  # Running the newest kernel with another update waiting for a reboot.
+  rm "$TEST_ROOT/boot/vmlinuz-6.1.0-29-amd64"; : > "$TEST_ROOT/flag"
+  out="$(verify_kernel "$TEST_ROOT/boot" "$TEST_ROOT/flag"; echo "fail=$VERIFY_FAIL reboot=$VERIFY_REBOOT")"
+  [[ "$out" == *'fail=0 reboot=1'* ]] || fail "pending reboot flag reported as: $out"
+)
+printf 'PASS: a kernel or update waiting for the reboot is shown as pending, not as broken.\n'
 
 upgrade_has_kernel $'Inst libc6 [2.36-9] (2.36-9+deb12u9 Debian:12.9/stable [amd64])\nInst linux-image-6.1.0-29-amd64 (6.1.123-1 Debian-Security:12/stable-security [amd64])' || fail 'new kernel ABI package missed'
 if upgrade_has_kernel $'Inst libc6 [2.36-9] (2.36-9+deb12u9)\nConf libc6 (2.36-9+deb12u9)'; then fail 'kernel reported without a kernel package'; fi

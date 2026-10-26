@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action item_firewall_pause item_ask_reboot_time item_menu guard_confirm coreutils_selfcheck release_info
+load_optimizer_functions confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action item_firewall_pause item_ask_reboot_time reboot_time_normalize item_menu guard_confirm coreutils_selfcheck release_info
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -95,12 +95,15 @@ restore_zram_group() { record 'group zram'; }
 restore_resource() { record "resource $1"; }
 restore_sysctl_runtime() { record 'sysctl runtime'; }
 restore_packages_offer() { record "packages $*"; }
+restore_zram_settle() { record 'zram settle'; }
 restore_value() { echo inactive; }
 restore_tool_packages() { :; }
 reset; restore_all_groups
 [[ "$(head -n 2 "$TEST_ROOT/trace" | tr '\n' ' ')" == 'group fail2ban group firewall ' ]] || fail 'full rollback order'
 grep -Fxq 'resource bbr_file' "$TEST_ROOT/trace" || fail 'plain group resources not restored'
 grep -Fxq 'packages ' "$TEST_ROOT/trace" || fail 'full rollback did not offer package removal'
+# The package default can bring ZRAM back: settled after the package question.
+[[ "$(tail -n 1 "$TEST_ROOT/trace")" == 'zram settle' ]] || fail 'ZRAM not settled after the package question'
 confirm_yes() { return 0; }
 reset; printf '1\n' > "$TEST_ROOT/pick"
 restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
@@ -125,6 +128,11 @@ restore_resource() { record "resource $1"; if [[ -n "${STATE[$1]:-}" ]]; then ST
 reset; STATE=([bbr_file]=applied)
 item_turn_off bbr
 grep -Fxq 'result bbr reverted' "$TEST_ROOT/trace" || fail 'undone item not recorded for vps check'
+if grep -q '^packages' "$TEST_ROOT/trace"; then fail 'BBR off offered a package removal'; fi
+# Automatic updates off: the package this tool installed for them is offered too.
+reset; STATE=([apt_file]=applied)
+item_turn_off updates
+grep -Fxq 'packages unattended-upgrades' "$TEST_ROOT/trace" || fail 'updates off did not offer removing unattended-upgrades'
 restore_resource() { record "resource $1"; }
 reset; TOOLS_PACKAGES=(curl htop)
 item_turn_off tools
@@ -148,8 +156,14 @@ reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
 [[ "$(item_keys | wc -l | tr -d ' ')" == 18 ]] || fail 'item count'
-printf '04:30\n' | item_ask_reboot_time 2>/dev/null || fail 'valid reboot time rejected'
-if printf '4:30\n' | item_ask_reboot_time 2>/dev/null; then fail 'invalid reboot time accepted'; fi
+item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
+# Found on a real VPS: 4:30 was refused although it is a plain time.
+item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'
+[[ "$AUTO_REBOOT_TIME" == 04:30 ]] || fail "reboot time not normalized: $AUTO_REBOOT_TIME"
+for bad in 24:00 4:5 0430 '04:30 x'; do
+  if item_ask_reboot_time <<< "$bad" > /dev/null 2>&1; then fail "invalid reboot time accepted: $bad"; fi
+  [[ -z "$AUTO_REBOOT_TIME" ]] || fail "rejected time kept: $bad"
+done
 printf 'PASS: single-item menu dispatch, undo of own changes only, firewall pause.\n'
 
 # CONNECTED: a typo or lowercase asks again; n, timeout and end of input restore.

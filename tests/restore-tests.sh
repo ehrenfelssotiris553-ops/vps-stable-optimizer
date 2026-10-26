@@ -8,7 +8,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
-  restore_packages_record restore_group_ids restore_group_pending restore_group_apply
+  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 WARNINGS=0
@@ -20,6 +20,7 @@ STATE_ROOT="$TMP/state"
 BBR_FILE="$TMP/bbr.conf"
 MODULE_FILE="$TMP/module.conf"
 ZRAM_FILE="$TMP/zram.conf"
+ZRAM_SYSCTL_FILE="$TMP/99-vps-stable-zram.conf"
 JOURNAL_FILE="$TMP/journal.conf"
 APT_FILE="$TMP/apt.conf"
 F2B_DIR="$TMP/f2b"
@@ -458,6 +459,84 @@ value_baseline() {
   RESTORE_ALL=1 restore_zram_group > /dev/null
   if grep -q '^offer' "$TRACE"; then die 'package offered twice during a full rollback'; fi
 )
+
+# Found on a real VPS: with the package default in place, systemd started ZRAM
+# again seconds after the rollback (the next unit start pulls in swap.target),
+# and zram0 stayed set up, so turning ZRAM on later failed with "busy".
+# Once the package is gone, that ZRAM is switched off for good and released.
+(
+  value_fixture zram-settle
+  ZRAM_FILE="$TMP/zram-settle/zram-generator.conf"
+  value_baseline zram_swap absent absent
+  SWAP=/dev/zram0:366076:100 INSTALLED=0
+  restore_value() { case "$1" in zram_swap) echo "$SWAP" ;; *) return 1 ;; esac; }
+  installed() { [[ "$1" == systemd-zram-generator ]] && ((INSTALLED)); }
+  active() { [[ "$1" == dev-zram0.swap && "$SWAP" != absent ]]; }
+  systemctl() { [[ "$*" == 'stop dev-zram0.swap' ]] || die "unexpected systemctl $*"; printf 'stop swap\n' >> "$TRACE"; SWAP=absent; }
+  zram_reset_idle() { printf 'reset\n' >> "$TRACE"; }
+  restore_zram_settle > /dev/null
+  [[ "$(head -n 2 "$TRACE")" == $'stop swap\nreset' ]] || die "ZRAM brought back by the package default not switched off: $(cat "$TRACE")"
+  expect "$(restore_read zram_swap state)" restored
+  # Kept package: its default ZRAM is started now and the user is told so.
+  INSTALLED=1 SWAP=absent; : > "$TRACE"
+  printf '[zram0]\n' > "$ZRAM_VENDOR_FILE"
+  restore_tool_packages() { echo systemd-zram-generator; }
+  systemctl() { [[ "$*" == 'start dev-zram0.swap' ]] || die "unexpected systemctl $*"; printf 'start\n' >> "$TRACE"; SWAP=/dev/zram0:1:100; }
+  module_result() { printf 'result %s %s\n' "$1" "$2" >> "$TRACE"; }
+  warn() { printf 'WARN %s\n' "$*" >> "$TRACE"; }
+  restore_zram_settle
+  grep -Fxq start "$TRACE" || die 'kept package default ZRAM not started'
+  grep -q '^WARN 保留了 systemd-zram-generator' "$TRACE" || die 'kept package default ZRAM not explained'
+  grep -Fxq 'result zram present' "$TRACE" || die 'running package default ZRAM recorded as undone'
+  # An administrator's own zram-generator: a rollback never switches ZRAM on.
+  restore_tool_packages() { :; }
+  SWAP=absent; : > "$TRACE"
+  restore_zram_settle
+  [[ ! -s "$TRACE" ]] || die "rollback started the administrator's ZRAM: $(cat "$TRACE")"
+  # This tool's own configuration is back in place: nothing to settle.
+  restore_tool_packages() { echo systemd-zram-generator; }
+  printf '[zram0]\n' > "$ZRAM_FILE"
+  restore_zram_settle
+  [[ ! -s "$TRACE" ]] || die 'ZRAM settled while a ZRAM configuration exists'
+)
+
+# A zram0 left set up without swap on it is reset; one in use is left alone.
+(
+  dev="$TMP/zram-dev"; mkdir -p "$dev"
+  printf '1\n' > "$dev/initstate"; : > "$dev/reset"
+  zram_swap_active() { return 1; }
+  zram_reset_idle "$dev"
+  expect "$(cat "$dev/reset")" 1
+  : > "$dev/reset"
+  zram_swap_active() { return 0; }
+  zram_reset_idle "$dev"
+  [[ ! -s "$dev/reset" ]] || die 'zram0 in use was reset'
+  printf '0\n' > "$dev/initstate"; zram_swap_active() { return 1; }
+  zram_reset_idle "$dev"
+  [[ ! -s "$dev/reset" ]] || die 'an idle unset zram0 was reset'
+)
+
+# The ZRAM tuning goes back with ZRAM: its file and the running values.
+(
+  value_fixture zram-tune
+  ZRAM_SYSCTL_FILE="$TMP/zram-tune/99-vps-stable-zram.conf"
+  ZRAM_FILE="$TMP/zram-tune/zram.conf"
+  restore_snapshot zram_sysctl_file
+  printf 'vm.swappiness = 100\nvm.page-cluster = 0\n' > "$ZRAM_SYSCTL_FILE"
+  restore_mark zram_sysctl_file applied
+  RESTORE_READY=1
+  restore_record_sysctl vm.swappiness 60 zram_sysctl_runtime
+  restore_record_sysctl vm.page-cluster 3 zram_sysctl_runtime
+  restore_group_pending zram || die 'ZRAM tuning not pending'
+  installed() { return 1; }
+  sysctl() { [[ "$1" == -w ]] || die "unexpected sysctl $*"; printf '%s\n' "$2" >> "$TRACE"; }
+  restore_zram_group > /dev/null
+  [[ ! -e "$ZRAM_SYSCTL_FILE" ]] || die 'ZRAM tuning file kept'
+  expect "$(cat "$TRACE")" $'vm.swappiness=60\nvm.page-cluster=3'
+  [[ ! -e "$RESTORE_ROOT/zram_sysctl_runtime" && ! -e "$RESTORE_ROOT/sysctl_runtime" ]] || die 'ZRAM originals kept or mixed with the hardening record'
+  if restore_group_pending zram; then die 'ZRAM group still pending after its rollback'; fi
+)
+printf 'PASS: ZRAM rollback survives the package default, releases zram0 and restores its tuning.\n'
 printf 'PASS: rule-level firewall rollback, access-widening order and no re-enabling.\n'
 
 # Fail2ban: lift this tool's bans first, remove only its own files, and let a
@@ -555,6 +634,20 @@ printf 'PASS: SSH drop-in rollback (key-only and key-login switch) reloads sshd 
   expect "$(cat "$TMP/sysctl/trace")" 'kernel.kptr_restrict=0'
   [[ ! -e "$RESTORE_ROOT/sysctl_runtime" ]] || die 'applied sysctl originals kept'
   expect "$RESTORE_PARTIAL" 0
+  # Per-interface IPv6 values: eth0 and veth0 are different keys, the first
+  # value still wins, and an interface that is gone (a container's veth) has
+  # nothing left to restore instead of leaving the rollback unfinished.
+  : > "$TMP/sysctl/trace"
+  restore_record_sysctl net.ipv6.conf.vps-gone0.accept_redirects 1
+  restore_record_sysctl net.ipv6.conf.vps-gone0.accept_redirects 0
+  restore_record_sysctl net.ipv6.conf.xvps-gone0.accept_redirects 1
+  restore_record_sysctl kernel.dmesg_restrict 0
+  expect "$(cut -d= -f1 "$RESTORE_ROOT/sysctl_runtime" | tr '\n' ' ')" 'net.ipv6.conf.vps-gone0.accept_redirects net.ipv6.conf.xvps-gone0.accept_redirects kernel.dmesg_restrict '
+  expect "$(grep -c '^net.ipv6.conf.vps-gone0.accept_redirects=1$' "$RESTORE_ROOT/sysctl_runtime")" 1
+  restore_sysctl_runtime
+  expect "$(cat "$TMP/sysctl/trace")" 'kernel.dmesg_restrict=0'
+  expect "$RESTORE_PARTIAL" 0
+  [[ ! -e "$RESTORE_ROOT/sysctl_runtime" ]] || die 'a vanished interface left the sysctl rollback unfinished'
 )
 
 # UFW IPv6 switch: tracked as a value and switched back with the real helper.

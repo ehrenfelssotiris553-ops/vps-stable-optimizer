@@ -38,6 +38,7 @@ reset_case() {
   printf '0\n' > "$CASE_DIR/service-queued"
   printf '0\n' > "$CASE_DIR/timer-stop-called"
   printf 'disabled\n' > "$CASE_DIR/ufw-boot"
+  printf 'inactive\n' > "$CASE_DIR/ufw-service"
   ENABLE_FAIL=0
   BOOT_ENABLE_FAIL=0
   LARGE_NFT=0
@@ -86,6 +87,7 @@ systemctl() {
     is-active)
       case "${*: -1}" in
         vps-stable-ufw-rollback-*.timer) [[ "$(cat "$CASE_DIR/timer-active")" == 1 ]] ;;
+        ufw.service) [[ "$(cat "$CASE_DIR/ufw-service")" == active ]] ;;
         *) return 3 ;;
       esac ;;
     stop)
@@ -115,6 +117,11 @@ systemctl() {
       [[ "$*" == 'enable ufw.service' ]] || fail "unmocked systemctl enable: $*"
       if ((BOOT_ENABLE_FAIL)); then return 1; fi
       printf 'enabled\n' > "$CASE_DIR/ufw-boot" ;;
+    # Only reached while UFW is active: ufw-init then reports "already started".
+    start)
+      [[ "$*" == 'start ufw.service' ]] || fail "unmocked systemctl start: $*"
+      [[ "$(cat "$CASE_DIR/ufw-active")" == 1 ]] || fail 'ufw.service started while UFW was off'
+      printf 'active\n' > "$CASE_DIR/ufw-service" ;;
     *) fail "unmocked systemctl command: $*" ;;
   esac
 }
@@ -161,6 +168,8 @@ grep -Fxq 'ufw limit 22/tcp' "$CASE_DIR/rules" || fail 'password SSH did not use
 grep -Fxq 'ufw allow 80/tcp' "$CASE_DIR/rules" || fail 'accepted web ports were not opened'
 grep -Fxq 'firewall applied' "$CASE_DIR/results" || fail 'applied firewall result missing'
 [[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] || fail 'confirmed firewall not enabled at boot (ufw.service)'
+# Started too, so the next run does not take the reboot for an outside change.
+[[ "$(cat "$CASE_DIR/ufw-service")" == active ]] || fail 'ufw.service left inactive after the firewall was confirmed'
 
 reset_case key_only_ssh
 KEY_ONLY=1
@@ -205,6 +214,7 @@ firewall_stage < "$CASE_DIR/input"
 grep -Fxq 'ufw --force disable' "$CASE_DIR/calls" || fail 'no immediate disable after missing confirmation'
 grep -Fxq 'firewall failed' "$CASE_DIR/results" || fail 'failed confirmation not recorded'
 [[ "$(cat "$CASE_DIR/ufw-boot")" == disabled ]] || fail 'unconfirmed firewall enabled at boot'
+[[ "$(cat "$CASE_DIR/ufw-service")" == inactive ]] || fail 'unconfirmed firewall started ufw.service'
 
 reset_case enable_failure
 ENABLE_FAIL=1
@@ -278,6 +288,7 @@ printf 'enabled\n' > "$CASE_DIR/ufw-boot"
 WEB_YES=0
 firewall_stage < "$CASE_DIR/input"
 if grep -q '^systemctl enable' "$CASE_DIR/calls"; then fail 'ufw.service enabled again although it already was'; fi
+[[ "$(cat "$CASE_DIR/ufw-service")" == active ]] || fail 'running UFW with an inactive ufw.service was not started'
 
 reset_case boot_enable_failure
 BOOT_ENABLE_FAIL=1

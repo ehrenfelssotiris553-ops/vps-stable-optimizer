@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -119,7 +119,41 @@ if grep -q 'ip_forward' "$SYSCTL_HARDENING_FILE"; then fail 'forwarding must not
 reset; SYSCTL_CHOICE=0; rm -f "$SYSCTL_HARDENING_FILE"
 sysctl_hardening_stage
 [[ ! -e "$SYSCTL_HARDENING_FILE" ]] || fail 'sysctl changed without consent'
-printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys and records originals.\n'
+# IPv6 takes accept_redirects from each interface only, and all/default never
+# reach one that already exists (found on a real VPS: eth0 stayed at 1). A
+# glob line covers every interface at boot; existing ones are set right away.
+SYSVAL[net.ipv6.conf.all.accept_redirects]=1
+SYSVAL[net.ipv6.conf.default.accept_redirects]=1
+sysctl_ipv6_iface_redirects() { printf '%s\n' net.ipv6.conf.eth0.accept_redirects=1 net.ipv6.conf.lo.accept_redirects=1; }
+sysctl() {
+  case "$1" in
+    -n) [[ -n "${SYSVAL[$2]:-}" ]] && echo "${SYSVAL[$2]}" ;;
+    -e|-w) record "sysctl $*" ;;
+    *) fail "unexpected sysctl $*" ;;
+  esac
+}
+reset; SYSCTL_CHOICE=1; rm -f "$SYSCTL_HARDENING_FILE"
+sysctl_hardening_stage
+grep -Fxq 'net.ipv6.conf.*.accept_redirects = 0' "$SYSCTL_HARDENING_FILE" || fail 'IPv6 per-interface glob not written'
+grep -Fxq 'orig net.ipv6.conf.eth0.accept_redirects=1' "$TEST_ROOT/trace" || fail 'interface original not recorded for rollback'
+grep -Fxq 'sysctl -w net.ipv6.conf.eth0.accept_redirects=0' "$TEST_ROOT/trace" || fail 'existing interface not switched now'
+# The administrator's own IPv6 redirect policy: no glob on top of it.
+reset; rm -f "$SYSCTL_HARDENING_FILE"; CONFIGURED=net.ipv6.conf.all.accept_redirects
+sysctl_hardening_stage
+if grep -Fq 'conf.*' "$SYSCTL_HARDENING_FILE"; then fail 'glob written although IPv6 redirects are configured elsewhere'; fi
+if grep -q 'sysctl -w' "$TEST_ROOT/trace"; then fail 'interfaces changed although IPv6 redirects are configured elsewhere'; fi
+CONFIGURED=kernel.dmesg_restrict
+unset 'SYSVAL[net.ipv6.conf.all.accept_redirects]' 'SYSVAL[net.ipv6.conf.default.accept_redirects]'
+unset -f sysctl_ipv6_iface_redirects
+(
+  load_optimizer_functions sysctl_ipv6_iface_redirects
+  P="$TEST_ROOT/proc-ipv6"
+  for d in all default eth0 veth-a1 eth0.100; do mkdir -p "$P/$d"; printf '1\n' > "$P/$d/accept_redirects"; done
+  # all/default are separate keys; a dotted VLAN name cannot be a dotted sysctl key.
+  out="$(sysctl_ipv6_iface_redirects "$P" | sort | tr '\n' ' ')"
+  [[ "$out" == 'net.ipv6.conf.eth0.accept_redirects=1 net.ipv6.conf.veth-a1.accept_redirects=1 ' ]] || fail "interface list: $out"
+)
+printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys, records originals and reaches every IPv6 interface.\n'
 
 # Real sysctl_key_configured against fixture files.
 (
@@ -260,7 +294,8 @@ printf 'PASS: terminal multiplexer detection.\n'
   SUDO_USER='' UPGRADE_APPROVED=1 AUTO_UPDATES=1 MEM_MIB=4096 INSTALL_TOOLS=0 ADMIN_NAME=''
   SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22'
   TOOLS_PACKAGES=(curl)
-  printf '04:00\nops\n' > "$TEST_ROOT/q-input"
+  # 4:00 is the same time as 04:00, the form unattended-upgrades expects.
+  printf '4:00\nops\n' > "$TEST_ROOT/q-input"
   setup_questions < "$TEST_ROOT/q-input" > "$TEST_ROOT/q-out"
   [[ "$INSTALL_TOOLS" == 1 && "$VNSTAT_CHOICE" == 0 && "$KERNEL_CLEAN_CHOICE" == 0 ]] || fail 'tool/vnstat/kernel choices'
   [[ "$AUTO_REBOOT_TIME" == 04:00 && "$ZRAM_CHOICE" == 0 && "$SYSCTL_CHOICE" == 1 ]] || fail 'reboot/zram/sysctl choices'

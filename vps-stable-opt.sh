@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.1 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.2 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.1
+SCRIPT_VERSION=2.7.2
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -17,6 +17,8 @@ MODULE_FILE=/etc/modules-load.d/99-vps-stable-bbr.conf
 ZRAM_FILE=/etc/systemd/zram-generator.conf
 # The zram-generator package's own default (creates zram0 when nothing overrides it).
 ZRAM_VENDOR_FILE=/usr/lib/systemd/zram-generator.conf
+# Memory-management values that suit a swap that lives only in compressed RAM.
+ZRAM_SYSCTL_FILE=/etc/sysctl.d/99-vps-stable-zram.conf
 UFW_CONF=/etc/ufw/ufw.conf
 JOURNAL_FILE=/etc/systemd/journald.conf.d/99-vps-stable.conf
 F2B_FILE=/etc/fail2ban/jail.d/99-vps-stable-sshd.local
@@ -425,15 +427,23 @@ details_report() {
 plan() {
   say '给机器做体检（只检查，不修改）'
   printf '系统：%s | 内核：%s | 虚拟化：%s | 内存：%s MiB | 系统盘：%s GiB\n' "$PRETTY_NAME" "$(uname -r)" "$VIRT" "$MEM_MIB" "$ROOT_GIB"
-  echo '选择“一键开荒”时，会重新读取机器状态并检查，不沿用旧报告直接修改。'
-  echo '系统更新、自动更新、常用工具、时区、SSH 加固、防火墙分别确认；BBR/ZRAM 等按检测结果决定。'
-  echo '默认保留 SSH 端口、root 登录、IPv6、MTU、DNS；不重装系统、不建磁盘 Swap、不换第三方内核。'
+  # Menus 8 and 9 change one thing only: the full setup plan would mislead there.
+  case "$MODE" in
+    ssh) echo '这次只做 SSH 登录加固：先体检，再按提示一步步确认。' ;;
+    firewall) echo '这次只设置防火墙和 SSH 防爆破：先体检，再按提示一步步确认。' ;;
+    *)
+      echo '选择“一键开荒”时，会重新读取机器状态并检查，不沿用旧报告直接修改。'
+      echo '系统更新、自动更新、常用工具、时区、SSH 加固、防火墙分别确认；BBR/ZRAM 等按检测结果决定。'
+      echo '默认保留 SSH 端口、root 登录、IPv6、MTU、DNS；不重装系统、不建磁盘 Swap、不换第三方内核。' ;;
+  esac
   preflight_report
   security_audit
   health_report
   state_report
-  decision_report "$PREFLIGHT_BLOCKERS" "$SOURCE_REVIEW_REQUIRED"
-  echo 'SSH 登录方式、失败服务等体检提示需要人工判断，本工具不会逐条自动修复。'
+  case "$MODE" in
+    ssh|firewall) ;;
+    *) decision_report "$PREFLIGHT_BLOCKERS" "$SOURCE_REVIEW_REQUIRED" ;;
+  esac
 }
 
 # Matches APT's own upgrade simulation: a new linux-image/modules package means
@@ -447,6 +457,7 @@ UPGRADE_COUNT=0
 apt_index_stage() {
   say '第2步：软件索引与升级计划'
   local free_mb simulation count
+  local -a names=()
   free_mb="$(df -Pm / | awk 'NR==2 {print $4}')"
   [[ "$free_mb" =~ ^[0-9]+$ ]] || die '无法确定磁盘剩余空间。'
   ((free_mb >= 650)) || die "磁盘只剩 ${free_mb}MiB，至少需要 650MiB。"
@@ -463,10 +474,15 @@ apt_index_stage() {
     die '系统升级模拟失败；请人工检查软件包和软件源，未执行升级。'
   fi
   printf '%s\n' "$simulation" > "$RUN_BACKUP_DIR/upgrade-simulation.txt"
-  printf '%s\n' "$simulation" | sed -n '1,120p'
   count="$(grep -c '^Inst ' <<< "$simulation" || true)"
   UPGRADE_COUNT="$count"
   printf '计划升级或新装的软件包：%s 个（完整清单保存在本次备份目录）。\n' "$count"
+  # Only the package names on screen; APT's raw Inst/Conf lines run to hundreds.
+  mapfile -t names < <(awk '$1 == "Inst" {print $2}' <<< "$simulation")
+  if ((${#names[@]})); then
+    printf '%s\n' "${names[@]:0:60}" | paste -sd ' ' - | fold -s -w 76 | sed 's/^/  /'
+    if ((${#names[@]} > 60)); then echo "  ……共 ${#names[@]} 个，其余见备份目录里的 upgrade-simulation.txt"; fi
+  fi
   KERNEL_UPDATE=0
   if upgrade_has_kernel "$simulation"; then
     KERNEL_UPDATE=1
@@ -554,9 +570,9 @@ setup_questions() {
       if confirm_yes '升级后清理不再需要的旧内核吗？（保留正在运行的和最新的内核，先模拟确认；删除后无法撤销）'; then KERNEL_CLEAN_CHOICE=1; else KERNEL_CLEAN_CHOICE=0; fi
     fi
     if ((AUTO_UPDATES)); then
-      read -r -p '自动安全更新需要重启时，允许每天几点自动重启？输入时间（例如 04:00），直接回车表示不自动重启: ' AUTO_REBOOT_TIME || AUTO_REBOOT_TIME=''
-      if [[ -n "$AUTO_REBOOT_TIME" && ! "$AUTO_REBOOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
-        warn "时间格式不对：$AUTO_REBOOT_TIME，按不自动重启处理。"; AUTO_REBOOT_TIME=''
+      read -r -p '自动安全更新需要重启时，允许每天几点自动重启？输入服务器时间（例如 04:00），直接回车表示不自动重启: ' AUTO_REBOOT_TIME || AUTO_REBOOT_TIME=''
+      if [[ -n "$AUTO_REBOOT_TIME" ]] && ! AUTO_REBOOT_TIME="$(reboot_time_normalize "$AUTO_REBOOT_TIME")"; then
+        warn '时间格式不对，按不自动重启处理。'; AUTO_REBOOT_TIME=''
       fi
     fi
     if ((MEM_MIB >= 2048)) && ! swap_exists; then
@@ -639,7 +655,7 @@ kernel_cleanup() {
   running="$(uname -r)"
   sim="$(apt-get -s autoremove --purge 2>&1)" || { warn '旧内核清理模拟失败，跳过。'; return 0; }
   mapfile -t removed < <(awk '$1 == "Purg" || $1 == "Remv" {sub(/:.*/, "", $2); print $2}' <<< "$sim" | sort -u)
-  if ((${#removed[@]} == 0)); then ok '没有需要清理的旧内核。'; return 0; fi
+  if ((${#removed[@]} == 0)); then ok '没有需要清理的旧内核：系统会保留正在用的内核和上一个版本备用（新内核启动不了时还能选回），更旧的才会清理。'; return 0; fi
   for pkg in "${removed[@]}"; do
     if [[ ! "$pkg" =~ ^linux-(image|modules|modules-extra|headers)-[0-9] || "$pkg" == *"$running"* ]]; then
       warn "自动清理还会删除其他软件包（$pkg），为安全起见跳过；可以以后手动运行 apt autoremove。"
@@ -896,6 +912,73 @@ zram_vendor_default_only() {
   ! swapon --noheadings --show=NAME 2>/dev/null | grep -qv '^/dev/zram'
 }
 
+zram_swap_active() {
+  awk 'NR > 1 && $1 == "/dev/zram0" {found = 1} END {exit !found}' /proc/swaps 2>/dev/null
+}
+
+# zram0 still set up but carrying no swap (stopped after its unit file was
+# already gone, so nothing reset it) refuses a new size: it is reset here. A
+# device in use or mounted is left alone; the kernel would refuse anyway.
+zram_reset_idle() {
+  local dev="${1:-/sys/block/zram0}"
+  [[ "$(cat -- "$dev/initstate" 2>/dev/null || true)" == 1 ]] || return 0
+  if zram_swap_active || grep -q '^/dev/zram0 ' /proc/mounts 2>/dev/null; then return 0; fi
+  printf '1\n' > "$dev/reset" 2>/dev/null
+}
+
+# Starts the generated swap; a leftover set-up device or an earlier failed
+# attempt would make the start fail again.
+zram_start() {
+  systemctl daemon-reload || return 1
+  zram_reset_idle || true
+  systemctl reset-failed systemd-zram-setup@zram0.service dev-zram0.swap >/dev/null 2>&1 || true
+  systemctl start dev-zram0.swap
+}
+
+# The ZRAM configuration is still exactly what this tool wrote.
+zram_file_ours() {
+  local fp
+  [[ "$RESTORE_READY" == 1 ]] || return 1
+  [[ "$(restore_read zram_file state 2>/dev/null || true)" == applied ]] || return 1
+  fp="$(restore_fingerprint zram_file 2>/dev/null)" || return 1
+  [[ "$fp" == "$(restore_read zram_file last_fp 2>/dev/null || true)" ]]
+}
+
+# For a swap that lives only in compressed RAM: reading neighbouring pages
+# ahead (page-cluster) gains nothing there, and moving idle program memory into
+# ZRAM is cheaper than dropping file cache that must be read back from disk.
+zram_sysctl_pairs() {
+  printf '%s\n' vm.swappiness=100 vm.page-cluster=0
+}
+
+zram_tune() {
+  local pair key value current text='' existed=0
+  local -a originals=() kept=()
+  # A disk swap next to ZRAM would be slowed down by both values.
+  if swapon --noheadings --show=NAME 2>/dev/null | grep -qv '^/dev/zram'; then return 0; fi
+  while IFS= read -r pair; do
+    key="${pair%%=*}"; value="${pair#*=}"
+    current="$(sysctl -n "$key" 2>/dev/null || true)"
+    [[ -n "$current" ]] || continue
+    if sysctl_key_configured "$key" "$ZRAM_SYSCTL_FILE"; then kept+=("$key"); continue; fi
+    text+="$key = $value"$'\n'
+    originals+=("$key=$current")
+  done < <(zram_sysctl_pairs)
+  if ((${#kept[@]})); then ok "已有其他配置的内存参数保持不变：${kept[*]}"; fi
+  [[ -n "$text" ]] || return 0
+  if [[ -e "$ZRAM_SYSCTL_FILE" ]]; then existed=1; fi
+  put_file "$ZRAM_SYSCTL_FILE" "# VPS Stable Optimizer v2.6: ZRAM swap tuning"$'\n'"${text%$'\n'}" || return 0
+  # Values read while an existing file was already in force are not originals.
+  if ((existed == 0)); then
+    for pair in "${originals[@]}"; do
+      restore_record_sysctl "${pair%%=*}" "${pair#*=}" zram_sysctl_runtime || warn "无法记录 ${pair%%=*} 的原值；回退后要重启才会恢复默认。"
+    done
+  fi
+  text="${text%$'\n'}"
+  if sysctl -e -p "$ZRAM_SYSCTL_FILE" >/dev/null; then ok "ZRAM 配套内存参数已生效：${text//$'\n'/，}"
+  else warn 'ZRAM 配套内存参数没有生效，请查看日志。'; fi
+}
+
 zram_stage() {
   say '第4步：内存与 ZRAM（在系统升级前配置）'
   local size='ram / 2' vendor=0
@@ -904,9 +987,19 @@ zram_stage() {
     if [[ "${ZRAM_CHOICE:-}" == 1 ]] && zram_vendor_default_only; then
       vendor=1
       echo '现在的 ZRAM 来自 systemd-zram-generator 软件包自带的默认配置（约内存一半），改用本工具的配置。'
+    elif zram_file_ours && ! swapon --noheadings 2>/dev/null | grep -q .; then
+      echo '本工具的 ZRAM 配置还在，但 ZRAM 没有运行（可能上次启动失败）：重新启动它。'
+      if zram_start; then zram_tune; module_result zram applied 'zram0 restarted'
+      else warn 'ZRAM 仍然没有启动，请运行 systemctl status systemd-zram-setup@zram0 查看原因。'; module_result zram failed 'dev-zram0.swap did not start'; fi
+      swapon --show || true
+      return 0
     else
       ok '已有 Swap/ZRAM，保持不变。'; swapon --show || true
-      module_result zram preserved 'existing swap/zram'; return 0
+      # A ZRAM this tool set up earlier also gets the tuning added later.
+      if zram_file_ours && zram_swap_active; then
+        zram_tune; module_result zram present 'zram0 (this tool)'
+      else module_result zram preserved 'existing swap/zram'; fi
+      return 0
     fi
   fi
   if ((MEM_MIB >= 2048)); then
@@ -922,13 +1015,16 @@ zram_stage() {
     module_result zram unsupported 'package unavailable'; return 0
   fi
   install_pkgs systemd-zram-generator
-  if put_file "$ZRAM_FILE" "[zram0]"$'\n'"zram-size = $size"$'\n''swap-priority = 100'; then
-    systemctl daemon-reload
+  # zstd packs about a third more into the same RAM than the kernel default;
+  # zram-generator only warns and keeps the default if the kernel lacks it.
+  if put_file "$ZRAM_FILE" "[zram0]"$'\n'"zram-size = $size"$'\n''compression-algorithm = zstd'$'\n''swap-priority = 100'; then
     if ((vendor)); then
+      systemctl daemon-reload
       # Resizing a zram swap in use is not safe: the new size applies from the next boot.
       ok "已写入本工具的 ZRAM 配置（$size），重启后按这个大小生效；现在先保留正在使用的 ZRAM。"
+      zram_tune
       module_result zram applied "zram0 = $size (from next boot)"
-    elif systemctl start dev-zram0.swap; then module_result zram applied "zram0 = $size"
+    elif zram_start; then zram_tune; module_result zram applied "zram0 = $size"
     else warn 'ZRAM 没有启动，请检查服务。'; module_result zram failed 'dev-zram0.swap did not start'; fi
   else
     module_result zram preserved 'zram config conflict'
@@ -1080,11 +1176,12 @@ sysctl_hardening_pairs() {
     kernel.kptr_restrict=2 kernel.dmesg_restrict=1
 }
 
-# True when KEY is assigned in any sysctl configuration file other than ours.
+# True when KEY is assigned in any sysctl configuration file other than ours
+# (OWN, the hardening file by default).
 sysctl_key_configured() {
-  local key="$1" f line k
+  local key="$1" own="${2:-$SYSCTL_HARDENING_FILE}" f line k
   while IFS= read -r f; do
-    [[ -f "$f" && "$f" != "$SYSCTL_HARDENING_FILE" ]] || continue
+    [[ -f "$f" && "$f" != "$own" ]] || continue
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line#"${line%%[![:space:]]*}"}"
       case "$line" in ''|'#'*|';'*) continue ;; esac
@@ -1098,10 +1195,24 @@ sysctl_key_configured() {
   return 1
 }
 
+# IPv6 reads accept_redirects only from each interface: all/default never reach
+# an interface that already exists (eth0 comes up before systemd-sysctl at
+# boot). Prints "key=value" for every existing interface (not all/default).
+sysctl_ipv6_iface_redirects() {
+  local f iface
+  for f in "${1:-/proc/sys/net/ipv6/conf}"/*/accept_redirects; do
+    [[ -f "$f" ]] || continue
+    iface="${f%/accept_redirects}"; iface="${iface##*/}"
+    # Dotted names (VLANs) cannot be written in sysctl's dotted key notation.
+    [[ "$iface" =~ ^[A-Za-z0-9_-]+$ && "$iface" != all && "$iface" != default ]] || continue
+    printf 'net.ipv6.conf.%s.accept_redirects=%s\n' "$iface" "$(cat -- "$f" 2>/dev/null || true)"
+  done
+}
+
 sysctl_hardening_stage() {
   say '第7步：内核网络安全参数（可选）'
   local pair key value current text=''
-  local -a kept=() originals=()
+  local -a kept=() originals=() ifaces=()
   if [[ "${SYSCTL_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改内核网络参数。'; module_result sysctl declined 'not requested'; return 0; fi
   while IFS= read -r pair; do
     key="${pair%%=*}"; value="${pair#*=}"
@@ -1111,6 +1222,15 @@ sysctl_hardening_stage() {
     text+="$key = $value"$'\n'
     originals+=("$key=$current")
   done < <(sysctl_hardening_pairs)
+  # The glob reaches every interface at boot and on hotplug (udev runs
+  # systemd-sysctl for each new interface); existing ones are written below.
+  if [[ "$text" == *'net.ipv6.conf.all.accept_redirects = 0'* ]]; then
+    text+='net.ipv6.conf.*.accept_redirects = 0'$'\n'
+    while IFS= read -r pair; do
+      [[ "${pair#*=}" =~ ^[0-9]+$ ]] || continue
+      ifaces+=("${pair%%=*}"); originals+=("$pair")
+    done < <(sysctl_ipv6_iface_redirects)
+  fi
   if ((${#kept[@]})); then ok "已有其他配置的参数保持不变：${kept[*]}"; fi
   if [[ -z "$text" ]]; then module_result sysctl preserved 'all keys configured elsewhere'; return 0; fi
   if ! put_file "$SYSCTL_HARDENING_FILE" "# VPS Stable Optimizer v2.6: network hardening"$'\n'"${text%$'\n'}"; then
@@ -1119,7 +1239,10 @@ sysctl_hardening_stage() {
   for pair in "${originals[@]}"; do
     restore_record_sysctl "${pair%%=*}" "${pair#*=}" || warn "无法记录 ${pair%%=*} 的原值；回退后要重启才会恢复默认。"
   done
-  if sysctl -e -p "$SYSCTL_HARDENING_FILE" >/dev/null; then ok '内核网络安全参数已生效。'; module_result sysctl applied "$(grep -c ' = ' "$SYSCTL_HARDENING_FILE") keys"
+  if sysctl -e -p "$SYSCTL_HARDENING_FILE" >/dev/null; then
+    # Older procps ignores glob keys: each existing interface is set directly.
+    for key in "${ifaces[@]}"; do sysctl -w "$key=0" >/dev/null 2>&1 || true; done
+    ok '内核网络安全参数已生效。'; module_result sysctl applied "$(grep -c ' = ' "$SYSCTL_HARDENING_FILE") keys"
   else warn '部分内核参数没有生效，请查看日志。'; module_result sysctl failed 'sysctl -p failed'; fi
 }
 
@@ -1555,15 +1678,20 @@ ssh_password_disabled() {
 ufw_boot_enable() {
   local state
   state="$(systemctl is-enabled ufw.service 2>/dev/null || true)"
-  [[ "$state" != enabled ]] || return 0
   case "$state" in
+    enabled) ;;
     static|indirect|generated|alias)
       warn "ufw.service 的启用方式比较特殊（$state），无法确认开机时会不会加载防火墙，请人工检查。"; return 0 ;;
+    *)
+      # enabled-runtime lasts only until the next reboot; enable makes it persistent.
+      if systemctl enable ufw.service >/dev/null 2>&1 && [[ "$(systemctl is-enabled ufw.service 2>/dev/null || true)" == enabled ]]; then
+        ok '已设置防火墙开机自动加载（ufw.service）。'
+      else warn '无法设置 ufw.service 开机启动：重启后防火墙可能不会加载，请手动运行 systemctl enable ufw。'; return 0; fi ;;
   esac
-  # enabled-runtime lasts only until the next reboot; enable makes it persistent.
-  if systemctl enable ufw.service >/dev/null 2>&1 && [[ "$(systemctl is-enabled ufw.service 2>/dev/null || true)" == enabled ]]; then
-    ok '已设置防火墙开机自动加载（ufw.service）。'
-  else warn '无法设置 ufw.service 开机启动：重启后防火墙可能不会加载，请手动运行 systemctl enable ufw。'; fi
+  # "ufw enable" loads the rules without starting ufw.service. Starting it now
+  # only reports "already started" (rules untouched), and the service state
+  # matches the one after a reboot, so later runs see no change from outside.
+  if ufw_active && ! active ufw.service; then systemctl start ufw.service >/dev/null 2>&1 || true; fi
 }
 
 # Existing UFW active: preserve current policies, no automatic edits except confirmed web ALLOW.
@@ -2507,13 +2635,13 @@ audit_network() {
   if command -v ufw >/dev/null; then
     if data="$(ufw status verbose 2>/dev/null)" && [[ -n "$data" ]]; then audit_bounded_lines 60 <<< "$data"
     else warn '无法取得 UFW 状态，可能权限不足；状态未知。'; fi
+    if [[ -r /etc/default/ufw ]]; then ipv6="$(audit_ufw_ipv6 < /etc/default/ufw)"; fi
+    case "$ipv6" in
+      yes) echo 'UFW IPV6=yes：配置允许管理 IPv6；仍需核对实际 v6 规则与监听。' ;;
+      no) warn 'UFW IPV6=no：不要假设 UFW 已保护 IPv6 入口；请人工核对 IPv6 与上游防火墙。' ;;
+      *) warn 'UFW IPV6 配置未知（缺失、不可读、重复或复杂赋值），不执行该配置文件。' ;;
+    esac
   else warn 'UFW 未安装；其他防火墙和商家规则需另外确认。'; fi
-  if [[ -r /etc/default/ufw ]]; then ipv6="$(audit_ufw_ipv6 < /etc/default/ufw)"; fi
-  case "$ipv6" in
-    yes) echo 'UFW IPV6=yes：配置允许管理 IPv6；仍需核对实际 v6 规则与监听。' ;;
-    no) warn 'UFW IPV6=no：不要假设 UFW 已保护 IPv6 入口；请人工核对 IPv6 与上游防火墙。' ;;
-    *) warn 'UFW IPV6 配置未知（缺失、不可读、重复或复杂赋值），不执行该配置文件。' ;;
-  esac
   echo '商家安全组、上游防火墙和公网实际可达性无法仅从本机验证，请在服务商控制台与另一台机器确认。'
 }
 
@@ -2567,13 +2695,14 @@ health_report() {
   say '磁盘、内存与服务健康检查（只读）'
   echo '-- 根分区与 /boot 容量（KiB） --'
   if command -v df >/dev/null; then
-    if data="$(df -Pk / /boot 2>/dev/null)" && [[ -n "$data" ]]; then
+    # Without a separate /boot, df prints the root line twice.
+    if data="$(df -Pk / /boot 2>/dev/null | awk '!seen[$0]++')" && [[ -n "$data" ]]; then
       audit_bounded_lines 12 <<< "$data"
       risks="$(audit_disk_risks 磁盘 <<< "$data")"
       if [[ -n "$risks" ]]; then while IFS= read -r line; do warn "$(audit_clean_text <<< "$line")"; done <<< "$risks"; fi
     else warn '根分区或 /boot 容量查询失败或为空，状态未知。'; fi
     echo '-- inode 使用量 --'
-    if inode="$(df -Pi / /boot 2>/dev/null)" && [[ -n "$inode" ]]; then
+    if inode="$(df -Pi / /boot 2>/dev/null | awk '!seen[$0]++')" && [[ -n "$inode" ]]; then
       audit_bounded_lines 12 <<< "$inode"
       risks="$(audit_disk_risks inode <<< "$inode")"
       if [[ -n "$risks" ]]; then while IFS= read -r line; do warn "$(audit_clean_text <<< "$line")"; done <<< "$risks"; fi
@@ -2756,7 +2885,7 @@ backup_config_group() {
 backup_configs() {
   local file unit
   say '保存配置快照与优化前状态'
-  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
+  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
       /etc/ssh/sshd_config /etc/default/ssh /etc/default/ufw \
       /etc/ufw/ufw.conf /etc/ufw/sysctl.conf /etc/ufw/before.rules /etc/ufw/before6.rules \
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
@@ -3111,7 +3240,7 @@ decision_report() {
   elif ((MEM_MIB>=2048)); then
     decision_line '保留现状' '内存缓冲（ZRAM）' '内存不少于 2GiB，默认不新增 ZRAM。'
   elif available systemd-zram-generator; then
-    decision_line '准备调整' '内存缓冲（ZRAM）' '内存低于 2GiB，未发现 Swap/ZRAM；计划配置约内存一半大小的 ZRAM，不创建硬盘 Swap。'
+    decision_line '准备调整' '内存缓冲（ZRAM）' '内存低于 2GiB，未发现 Swap/ZRAM；计划配置约内存一半大小的 ZRAM（zstd 压缩，并配好适合 ZRAM 的 swappiness 和 page-cluster），不创建硬盘 Swap。'
   else
     decision_line '准备调整' '内存缓冲（ZRAM）' '内存低于 2GiB，未发现 Swap/ZRAM；当前软件索引未确认组件可用，更新索引后再检查，不可用就跳过。'
   fi
@@ -3416,7 +3545,7 @@ restore_ids() {
     # Package installation can create UFW defaults, so the stage tracks them too.
     apt_upgrade) printf '%s\n' apt_auto_file svc_timesync svc_trim svc_apt_daily svc_apt_upgrade svc_ufw svc_fail2ban ntp ufw_policy_in ufw_policy_out ufw_runtime ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
-    zram) printf '%s\n' zram_file zram_swap ;;
+    zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     journal) printf '%s\n' journal_file ;;
     trim) printf '%s\n' svc_trim ;;
@@ -3433,14 +3562,14 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file zram_file zram_swap journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file zram_file zram_swap zram_sysctl_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
 }
 
 restore_label() {
   case "$1" in
     bbr_file) echo 'BBR 配置文件' ;; bbr_module) echo 'BBR 模块加载配置' ;;
     cc) echo 'TCP 拥塞算法' ;; qdisc) echo '默认队列算法' ;;
-    zram_file) echo 'ZRAM 配置' ;; zram_swap) echo 'ZRAM 交换空间' ;;
+    zram_file) echo 'ZRAM 配置' ;; zram_swap) echo 'ZRAM 交换空间' ;; zram_sysctl_file) echo 'ZRAM 配套内存参数' ;;
     journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
@@ -3459,6 +3588,7 @@ restore_path() {
   case "$1" in
     bbr_file) printf '%s\n' "$BBR_FILE" ;; bbr_module) printf '%s\n' "$MODULE_FILE" ;;
     zram_file) printf '%s\n' "$ZRAM_FILE" ;; journal_file) printf '%s\n' "$JOURNAL_FILE" ;;
+    zram_sysctl_file) printf '%s\n' "$ZRAM_SYSCTL_FILE" ;;
     apt_file) printf '%s\n' "$APT_FILE" ;; f2b_jail) printf '%s\n' "$F2B_FILE" ;;
     apt_auto_file) echo /etc/apt/apt.conf.d/20auto-upgrades ;;
     f2b_action) printf '%s\n' "$F2B_ACTION_FILE" ;;
@@ -3653,26 +3783,30 @@ restore_record_fw_rule() {
 }
 
 # Running sysctl values before this tool first changed them (first value wins).
+# NAME is the record (sysctl_runtime for the hardening, zram_sysctl_runtime for ZRAM).
 restore_record_sysctl() {
-  local key="$1" value="$2" file="$RESTORE_ROOT/sysctl_runtime"
+  local key="$1" value="$2" file="$RESTORE_ROOT/${3:-sysctl_runtime}"
   [[ "$RESTORE_READY" == 1 ]] || return 0
-  [[ "$key" =~ ^[a-z0-9_.]+$ && "$value" =~ ^-?[0-9]+$ ]] || return 1
+  [[ "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ && "$value" =~ ^-?[0-9]+$ ]] || return 1
   [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
-  if [[ -f "$file" ]] && grep -q -- "^$key=" "$file"; then return 0; fi
+  if [[ -f "$file" ]] && awk -F= -v k="$key" '$1 == k {found = 1} END {exit !found}' "$file"; then return 0; fi
   printf '%s=%s\n' "$key" "$value" >> "$file" && chmod 600 -- "$file"
 }
 
-# Applied after the hardening file itself was removed.
+# Applied after the configuration file itself was removed. An interface that
+# no longer exists (a container's veth) has nothing left to restore.
 restore_sysctl_runtime() {
-  local file="$RESTORE_ROOT/sysctl_runtime" line key value failed=0
+  local file="$RESTORE_ROOT/${1:-sysctl_runtime}" line key value failed=0
   [[ -e "$file" || -L "$file" ]] || return 0
   restore_data_safe "$file" || { warn '内核参数原值记录不安全，跳过。'; RESTORE_PARTIAL=1; return 0; }
   while IFS= read -r line; do
     key="${line%%=*}"; value="${line#*=}"
-    if [[ ! "$key" =~ ^[a-z0-9_.]+$ || ! "$value" =~ ^-?[0-9]+$ ]]; then warn "忽略格式异常的记录：$line"; failed=1; continue; fi
+    if [[ ! "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ || ! "$value" =~ ^-?[0-9]+$ ]]; then warn "忽略格式异常的记录：$line"; failed=1; continue; fi
+    if [[ "$key" =~ ^net\.ipv6\.conf\.([^.]+)\.accept_redirects$ && "${BASH_REMATCH[1]}" != all && "${BASH_REMATCH[1]}" != default &&
+          ! -d "/proc/sys/net/ipv6/conf/${BASH_REMATCH[1]}" ]]; then continue; fi
     sysctl -w "$key=$value" >/dev/null || { warn "无法恢复 $key=$value"; failed=1; }
   done < "$file"
-  if ((failed)); then RESTORE_PARTIAL=1; else rm -f -- "$file"; ok '内核网络参数已恢复为原来的运行值。'; fi
+  if ((failed)); then RESTORE_PARTIAL=1; else rm -f -- "$file"; ok '内核参数已恢复为原来的运行值。'; fi
 }
 
 restore_before_stage() {
@@ -3689,7 +3823,7 @@ restore_before_stage() {
     # A hand-made change does not block the step: rollback always returns a
     # setting to its state before this tool's first run (origin_fp).
     if [[ "$fp" != "$last" ]]; then
-      ok "$(restore_label "$id") 在本工具之后被手动改过：按这次的选择继续。"
+      ok "$(restore_label "$id") 和本工具上次记下的状态不同（手动改过，或重启后系统自动变化）：按这次的选择继续。"
     fi
   done < <(restore_ids "$stage")
   ((bad == 0)) || return 1
@@ -3869,6 +4003,8 @@ restore_apply_one() {
       if [[ "$(restore_value zram_swap)" != absent ]]; then swapoff /dev/zram0 || return 1; fi
       [[ "$(restore_value zram_swap)" == absent ]] || return 1
       if active systemd-zram-setup@zram0.service; then systemctl stop systemd-zram-setup@zram0.service || return 1; fi
+      # Once the package is gone that stop no longer resets the device.
+      zram_reset_idle || warn '/dev/zram0 暂时无法释放，重启后会自动释放。'
       ! active dev-zram0.swap ;;
     *) return 1 ;;
   esac
@@ -4040,10 +4176,11 @@ restore_ssh_group() {
 }
 
 restore_zram_group() {
-  local file_needed=0 swap_needed=0 origin
+  local file_needed=0 swap_needed=0 tune_needed=0 origin
   if restore_needed zram_file; then file_needed=1; fi
   if restore_needed zram_swap; then swap_needed=1; fi
-  ((file_needed || swap_needed)) || return 0
+  if restore_needed zram_sysctl_file || [[ -s "$RESTORE_ROOT/zram_sysctl_runtime" ]]; then tune_needed=1; fi
+  ((file_needed || swap_needed || tune_needed)) || return 0
   origin="$(restore_read zram_swap origin_value 2>/dev/null || true)"
   if ((swap_needed)) && [[ -n "$origin" && "$origin" != absent ]]; then
     # A swap existed before (for example the package's own default): only the
@@ -4062,12 +4199,36 @@ restore_zram_group() {
     restore_mark zram_file applied || die '无法记录待重试的 ZRAM 回退。'
     RESTORE_PARTIAL=1
   fi
-  # The package's own default turns ZRAM on again at the next boot.
+  restore_resource zram_sysctl_file
+  if [[ "$(restore_read zram_sysctl_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime zram_sysctl_runtime; fi
+  # The package's own default turns ZRAM on again (see restore_zram_settle).
   if [[ "$origin" == absent ]] && installed systemd-zram-generator && grep -q '^[[:space:]]*\[zram' "$ZRAM_VENDOR_FILE" 2>/dev/null; then
-    warn 'systemd-zram-generator 软件包自带默认配置：重启后会按约一半内存重新开启 ZRAM。要保持关闭，需要卸载这个本工具装的软件包。'
+    warn 'systemd-zram-generator 软件包自带默认配置：它会让 ZRAM 按约一半内存重新开启（不用等重启，系统下次启动任何服务时就会开启）。要保持关闭，需要卸载这个本工具装的软件包。'
     if [[ "${RESTORE_ALL:-0}" == 1 ]]; then echo '稍后询问是否卸载本工具新装的软件包时，把它一起卸载即可。'
-    else restore_packages_offer systemd-zram-generator; fi
+    else restore_packages_offer systemd-zram-generator; restore_zram_settle; fi
   fi
+}
+
+# The package default is read again at every daemon-reload, and swap.target
+# then starts that ZRAM along with the next unit any service start pulls in:
+# it is back within moments, not only after a reboot. Once the package is gone
+# such a ZRAM is switched off for good; while the package stays, its ZRAM is
+# started now, so what is shown is what the next boot will have.
+restore_zram_settle() {
+  [[ -d "$RESTORE_ROOT/zram_swap" && ! -e "$ZRAM_FILE" ]] || return 0
+  [[ "$(restore_read zram_swap origin_value 2>/dev/null || true)" == absent ]] || return 0
+  if installed systemd-zram-generator; then
+    grep -q '^[[:space:]]*\[zram' "$ZRAM_VENDOR_FILE" 2>/dev/null || return 0
+    # Only a package this tool installed; an administrator's own stays as it is.
+    restore_tool_packages | grep -Fxq systemd-zram-generator || return 0
+    if zram_swap_active || systemctl start dev-zram0.swap >/dev/null 2>&1; then
+      warn '保留了 systemd-zram-generator：ZRAM 按它自带的默认配置（约内存一半）继续开启。要彻底关闭，以后在撤销里选「卸载本工具新装的软件包」。'
+      module_result zram present 'package default'
+    fi
+    return 0
+  fi
+  if restore_needed zram_swap; then restore_resource zram_swap; fi
+  zram_reset_idle || true
 }
 
 # Packages this tool installed, minus anything present before its first run.
@@ -4168,7 +4329,7 @@ restore_group_ids() {
     firewall) printf '%s\n' ufw_runtime ufw_policy_in ufw_policy_out ufw_ipv6 svc_ufw ;;
     fail2ban) printf '%s\n' f2b_jail f2b_action svc_fail2ban ;;
     ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
-    zram) printf '%s\n' zram_file zram_swap ;;
+    zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
     journal) printf '%s\n' journal_file ;;
@@ -4193,6 +4354,7 @@ restore_group_pending() {
   case "$group" in
     firewall) [[ -s "$RESTORE_ROOT/fw_rules" ]] && return 0 ;;
     sysctl) [[ -s "$RESTORE_ROOT/sysctl_runtime" ]] && return 0 ;;
+    zram) [[ -s "$RESTORE_ROOT/zram_sysctl_runtime" ]] && return 0 ;;
   esac
   return 1
 }
@@ -4255,6 +4417,7 @@ restore_all_groups() {
   # Fail2ban first (its bans live in UFW), then the firewall itself.
   while IFS= read -r group; do restore_group_apply "$group"; done < <(restore_groups)
   restore_packages_offer
+  restore_zram_settle
   restore_firewall_warning "$firewall_before"
 }
 
@@ -4274,7 +4437,7 @@ restore_pick_group() {
   read -r -p "要撤销哪一项？[1-$i，回车取消]: " choice || choice=''
   [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= i)) || { ok '已取消。'; return 0; }
   group="${pending[choice - 1]}"
-  if [[ "$group" == packages ]]; then restore_packages_offer; return 0; fi
+  if [[ "$group" == packages ]]; then restore_packages_offer; restore_zram_settle; return 0; fi
   confirm_yes "确定撤销「$(restore_group_label "$group")」吗？" || { ok '已取消。'; return 0; }
   firewall_before="$(restore_value ufw_runtime 2>/dev/null || true)"
   restore_group_apply "$group"
@@ -4375,12 +4538,15 @@ VERIFY_FAIL=0
 VERIFY_EXIT=0
 VERIFY_NA=0
 VERIFY_UNKNOWN=0
+VERIFY_REBOOT=0
 verify_line() {
   case "$1" in
     pass) VERIFY_PASS=$((VERIFY_PASS + 1)); printf '\033[1;32m[✅ 生效]\033[0m   %s：%s\n' "$2" "$3" ;;
     healthy) VERIFY_PASS=$((VERIFY_PASS + 1)); printf '\033[1;32m[✅ 正常]\033[0m   %s：%s\n' "$2" "$3" ;;
     fail) VERIFY_FAIL=$((VERIFY_FAIL + 1)); printf '\033[1;31m[❌ 未生效]\033[0m %s：%s\n' "$2" "$3" ;;
     na) VERIFY_NA=$((VERIFY_NA + 1)); printf '[➖ 未处理] %s：%s\n' "$2" "$3" ;;
+    # Expected to take effect with the next boot: not a failure.
+    reboot) VERIFY_REBOOT=$((${VERIFY_REBOOT:-0} + 1)); printf '\033[1;33m[⏳ 待重启]\033[0m %s：%s\n' "$2" "$3" ;;
     *) VERIFY_UNKNOWN=$((VERIFY_UNKNOWN + 1)); printf '\033[1;33m[❓ 无法确认]\033[0m %s：%s\n' "$2" "$3" ;;
   esac
 }
@@ -4429,10 +4595,18 @@ check_bbr() {
 }
 
 check_zram() {
-  local size
+  local size line bad='' algorithm
   size="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
-  if [[ -n "$size" ]]; then verify_set pass "/dev/zram0 已启用，约 ${size} MiB"
-  else verify_set fail '没有找到正在使用的 /dev/zram0'; fi
+  [[ -n "$size" ]] || { verify_set fail '没有找到正在使用的 /dev/zram0'; return 0; }
+  if [[ -f "$ZRAM_SYSCTL_FILE" ]]; then
+    while IFS= read -r line; do
+      case "$line" in 'bad '*) bad+=" ${line#bad }" ;; esac
+    done < <(sysctl_file_mismatch "$ZRAM_SYSCTL_FILE")
+  fi
+  # The selected algorithm is the bracketed one: "lzo [lz4] zstd".
+  algorithm="$(sed -n 's/.*\[\([a-z0-9-]*\)\].*/\1/p' /sys/block/zram0/comp_algorithm 2>/dev/null || true)"
+  if [[ -n "$bad" ]]; then verify_set fail "/dev/zram0 已启用，但配套内存参数和配置不一致：${bad# }"
+  else verify_set pass "/dev/zram0 已启用，约 ${size} MiB${algorithm:+，压缩算法 $algorithm}"; fi
 }
 
 check_ntp() {
@@ -4579,18 +4753,36 @@ check_fail2ban() {
   fi
 }
 
-check_sysctl() {
-  local key value current bad='' missing=''
-  [[ -f "$SYSCTL_HARDENING_FILE" ]] || { verify_set fail "配置文件不在了：$SYSCTL_HARDENING_FILE"; return 0; }
+# Compares each "key = value" line of FILE with the running value and prints
+# "bad key=current" or "missing key". A glob key (net.ipv6.conf.*.x) is checked
+# on every interface it covers (under PROC, /proc/sys by default).
+sysctl_file_mismatch() {
+  local proc="${2:-/proc/sys}" key value current path
   while IFS='=' read -r key value; do
     key="${key//[[:space:]]/}"; value="${value//[[:space:]]/}"
-    [[ "$key" =~ ^[a-z0-9_.]+$ && -n "$value" ]] || continue
-    current="$(sysctl -n "$key" 2>/dev/null || true)"
-    # Whitespace inside multi-value keys (tabs vs spaces) is not a mismatch.
-    current="${current//[[:space:]]/}"
-    if [[ -z "$current" ]]; then missing+=" $key"
-    elif [[ "$current" != "$value" ]]; then bad+=" $key=$current"; fi
-  done < "$SYSCTL_HARDENING_FILE"
+    [[ -n "$value" ]] || continue
+    if [[ "$key" =~ ^[a-z0-9_.-]+$ ]]; then
+      current="$(sysctl -n "$key" 2>/dev/null || true)"
+      # Whitespace inside multi-value keys (tabs vs spaces) is not a mismatch.
+      current="${current//[[:space:]]/}"
+      if [[ -z "$current" ]]; then echo "missing $key"
+      elif [[ "$current" != "$value" ]]; then echo "bad $key=$current"; fi
+    elif [[ "$key" =~ ^[a-z0-9_.-]+\*[a-z0-9_.-]*$ ]]; then
+      for path in "$proc"/${key//.//}; do
+        [[ -f "$path" ]] || continue
+        current="$(cat -- "$path" 2>/dev/null || true)"
+        if [[ "$current" != "$value" ]]; then path="${path#"$proc"/}"; echo "bad ${path//\//.}=$current"; fi
+      done
+    fi
+  done < "$1"
+}
+
+check_sysctl() {
+  local line bad='' missing=''
+  [[ -f "$SYSCTL_HARDENING_FILE" ]] || { verify_set fail "配置文件不在了：$SYSCTL_HARDENING_FILE"; return 0; }
+  while IFS= read -r line; do
+    case "$line" in 'bad '*) bad+=" ${line#bad }" ;; 'missing '*) missing+=" ${line#missing }" ;; esac
+  done < <(sysctl_file_mismatch "$SYSCTL_HARDENING_FILE")
   if [[ -n "$bad" ]]; then verify_set fail "这些参数的当前值和配置不一致：${bad# }"
   elif [[ -n "$missing" ]]; then verify_set unknown "其余已生效；这些参数读不到（内核或容器不提供），无法确认：${missing# }"
   else verify_set pass "已生效（$1）"; fi
@@ -4623,17 +4815,26 @@ boot_kernels() {
   done | sort -V
 }
 
+# Arguments allow isolated tests (boot directory, reboot-required flag).
 verify_kernel() {
-  local running newest
+  local boot="${1:-/boot}" flag="${2:-/var/run/reboot-required}" running newest installed uptime=''
   local -a kernels=()
   running="$(uname -r)"
-  mapfile -t kernels < <(boot_kernels)
+  mapfile -t kernels < <(boot_kernels "$boot")
   if ((${#kernels[@]} == 0)); then verify_line unknown '内核' "正在运行 $running；/boot 中没有内核文件（服务商可能使用外部内核）"; return 0; fi
   newest="${kernels[-1]}"
   if [[ "$running" != "$newest" ]]; then
-    verify_line fail '内核' "已安装更新的内核 $newest，但正在运行 $running：需要重启（已重启仍如此，可能是服务商外部内核或开机默认项不同）"
-  elif [[ -e /var/run/reboot-required ]]; then
-    verify_line fail '内核' "正在运行最新内核 $running，但系统仍提示需要重启（其他软件包的更新）"
+    # dpkg sets the change time when it installs a file (mtime is the build date).
+    installed="$(stat -c %Z -- "$boot/vmlinuz-$newest" 2>/dev/null || echo 0)"
+    read -r uptime _ 2>/dev/null < /proc/uptime || uptime=''
+    uptime="${uptime%%.*}"
+    if [[ "$uptime" =~ ^[0-9]+$ && "$installed" =~ ^[0-9]+$ ]] && ((installed > $(date +%s) - uptime)); then
+      verify_line reboot '内核' "新内核 $newest 是这次开机后才装的，重启后才会使用（现在运行 $running）"
+    else
+      verify_line fail '内核' "已安装更新的内核 $newest，但正在运行 $running：需要重启（已重启仍如此，可能是服务商外部内核或开机默认项不同）"
+    fi
+  elif [[ -e "$flag" ]]; then
+    verify_line reboot '内核' "正在运行最新内核 $running；有其他软件包的更新要重启后才完全生效"
   else
     verify_line pass '内核' "正在运行已安装的最新内核 $running"
   fi
@@ -4688,8 +4889,11 @@ verify_summary() {
   if docker_present; then verify_line unknown 'Docker' '已安装：用 -p 发布的容器端口会绕过防火墙，请确认这些端口确实需要对外'; fi
   verify_health
   echo
-  printf '结论：%s 项正常，%s 项未生效，%s 项按计划未处理，%s 项无法确认。\n' "$VERIFY_PASS" "$VERIFY_FAIL" "$VERIFY_NA" "$VERIFY_UNKNOWN"
+  printf '结论：%s 项正常，%s 项未生效，%s 项按计划未处理，%s 项无法确认' "$VERIFY_PASS" "$VERIFY_FAIL" "$VERIFY_NA" "$VERIFY_UNKNOWN"
+  if ((${VERIFY_REBOOT:-0})); then printf '，%s 项等重启后生效' "$VERIFY_REBOOT"; fi
+  echo '。'
   if ((VERIFY_FAIL)); then echo '“未生效”的项目请按说明处理；处理后可再次运行 vps check。'; fi
+  if ((${VERIFY_REBOOT:-0})); then echo '“待重启”的项目重启后自动生效：选菜单 7 重启，重启后再选 3 验收。'; fi
 }
 
 ufw_mentions() {
@@ -5053,7 +5257,9 @@ port_list() {
   rules="$(ufw show added)" || { warn '无法读取 UFW 规则。'; return 0; }
   mapfile -t ssh < <(port_ssh_ports)
   if ufw_active; then echo '防火墙状态：开启'; else echo '防火墙状态：未开启（以下规则暂不生效）'; fi
-  printf '%-14s %-8s %s\n' '端口' '协议' '来源'
+  # printf pads by bytes, and a Chinese character is 3 bytes but 2 columns
+  # wide: the header is spaced by hand to line up with the rows below.
+  echo '端口           协议     来源'
   while IFS= read -r line; do
     [[ "$line" == 'ufw '* ]] || continue
     if parsed="$(port_rule_parse "$line")"; then
@@ -5193,10 +5399,20 @@ item_status() {
   esac
 }
 
+# 24-hour H:MM or HH:MM, printed as HH:MM (the form unattended-upgrades expects).
+reboot_time_normalize() {
+  [[ "$1" =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || return 1
+  printf '%02d:%s\n' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}"
+}
+
+# The time is the server's own clock, which may differ from the user's.
 item_ask_reboot_time() {
-  read -r -p '每天几点自动重启？（例如 04:00）: ' AUTO_REBOOT_TIME || AUTO_REBOOT_TIME=''
-  if [[ "$AUTO_REBOOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then return 0; fi
-  warn "时间格式不对：${AUTO_REBOOT_TIME:-空}（要写成 04:00 这种格式）。"
+  local zone answer=''
+  zone="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+  read -r -p "每天几点自动重启？（按服务器时区${zone:+ $zone}，例如 04:00）: " answer || answer=''
+  if AUTO_REBOOT_TIME="$(reboot_time_normalize "$answer")"; then return 0; fi
+  AUTO_REBOOT_TIME=''
+  warn "时间格式不对：${answer:-空}（要写成 04:00 这种格式）。"
   return 1
 }
 
@@ -5285,14 +5501,18 @@ item_turn_off() {
   restore_group_apply "$key"
   restore_firewall_warning "$before"
   if ((RESTORE_PARTIAL)); then warn '没有完全撤销，详情见上方提示。'
-  else ok "已撤销本工具对「$(item_label "$key")」的修改。"; fi
+  else
+    ok "已撤销本工具对「$(item_label "$key")」的修改。"
+    # Without the policy the package only keeps a shutdown helper running.
+    if [[ "$key" == updates ]]; then restore_packages_offer unattended-upgrades; fi
+  fi
 }
 
 # A temporary switch-off for troubleshooting; turning it on again goes through
 # the normal firewall stage with its SSH confirmation.
 item_firewall_pause() {
   if ! ufw_active; then ok '防火墙现在没有开启。'; return 0; fi
-  echo '临时关闭后，所有正在监听的端口都会直接暴露在公网，Fail2ban 的封禁也不起作用；排查完记得回到这里重新开启。'
+  echo '临时关闭后，所有正在监听的端口都会直接暴露在公网，Fail2ban 的封禁也不起作用；重启后也保持关闭，排查完记得回到这里重新开启。'
   if ! confirm_yes '临时关闭防火墙吗？'; then ok '已取消。'; return 0; fi
   ufw --force disable >/dev/null
   restore_adopt ufw_runtime || warn '无法更新防火墙的回退记录。'
@@ -5548,7 +5768,7 @@ offer_reboot() {
       return 0
     fi
     echo '稍后请在合适的时间手动重启：systemctl reboot，然后运行 vps check。'
-  else
+  elif [[ "$MODE" == setup ]]; then
     echo '建议找合适的时间重启一次，再运行 vps check，确认重启后各项仍然生效。'
   fi
 }
