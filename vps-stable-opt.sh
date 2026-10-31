@@ -2230,10 +2230,15 @@ ssh_effective_value() {
 # written as root. Failed attempts put text before TTY= ("3 incorrect password
 # attempts", "user NOT in sudoers") and a line from `logger -t sudo` by a local
 # user is not written as root: neither counts.
+# sudo logs under the real UID of the account that ran it, so lines from that
+# account (or root) count; a line another local user writes with
+# `logger -t sudo` carries that user's UID and is ignored.
 ssh_sudo_seen() {
-  local user="$1" since="$2"
+  local user="$1" since="$2" uid
   command -v journalctl >/dev/null || return 1
-  journalctl -q --since "@$since" _UID=0 -t sudo -o cat --no-pager 2>/dev/null |
+  uid="$(getent passwd "$user" | cut -d: -f3)" || return 1
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  journalctl -q --since "@$since" _UID=0 "_UID=$uid" -t sudo -o cat --no-pager 2>/dev/null |
     awk -v u="$user" '$1 == u && $2 == ":" && $3 ~ /^TTY=/ && $0 ~ /USER=root ; COMMAND=(\/usr)?\/bin\/true$/ {found = 1} END {exit !found}'
 }
 

@@ -28,11 +28,15 @@ effective=$'passwordauthentication yes\nauthorizedkeysfile .ssh/authorized_keys 
 ROOT_LINES=$'Accepted password for alice from 203.0.113.9 port 1 ssh2\nAccepted publickey for alice2 from 203.0.113.9 port 2 ssh2: ED25519 SHA256:x'
 journalctl() {
   if [[ " $* " == *' -t sudo '* ]]; then
-    # A different command, failed attempts, and (without _UID=0) a forged line.
-    printf '%s\n' 'alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id' \
-      '    alice : 3 incorrect password attempts ; TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true' \
-      '    alice : user NOT in sudoers ; TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true' "${SUDO_LINE:-}"
-    if [[ " $* " != *' _UID=0 '* ]]; then echo 'alice : TTY=forged ; PWD=/ ; USER=root ; COMMAND=/usr/bin/true'; fi
+    # sudo logs under the real UID of whoever ran it (alice: 1001, as seen on
+    # Debian 12/13 and Ubuntu 22.04-26.04, sudo-rs too): a different command
+    # and failed attempts. mallory (1002) can log anything as "sudo".
+    if [[ " $* " == *' _UID=1001 '* ]]; then
+      printf '%s\n' 'alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id' \
+        '    alice : 3 incorrect password attempts ; TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true' \
+        '    alice : user NOT in sudoers ; TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true' "${SUDO_LINE:-}"
+    fi
+    if [[ " $* " != *' _UID='* || " $* " == *' _UID=1002 '* ]]; then echo 'alice : TTY=forged ; PWD=/ ; USER=root ; COMMAND=/usr/bin/true'; fi
   else
     printf '%s\n' "$ROOT_LINES" "${JOURNAL_LINE:-}"
     # `logger -t sshd` by a local user: not written as root, so _UID=0 hides it.
@@ -45,9 +49,12 @@ ROOT_LINES=''
 if ssh_login_seen 1; then fail 'a line a local user logged as "sshd" counted as an SSH login'; fi
 JOURNAL_LINE='Accepted publickey for alice from 203.0.113.9 port 3 ssh2: ED25519 SHA256:x'
 ssh_login_seen 1 alice publickey || fail 'key login in the journal was missed'
+getent() { [[ "$1 $2" == 'passwd alice' ]] && echo 'alice:x:1001:1001::/home/alice:/bin/bash'; }
 if ssh_sudo_seen alice 1; then fail 'a different command, a failed attempt or a forged line counted as working sudo'; fi
 SUDO_LINE='alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true'
 ssh_sudo_seen alice 1 || fail 'sudo true in the journal was missed'
+if ssh_sudo_seen nobody-here 1; then fail 'sudo counted for an unknown account'; fi
+unset -f getent
 passwd() { [[ "$1" == -S ]] && printf '%s %s 2026-10-25 0 99999 7 -1\n' "$2" "$PW_FIXTURE"; }
 for PW_FIXTURE in P L NP; do [[ "$(console_password_state alice)" == "$PW_FIXTURE" ]] || fail "password state $PW_FIXTURE"; done
 for name in ops deploy a_1; do admin_name_valid "$name" || fail "valid admin name rejected: $name"; done
