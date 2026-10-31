@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
+load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group ufw_sysctl_keys restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
   restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
@@ -316,10 +316,27 @@ value_baseline() {
       *) die "unexpected fixture UFW: $*" ;;
     esac
   }
+  # UFW set two kernel values when it started; the kept security parameters
+  # still set one of them.
+  printf 'net.ipv4.conf.default.accept_redirects=1\nnet.ipv4.icmp_echo_ignore_broadcasts=0\n' > "$RESTORE_ROOT/ufw_sysctl_runtime"
+  chmod 600 "$RESTORE_ROOT/ufw_sysctl_runtime"
+  SYSCTL_HARDENING_FILE="$TMP/fw-order/98-hardening.conf" TCP_BUFFER_FILE="$TMP/fw-order/none.conf"
+  printf 'net.ipv4.conf.default.accept_redirects = 0\n' > "$SYSCTL_HARDENING_FILE"
+  sysctl() { [[ "$1" == -w ]] || die "unexpected sysctl $*"; printf 'sysctl %s\n' "$2" >> "$TRACE"; }
   restore_firewall_group
-  expect "$(cat "$TRACE")" $'disable\ndelete'
+  expect "$(cat "$TRACE")" $'disable\ndelete\nsysctl net.ipv4.icmp_echo_ignore_broadcasts=0'
   expect "$(restore_read ufw_runtime state)" restored
+  [[ ! -e "$RESTORE_ROOT/ufw_sysctl_runtime" ]] || die 'restored UFW kernel values kept'
   expect "$RESTORE_PARTIAL" 0
+)
+
+# The keys come from the IPT_SYSCTL file /etc/default/ufw names.
+(
+  mkdir -p "$TMP/ufw-keys"
+  printf '# comment\nnet/ipv4/conf/all/accept_redirects=0\n#net/ipv4/tcp_fin_timeout=30\n net/ipv6/conf/default/accept_redirects = 0\n' > "$TMP/ufw-keys/sysctl.conf"
+  printf 'IPV6=yes\nIPT_SYSCTL="%s"\n' "$TMP/ufw-keys/sysctl.conf" > "$TMP/ufw-keys/default"
+  expect "$(ufw_sysctl_keys "$TMP/ufw-keys/default" | tr '\n' ' ')" 'net.ipv4.conf.all.accept_redirects net.ipv6.conf.default.accept_redirects '
+  expect "$(ufw_sysctl_keys "$TMP/ufw-keys/absent" | wc -l)" 0
 )
 
 # Rollback never turns a firewall on and never narrows a live firewall's defaults.

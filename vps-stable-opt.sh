@@ -2049,11 +2049,21 @@ ufw_boot_enable() {
 }
 
 # Existing UFW active: preserve current policies, no automatic edits except confirmed web ALLOW.
+# The kernel settings UFW applies whenever it starts: the IPT_SYSCTL file of
+# /etc/default/ufw (normally /etc/ufw/sysctl.conf), as sysctl key names.
+ufw_sysctl_keys() {
+  local defaults="${1:-/etc/default/ufw}" file
+  file="$(awk -F= '$1 == "IPT_SYSCTL" {gsub(/["\047[:space:]]/, "", $2); path = $2} END {print path}' "$defaults" 2>/dev/null || true)"
+  [[ -n "$file" ]] || file=/etc/ufw/sysctl.conf
+  [[ -f "$file" && ! -L "$file" ]] || return 0
+  awk -F= '/^[[:space:]]*[a-z]/ && NF >= 2 {key = $1; gsub(/[[:space:]]/, "", key); gsub(/\//, ".", key); print key}' "$file"
+}
+
 firewall_stage() {
   say '第14步：防火墙（需要新 SSH 窗口确认）'
   FIREWALL_READY=0
   command -v ufw >/dev/null || { warn '还没有安装 ufw，请先运行一键开荒。'; module_result firewall skipped 'ufw missing'; return 0; }
-  local state rules p ip unit deadline since ssh_verb=limit web=0 line
+  local state rules p ip unit deadline since ssh_verb=limit web=0 line key value
   local -a listeners=() extra=()
   if ! state="$(ufw status 2>/dev/null)"; then
     warn '无法确定防火墙状态，跳过。'; module_result firewall failed 'UFW state unknown'; return 0
@@ -2158,6 +2168,14 @@ firewall_stage() {
   # Count the confirmation window from arming, not from completion of ufw enable.
   deadline=$((SECONDS + 180))
   ok "已启用 240 秒自动撤销计时器：$unit.timer"
+  # UFW changes these when it starts and leaves them when it stops: keep the
+  # running values, so that turning the firewall off again puts them back.
+  if ! ufw_active; then
+    while IFS= read -r key; do
+      value="$(sysctl -n "$key" 2>/dev/null)" || continue
+      restore_record_sysctl "$key" "$value" ufw_sysctl_runtime || warn "无法记录 $key 的原值；撤销防火墙后要重启才会恢复。"
+    done < <(ufw_sysctl_keys)
+  fi
   if ! ufw --force enable; then
     warn '开启防火墙失败，自动撤销计时器保持启用。'; module_result firewall failed 'ufw enable failed'; return 0
   fi
@@ -4240,9 +4258,15 @@ restore_record_sysctl() {
 }
 
 # Applied after the configuration file itself was removed. An interface that
-# no longer exists (a container's veth) has nothing left to restore.
+# no longer exists (a container's veth) has nothing left to restore. Keys set
+# by one of the FILEs (this tool's settings that stay) keep their value.
+# Usage: restore_sysctl_runtime [NAME [FILE...]]
 restore_sysctl_runtime() {
-  local file="$RESTORE_ROOT/${1:-sysctl_runtime}" line key value failed=0
+  local file="$RESTORE_ROOT/${1:-sysctl_runtime}" line key value failed=0 keep='' f
+  if (($#)); then shift; fi
+  for f in "$@"; do
+    if [[ -f "$f" ]]; then keep+=" $(awk -F= '/^[[:space:]]*[a-z]/ {k = $1; gsub(/[[:space:]]/, "", k); printf "%s ", k}' "$f")"; fi
+  done
   [[ -e "$file" || -L "$file" ]] || return 0
   restore_data_safe "$file" || { warn '内核参数原值记录不安全，跳过。'; RESTORE_PARTIAL=1; return 0; }
   while IFS= read -r line; do
@@ -4250,6 +4274,7 @@ restore_sysctl_runtime() {
     if [[ ! "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ || ! "$value" =~ ^-?[0-9]+(\ [0-9]+)*$ ]]; then warn "忽略格式异常的记录：$line"; failed=1; continue; fi
     if [[ "$key" =~ ^net\.ipv6\.conf\.([^.]+)\.accept_redirects$ && "${BASH_REMATCH[1]}" != all && "${BASH_REMATCH[1]}" != default &&
           ! -d "/proc/sys/net/ipv6/conf/${BASH_REMATCH[1]}" ]]; then continue; fi
+    if [[ "$keep " == *" $key "* ]]; then continue; fi
     sysctl -w "$key=$value" >/dev/null || { warn "无法恢复 $key=$value"; failed=1; }
   done < "$file"
   if ((failed)); then RESTORE_PARTIAL=1; else rm -f -- "$file"; ok '内核参数已恢复为原来的运行值。'; fi
@@ -4598,6 +4623,9 @@ restore_firewall_group() {
   restore_resource ufw_ipv6
   restore_fw_rules_apply
   restore_resource svc_ufw
+  # The kernel settings UFW applied stay after it stops; the security
+  # parameters, when kept, still set some of the same keys themselves.
+  if ! ufw_active; then restore_sysctl_runtime ufw_sysctl_runtime "$SYSCTL_HARDENING_FILE" "$TCP_BUFFER_FILE"; fi
 }
 
 # Both SSH drop-ins (key-only, and the key-login switch for images that had it

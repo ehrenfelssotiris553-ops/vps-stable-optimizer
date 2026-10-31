@@ -26,6 +26,12 @@ KERNEL_PKG = re.compile(r'^linux-(image|modules|modules-extra|headers|tools|clou
 CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_congestion_control')
 # A loaded logging module fills in its slot ("NONE" before).
 NF_LOG = re.compile(r'^net\.netfilter\.nf_log\.[0-9]+$')
+# The layout UFW writes into user.rules/user6.rules the first time it starts:
+# chain declarations, logging and rate-limit chains. Rules that let traffic
+# in or out live in ufw-user-input/output/forward and are never covered here.
+UFW_LAYOUT = re.compile(
+    r'^(|\*filter|COMMIT|:ufw6?-[a-z-]+ - \[0:0\]'
+    r'|-[AI] ufw6?-((after|before|user)-logging-(input|output|forward)|logging-(allow|deny)|user-limit(-accept)?) .*)$')
 # Start/stop links of a SysV script that a removed package keeps.
 RC_LINK = re.compile(r'^/etc/rc[0-6S]\.d/[SK][0-9]+(.+)$')
 USER_FILES = {'/etc/' + f + s for f in ('passwd', 'group', 'shadow', 'gshadow', 'subuid', 'subgid')
@@ -133,6 +139,13 @@ def main():
         unexplained.append(f'user removed: {name}')
     users_changed = set(ua) != set(ub)
 
+    # UFW's stored rules: only its own layout may differ.
+    ufw_left = set(b.get('ufwrule', [])) ^ set(a.get('ufwrule', []))
+    ufw_layout_only = bool(ufw_left) and all(UFW_LAYOUT.match(x.partition(': ')[2]) for x in ufw_left)
+    if ufw_layout_only:
+        warnings.append('UFW rewrote user.rules/user6.rules in its own layout (logging and limit chains); none of the tool\'s rules are left')
+        a['ufwrule'] = b.get('ufwrule', [])
+
     # Files, links and directories under /etc.
     fa, fb = files(a), files(b)
     dangling = set(b.get('dangling', [])) - set(a.get('dangling', []))
@@ -143,6 +156,8 @@ def main():
         what = 'file added' if path not in fa else 'file removed' if path not in fb else 'file changed'
         if path in ALWAYS_EXPLAINED or path in up_files:
             explained.append(f'{what}: {path}')
+        elif ufw_layout_only and path in ('/etc/ufw/user.rules', '/etc/ufw/user6.rules'):
+            explained.append(f'{what}: {path} (UFW layout, see the warning)')
         elif path in USER_FILES and users_changed and users_ok:
             explained.append(f'{what}: {path} (users above)')
         elif what in ('file added', 'file changed') and path in rc_files:
