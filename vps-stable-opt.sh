@@ -2265,6 +2265,8 @@ ssh_home_safe() {
 # can only ever reach files that account could already write.
 ssh_append_key() {
   local user="$1" home="$2" key="$3"
+  # The inner script is single-quoted on purpose: its "$1" is the home folder.
+  # shellcheck disable=SC2016
   printf '%s\n' "$key" | runuser -u "$user" -- /bin/sh -c '
     umask 077
     d="$1/.ssh"; f="$d/authorized_keys"
@@ -2347,7 +2349,7 @@ ssh_enable_pubkey() {
 ssh_harden_stage() {
   say '第13步：SSH 登录加固（可选）'
   local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail
-  local -a missing=()
+  local -a overridden=()
   if [[ -z "${SSH_CHOICE:-}" ]]; then
     if [[ "$MODE" == ssh ]] || confirm_yes '加固 SSH 登录（只允许密钥登录，可选新建管理员并禁止 root 直接登录）吗？（推荐）'; then SSH_CHOICE=1; else SSH_CHOICE=0; fi
   fi
@@ -2472,12 +2474,12 @@ ssh_harden_stage() {
     rm -f -- "$SSH_DROPIN"; warn 'sshd -t 不接受新配置，已删除。'; module_result ssh failed 'sshd -t failed'; return 0
   fi
   effective="$(ssh_effective "$user")" || effective=''
-  [[ "$(ssh_effective_value "$effective" passwordauthentication)" == no ]] || missing+=(PasswordAuthentication)
-  [[ "$(ssh_effective_value "$effective" kbdinteractiveauthentication)" == no ]] || missing+=(KbdInteractiveAuthentication)
-  if ((want_admin)) && [[ "$(ssh_effective_value "$(ssh_effective root)" permitrootlogin)" != no ]]; then missing+=(PermitRootLogin); fi
-  if ((${#missing[@]})); then
+  [[ "$(ssh_effective_value "$effective" passwordauthentication)" == no ]] || overridden+=(PasswordAuthentication)
+  [[ "$(ssh_effective_value "$effective" kbdinteractiveauthentication)" == no ]] || overridden+=(KbdInteractiveAuthentication)
+  if ((want_admin)) && [[ "$(ssh_effective_value "$(ssh_effective root)" permitrootlogin)" != no ]]; then overridden+=(PermitRootLogin); fi
+  if ((${#overridden[@]})); then
     rm -f -- "$SSH_DROPIN"
-    warn "这些设置被更早的配置覆盖，没有生效：${missing[*]}（检查 /etc/ssh/sshd_config 和编号更小的 sshd_config.d 文件）。已撤销。"
+    warn "这些设置被更早的配置覆盖，没有生效：${overridden[*]}（检查 /etc/ssh/sshd_config 和编号更小的 sshd_config.d 文件）。已撤销。"
     module_result ssh preserved 'earlier sshd setting wins'; return 0
   fi
   unit="vps-stable-ssh-revert-$(date +%s)-$$"
@@ -4560,7 +4562,9 @@ restore_fw_rules_apply() {
   done < "$file"
   if ((${#remaining[@]})); then
     temp="$(mktemp "$RESTORE_ROOT/.write.XXXXXX")" || return 0
-    printf '%s\n' "${remaining[@]}" > "$temp" && chmod 600 -- "$temp" && mv -fT -- "$temp" "$file" || rm -f -- "$temp"
+    if ! { printf '%s\n' "${remaining[@]}" > "$temp" && chmod 600 -- "$temp" && mv -fT -- "$temp" "$file"; }; then
+      rm -f -- "$temp"
+    fi
   else
     rm -f -- "$file"
   fi
@@ -4892,7 +4896,7 @@ restore_pick_group() {
     else printf '  %s. %s\n' "$i" "$(restore_group_label "$group")"; fi
   done
   read -r -p "要撤销哪一项？[1-$i，回车取消]: " choice || choice=''
-  [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= i)) || { ok '已取消。'; return 0; }
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > i)); then ok '已取消。'; return 0; fi
   group="${pending[choice - 1]}"
   if [[ "$group" == packages ]]; then restore_packages_offer; restore_zram_settle; return 0; fi
   confirm_yes "确定撤销「$(restore_group_label "$group")」吗？" || { ok '已取消。'; return 0; }
@@ -4975,9 +4979,9 @@ module_result() {
 # Prints "result<TAB>boot<TAB>detail" for a module, or fails when unrecorded.
 # The possibly empty detail stays last: `read` merges consecutive tab separators.
 module_expect() {
-  local file="$STATE_ROOT/modules/$1" result ts boot detail
+  local file="$STATE_ROOT/modules/$1" result boot detail
   [[ "$1" =~ ^[a-z0-9_]+$ && -f "$file" && ! -L "$file" && -O "$file" ]] || return 1
-  IFS=$'\t' read -r result ts boot detail < "$file" || return 1
+  IFS=$'\t' read -r result _ boot detail < "$file" || return 1
   case "$result" in applied|present|preserved|unsupported|declined|skipped|failed|reverted) ;; *) return 1 ;; esac
   printf '%s\t%s\t%s\n' "$result" "$boot" "$detail"
 }
@@ -5034,8 +5038,8 @@ verify_set() {
 }
 
 verify_ssh_connection_cc() {
-  local rip rport lip lport
-  read -r rip rport lip lport <<< "${SSH_CONNECTION:-}"
+  local rport lport
+  read -r _ rport _ lport <<< "${SSH_CONNECTION:-}"
   [[ "$lport" =~ ^[0-9]+$ && "$rport" =~ ^[0-9]+$ ]] || return 1
   command -v ss >/dev/null || return 1
   ss -tinH state established "( sport = :$lport and dport = :$rport )" 2>/dev/null | grep -qw bbr
@@ -5101,10 +5105,10 @@ check_updates() {
 }
 
 check_tools() {
-  local pkg missing=''
-  for pkg in "${TOOLS_PACKAGES[@]}"; do installed "$pkg" || missing+=" $pkg"; done
-  if [[ -z "$missing" ]]; then verify_set pass "${TOOLS_PACKAGES[*]}"
-  else verify_set fail "缺少：${missing# }"; fi
+  local pkg absent=''
+  for pkg in "${TOOLS_PACKAGES[@]}"; do installed "$pkg" || absent+=" $pkg"; done
+  if [[ -z "$absent" ]]; then verify_set pass "${TOOLS_PACKAGES[*]}"
+  else verify_set fail "缺少：${absent# }"; fi
 }
 
 check_timezone() {

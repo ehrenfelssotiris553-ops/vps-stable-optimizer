@@ -1,0 +1,19 @@
+# After the drop: `vps` must say the setup still runs in tmux, menu 2 returns
+# to it, and the setup is finished there. The first rule needs the banner (in
+# these patterns "." also matches a line break), so a menu without it ends at
+# the last rule instead.
+一键开荒正在 tmux 里运行.*请输入选项 ==> 2
+回到那个界面吗？ ==>
+开始本次修改吗？ ==> y
+使用推荐设置吗？ ==>
+加固 SSH 登录吗？ ==> n
+防火墙同时放行网站端口 ==> n
+加入 Fail2ban 白名单吗？ ==>
+一并放行这些端口 ==> n
+开启 UFW 的 IPv6 防护吗？ ==> y
+正式开启防火墙吗？ ==> y
+等待确认（剩余 ==> !$VM_SSH true
+现在重启吗？ ==> n
+按回车关闭这个窗口 ==>
+按回车返回菜单 ==>
+请输入选项 ==> 0

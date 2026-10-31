@@ -1,0 +1,16 @@
+# `vps setup` with the recommended set on a Debian VM, logged in over SSH like
+# a real VPS: the allowlist is accepted, and the firewall is confirmed by a
+# second SSH login from outside ($VM_SSH), not by typing CONNECTED.
+在 tmux 里运行一键开荒吗？ ==> n
+仍然在当前窗口继续吗？ ==> y
+有需要人工核对的软件源 ==> y
+开始本次修改吗？ ==> y
+使用推荐设置吗？ ==>
+加固 SSH 登录吗？ ==> n
+防火墙同时放行网站端口 ==> n
+加入 Fail2ban 白名单吗？ ==>
+一并放行这些端口 ==> n
+开启 UFW 的 IPv6 防护吗？ ==> y
+正式开启防火墙吗？ ==> y
+等待确认（剩余 ==> !$VM_SSH true
+现在重启吗？ ==> n

@@ -2,4 +2,7 @@
 *.sh text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+*.yml text eol=lf
+*.exp text eol=lf
+*.rules text eol=lf
 SHA256SUMS text eol=lf

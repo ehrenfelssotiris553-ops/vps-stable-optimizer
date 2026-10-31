@@ -381,6 +381,18 @@ bash tests/run-all.sh
 
 这些测试只把主脚本里的函数单独提取出来，配合临时文件和模拟命令运行，不会执行真正的优化。通过后，再按「体检 → 开荒 → 重启 → 验收 → 单项设置 → 端口管理 → 只撤销某一项 → 全部撤销 → 卸载」的顺序做一遍真机验收。
 
+### GitHub 上的自动测试
+
+每次推送，GitHub 都会在用完即删的临时机器上自动测试，不碰任何真实的 VPS（配置在 `.github/workflows/`，用到的脚本在 `tests/ci/`）：
+
+| 层 | 内容 | 什么时候跑 |
+| --- | --- | --- |
+| 第 1 层（tests） | ShellCheck 0.11.0，主脚本和安装器不允许有任何提示；全部测试以 root 身份分别在 Debian 12、Debian 13、Ubuntu 22.04、24.04、26.04 里跑 | 每次推送 |
+| 第 2 层（real-run） | 在 Ubuntu 22.04、24.04、26.04 和 ARM 的临时虚拟机上真跑：安装、体检、一键开荒（自定义）、验收、全部撤销（含卸载软件包）、卸载，每一步之后检查留下的状态 | 每次推送 |
+| 第 3 层（vm-run） | 在临时虚拟机里再开 512 MiB 的 Debian 12、13 虚拟机，从外面 SSH 登录：推荐设置开荒、新窗口登录自动确认、白名单 IP 连续登录不被限速、重启后验收、在 tmux 里开荒时断线再回来、全部撤销、卸载 | 推送到 `release/` 开头的分支时，或手动触发 |
+
+交互的问题由 `tests/ci/answer.exp` 按 `tests/ci/rules/` 里的规则回答；遇到规则里没有的问题会直接判失败，不会卡住。`tests/consistency-tests.sh` 检查每个由工具管理的文件和设置都接进了备份、撤销、验收和单项设置，以后新功能漏接一处就会失败。
+
 本工具在一台 Debian 13 测试 VPS 上跑过三轮完整流程，发现的问题都已修复（见 `优化记录.md` 第十一、十二、十五节）；其他系统还没有在真机上验证，具体见「验证状态」一节。
 
 ## 发布新版本
@@ -397,7 +409,7 @@ bash tests/run-all.sh
 2. 重新生成 `SHA256SUMS`：
 
    ```bash
-   sha256sum -b .gitattributes README.md 优化记录.md install.sh tests/*.sh vps-stable-opt.sh > SHA256SUMS
+   sha256sum -b .gitattributes README.md 优化记录.md install.sh tests/*.sh tests/ci/*.sh tests/ci/answer.exp tests/ci/rules/*.rules .github/workflows/*.yml vps-stable-opt.sh > SHA256SUMS
    ```
 
 3. 提交并推送。主脚本和 `install.sh` 必须在同一次推送里更新，否则新装的机器会校验失败（安装会停止，不会装错）。

@@ -1,0 +1,33 @@
+# Layer 2: the real tool on throwaway Ubuntu runners (x64 and ARM): install,
+# plan, one-click setup, acceptance check, full rollback and uninstall.
+name: real-run
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: real-run-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ubuntu:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare the runner like a fresh VPS
+        run: bash tests/ci/runner-prepare.sh
+      - name: Real run
+        run: bash tests/ci/real-run.sh
+      - name: Keep the transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-run-${{ matrix.os }}
+          path: ${{ runner.temp }}/vps-ci-logs
+          if-no-files-found: ignore

@@ -1,0 +1,5 @@
+# Setup in tmux, then the SSH connection drops while it waits for the start:
+# reaching that question at all proves the Chinese text shows through tmux.
+在 tmux 里运行一键开荒吗？ ==>
+有需要人工核对的软件源 ==> y
+开始本次修改吗？ ==> @disconnect

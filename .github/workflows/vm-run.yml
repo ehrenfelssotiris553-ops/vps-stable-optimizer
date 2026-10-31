@@ -1,0 +1,43 @@
+# Layer 3: Debian 12/13 cloud VMs with 512 MiB inside the runner. Covers SSH
+# from outside, a reboot and setup in tmux after a dropped connection. Run it
+# before a release (push to a release/ branch) or by hand.
+name: vm-run
+on:
+  push:
+    branches: ['release/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: vm-run-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  debian:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['12', '13']
+    steps:
+      - uses: actions/checkout@v5
+      - name: KVM for the nested VM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo 'no KVM: the VM runs without acceleration (slow)'
+      - name: QEMU, cloud-init tools and expect
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            qemu-system-x86 qemu-utils cloud-image-utils expect openssh-client
+      - name: Debian ${{ matrix.release }} VM
+        run: bash tests/ci/vm-run.sh ${{ matrix.release }} 512
+      - name: Keep the transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-run-debian-${{ matrix.release }}
+          path: ${{ runner.temp }}/vps-ci-logs
+          if-no-files-found: ignore

@@ -1,0 +1,4 @@
+# `vps check`: no raw details, but the Fail2ban live test (reserved test
+# addresses are banned and unbanned).
+显示详细状态吗？ ==> n
+做一次 Fail2ban 实弹测试吗？ ==> y

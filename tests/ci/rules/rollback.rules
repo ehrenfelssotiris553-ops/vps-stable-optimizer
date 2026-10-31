@@ -1,0 +1,4 @@
+# `vps rollback`: undo everything and remove the packages this tool installed.
+1\) 全部撤销 ==> 1
+确定全部撤销吗？ ==> y
+确认卸载上述软件包吗？ ==> y

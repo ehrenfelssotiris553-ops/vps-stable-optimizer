@@ -1,0 +1,39 @@
+# Layer 1: every isolated test, as root, on each supported release, plus
+# ShellCheck (pinned) with no findings allowed in the script and installer.
+name: tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: ShellCheck 0.11.0
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 vps-stable-opt.sh install.sh tests/ci/*.sh
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 --severity=error tests/*.sh
+  isolated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:12', 'debian:13', 'ubuntu:22.04', 'ubuntu:24.04', 'ubuntu:26.04']
+    container: ${{ matrix.image }}
+    steps:
+      - name: Tools the tests use
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            ca-certificates git openssh-client procps iproute2 util-linux
+      - uses: actions/checkout@v5
+      - name: All isolated tests (root)
+        run: bash tests/run-all.sh
