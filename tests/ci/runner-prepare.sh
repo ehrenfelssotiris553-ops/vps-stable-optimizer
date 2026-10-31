@@ -30,6 +30,10 @@ done
 # installs packages, and Docker would put its firewall rules back.
 sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
 sudo systemctl mask docker.socket docker.service containerd.service 2>/dev/null || true
+# The Azure agent puts its own rules (for the metadata address) back now and
+# then; the tool rightly keeps a firewall it did not make, so it goes too.
+sudo systemctl stop walinuxagent.service 2>/dev/null || true
+sudo systemctl mask walinuxagent.service 2>/dev/null || true
 for tool in iptables ip6tables; do
   command -v "$tool" >/dev/null || continue
   for table in filter nat mangle raw; do

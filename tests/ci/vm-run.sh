@@ -5,6 +5,9 @@
 # - every supported release on a small-memory machine;
 # - SSH logins from outside (the new-login confirmation, and fast repeated
 #   logins from the allowlisted address);
+# - the real effect from outside: a port the firewall blocks, opens and
+#   closes again; a stranger on a second network card who guesses passwords
+#   is banned for real, listed by `vps bans` with its time, and unbanned there;
 # - a reboot;
 # - setup in tmux surviving a dropped connection;
 # - SSH hardening for real: a dropped connection mid-way puts the old login
@@ -65,7 +68,9 @@ if [[ -w /dev/kvm ]]; then accel=kvm cpu=host; fi
 printf 'Accelerator: %s, memory: %s MiB\n' "$accel" "$memory"
 qemu-system-x86_64 -machine accel="$accel" -cpu "$cpu" -m "$memory" -smp 2 \
   -drive file=disk.qcow2,if=virtio -drive file=seed.img,if=virtio,format=raw \
-  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n0 \
+  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8080-:8080 \
+  -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:01 \
+  -netdev user,id=n1,net=10.0.3.0/24,hostfwd=tcp:127.0.0.1:2223-:22 -device virtio-net-pci,netdev=n1,mac=52:54:00:12:34:02 \
   -display none -serial file:"$LOGS/console-$system.log" -daemonize -pidfile qemu.pid
 trap 'kill "$(cat "$WORK/qemu.pid" 2>/dev/null)" 2>/dev/null || true' EXIT
 
@@ -177,6 +182,53 @@ vm 'ufw show added; ufw status numbered' > "$LOGS/ufw-rules.log" || fail 'cannot
 cat "$LOGS/ufw-rules.log"
 grep -Fxq 'ufw allow from 10.0.2.2 to any port 22 proto tcp' "$LOGS/ufw-rules.log" || fail 'exemption rule not listed as expected'
 for i in 1 2 3 4 5 6 7 8 9 10; do vm true || fail "SSH login $i refused although the address is allowlisted"; done
+endgroup
+
+group 'From outside: the firewall really blocks, opens and closes a port'
+vm 'nohup python3 -m http.server 8080 >/dev/null 2>&1 </dev/null &'
+web() { curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/ || true; }
+sleep 2
+[[ -n "$(vm 'ss -H -lnt "( sport = :8080 )"')" ]] || fail 'the test web server on 8080 did not start'
+[[ "$(web)" != 200 ]] || fail 'port 8080 answered before it was opened'
+vm_drive port.rules port-open vps port open 8080 tcp || fail "port open exited with $?"
+[[ "$(web)" == 200 ]] || fail 'port 8080 does not answer after vps port open'
+vm_drive port.rules port-close vps port close 8080 tcp || fail "port close exited with $?"
+[[ "$(web)" != 200 ]] || fail 'port 8080 still answers after vps port close'
+vm 'pkill -f "http.server 8080"' || true
+endgroup
+
+group 'From outside: a stranger guessing passwords is banned for real, then unbanned'
+# The second network card: there the VM sees this runner as 10.0.3.2, an
+# address on no allowlist.
+nic2="$(vm "ip -o link | awk -F': ' '/52:54:00:12:34:02/ {print \$2}'")"
+[[ -n "$nic2" ]] || fail 'no second network card in the VM'
+vm "ip addr add 10.0.3.15/24 dev $nic2 2>/dev/null; ip link set $nic2 up"
+stranger() {
+  ssh -p 2223 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$@" </dev/null 2>&1 || true
+}
+# sshd answers with the methods it offers; a banned address gets nothing.
+reachable() { [[ "$(stranger -o BatchMode=yes -o PreferredAuthentications=none nobody-ci@127.0.0.1 true)" == *'Permission denied'* ]]; }
+for ((i = 0; i < 15; i++)); do reachable && break; sleep 2; done
+reachable || fail 'the second network card does not reach sshd'
+# Wrong passwords for an account that does not exist, as a scanner sends them.
+printf '#!/bin/sh\necho wrong-password\n' > "$WORK/askpass"
+chmod +x "$WORK/askpass"
+for i in 1 2 3; do
+  SSH_ASKPASS="$WORK/askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=none stranger -o PubkeyAuthentication=no \
+    -o PreferredAuthentications=password -o NumberOfPasswordPrompts=3 nobody-ci@127.0.0.1 true >/dev/null
+done
+banned() { [[ "$(vm 'fail2ban-client status sshd')" == *10.0.3.2* ]]; }
+for ((i = 0; i < 30; i++)); do banned && break; sleep 2; done
+banned || { vm 'fail2ban-client status sshd; journalctl -u ssh -u sshd -n 15 --no-pager -o cat' || true; fail 'the stranger was not banned'; }
+if reachable; then fail 'the banned stranger still reaches sshd'; fi
+vm true || fail 'the allowlisted address lost its access as well'
+vm_drive bans.rules bans vps bans || fail "bans exited with $?"
+grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}.*封禁.*10\.0\.3\.2' "$LOGS/bans.log" ||
+  fail 'vps bans lists no timed ban of the stranger'
+if banned; then fail 'the stranger is still banned after the unban in vps bans'; fi
+# UFW also limits SSH to 6 new connections per 30 seconds from one address.
+sleep 30
+reachable || fail 'the stranger is still blocked after the unban'
 endgroup
 
 group 'Reboot'

@@ -4,6 +4,8 @@
 确认卸载上述软件包吗？ ==> y
 每天几点自动重启 ==> 04:30
 防火墙已开启，同时配置 Fail2ban 防爆破吗？ ==> y
+# Worded without "防火墙" in front when asked from the single-item menu.
+同时放行网站端口 ==> n
 请输入端口 ==> 8080
 只允许某个 IP 访问吗？ ==>
 协议：1\) TCP ==> 1

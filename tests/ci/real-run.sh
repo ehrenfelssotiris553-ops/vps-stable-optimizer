@@ -39,6 +39,10 @@ before_updates=0 before_reboot=0
 if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then before_updates=1; fi
 if apt_has 'Unattended-Upgrade::Automatic-Reboot "true";'; then before_reboot=1; fi
 printf 'Before: %s | %s | %s\n' "$before_state" "$before_tz" "${before_ufw:-ufw not installed}"
+# Firewall rules at the start: the tool keeps a firewall that has rules.
+# shellcheck disable=SC2024
+sudo nft list ruleset > "$LOGS/ruleset-start.txt" 2>&1 || true
+if [[ -s "$LOGS/ruleset-start.txt" ]]; then notice "firewall rules at the start ($mode, $(uname -m))" "$LOGS/ruleset-start.txt"; fi
 # The whole picture before anything is installed, compared at the very end.
 # The snapshots belong to the CI user; only the scripts run as root.
 snapshot_since="$(date '+%F %T')"
