@@ -184,6 +184,10 @@ if ((old)); then
   # (Every run log: only this setup has run so far.)
   vm 'cat /var/lib/vps-stable-opt/logs/run-*.log' |
     sed -r 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\r//g' > "$LOGS/setup-runlog.log"
+  # How SSH looks after the upgrade (the firewall step needs it confirmed).
+  vm 'sshd -t; echo "sshd -t: $?"; ls -ld /run/sshd; systemctl is-active ssh.socket ssh.service; ss -H -lntp "( sport = :22 )"; systemctl show ssh.socket -p Listen --value; dpkg-query -W openssh-server' \
+    > "$LOGS/ssh-after-upgrade.log" 2>&1 || true
+  notice "SSH after the upgrade ($system)" "$LOGS/ssh-after-upgrade.log"
   has setup-runlog '已在系统日志里看到新窗口登录成功，自动确认'
   has setup-runlog '本次流程已完成'
   ssh_facts setup-runlog
@@ -234,6 +238,17 @@ if ((zram_kernel)); then
   near "${zsaid:-0}" $((zbytes / 1048576)) || fail "ZRAM is $((zbytes / 1048576)) MiB, the check says $zsaid"
   [[ "$zline" == *"压缩算法 $zalg"* ]] || fail "ZRAM uses $zalg, the check says: $zline"
 fi
+endgroup
+
+group 'SSH with the listening socket only (as right after an OpenSSH update)'
+# Where systemd's socket starts sshd on demand, an OpenSSH update stops the
+# service until the next login; the tool must still see SSH then. Recorded
+# for review: sshd -t, the privilege separation directory, the listener.
+# shellcheck disable=SC2016
+vm 'if systemctl is-active -q ssh.socket; then systemctl stop ssh.service; sleep 1; echo "service: $(systemctl is-active ssh.service)"; ls -ld /run/sshd 2>&1; sshd -t 2>&1; echo "sshd -t: $?"; sshd -T 2>&1 | grep -m1 "^port "; ss -H -lntp "( sport = :22 )"; else echo "no ssh.socket here"; fi' \
+  > "$LOGS/ssh-socket-only.log" 2>&1 || true
+notice "SSH with the socket only ($system)" "$LOGS/ssh-socket-only.log"
+wait_ssh
 endgroup
 
 group 'Allowlisted address: no SSH rate limit'
