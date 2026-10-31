@@ -98,11 +98,13 @@ else
   endgroup
 fi
 
-# What the health report's journal query sees here, for review.
+# The health report must raise no false alarm on a fresh machine.
 # The transcript belongs to the CI user; only the probe runs as root.
+rc=0
 # shellcheck disable=SC2024
-sudo bash "$CI/journal-probe.sh" > "$LOGS/journal-probe.log" 2>&1 || true
+sudo bash "$CI/journal-probe.sh" > "$LOGS/journal-probe.log" 2>&1 || rc=$?
 notice "journal probe ($mode, $(uname -m))" "$LOGS/journal-probe.log"
+((rc == 0)) || fail 'the health report counts journal lines on a fresh machine (see the journal probe notice)'
 
 check_all() {
   local name="$1" rc=0

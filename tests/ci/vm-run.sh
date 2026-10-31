@@ -156,8 +156,14 @@ group 'Recommended setup over SSH'
 vm_drive setup-vm.rules setup vps setup || fail "setup exited with $?"
 has setup '已在系统日志里看到新窗口登录成功，自动确认'
 has setup '本次流程已完成'
-vm 'bash -s' < "$CI/journal-probe.sh" > "$LOGS/journal-probe.log" 2>&1 || true
-notice "journal probe ($system)" "$LOGS/journal-probe.log"
+# The health report must raise no false alarm on a fresh machine.
+probe() {
+  local rc=0
+  vm 'bash -s' < "$CI/journal-probe.sh" > "$LOGS/$1.log" 2>&1 || rc=$?
+  notice "$1 ($system)" "$LOGS/$1.log"
+  ((rc == 0)) || fail "the health report counts journal lines on a fresh machine ($1 notice)"
+}
+probe journal-probe
 endgroup
 
 # `vps check` (after a command prefix such as sudo) with every item expected.
@@ -237,6 +243,7 @@ sleep 20
 wait_ssh
 check_all check-after-reboot
 has check-after-reboot '开荒之后已经重启过'
+probe journal-probe-after-reboot
 endgroup
 
 group 'Setup in tmux survives a dropped connection'

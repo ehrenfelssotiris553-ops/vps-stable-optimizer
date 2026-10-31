@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# CI only, as root on the machine under test: what the health report's journal
-# query really returns, and which lines its patterns count. On fresh cloud
-# machines a count above zero, or "empty or access hint", is suspect.
+# CI only, as root on the machine under test, with the tool installed: the
+# health report's journal query, run through the tool's own patterns
+# (audit_journal_counts), printing each line it counts. A fresh cloud machine
+# has no out-of-memory, storage or crash lines and a readable journal, so any
+# count fails: that would be a false alarm for every user of such a machine.
 set -Eeuo pipefail
-out="$(journalctl --system -b 0 --since '-24 hours' -n 1000 --no-pager -o cat 2>&1 || true)"
-printf 'journal lines: %s\n' "$(grep -c '' <<< "$out" || true)"
-printf 'first lines:\n%s\n' "$(head -n 3 <<< "$out")"
-awk '
-  {line = tolower(substr($0, 1, 1024))}
-  line ~ /^hint:|^no journal files|^-- no entries --$|^failed to open|^you are currently not seeing|^insufficient permissions|^no entries were found/ {print "access: " $0}
-  line ~ /out of memory:|oom-kill:|oom_reaper:|memory cgroup out of memory|killed process [0-9]+|invoked oom-killer/ {print "oom: " $0}
-  line ~ /i\/o error|buffer i\/o|blk_update_request:.*error|blk_print_req_error:|ext4-fs error|xfs.*(corrupt|i\/o error)|btrfs.*(error|corrupt)|nvme.*(i\/o|timeout)/ {print "io: " $0}
-  line ~ /kernel panic|not syncing:|watchdog.*(lockup|locked up)|soft lockup|hard lockup|unclean shutdown|uncleanly shut down|not cleanly shut down/ {print "crash: " $0}
-' <<< "$out" | head -n 20
+script=/usr/local/lib/vps-stable-opt/vps-stable-opt.sh
+definition="$(awk '$0 == "audit_journal_counts() {" {copy = 1} copy {print} copy && $0 == "}" {exit}' "$script")"
+[[ -n "$definition" ]] || { echo 'audit_journal_counts not found in the installed tool'; exit 1; }
+# Each count also prints the line it counts ($0 belongs to awk).
+# shellcheck disable=SC2016
+eval "$(sed -E 's/\) (access_issue|oom|io|crash)\+\+/) {\1++; print "\1: " $0}/' <<< "$definition")"
+out="$(journalctl --system -b 0 --since '-24 hours' -n 1000 --no-pager -o cat 2>&1 | LC_ALL=C audit_journal_counts)"
+counted="$(grep -E '^(access_issue|oom|io|crash): ' <<< "$out" || true)"
+read -r scanned oom io crash access _ <<< "$(tail -n 1 <<< "$out")"
+printf 'scanned %s, out of memory %s, storage %s, crash %s, access %s\n' "$scanned" "$oom" "$io" "$crash" "$access"
+if [[ -n "$counted" ]]; then head -n 20 <<< "$counted"; fi
+((scanned > 0 && oom + io + crash + access == 0))

@@ -2910,14 +2910,19 @@ audit_disk_risks() {
 
 # Only counters leave this parser. Raw journal messages are never printed.
 # n=1000 limits records upstream; cap scanned lines and per-line text as well.
+# Not counted: the kernel command line (its parameters, such as
+# nvme_core.io_timeout, read like errors) and reads from an empty floppy or
+# CD drive (fd0, sr0), which KVM machines often have and which always fail.
 audit_journal_counts() {
   awk '
     NR>3000 {limited=1; next}
     {
       line=tolower(substr($0,1,1024)); scanned++
+      if(line~/^(kernel )?command line:/) next
       if(line~/^hint:|^no journal files|^-- no entries --$|^failed to open|^you are currently not seeing|^insufficient permissions|^no entries were found/) access_issue++
       if(line~/out of memory:|oom-kill:|oom_reaper:|memory cgroup out of memory|killed process [0-9]+|invoked oom-killer/) oom++
-      if(line~/i\/o error|buffer i\/o|blk_update_request:.*error|blk_print_req_error:|ext4-fs error|xfs.*(corrupt|i\/o error)|btrfs.*(error|corrupt)|nvme.*(i\/o|timeout)/) io++
+      if(line~/dev (fd|sr)[0-9]/) next
+      if(line~/i\/o error|buffer i\/o|blk_update_request:.*error|blk_print_req_error:|ext4-fs error|xfs.*(corrupt|i\/o error)|btrfs.*(error|corrupt)|nvme[0-9].*(i\/o|timeout)/) io++
       if(line~/kernel panic|not syncing:|watchdog.*(lockup|locked up)|soft lockup|hard lockup|unclean shutdown|uncleanly shut down|not cleanly shut down/) crash++
     }
     END {printf "%d %d %d %d %d %d\n",scanned,oom,io,crash,access_issue,limited}'

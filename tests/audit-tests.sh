@@ -80,6 +80,18 @@ out="$(awk 'BEGIN {for(i=1;i<=3002;i++) print "sample"}' | audit_journal_counts)
 [[ "$out" == '3000 0 0 0 0 1' ]] || fail 'journal scan cap'
 passed 'journal raw text never printed; empty/partial logs and scan cap represented'
 
+# Seen on fresh cloud machines in CI: boot parameters that read like errors,
+# and an empty floppy drive on KVM. A real NVMe timeout still counts.
+out="$(printf '%s\n' 'Command line: BOOT_IMAGE=/boot/vmlinuz root=/dev/vda1 nvme_core.io_timeout=240 panic=-1' \
+  'Kernel command line: BOOT_IMAGE=/boot/vmlinuz nvme_core.io_timeout=240' \
+  'blk_update_request: I/O error, dev fd0, sector 0 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 0' \
+  'Buffer I/O error on dev fd0, logical block 0, async page read' \
+  'I/O error, dev sr0, sector 0 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2' | audit_journal_counts)"
+[[ "$out" == '5 0 0 0 0 0' ]] || fail "boot parameters or an empty floppy/CD drive counted as storage errors: $out"
+[[ "$(printf 'nvme nvme0: I/O 7 QID 2 timeout, aborting\n' | audit_journal_counts)" == '1 0 1 0 0 0' ]] || fail 'a real NVMe timeout was missed'
+[[ "$(printf 'blk_update_request: I/O error, dev vda, sector 2048\n' | audit_journal_counts)" == '1 0 1 0 0 0' ]] || fail 'a real disk error was missed'
+passed 'boot parameters and empty floppy/CD drives are no storage errors; real disk and NVMe errors are'
+
 sshd() {
   case "$*" in
     -t) return "${SSHD_RC:-0}" ;;
