@@ -9,10 +9,14 @@ export LC_ALL=C
   sysctl -a 2>/dev/null | sed 's/^/sysctl /' || true
   dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null |
     awk '$1 == "ii" {print "pkg " $2} $1 == "rc" {print "pkgconf " $2}' || true
-  # Configuration files that removed packages keep (state "rc").
-  for p in $(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 == "rc" {print $2}'); do
+  # Configuration files that removed packages keep (state "rc"), dpkg's own
+  # and those kept with ucf.
+  rc="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 == "rc" {print $2}')"
+  for p in $rc; do
     dpkg-query -W -f='${Conffiles}\n' "$p" 2>/dev/null | awk 'NF >= 2 {print "rcfile " $1}'
+    if [[ -r /var/lib/ucf/registry ]]; then awk -v p="$p" '$1 == p {print "rcfile " $2}' /var/lib/ucf/registry; fi
   done
+  apt-mark showauto 2>/dev/null | sed 's/^/autopkg /' || true
   systemctl list-unit-files --no-legend --no-pager 2>/dev/null | awk 'NF >= 2 {print "unit " $1 " " $2}' || true
   find /etc -xdev -type f -print0 | sort -z | xargs -0 -r sha256sum |
     awk '{h = $1; sub(/^[0-9a-f]+  /, ""); print "file " $0 " " h}'
@@ -32,6 +36,10 @@ export LC_ALL=C
     fi
   done
   awk 'NR > 1 {print "swap " $1 " " $2}' /proc/swaps
+  # UFW's stored rules, line by line (a changed checksum alone does not say what).
+  for f in /etc/ufw/user.rules /etc/ufw/user6.rules; do
+    if [[ -r "$f" ]]; then grep -v '^#' "$f" | sed "s|^|ufwrule ${f##*/}: |"; fi
+  done
   getent passwd | awk -F: '{print "user " $1 " " $3}'
   systemctl list-units --all --no-legend --plain 'vps-stable-*' 2>/dev/null | awk '{print "vpsunit " $1}' || true
 } | sort -u

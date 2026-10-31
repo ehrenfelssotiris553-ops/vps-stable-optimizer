@@ -181,8 +181,8 @@ if ((old)); then
   has setup-return '一键开荒已结束（退出码 0）'
   # tmux redraws the screen in pieces, which can split a line of text: the
   # facts come from the tool's own run log and a plan outside tmux.
-  # shellcheck disable=SC2016
-  vm 'cat "$(ls -t /var/lib/vps-stable-opt/logs/run-*.log | head -n 1)"' |
+  # (Every run log: only this setup has run so far.)
+  vm 'cat /var/lib/vps-stable-opt/logs/run-*.log' |
     sed -r 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\r//g' > "$LOGS/setup-runlog.log"
   has setup-runlog '已在系统日志里看到新窗口登录成功，自动确认'
   has setup-runlog '本次流程已完成'

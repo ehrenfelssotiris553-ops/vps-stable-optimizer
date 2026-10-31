@@ -24,6 +24,10 @@ VOLATILE = re.compile(
     r'|net\.ipv[46]\.(conf|neigh)\.veth[0-9a-f]+\.)')
 KERNEL_PKG = re.compile(r'^linux-(image|modules|modules-extra|headers|tools|cloud-tools)-')
 CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_congestion_control')
+# A loaded logging module fills in its slot ("NONE" before).
+NF_LOG = re.compile(r'^net\.netfilter\.nf_log\.[0-9]+$')
+# Start/stop links of a SysV script that a removed package keeps.
+RC_LINK = re.compile(r'^/etc/rc[0-6S]\.d/[SK][0-9]+(.+)$')
 USER_FILES = {'/etc/' + f + s for f in ('passwd', 'group', 'shadow', 'gshadow', 'subuid', 'subgid')
               for s in ('', '-')}
 ALWAYS_EXPLAINED = {'/etc/ld.so.cache'}
@@ -88,13 +92,23 @@ def main():
             unexplained.append(f'kernel parameter gone: {key} (was {sa[key]})')
         elif key in CC_KEYS and set(sa[key].split()) <= set(sb[key].split()):
             explained.append(f'{key}: {sa[key]} -> {sb[key]} (module loaded)')
+        elif NF_LOG.match(key) and sa[key] == 'NONE':
+            explained.append(f'{key}: NONE -> {sb[key]} (logging module loaded)')
         else:
             unexplained.append(f'kernel parameter changed: {key}: {sa[key]} -> {sb[key]}')
 
     # Packages.
     pa, pb = set(a.get('pkg', [])), set(b.get('pkg', []))
+    auto_b = set(b.get('autopkg', []))
     for name in sorted(pb - pa):
-        (explained if name in up_pkgs or KERNEL_PKG.match(name) else unexplained).append(f'package installed: {name}')
+        if name in up_pkgs or KERNEL_PKG.match(name):
+            explained.append(f'package installed: {name}')
+        elif name in auto_b:
+            # Removing the tool's packages skips autoremove when it would also
+            # take packages the tool did not install.
+            warnings.append(f'dependency installed with a tool package stays (marked automatic): {name}')
+        else:
+            unexplained.append(f'package installed: {name}')
     for name in sorted(pa - pb):
         (explained if name in up_pkgs or KERNEL_PKG.match(name) else unexplained).append(f'package removed: {name}')
     rc_new = sorted(set(b.get('pkgconf', [])) - set(a.get('pkgconf', [])))
@@ -131,7 +145,7 @@ def main():
             explained.append(f'{what}: {path}')
         elif path in USER_FILES and users_changed and users_ok:
             explained.append(f'{what}: {path} (users above)')
-        elif what == 'file added' and path in rc_files:
+        elif what in ('file added', 'file changed') and path in rc_files:
             continue  # listed with the package warning
         else:
             unexplained.append(f'{what}: {path}')
@@ -139,8 +153,14 @@ def main():
     for path in sorted(set(la) | set(lb)):
         if la.get(path) == lb.get(path):
             continue
+        rc_link = RC_LINK.match(path)
         if path not in la and path in dangling and path.startswith('/etc/systemd/system/'):
             warnings.append(f'enablement link of a removed package stays (dangling): {path}')
+        elif path not in la and rc_link and '/etc/init.d/' + rc_link.group(1) in rc_files:
+            warnings.append(f'start/stop link of a removed package stays: {path}')
+        elif (path == '/etc/localtime' and path in la and path in lb
+              and la[path].split('zoneinfo/')[-1] == lb[path].split('zoneinfo/')[-1]):
+            explained.append(f'/etc/localtime: same zone, link written differently ({la[path]} -> {lb[path]})')
         elif path in up_files:
             explained.append(f'link changed: {path}')
         else:
@@ -171,7 +191,7 @@ def main():
         warnings.append("UFW's empty chains (they filter nothing) stay until a reboot: " + ' '.join(inert))
     for kind, label in (('local', 'tool path'), ('cron', 'root crontab'), ('nft', 'nft rule'),
                         ('iptables-save', 'iptables rule'), ('ip6tables-save', 'ip6tables rule'),
-                        ('swap', 'swap'), ('vpsunit', 'tool unit')):
+                        ('swap', 'swap'), ('vpsunit', 'tool unit'), ('ufwrule', 'stored UFW rule')):
         sa_k, sb_k = set(a.get(kind, [])), set(b.get(kind, []))
         unexplained += [f'{label} left: {x}' for x in sorted(sb_k - sa_k)]
         unexplained += [f'{label} gone: {x}' for x in sorted(sa_k - sb_k)]
