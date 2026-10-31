@@ -6219,7 +6219,7 @@ f2b_ban_events() {
     fi
   } | awk '
     / \[sshd\] (Restore )?Ban [0-9A-Fa-f:.]+$/ || / \[sshd\] Unban [0-9A-Fa-f:.]+$/ {
-      if ($1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/) t = $1 " " substr($2, 1, 8)
+      if ($1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) t = $1 " " substr($2, 1, 8)
       else { t = substr($1, 1, 19); sub(/T/, " ", t) }
       if ($0 ~ / Unban /) e = "解封"; else if ($0 ~ / Restore Ban /) e = "重启后恢复封禁"; else e = "封禁"
       print t "\t" e "\t" $NF

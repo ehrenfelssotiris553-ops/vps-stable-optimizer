@@ -19,7 +19,7 @@ printf 'Before: %s | %s | %s\n' "$before_state" "$before_tz" "${before_ufw:-ufw 
 
 group 'Install from the checkout'
 sudo bash "$ROOT/install.sh" --local-file "$ROOT/vps-stable-opt.sh" --no-run
-[[ "$(vps --version)" == "$(sed -n 's/^SCRIPT_VERSION=//p' "$ROOT/vps-stable-opt.sh")" ]] || fail 'installed version differs'
+[[ "$(sudo vps --version)" == "$(sed -n 's/^SCRIPT_VERSION=//p' "$ROOT/vps-stable-opt.sh")" ]] || fail 'installed version differs'
 endgroup
 
 group 'Plan (read-only)'
