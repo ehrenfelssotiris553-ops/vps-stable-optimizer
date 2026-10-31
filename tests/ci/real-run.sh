@@ -30,7 +30,9 @@ tool_packages() {
   for p in curl wget ca-certificates vim htop unzip lsof tmux; do if installed "$p"; then printf '%s ' "$p"; fi; done
 }
 before_state="$(state)" before_tz="$(tz)" before_ufw="$(ufw_line)"
+tcp_rmem_max() { sysctl -n net.ipv4.tcp_rmem | awk '{print $3}'; }
 before_cc="$(sysctl -n net.ipv4.tcp_congestion_control)" before_rmem="$(sysctl -n net.core.rmem_max)"
+before_tcp_rmem="$(tcp_rmem_max)"
 before_kptr="$(sysctl -n kernel.kptr_restrict)" before_tools="$(tool_packages)"
 before_trim="$(systemctl is-enabled fstrim.timer 2>/dev/null || true)"
 before_updates=0 before_reboot=0
@@ -129,8 +131,10 @@ item_do item-sysctl-on sysctl 1
 item_do item-tcp-off tcp 2
 [[ ! -e /etc/sysctl.d/99-vps-stable-tcp.conf ]] || fail 'TCP buffers off: file left'
 [[ "$(sysctl -n net.core.rmem_max)" == "$before_rmem" ]] || fail 'TCP buffers off: rmem_max not back'
+[[ "$(tcp_rmem_max)" == "$before_tcp_rmem" ]] || fail 'TCP buffers off: tcp_rmem not back'
 item_do item-tcp-on tcp 1
-(($(sysctl -n net.core.rmem_max) > before_rmem)) || fail 'TCP buffers on: rmem_max not raised'
+# The limit TCP uses; net.core.rmem_max stays as it is when another file sets it.
+(($(tcp_rmem_max) > before_tcp_rmem)) || fail "TCP buffers on: tcp_rmem not raised ($(tcp_rmem_max))"
 
 item_do item-journal-off journal 2
 [[ ! -e /etc/systemd/journald.conf.d/99-vps-stable.conf ]] || fail 'journal limit off: file left'

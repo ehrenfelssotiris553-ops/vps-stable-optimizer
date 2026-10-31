@@ -26,7 +26,10 @@ for f in /etc/apt/sources.list.d/*; do
   case "${f##*/}" in ubuntu.sources) continue ;; esac
   sudo mv -- "$f" /etc/apt/sources.list.d.ci-off/
 done
+# Masked, not just stopped: needrestart restarts services after the setup
+# installs packages, and Docker would put its firewall rules back.
 sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
+sudo systemctl mask docker.socket docker.service containerd.service 2>/dev/null || true
 for tool in iptables ip6tables; do
   command -v "$tool" >/dev/null || continue
   for table in filter nat mangle raw; do
