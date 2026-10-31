@@ -13,6 +13,7 @@ warn() { :; }
 die() { builtin printf 'STOP: %s\n' "$*" >&2; exit 1; }
 backup_config_path() { :; }
 record_config_change() { :; }
+restore_record_dir() { builtin printf '%s\n' "$1" >> "$TEST_ROOT/created-dirs"; }
 PAYLOAD=$'managed configuration\nline two'
 
 mkdir -m 700 -- "$TEST_ROOT/private-parent"
@@ -28,6 +29,13 @@ if put_file "$TEST_ROOT/private-parent/new.conf" different; then fail 'different
 ln -s new.conf "$TEST_ROOT/private-parent/link.conf"
 if put_file "$TEST_ROOT/private-parent/link.conf" different; then fail 'configuration symlink was accepted'; fi
 [[ -L "$TEST_ROOT/private-parent/link.conf" ]] || fail 'configuration symlink was replaced'
+# Directories created for a file are recorded for the rollback, every level;
+# an existing one is not.
+put_file "$TEST_ROOT/new-parent/sub/new.conf" "$PAYLOAD"
+[[ "$(cat "$TEST_ROOT/created-dirs")" == "$TEST_ROOT/new-parent/sub"$'\n'"$TEST_ROOT/new-parent" ]] ||
+  fail "created directories not recorded: $(cat "$TEST_ROOT/created-dirs")"
+put_file "$TEST_ROOT/new-parent/second.conf" "$PAYLOAD"
+[[ "$(wc -l < "$TEST_ROOT/created-dirs")" == 2 ]] || fail 'an existing directory was recorded as created'
 builtin printf '%s\n' 'PASS: fresh publication and existing file/link/permission preservation.'
 
 for failure in mktemp printf chmod mv; do

@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group ufw_sysctl_keys restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
+load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group ufw_sysctl_keys restore_record_dir restore_created_dirs restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
   restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
@@ -30,6 +30,8 @@ SSH_DROPIN="$TMP/ssh/01-vps-stable-keyonly.conf"
 SSH_PUBKEY_DROPIN="$TMP/ssh/00-vps-stable-pubkey.conf"
 ZRAM_VENDOR_FILE="$TMP/zram-vendor.conf"
 UFW_CONF="$TMP/ufw.conf"
+SYSCTL_HARDENING_FILE="$TMP/no-hardening.conf"
+TCP_BUFFER_FILE="$TMP/no-tcp.conf"
 mkdir -p "$RESTORE_ROOT"
 chmod 700 "$STATE_ROOT" "$RESTORE_ROOT"
 module_result() { :; }
@@ -328,6 +330,27 @@ value_baseline() {
   expect "$(restore_read ufw_runtime state)" restored
   [[ ! -e "$RESTORE_ROOT/ufw_sysctl_runtime" ]] || die 'restored UFW kernel values kept'
   expect "$RESTORE_PARTIAL" 0
+)
+
+# Directories the tool created go once empty, deepest first; one with
+# anything in it stays recorded, one that is gone is dropped.
+(
+  RESTORE_ROOT="$TMP/dirs/restore-v2"
+  mkdir -p "$RESTORE_ROOT"; chmod 700 "${RESTORE_ROOT%/*}" "$RESTORE_ROOT"
+  RESTORE_READY=1
+  mkdir -p "$TMP/dirs/a/b" "$TMP/dirs/kept"
+  touch "$TMP/dirs/kept/user.conf"
+  for d in "$TMP/dirs/a" "$TMP/dirs/a/b" "$TMP/dirs/kept" "$TMP/dirs/gone"; do restore_record_dir "$d"; done
+  restore_record_dir "$TMP/dirs/a"
+  if restore_record_dir 'relative/dir'; then die 'a relative directory was recorded'; fi
+  expect "$(wc -l < "$RESTORE_ROOT/created_dirs")" 4
+  restore_created_dirs
+  [[ ! -e "$TMP/dirs/a" ]] || die 'empty created directories stayed'
+  [[ -f "$TMP/dirs/kept/user.conf" ]] || die 'a directory with a file in it was touched'
+  expect "$(cat "$RESTORE_ROOT/created_dirs")" "$TMP/dirs/kept"
+  rm -f "$TMP/dirs/kept/user.conf"
+  restore_created_dirs
+  [[ ! -e "$TMP/dirs/kept" && ! -e "$RESTORE_ROOT/created_dirs" ]] || die 'an emptied directory or its record stayed'
 )
 
 # The keys come from the IPT_SYSCTL file /etc/default/ufw names.

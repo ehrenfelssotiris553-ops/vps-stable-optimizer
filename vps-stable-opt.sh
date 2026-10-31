@@ -286,7 +286,8 @@ log_rotate() {
 
 # Never overwrite an existing file. Result: 0=matches or created, 1=conflict.
 put_file() {
-  local dest="$1" contents="$2" temp parent actual
+  local dest="$1" contents="$2" temp parent actual missing dir
+  local -a created=()
   if [[ -e "$dest" || -L "$dest" ]]; then
     if [[ -f "$dest" && ! -L "$dest" ]] && actual="$(cat -- "$dest")" && [[ "$actual" == "$contents" ]]; then
       ok "已经配置好：$dest"; return 0
@@ -296,7 +297,13 @@ put_file() {
   backup_config_path "$dest" || die "无法备份原配置：$dest"
   parent="$(dirname -- "$dest")" || return 1
   if [[ ! -d "$parent" ]]; then
+    # Every level created here goes again with the rollback once it is empty.
+    missing="$parent"
+    while [[ ! -e "$missing" && ! -L "$missing" && "$missing" != / ]]; do created+=("$missing"); missing="$(dirname -- "$missing")"; done
     install -d -m 755 -- "$parent" || { warn "无法创建配置目录：$parent"; return 1; }
+    for dir in "${created[@]}"; do
+      restore_record_dir "$dir" || warn "无法记录新建的目录：$dir（撤销后可能留下空目录）"
+    done
   fi
   temp="$(mktemp "$dest.tmp.XXXXXX")" || { warn "无法创建临时配置文件：$dest"; return 1; }
   if ! printf '%s\n' "$contents" > "$temp" || ! chmod 644 -- "$temp"; then
@@ -4245,6 +4252,39 @@ restore_record_fw_rule() {
   printf '%s\n' "$rule" >> "$file" && chmod 600 -- "$file"
 }
 
+# A directory this tool created for one of its files: removed again by
+# restore_created_dirs once it is empty.
+restore_record_dir() {
+  local dir="$1" file="$RESTORE_ROOT/created_dirs"
+  [[ "$RESTORE_READY" == 1 ]] || return 0
+  [[ "$dir" == /?* && "$dir" != *$'\n'* && "/$dir/" != */../* ]] || return 1
+  [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
+  if [[ -f "$file" ]] && grep -Fxq -- "$dir" "$file"; then return 0; fi
+  printf '%s\n' "$dir" >> "$file" && chmod 600 -- "$file"
+}
+
+# Removes the recorded directories that are empty now, deepest first. One with
+# anything in it (a file of the user or of a package) stays recorded.
+restore_created_dirs() {
+  local file="$RESTORE_ROOT/created_dirs" dir temp
+  local -a remaining=()
+  [[ -e "$file" || -L "$file" ]] || return 0
+  restore_data_safe "$file" || { warn '新建目录的记录不安全，已跳过。'; return 0; }
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    if [[ -d "$dir" && ! -L "$dir" && -z "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] &&
+       rmdir -- "$dir" 2>/dev/null; then
+      ok "已删除本工具创建的空目录：$dir"; continue
+    fi
+    if [[ -e "$dir" || -L "$dir" ]]; then remaining+=("$dir"); fi
+  done < <(sort -r -- "$file")
+  if ((${#remaining[@]} == 0)); then rm -f -- "$file"; return 0; fi
+  temp="$(mktemp "$RESTORE_ROOT/.write.XXXXXX")" || return 0
+  if ! { printf '%s\n' "${remaining[@]}" > "$temp" && chmod 600 -- "$temp" && mv -fT -- "$temp" "$file"; }; then
+    rm -f -- "$temp"
+  fi
+}
+
 # Running sysctl values before this tool first changed them (first value wins).
 # NAME is the record (sysctl_runtime for the hardening, zram_sysctl_runtime for
 # ZRAM, tcp_sysctl_runtime for the buffers). tcp_rmem holds three numbers.
@@ -4895,6 +4935,7 @@ restore_group_apply() {
       # Restore NTP policy before its service state, timers after APT policy.
       while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids "$group") ;;
   esac
+  restore_created_dirs
   # Group names are module names: vps check then reports it as undone, not broken.
   if ((was_pending && RESTORE_PARTIAL == 0)) && ! restore_group_pending "$group"; then
     module_result "$group" reverted '由撤销功能恢复'

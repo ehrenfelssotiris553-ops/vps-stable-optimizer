@@ -169,6 +169,10 @@ def main():
         if la.get(path) == lb.get(path):
             continue
         rc_link = RC_LINK.match(path)
+        unit = path.rsplit('/', 1)[-1]
+        if (path not in la and lb.get(path) == '/dev/null' and path.startswith('/etc/systemd/system/')
+                and unit.rsplit('.', 1)[0] in set(b.get('pkgconf', []))):
+            continue  # the mask of a removed package's service, warned with the unit
         if path not in la and path in dangling and path.startswith('/etc/systemd/system/'):
             warnings.append(f'enablement link of a removed package stays (dangling): {path}')
         elif path not in la and rc_link and '/etc/init.d/' + rc_link.group(1) in rc_files:
@@ -193,8 +197,13 @@ def main():
 
     # Everything else must be exactly as before.
     ua_units, ub_units = pairs(a, 'unit', ' '), pairs(b, 'unit', ' ')
+    rc_pkgs = set(b.get('pkgconf', []))
     for name in sorted(set(ua_units) | set(ub_units)):
         if ua_units.get(name) != ub_units.get(name):
+            # Removing a package whose SysV script stays masks its service.
+            if ub_units.get(name) == 'masked' and name not in ua_units and name.rsplit('.', 1)[0] in rc_pkgs:
+                warnings.append(f'the service of a removed package is masked (apt remove does that): {name}')
+                continue
             unexplained.append(f'unit {name}: {ua_units.get(name, "(none)")} -> {ub_units.get(name, "(none)")}')
     inert = []
     for kind in ('nft', 'iptables-save', 'ip6tables-save'):
