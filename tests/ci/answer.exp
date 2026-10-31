@@ -8,6 +8,9 @@
 #   (nothing)      just Enter
 #   !COMMAND       run COMMAND here in the background, through sh (for
 #                  example a second SSH login that confirms a guard)
+#   !!COMMAND      run COMMAND here, wait for it, then press Enter
+#   $NAME          the value of environment variable NAME (a test password,
+#                  a public key), then Enter
 #   @disconnect    drop the connection at this point and end with success
 # A [y/N], [Y/n] or typed-word question that no rule knows ends the run with
 # exit code 3 instead of waiting; no matching output for 50 minutes (or
@@ -45,8 +48,13 @@ while {[gets $f line] >= 0} {
 close $f
 
 proc respond {answer} {
-  if {[string index $answer 0] eq "!"} {
+  if {[string range $answer 0 1] eq "!!"} {
+    catch {exec sh -c "[string range $answer 2 end] </dev/null >/dev/null 2>&1"}
+    send -- "\r"
+  } elseif {[string index $answer 0] eq "!"} {
     exec sh -c "[string range $answer 1 end] </dev/null >/dev/null 2>&1 &"
+  } elseif {[string index $answer 0] eq "\$"} {
+    send -- "$::env([string range $answer 1 end])\r"
   } elseif {$answer eq "@disconnect"} {
     close
     catch wait

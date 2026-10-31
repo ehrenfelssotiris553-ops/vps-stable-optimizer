@@ -1,24 +1,29 @@
-# Layer 3: Debian 12/13 cloud VMs with 512 MiB inside the runner. Covers SSH
-# from outside, a reboot and setup in tmux after a dropped connection. Run it
-# before a release (push to a release/ branch) or by hand.
+# Layer 3: an official cloud image of every supported release as a VM with
+# 512 MiB inside the runner. Covers SSH from outside, a reboot, setup in tmux
+# after a dropped connection and the SSH hardening for real. Runs before a
+# release (push to a release/ branch), weekly, or by hand.
 name: vm-run
 on:
   push:
     branches: ['release/**']
   workflow_dispatch:
+  # Weekly (Sunday 03:00 Beijing time) even without changes: package updates
+  # of a release can break the tool too.
+  schedule:
+    - cron: '0 19 * * 6'
 permissions:
   contents: read
 concurrency:
   group: vm-run-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  debian:
+  vm:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        release: ['12', '13']
+        system: [debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
     steps:
       - uses: actions/checkout@v5
       - name: KVM for the nested VM
@@ -32,12 +37,12 @@ jobs:
           sudo apt-get update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils expect openssh-client
-      - name: Debian ${{ matrix.release }} VM
-        run: bash tests/ci/report.sh 'Debian ${{ matrix.release }} VM' bash tests/ci/vm-run.sh ${{ matrix.release }} 512
+      - name: ${{ matrix.system }} VM
+        run: bash tests/ci/report.sh '${{ matrix.system }} VM' bash tests/ci/vm-run.sh ${{ matrix.system }} 512
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: vm-run-debian-${{ matrix.release }}
+          name: vm-run-${{ matrix.system }}
           path: ${{ runner.temp }}/vps-ci-logs
           if-no-files-found: ignore

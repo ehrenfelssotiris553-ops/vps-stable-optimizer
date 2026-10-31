@@ -2,3 +2,5 @@
 1\) 全部撤销 ==> 1
 确定全部撤销吗？ ==> y
 确认卸载上述软件包吗？ ==> y
+# Run as the admin account made by the SSH hardening (VM only).
+\[sudo\] password for ops: ==> $ADMIN_PW

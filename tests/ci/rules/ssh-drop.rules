@@ -1,0 +1,13 @@
+# `vps ssh` as root on the VM: a new admin "ops" with sudo (test password and
+# the CI key), whose key login and sudo are proven from outside. Then, with
+# password and root login already off, the connection drops: the guard timer
+# has to bring the old settings back by itself.
+有需要人工核对的软件源 ==> y
+开始本次修改吗？ ==> y
+新建一个普通管理员账户 ==> y
+管理员账户名 ==> ops
+(New|Retype new) password: ==> $ADMIN_PW
+要再添加一个公钥吗？ ==> n
+公钥（直接回车跳过） ==> $VM_PUBKEY
+完成后回到这里按回车继续 ==> !!$VM_OPS_SUDO
+等待确认（剩余 ==> @disconnect

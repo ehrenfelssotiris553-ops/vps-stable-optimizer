@@ -5,6 +5,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # Weekly (Sunday 03:00 Beijing time) even without changes: package updates
+  # of a release can break the tool too.
+  schedule:
+    - cron: '0 19 * * 6'
 permissions:
   contents: read
 concurrency:

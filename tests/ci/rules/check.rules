@@ -2,3 +2,5 @@
 # addresses are banned and unbanned).
 显示详细状态吗？ ==> n
 做一次 Fail2ban 实弹测试吗？ ==> y
+# Run as the admin account made by the SSH hardening (VM only).
+\[sudo\] password for ops: ==> $ADMIN_PW
