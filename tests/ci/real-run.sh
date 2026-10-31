@@ -39,6 +39,11 @@ before_updates=0 before_reboot=0
 if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then before_updates=1; fi
 if apt_has 'Unattended-Upgrade::Automatic-Reboot "true";'; then before_reboot=1; fi
 printf 'Before: %s | %s | %s\n' "$before_state" "$before_tz" "${before_ufw:-ufw not installed}"
+# The whole picture before anything is installed, compared at the very end.
+# The snapshots belong to the CI user; only the scripts run as root.
+snapshot_since="$(date '+%F %T')"
+# shellcheck disable=SC2024
+sudo bash "$CI/snapshot.sh" > "$LOGS/snapshot-before.txt"
 
 # The newest commit on origin/main whose tool has another version than this one.
 previous_release() {
@@ -236,6 +241,18 @@ if command -v vps >/dev/null; then fail 'vps command left after uninstall'; fi
 for d in /usr/local/lib/vps-stable-opt /var/lib/vps-stable-opt /var/backups/vps-stable-opt; do
   [[ ! -e "$d" ]] || fail "$d left after uninstall"
 done
+endgroup
+
+group 'Nothing left behind: everything compared with before the install'
+# shellcheck disable=SC2024
+sudo bash "$CI/snapshot.sh" > "$LOGS/snapshot-after.txt"
+# shellcheck disable=SC2024
+sudo bash "$CI/upgrade-info.sh" "$snapshot_since" > "$LOGS/upgrade-info.txt"
+rc=0
+python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt" --upgrades "$LOGS/upgrade-info.txt" \
+  > "$LOGS/snapdiff.log" || rc=$?
+cat "$LOGS/snapdiff.log"
+((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup
 printf 'PASS: real run (%s) on %s: install, setup, check, single items, ports, rollback, uninstall.\n' \
   "$mode" "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"

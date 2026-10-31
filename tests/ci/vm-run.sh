@@ -134,6 +134,9 @@ group 'Boot and install'
 wait_ssh
 # shellcheck disable=SC2016
 vm 'cloud-init status --wait >/dev/null 2>&1 || true; . /etc/os-release; echo "$PRETTY_NAME"; free -m | sed -n 2p'
+# The whole picture before anything is installed, compared at the very end.
+snapshot_since="$(vm "date '+%F %T'")"
+vm 'bash -s' < "$CI/snapshot.sh" > "$LOGS/snapshot-before.txt"
 scp -q -i key -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
   "$ROOT/install.sh" "$ROOT/vps-stable-opt.sh" root@127.0.0.1:/root/
 vm 'bash /root/install.sh --local-file /root/vps-stable-opt.sh --no-run'
@@ -237,5 +240,16 @@ vm 'for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-sta
 vm 'swapon --noheadings | grep -q zram' && fail 'ZRAM still on after rollback'
 vm_drive uninstall.rules uninstall vps uninstall || fail "uninstall exited with $?"
 vm 'command -v vps' && fail 'vps command left after uninstall'
+endgroup
+
+group 'Nothing left behind: everything compared with before the install'
+vm 'bash -s' < "$CI/snapshot.sh" > "$LOGS/snapshot-after.txt"
+vm "bash -s '$snapshot_since'" < "$CI/upgrade-info.sh" > "$LOGS/upgrade-info.txt"
+rc=0
+# ops, the admin made by the SSH hardening, stays by design (with its key).
+python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt" --upgrades "$LOGS/upgrade-info.txt" \
+  --allow-user ops > "$LOGS/snapdiff.log" || rc=$?
+cat "$LOGS/snapdiff.log"
+((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup
 printf 'PASS: %s VM (%s MiB): setup, check, allowlisted logins, reboot, tmux reconnect, SSH hardening (dropped and kept), rollback, uninstall.\n' "$system" "$memory"
