@@ -111,6 +111,7 @@ printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
 printf '%s\n' 'PASS: the menu announces an update that waits for a reboot.'
 
 LOG_DIR="$TEST_ROOT/logs"
+LEGACY_LOG_DIR="$TEST_ROOT/legacy-logs"
 STATE_ROOT="$TEST_ROOT/state"
 BACKUP_ROOT="$TEST_ROOT/absent-backups"
 records_report > "$TEST_ROOT/absent-output"
@@ -124,6 +125,10 @@ if ((EUID != 0)); then
 fi
 [[ "$STATE_REPORT_CALLS" == 1 ]] || fail 'root records did not include run metadata'
 grep -Fq '还没有配置备份' "$TEST_ROOT/absent-output" || fail 'absent backup guidance missing'
+if grep -Fq '旧版本的操作日志' "$TEST_ROOT/absent-output"; then fail 'an absent legacy log directory was mentioned'; fi
+mkdir -- "$LEGACY_LOG_DIR"
+records_report > "$TEST_ROOT/legacy-output"
+grep -Fq "旧版本的操作日志：$LEGACY_LOG_DIR" "$TEST_ROOT/legacy-output" || fail 'a legacy log directory was not mentioned'
 
 # All fixtures below belong to the test process; no real backup is consulted.
 BACKUP_ROOT="$TEST_ROOT/backups"

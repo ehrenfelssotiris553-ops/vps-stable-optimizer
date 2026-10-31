@@ -36,7 +36,7 @@ jobs:
         run: bash tests/ci/report.sh 'Debian ${{ matrix.release }} VM' bash tests/ci/vm-run.sh ${{ matrix.release }} 512
       - name: Keep the transcripts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: vm-run-debian-${{ matrix.release }}
           path: ${{ runner.temp }}/vps-ci-logs

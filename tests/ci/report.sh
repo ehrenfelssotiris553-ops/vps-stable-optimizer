@@ -23,6 +23,10 @@ rc=0
 "$@" 2>&1 | tee -- "$out" || rc="${PIPESTATUS[0]}"
 if ((rc)); then
   annotate "$title (exit $rc)" "$out"
+  # Failures from earlier in a long output (each test file keeps going).
+  if grep -E '^(FAIL|STOP):|^Running |unbound variable|command not found|No such file|Cannot extract|answer.exp:' -- "$out" > "$out.lines"; then
+    annotate "$title - failure lines" "$out.lines"
+  fi
   latest="$(find "$logs" -maxdepth 1 -name '*.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
   if [[ -n "$latest" ]]; then annotate "$title - end of ${latest##*/}" "$latest"; fi
 fi

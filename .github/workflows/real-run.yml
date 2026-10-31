@@ -26,7 +26,7 @@ jobs:
         run: bash tests/ci/report.sh 'real run ${{ matrix.os }}' bash tests/ci/real-run.sh
       - name: Keep the transcripts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: real-run-${{ matrix.os }}
           path: ${{ runner.temp }}/vps-ci-logs

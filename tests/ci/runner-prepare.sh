@@ -7,8 +7,19 @@
 # - Only the distribution's own package sources stay, as on a fresh VPS. The
 #   image adds Microsoft, PPAs and others; one of them being down would fail
 #   the tool's strict index update for a reason that has nothing to do with it.
+# - The directories the installer writes into belong to root and only root
+#   can write them, as on a fresh VPS; the image leaves some writable to
+#   others, which the installer rightly refuses.
 # - expect is installed to answer the questions.
 set -Eeuo pipefail
+for dir in / /usr /usr/local /usr/local/lib /usr/local/bin /var /var/lib /var/backups /var/log; do
+  [[ -d "$dir" && ! -L "$dir" ]] || continue
+  before="$(stat -c '%U:%G %a' -- "$dir")"
+  sudo chown root:root -- "$dir"
+  sudo chmod go-w -- "$dir"
+  after="$(stat -c '%U:%G %a' -- "$dir")"
+  if [[ "$before" != "$after" ]]; then printf 'Made %s safe: %s -> %s\n' "$dir" "$before" "$after"; fi
+done
 sudo mkdir -p /etc/apt/sources.list.d.ci-off
 for f in /etc/apt/sources.list.d/*; do
   [[ -e "$f" ]] || continue
