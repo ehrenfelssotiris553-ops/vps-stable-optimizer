@@ -107,7 +107,8 @@ check_all check
 endgroup
 
 group 'Allowlisted address: no SSH rate limit'
-vm 'ufw show added; ufw status numbered' | tee "$LOGS/ufw-rules.log"
+vm 'ufw show added; ufw status numbered' > "$LOGS/ufw-rules.log" || fail 'cannot read the UFW rules'
+cat "$LOGS/ufw-rules.log"
 grep -Fxq 'ufw allow from 10.0.2.2 to any port 22 proto tcp' "$LOGS/ufw-rules.log" || fail 'exemption rule not listed as expected'
 for i in 1 2 3 4 5 6 7 8 9 10; do vm true || fail "SSH login $i refused although the address is allowlisted"; done
 endgroup

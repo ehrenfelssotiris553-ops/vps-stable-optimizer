@@ -46,7 +46,7 @@ close $f
 
 proc respond {answer} {
   if {[string index $answer 0] eq "!"} {
-    exec sh -c "[string range $answer 1 end] >/dev/null 2>&1 &"
+    exec sh -c "[string range $answer 1 end] </dev/null >/dev/null 2>&1 &"
   } elseif {$answer eq "@disconnect"} {
     close
     catch wait

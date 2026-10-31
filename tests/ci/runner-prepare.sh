@@ -4,8 +4,17 @@
 # - Docker and its firewall rules go out of the way. The tool rightly refuses
 #   to take over a firewall that already has rules.
 # - An SSH server runs, because the firewall step needs real SSH ports.
+# - Only the distribution's own package sources stay, as on a fresh VPS. The
+#   image adds Microsoft, PPAs and others; one of them being down would fail
+#   the tool's strict index update for a reason that has nothing to do with it.
 # - expect is installed to answer the questions.
 set -Eeuo pipefail
+sudo mkdir -p /etc/apt/sources.list.d.ci-off
+for f in /etc/apt/sources.list.d/*; do
+  [[ -e "$f" ]] || continue
+  case "${f##*/}" in ubuntu.sources) continue ;; esac
+  sudo mv -- "$f" /etc/apt/sources.list.d.ci-off/
+done
 sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
 for tool in iptables ip6tables; do
   command -v "$tool" >/dev/null || continue
