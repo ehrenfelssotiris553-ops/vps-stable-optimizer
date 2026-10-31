@@ -28,7 +28,8 @@ set timeout 3000
 if {[info exists env(ANSWER_TIMEOUT)]} { set timeout $env(ANSWER_TIMEOUT) }
 # Only the end of the output matters, but a rule may span several lines.
 match_max 1000000
-set stty_init "rows 40 cols 120"
+# Wide enough that no question wraps: tmux draws a wrapped line as two.
+set stty_init "rows 40 cols 400"
 
 set rules {}
 set f [open $rules_file r]

@@ -130,6 +130,11 @@ vm 'cloud-init status --wait >/dev/null 2>&1 || true; . /etc/os-release; echo "$
 scp -q -i key -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
   "$ROOT/install.sh" "$ROOT/vps-stable-opt.sh" root@127.0.0.1:/root/
 vm 'bash /root/install.sh --local-file /root/vps-stable-opt.sh --no-run'
+# Ubuntu's cloud kernels keep zram in linux-modules-extra, which the tool
+# deliberately does not install: there ZRAM has to be reported unsupported.
+zram_kernel=1
+vm 'modinfo zram >/dev/null 2>&1' || zram_kernel=0
+printf 'zram module in this kernel: %s\n' "$zram_kernel"
 endgroup
 
 group 'Recommended setup over SSH'
@@ -145,9 +150,11 @@ check_all() {
   vm_drive check.rules "$name" "$@" vps check || rc=$?
   cat "$LOGS/$name.log"
   [[ "$rc" == 0 || "$rc" == 3 ]] || fail "$name exited with $rc"
-  for item in 'BBR 网络优化' '内核网络安全参数' 'ZRAM 内存缓冲' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破'; do
+  for item in 'BBR 网络优化' '内核网络安全参数' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破'; do
     passed "$name" "$item"
   done
+  if ((zram_kernel)); then passed "$name" 'ZRAM 内存缓冲'
+  else has "$name" '[➖ 未处理] ZRAM 内存缓冲：系统不支持'; fi
 }
 group 'Acceptance check'
 check_all check
