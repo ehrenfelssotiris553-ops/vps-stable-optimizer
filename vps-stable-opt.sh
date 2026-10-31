@@ -2913,13 +2913,15 @@ audit_disk_risks() {
 # Not counted: the kernel command line (its parameters, such as
 # nvme_core.io_timeout, read like errors) and reads from an empty floppy or
 # CD drive (fd0, sr0), which KVM machines often have and which always fail.
+# Access hints are journalctl's own wording; services log "Failed to open
+# ..." too (systemd-networkd does at every boot on Ubuntu 26.04).
 audit_journal_counts() {
   awk '
     NR>3000 {limited=1; next}
     {
       line=tolower(substr($0,1,1024)); scanned++
       if(line~/^(kernel )?command line:/) next
-      if(line~/^hint:|^no journal files|^-- no entries --$|^failed to open|^you are currently not seeing|^insufficient permissions|^no entries were found/) access_issue++
+      if(line~/^hint:|^no journal files|^-- no entries --$|^failed to open (journal|files)|^you are currently not seeing|^insufficient permissions|^no entries were found/) access_issue++
       if(line~/out of memory:|oom-kill:|oom_reaper:|memory cgroup out of memory|killed process [0-9]+|invoked oom-killer/) oom++
       if(line~/dev (fd|sr)[0-9]/) next
       if(line~/i\/o error|buffer i\/o|blk_update_request:.*error|blk_print_req_error:|ext4-fs error|xfs.*(corrupt|i\/o error)|btrfs.*(error|corrupt)|nvme[0-9].*(i\/o|timeout)/) io++

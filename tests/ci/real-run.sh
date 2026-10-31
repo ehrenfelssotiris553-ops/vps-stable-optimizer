@@ -203,13 +203,14 @@ item_do item-tools-on tools 1
 [[ "$(tool_packages)" == 'curl wget ca-certificates vim htop unzip lsof tmux ' ]] || fail "tools on: $(tool_packages)"
 
 item_do item-fail2ban-off fail2ban 2
-[[ ! -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local ]] || fail 'Fail2ban off: jail left'
+# jail.d is root-only on some releases (Ubuntu 26.04).
+if sudo test -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local; then fail 'Fail2ban off: jail left'; fi
 item_do item-firewall-off firewall 3
 [[ "$(ufw_line)" == "$before_ufw" ]] || fail "firewall off: $(ufw_line)"
 item_do item-firewall-on firewall 1
 [[ "$(ufw_line)" == 'Status: active' ]] || fail 'firewall on: not active'
 item_do item-fail2ban-on fail2ban 1
-[[ -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local ]] || fail 'Fail2ban on: no jail'
+sudo test -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local || fail 'Fail2ban on: no jail'
 systemctl is-active -q fail2ban || fail 'Fail2ban on: not running'
 endgroup
 
@@ -241,7 +242,7 @@ has rollback '撤销完成'
 [[ "$(ufw_line)" == "$before_ufw" ]] || fail 'firewall not back to how it was'
 for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/sysctl.d/99-vps-stable-bbr.conf \
     /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/apt/apt.conf.d/53-vps-stable-auto-reboot; do
-  [[ ! -e "$f" ]] || fail "$f left after rollback"
+  if sudo test -e "$f"; then fail "$f left after rollback"; fi
 done
 endgroup
 

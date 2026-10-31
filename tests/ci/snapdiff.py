@@ -25,6 +25,16 @@ CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_co
 USER_FILES = {'/etc/' + f + s for f in ('passwd', 'group', 'shadow', 'gshadow', 'subuid', 'subgid')
               for s in ('', '-')}
 ALWAYS_EXPLAINED = {'/etc/ld.so.cache'}
+# What `ufw disable` and removing UFW leave in the kernel until a reboot: empty
+# ufw chains, plain jumps into them and accept policies. They filter nothing
+# (the tool itself treats them as no firewall); any other rule fails.
+INERT_FIREWALL = re.compile(
+    r'^(\*(filter|nat|mangle|raw|security)|COMMIT'
+    r'|:(INPUT|FORWARD|OUTPUT|PREROUTING|POSTROUTING) ACCEPT \[0:0\]'
+    r'|:ufw6?-[a-z-]+ - \[0:0\]|-A (INPUT|FORWARD|OUTPUT) -j ufw6?-[a-z-]+'
+    r'|#.*|\}|table (ip|ip6|inet) filter \{|chain [A-Za-z0-9_-]+ \{'
+    r'|type filter hook (input|forward|output) priority filter; policy accept;'
+    r'|(counter )?jump ufw6?-[a-z-]+)$')
 
 
 def load(path):
@@ -149,6 +159,14 @@ def main():
     for name in sorted(set(ua_units) | set(ub_units)):
         if ua_units.get(name) != ub_units.get(name):
             unexplained.append(f'unit {name}: {ua_units.get(name, "(none)")} -> {ub_units.get(name, "(none)")}')
+    inert = []
+    for kind in ('nft', 'iptables-save', 'ip6tables-save'):
+        left = set(b.get(kind, [])) - set(a.get(kind, []))
+        if left and all(INERT_FIREWALL.match(x) for x in left):
+            inert.append(kind)
+            a[kind] = b.get(kind, [])
+    if inert:
+        warnings.append("UFW's empty chains (they filter nothing) stay until a reboot: " + ' '.join(inert))
     for kind, label in (('local', 'tool path'), ('cron', 'root crontab'), ('nft', 'nft rule'),
                         ('iptables-save', 'iptables rule'), ('ip6tables-save', 'ip6tables rule'),
                         ('swap', 'swap'), ('vpsunit', 'tool unit')):

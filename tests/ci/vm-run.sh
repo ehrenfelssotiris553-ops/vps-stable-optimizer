@@ -14,19 +14,28 @@
 #   settings back by itself; then key-only login, a new sudo admin and no root
 #   login, which also survive a reboot;
 # - then a full rollback and the uninstall.
-# Usage: vm-run.sh debian-12|debian-13|ubuntu-22.04|ubuntu-24.04|ubuntu-26.04 [MEMORY_MIB]
+# SYSTEM-old starts from the first image of the release instead, as some
+# providers still hand out: years of updates, a new kernel, changed
+# configuration files. There the setup runs in tmux and the connection is cut
+# while the system upgrade runs; the setup must go on and be finished after
+# logging in again.
+# Usage: vm-run.sh debian-12|debian-13|ubuntu-22.04|ubuntu-24.04|ubuntu-26.04[-old] [MEMORY_MIB]
 set -Eeuo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 # shellcheck source=tests/ci/lib.sh
 source "$ROOT/tests/ci/lib.sh"
-system="${1:-}" memory="${2:-512}"
-case "$system" in
-  debian-12) codename=bookworm ;;
-  debian-13) codename=trixie ;;
-  ubuntu-22.04 | ubuntu-24.04 | ubuntu-26.04) ;;
-  *) fail 'usage: vm-run.sh debian-12|debian-13|ubuntu-22.04|ubuntu-24.04|ubuntu-26.04 [MEMORY_MIB]' ;;
+system="${1:-}" memory="${2:-512}" old=0
+if [[ "$system" == *-old ]]; then old=1; fi
+case "${system%-old}" in
+  debian-12) codename=bookworm first=20230612-1409 ;;
+  debian-13) codename=trixie first='' ;;
+  ubuntu-22.04) codename=jammy first=release-20220420 ;;
+  ubuntu-24.04) codename=noble first=release-20240423 ;;
+  ubuntu-26.04) codename=resolute first='' ;;
+  *) fail 'usage: vm-run.sh debian-12|debian-13|ubuntu-22.04|ubuntu-24.04|ubuntu-26.04[-old] [MEMORY_MIB]' ;;
 esac
-release="${system#*-}"
+if ((old)) && [[ -z "$first" ]]; then fail "no first image recorded for ${system%-old}"; fi
+release="${system%-old}" release="${release#*-}"
 WORK="${RUNNER_TEMP:-/tmp}/vm-$system"
 mkdir -p -- "$WORK"
 cd -- "$WORK"
@@ -35,10 +44,12 @@ group "$system cloud image"
 if [[ "$system" == debian-* ]]; then
   image="debian-$release-genericcloud-amd64.qcow2"
   base="https://cloud.debian.org/images/cloud/$codename/latest"
+  if ((old)); then image="debian-$release-genericcloud-amd64-$first.qcow2" base="https://cloud.debian.org/images/cloud/$codename/$first"; fi
   sums=SHA512SUMS check=sha512sum
 else
   image="ubuntu-$release-server-cloudimg-amd64.img"
   base="https://cloud-images.ubuntu.com/releases/$release/release"
+  if ((old)); then base="https://cloud-images.ubuntu.com/releases/$codename/$first"; fi
   sums=SHA256SUMS check=sha256sum
 fi
 curl -fsSLO "$base/$image"
@@ -153,12 +164,32 @@ vm 'modinfo zram >/dev/null 2>&1' || zram_kernel=0
 printf 'zram module in this kernel: %s\n' "$zram_kernel"
 endgroup
 
-group 'Recommended setup over SSH'
-vm_drive setup-vm.rules setup vps setup || fail "setup exited with $?"
-has setup '已在系统日志里看到新窗口登录成功，自动确认'
-has setup '本次流程已完成'
-plan_facts setup
-ssh_facts setup
+if ((old)); then
+  group 'Recommended setup in tmux; the connection drops in the middle of the system upgrade'
+  ANSWER_TIMEOUT=2700 vm_drive tmux-upgrade.rules setup vps setup &
+  drive_pid=$!
+  upgrading() { vm 'grep -qsx apt_upgrade /var/lib/vps-stable-opt/run-*/active_stage && pgrep -x dpkg >/dev/null' 2>/dev/null; }
+  for ((i = 0; i < 360; i++)); do upgrading && break; sleep 5; done
+  upgrading || fail 'the system upgrade never got going'
+  # Like a network drop: the SSH client goes away while dpkg works.
+  pkill -f 'answer\.exp .*tmux-upgrade\.rules' || true
+  wait "$drive_pid" || true
+  sleep 5
+  vm 'tmux has-session -t =vps-setup' || fail 'the setup in tmux ended with the connection'
+  printf 'After the drop: %s\n' "$(vm 'pgrep -a dpkg | head -n 2' || true)"
+  ANSWER_TIMEOUT=2700 vm_drive tmux-return.rules setup-return vps || fail "return to tmux exited with $?"
+  has setup-return '一键开荒已结束（退出码 0）'
+  has setup-return '已在系统日志里看到新窗口登录成功，自动确认'
+  plan_facts setup
+  ssh_facts setup-return
+else
+  group 'Recommended setup over SSH'
+  vm_drive setup-vm.rules setup vps setup || fail "setup exited with $?"
+  has setup '已在系统日志里看到新窗口登录成功，自动确认'
+  has setup '本次流程已完成'
+  plan_facts setup
+  ssh_facts setup
+fi
 # The health report must raise no false alarm on a fresh machine.
 probe() {
   local rc=0
@@ -261,13 +292,16 @@ has check-after-reboot '开荒之后已经重启过'
 probe journal-probe-after-reboot
 endgroup
 
-group 'Setup in tmux survives a dropped connection'
-ANSWER_TIMEOUT=900 vm_drive tmux-start.rules tmux-start vps setup || fail "tmux start exited with $?"
-vm 'tmux has-session -t =vps-setup' || fail 'the setup in tmux ended with the connection'
-ANSWER_TIMEOUT=1800 vm_drive tmux-return.rules tmux-return vps || fail "return to tmux exited with $?"
-has tmux-return '一键开荒已结束（退出码 0）'
-if vm 'tmux has-session -t =vps-setup' 2>/dev/null; then fail 'the tmux session stayed after Enter'; fi
-endgroup
+if ((!old)); then
+  # (On an old image the first setup already ran in tmux and lost its connection.)
+  group 'Setup in tmux survives a dropped connection'
+  ANSWER_TIMEOUT=900 vm_drive tmux-start.rules tmux-start vps setup || fail "tmux start exited with $?"
+  vm 'tmux has-session -t =vps-setup' || fail 'the setup in tmux ended with the connection'
+  ANSWER_TIMEOUT=1800 vm_drive tmux-return.rules tmux-return vps || fail "return to tmux exited with $?"
+  has tmux-return '一键开荒已结束（退出码 0）'
+  if vm 'tmux has-session -t =vps-setup' 2>/dev/null; then fail 'the tmux session stayed after Enter'; fi
+  endgroup
+fi
 
 group 'SSH hardening: a connection dropped mid-way puts the old settings back'
 vm_drive ssh-drop.rules ssh-drop vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (dropped) exited with $rc"; }

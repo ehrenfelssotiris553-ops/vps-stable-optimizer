@@ -91,6 +91,11 @@ out="$(printf '%s\n' 'Command line: BOOT_IMAGE=/boot/vmlinuz root=/dev/vda1 nvme
 [[ "$(printf 'nvme nvme0: I/O 7 QID 2 timeout, aborting\n' | audit_journal_counts)" == '1 0 1 0 0 0' ]] || fail 'a real NVMe timeout was missed'
 [[ "$(printf 'blk_update_request: I/O error, dev vda, sector 2048\n' | audit_journal_counts)" == '1 0 1 0 0 0' ]] || fail 'a real disk error was missed'
 passed 'boot parameters and empty floppy/CD drives are no storage errors; real disk and NVMe errors are'
+# A service that fails to open something is no hint that the journal is unreadable.
+[[ "$(printf 'Failed to open nftables netlink socket. IPMasquerade= and NFTSet= settings will not be applied. Ignoring: Protocol not supported\n' | audit_journal_counts)" == '1 0 0 0 0 0' ]] ||
+  fail 'a service message counted as a journal access problem'
+[[ "$(printf 'Failed to open journal: Permission denied\n' | audit_journal_counts)" == '1 0 0 0 1 0' ]] || fail 'journalctl access error missed'
+passed 'journal access hints are journalctl messages, not any service message'
 
 sshd() {
   case "$*" in
