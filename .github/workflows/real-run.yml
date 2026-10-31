@@ -1,5 +1,7 @@
 # Layer 2: the real tool on throwaway Ubuntu runners (x64 and ARM): install,
-# plan, one-click setup, acceptance check, full rollback and uninstall.
+# plan, one-click setup, acceptance check, every single item off and on again,
+# port management, full rollback and uninstall. Once fresh, and once set up by
+# the previous release and then upgraded in place.
 name: real-run
 on:
   push:
@@ -22,16 +24,19 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm]
+        mode: [fresh, upgrade]
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Prepare the runner like a fresh VPS
         run: bash tests/ci/report.sh 'prepare ${{ matrix.os }}' bash tests/ci/runner-prepare.sh
       - name: Real run
-        run: bash tests/ci/report.sh 'real run ${{ matrix.os }}' bash tests/ci/real-run.sh
+        run: bash tests/ci/report.sh 'real run ${{ matrix.mode }} ${{ matrix.os }}' bash tests/ci/real-run.sh ${{ matrix.mode }}
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: real-run-${{ matrix.os }}
+          name: real-run-${{ matrix.mode }}-${{ matrix.os }}
           path: ${{ runner.temp }}/vps-ci-logs
           if-no-files-found: ignore

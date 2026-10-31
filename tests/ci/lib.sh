@@ -14,12 +14,23 @@ endgroup() { printf '::endgroup::\n'; }
 drive() {
   local rules="$1" name="$2" rc=0
   shift 2
-  LANG=C.UTF-8 TERM=xterm expect "$CI/answer.exp" "$CI/rules/$rules" "$LOGS/$name.raw" "$@" || rc=$?
+  # A name from tests/ci/rules/, or a path (rules written for one run).
+  [[ "$rules" == /* ]] || rules="$CI/rules/$rules"
+  LANG=C.UTF-8 TERM=xterm expect "$CI/answer.exp" "$rules" "$LOGS/$name.raw" "$@" || rc=$?
   sed -r 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\x1b[()][A-Za-z0-9]//g; s/\r//g' "$LOGS/$name.raw" > "$LOGS/$name.log"
   return "$rc"
 }
 
 has() { grep -Fq -- "$2" "$LOGS/$1.log" || fail "$1: \"$2\" is missing"; }
+
+# The menu number of single item KEY, from the tool's own list (item_keys).
+item_index() {
+  awk -v key="$1" '
+    /^item_keys\(\) \{/ {list = 1; next}
+    list && /printf/ {for (i = 3; i <= NF; i++) if ($i == key) {print i - 2; found = 1}; exit}
+    END {exit !found}
+  ' "$ROOT/vps-stable-opt.sh"
+}
 lacks() { if grep -Fq -- "$2" "$LOGS/$1.log"; then fail "$1: \"$2\" should not be there"; fi; }
 
 # An acceptance line "[✅ 生效]   LABEL：…" (or "✅ 正常" for health lines).

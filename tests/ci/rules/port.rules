@@ -1,0 +1,4 @@
+# `vps port open|close ...` from the command line.
+仍然对所有人开放吗？ ==> y
+确认放行？ ==> y
+确认关闭这些端口吗？ ==> y

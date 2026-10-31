@@ -1,0 +1,11 @@
+# `vps item`: what an item asks beyond the setup questions (which follow from
+# setup-custom.rules). The menu choices come first, written for each run.
+撤销本工具对 ==> y
+确认卸载上述软件包吗？ ==> y
+每天几点自动重启 ==> 04:30
+防火墙已开启，同时配置 Fail2ban 防爆破吗？ ==> y
+请输入端口 ==> 8080
+只允许某个 IP 访问吗？ ==>
+协议：1\) TCP ==> 1
+仍然对所有人开放吗？ ==> y
+确认放行？ ==> y
