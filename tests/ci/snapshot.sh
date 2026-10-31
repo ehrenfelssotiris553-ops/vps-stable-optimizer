@@ -38,7 +38,7 @@ export LC_ALL=C
   awk 'NR > 1 {print "swap " $1 " " $2}' /proc/swaps
   # UFW's stored rules, line by line (a changed checksum alone does not say what).
   for f in /etc/ufw/user.rules /etc/ufw/user6.rules; do
-    if [[ -r "$f" ]]; then grep -v '^#' "$f" | sed "s|^|ufwrule ${f##*/}: |"; fi
+    if [[ -r "$f" ]]; then { grep -v '^#' "$f" || true; } | sed "s|^|ufwrule ${f##*/}: |"; fi
   done
   getent passwd | awk -F: '{print "user " $1 " " $3}'
   systemctl list-units --all --no-legend --plain 'vps-stable-*' 2>/dev/null | awk '{print "vpsunit " $1}' || true

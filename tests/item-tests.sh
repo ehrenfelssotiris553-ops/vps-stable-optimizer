@@ -101,6 +101,7 @@ printf 'ufw limit 22/tcp\n' > "$RESTORE_ROOT/fw_rules"
 restore_group_pending firewall || fail 'recorded firewall rules not pending'
 rm -f "$RESTORE_ROOT/fw_rules"
 restore_firewall_group() { record 'group firewall'; }
+restore_created_dirs() { :; }
 restore_fail2ban_group() { record 'group fail2ban'; }
 restore_ssh_group() { record 'group ssh'; }
 restore_zram_group() { record 'group zram'; }

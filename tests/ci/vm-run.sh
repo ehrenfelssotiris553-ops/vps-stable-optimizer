@@ -248,6 +248,14 @@ group 'SSH with the listening socket only (as right after an OpenSSH update)'
 vm 'if systemctl is-active -q ssh.socket; then systemctl stop ssh.service; sleep 1; echo "service: $(systemctl is-active ssh.service)"; ls -ld /run/sshd 2>&1; sshd -t 2>&1; echo "sshd -t: $?"; sshd -T 2>&1 | grep -m1 "^port "; ss -H -lntp "( sport = :22 )"; else echo "no ssh.socket here"; fi' \
   > "$LOGS/ssh-socket-only.log" 2>&1 || true
 notice "SSH with the socket only ($system)" "$LOGS/ssh-socket-only.log"
+if [[ "$(vm 'systemctl is-active ssh.socket' 2>/dev/null || true)" == active ]]; then
+  # The check runs in the same session that stopped the service: a new login
+  # would start it again through the socket.
+  vm_drive check.rules check-socket-only 'systemctl stop ssh.service; sleep 1; ls -ld /run/sshd 2>&1; vps check' ||
+    [[ $? == 3 ]] || fail 'check with the socket only failed'
+  passed check-socket-only '防火墙'
+  has check-socket-only 'SSH 端口已放行'
+fi
 wait_ssh
 endgroup
 
@@ -361,6 +369,8 @@ for ((i = 0; i < 90; i++)); do
   sleep 5
 done
 vm_ops "[ ! -e $KEYONLY ]" || fail 'key-only login stayed after the dropped connection'
+# The undo removes the file, then reloads sshd: give the reload a moment.
+for ((i = 0; i < 15; i++)); do vm true 2>/dev/null && break; sleep 2; done
 vm true || fail 'root cannot log in again after the undo'
 [[ "$(ssh_methods root)" == *password* ]] || fail "password login not back after the undo: $(ssh_methods root)"
 endgroup

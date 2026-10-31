@@ -27,6 +27,13 @@ audit_ufw_ipv6() { echo yes; }
 ufw_ipv6_check() { if ((FLIP_IPV6)); then IPV6_FLIPPED=1; fi; }
 # A new SSH login seen in the journal confirms without typing.
 ssh_login_seen() { ((LOGIN_SEEN)); }
+# UFW's own kernel settings (IPT_SYSCTL): their running values are kept for
+# the rollback before UFW is turned on, and only then.
+ufw_sysctl_keys() { printf '%s\n' net.ipv4.conf.default.accept_redirects; }
+sysctl() { [[ "$*" == '-n net.ipv4.conf.default.accept_redirects' ]] || fail "unexpected sysctl $*"; echo 1; }
+restore_record_sysctl() {
+  printf 'record %s=%s %s (ufw %s)\n' "$1" "$2" "$3" "$(cat "$CASE_DIR/ufw-active")" >> "$CASE_DIR/calls"
+}
 # Listening sockets as `ss -H -lntup` prints them; a case sets LISTEN.
 ss() { printf '%s' "$LISTEN"; }
 # [Y/n] questions of the firewall step: allow the listed services too, and
@@ -187,6 +194,8 @@ grep -Fxq 'ufw limit 22/tcp' "$CASE_DIR/rules" || fail 'password SSH did not use
 grep -Fxq 'ufw allow 80/tcp' "$CASE_DIR/rules" || fail 'accepted web ports were not opened'
 grep -Fxq 'firewall applied' "$CASE_DIR/results" || fail 'applied firewall result missing'
 if grep -q '^ask ' "$CASE_DIR/calls"; then fail 'asked about other services although nothing else listens'; fi
+grep -Fxq 'record net.ipv4.conf.default.accept_redirects=1 ufw_sysctl_runtime (ufw 0)' "$CASE_DIR/calls" ||
+  fail "UFW's kernel settings were not kept before UFW was turned on"
 [[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] || fail 'confirmed firewall not enabled at boot (ufw.service)'
 # Started too, so the next run does not take the reboot for an outside change.
 [[ "$(cat "$CASE_DIR/ufw-service")" == active ]] || fail 'ufw.service left inactive after the firewall was confirmed'

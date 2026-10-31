@@ -55,6 +55,25 @@ SUDO_LINE='alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/tr
 ssh_sudo_seen alice 1 || fail 'sudo true in the journal was missed'
 if ssh_sudo_seen nobody-here 1; then fail 'sudo counted for an unknown account'; fi
 unset -f getent
+# The privilege separation directory sshd -t needs: created when missing (as
+# ssh.service does), an existing directory or link left alone.
+(
+  load_optimizer_functions sshd_runtime_dir
+  sshd() { :; }
+  base="$(mktemp -d)"
+  sshd_runtime_dir "$base/sshd"
+  [[ -d "$base/sshd" && "$(stat -c %a "$base/sshd")" == 755 ]] || fail 'missing sshd runtime directory not created as 0755'
+  mkdir "$base/own"; touch "$base/own/keep"; sshd_runtime_dir "$base/own"
+  [[ -f "$base/own/keep" ]] || fail 'an existing directory was changed'
+  # (Windows Git Bash cannot create links without extra rights.)
+  if ln -s /nonexistent "$base/link" 2>/dev/null; then
+    sshd_runtime_dir "$base/link"
+    [[ -L "$base/link" ]] || fail 'a link was replaced'
+  fi
+  sshd_runtime_dir "$base/absent-parent/sshd"
+  [[ ! -e "$base/absent-parent" ]] || fail 'a missing parent directory was created'
+  rm -rf -- "$base"
+)
 # The journal is searched from whole seconds: a login just before a change,
 # in the same second, must fall before the confirmation window.
 before="$(date +%s)"

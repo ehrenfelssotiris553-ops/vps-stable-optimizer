@@ -323,9 +323,23 @@ put_file() {
   ok "已配置：$dest"
 }
 
+# Where systemd starts sshd from its socket (Ubuntu 24.04 and later), the
+# privilege separation directory exists only while ssh.service runs, and every
+# OpenSSH update stops the service until the next login: sshd -t and -T then
+# fail ("Missing privilege separation directory") although SSH works. Create it
+# as the service does; no configuration changes, and /run is gone at reboot.
+sshd_runtime_dir() {
+  local dir="${1:-/run/sshd}"
+  [[ -e "$dir" || -L "$dir" ]] && return 0
+  [[ -d "${dir%/*}" ]] || return 0
+  command -v sshd >/dev/null || return 0
+  install -d -m 0755 -- "$dir" 2>/dev/null || true
+}
+
 ssh_candidates() {
   local bin
   bin="$(command -v sshd || true)"
+  sshd_runtime_dir
   if [[ -n "$bin" ]]; then "$bin" -T 2>/dev/null | awk '$1=="port" && $2~/^[0-9]+$/ && $2>=1 && $2<=65535 {print $2}' || true; fi
   if [[ -n "${SSH_CONNECTION:-}" ]]; then awk 'NF==4 && $4~/^[0-9]+$/ && $4>=1 && $4<=65535 {print $4}' <<< "$SSH_CONNECTION"; fi
 }
@@ -348,6 +362,7 @@ SSH_PORTS=()
 ssh_detect() {
   SSH_PORTS=()
   command -v sshd >/dev/null || return 1
+  sshd_runtime_dir
   sshd -t >/dev/null 2>&1 || return 1
   local port
   while IFS= read -r port; do
@@ -433,6 +448,7 @@ details_report() {
   echo '-- 日志上限 --'; systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E '^(SystemMaxUse|RuntimeMaxUse|MaxRetentionSec)=' || true
   echo '-- 默认路由 --'; ip -4 route show default 2>/dev/null || true; ip -6 route show default 2>/dev/null || true
   echo '-- SSH 实际生效的登录设置 --'
+  sshd_runtime_dir
   if command -v sshd >/dev/null && sshd -T 2>/dev/null | audit_sshd_values; then :; else echo '无法执行 sshd -T'; fi
   restart_report
   state_report
@@ -2029,6 +2045,7 @@ ufw_ipv6_check() {
 ssh_password_disabled() {
   local values
   command -v sshd >/dev/null || return 1
+  sshd_runtime_dir
   values="$(sshd -T 2>/dev/null | audit_sshd_values)" || return 1
   grep -Fxq 'passwordauthentication=no' <<< "$values" && grep -Fxq 'kbdinteractiveauthentication=no' <<< "$values"
 }
@@ -2252,6 +2269,7 @@ ssh_effective() {
   local user="$1" addr="${SSH_CONNECTION:-}"
   addr="${addr%% *}"
   [[ -n "$addr" ]] || addr=127.0.0.1
+  sshd_runtime_dir
   sshd -T -C "user=$user,host=$(hostname 2>/dev/null || echo localhost),addr=$addr" 2>/dev/null
 }
 
@@ -2371,6 +2389,7 @@ ssh_console_guard() {
 ssh_enable_pubkey() {
   local user="$1" effective
   put_file "$SSH_PUBKEY_DROPIN" $'# VPS Stable Optimizer v2.6: allow SSH public key login\nPubkeyAuthentication yes' || return 1
+  sshd_runtime_dir
   if ! sshd -t; then
     rm -f -- "$SSH_PUBKEY_DROPIN"; warn 'sshd -t 不接受开启公钥登录的配置，已删除。'; return 1
   fi
@@ -2395,6 +2414,7 @@ ssh_harden_stage() {
   if ! command -v sshd >/dev/null || ! command -v ssh-keygen >/dev/null || ! command -v runuser >/dev/null; then
     warn '缺少 sshd、ssh-keygen 或 runuser，无法加固 SSH。'; module_result ssh unsupported 'OpenSSH tools missing'; return 0
   fi
+  sshd_runtime_dir
   sshd -t || { warn 'sshd -t 检查失败：请先修好 SSH 配置。'; module_result ssh skipped 'sshd -t failed'; return 0; }
   command -v systemd-run >/dev/null || { warn '缺少 systemd-run，无法提供防失联保护。'; module_result ssh unsupported 'systemd-run missing'; return 0; }
   if guard_leftovers; then module_result ssh skipped 'earlier protection timer pending'; return 0; fi
@@ -2508,6 +2528,7 @@ ssh_harden_stage() {
   fi
   ssh_console_guard "$user" || { ok '保留密码登录；SSH 设置没有改动。'; module_result ssh declined 'no console password'; return 0; }
   put_file "$SSH_DROPIN" "$(ssh_dropin_text "$want_admin")" || { module_result ssh preserved 'drop-in path conflict'; return 0; }
+  sshd_runtime_dir
   if ! sshd -t; then
     rm -f -- "$SSH_DROPIN"; warn 'sshd -t 不接受新配置，已删除。'; module_result ssh failed 'sshd -t failed'; return 0
   fi
@@ -3086,6 +3107,7 @@ security_audit() {
   local data='' values=''
   say '登录与网络安全审计（只读，不改变登录入口）'
   if command -v sshd >/dev/null; then
+    sshd_runtime_dir
     if sshd -t >/dev/null 2>&1; then ok 'sshd -t 配置检查通过（不验证真实登录）。'
     else warn 'sshd -t 未通过或权限不足，SSH 配置有效性未知；保留现状。'; fi
     if data="$(sshd -T 2>/dev/null)" && [[ -n "$data" ]]; then

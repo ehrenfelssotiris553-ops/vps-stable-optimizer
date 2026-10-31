@@ -23,7 +23,9 @@ VOLATILE = re.compile(
     # A container's virtual interface gets a new name whenever it starts.
     r'|net\.ipv[46]\.(conf|neigh)\.veth[0-9a-f]+\.)')
 KERNEL_PKG = re.compile(r'^linux-(image|modules|modules-extra|headers|tools|cloud-tools)-')
-CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_congestion_control')
+# Lists that grow when a module loads: congestion control, upper layer protocols.
+CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_congestion_control',
+           'net.ipv4.tcp_available_ulp')
 # A loaded logging module fills in its slot ("NONE" before).
 NF_LOG = re.compile(r'^net\.netfilter\.nf_log\.[0-9]+$')
 # The layout UFW writes into user.rules/user6.rules the first time it starts:
@@ -200,9 +202,10 @@ def main():
     rc_pkgs = set(b.get('pkgconf', []))
     for name in sorted(set(ua_units) | set(ub_units)):
         if ua_units.get(name) != ub_units.get(name):
-            # Removing a package whose SysV script stays masks its service.
-            if ub_units.get(name) == 'masked' and name not in ua_units and name.rsplit('.', 1)[0] in rc_pkgs:
-                warnings.append(f'the service of a removed package is masked (apt remove does that): {name}')
+            # Removing a package whose SysV script stays masks its service, or
+            # systemd generates a unit from that script.
+            if ub_units.get(name) in ('masked', 'generated') and name not in ua_units and name.rsplit('.', 1)[0] in rc_pkgs:
+                warnings.append(f'a unit for the SysV script of a removed package ({ub_units[name]}): {name}')
                 continue
             unexplained.append(f'unit {name}: {ua_units.get(name, "(none)")} -> {ub_units.get(name, "(none)")}')
     inert = []
