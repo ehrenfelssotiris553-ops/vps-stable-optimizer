@@ -169,7 +169,8 @@ if ((old)); then
   ANSWER_TIMEOUT=2700 vm_drive tmux-upgrade.rules setup vps setup &
   drive_pid=$!
   upgrading() { vm 'grep -qsx apt_upgrade /var/lib/vps-stable-opt/run-*/active_stage && pgrep -x dpkg >/dev/null' 2>/dev/null; }
-  for ((i = 0; i < 360; i++)); do upgrading && break; sleep 5; done
+  # An old image first runs its own automatic updates, which the tool waits for.
+  for ((i = 0; i < 1080; i++)); do upgrading && break; sleep 5; done
   upgrading || fail 'the system upgrade never got going'
   # Like a network drop: the SSH client goes away while dpkg works.
   pkill -f 'answer\.exp .*tmux-upgrade\.rules' || true
