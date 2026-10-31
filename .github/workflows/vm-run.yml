@@ -33,7 +33,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils expect openssh-client
       - name: Debian ${{ matrix.release }} VM
-        run: bash tests/ci/vm-run.sh ${{ matrix.release }} 512
+        run: bash tests/ci/report.sh 'Debian ${{ matrix.release }} VM' bash tests/ci/vm-run.sh ${{ matrix.release }} 512
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@v4

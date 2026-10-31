@@ -21,9 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Prepare the runner like a fresh VPS
-        run: bash tests/ci/runner-prepare.sh
+        run: bash tests/ci/report.sh 'prepare ${{ matrix.os }}' bash tests/ci/runner-prepare.sh
       - name: Real run
-        run: bash tests/ci/real-run.sh
+        run: bash tests/ci/report.sh 'real run ${{ matrix.os }}' bash tests/ci/real-run.sh
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@v4

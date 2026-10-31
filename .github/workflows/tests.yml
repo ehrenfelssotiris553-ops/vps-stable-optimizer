@@ -18,8 +18,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: ShellCheck 0.11.0
         run: |
-          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 -x vps-stable-opt.sh install.sh tests/ci/*.sh
-          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 --severity=error tests/*.sh
+          bash tests/ci/report.sh 'ShellCheck' docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 -x vps-stable-opt.sh install.sh tests/ci/*.sh
+          bash tests/ci/report.sh 'ShellCheck tests' docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 --severity=error tests/*.sh
   isolated:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -36,4 +36,4 @@ jobs:
             ca-certificates git openssh-client procps iproute2 util-linux
       - uses: actions/checkout@v5
       - name: All isolated tests (root)
-        run: bash tests/run-all.sh
+        run: bash tests/ci/report.sh 'isolated tests ${{ matrix.image }}' bash tests/run-all.sh
