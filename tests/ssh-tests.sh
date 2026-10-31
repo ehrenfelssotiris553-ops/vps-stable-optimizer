@@ -6,7 +6,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey ssh_harden_stage
+load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey guard_since ssh_harden_stage
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -55,6 +55,10 @@ SUDO_LINE='alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/tr
 ssh_sudo_seen alice 1 || fail 'sudo true in the journal was missed'
 if ssh_sudo_seen nobody-here 1; then fail 'sudo counted for an unknown account'; fi
 unset -f getent
+# The journal is searched from whole seconds: a login just before a change,
+# in the same second, must fall before the confirmation window.
+before="$(date +%s)"
+(($(guard_since) > before)) || fail 'the confirmation window starts in the second of the change'
 passwd() { [[ "$1" == -S ]] && printf '%s %s 2026-10-25 0 99999 7 -1\n' "$2" "$PW_FIXTURE"; }
 for PW_FIXTURE in P L NP; do [[ "$(console_password_state alice)" == "$PW_FIXTURE" ]] || fail "password state $PW_FIXTURE"; done
 for name in ops deploy a_1; do admin_name_valid "$name" || fail "valid admin name rejected: $name"; done

@@ -1820,6 +1820,14 @@ guard_leftovers() {
   return 0
 }
 
+# The start of a confirmation window. The journal is searched from a whole
+# second on, so a login made just before the change, in the same second, would
+# count as one that went through it: start at the next second instead.
+guard_since() {
+  sleep 1
+  date +%s
+}
+
 guard_arm() {
   local unit="$1"
   shift
@@ -2154,7 +2162,7 @@ firewall_stage() {
     warn '开启防火墙失败，自动撤销计时器保持启用。'; module_result firewall failed 'ufw enable failed'; return 0
   fi
   # Only logins after this moment went through the enabled firewall.
-  since="$(date +%s)"
+  since="$(guard_since)"
   ufw status numbered
   echo '请保留这个窗口不要关。现在新开一个 SSH 窗口登录服务器：登录成功后，这里通常几秒内就会自动确认，新窗口里什么都不用输入。'
   echo '如果没有自动确认，就回到这个窗口输入 CONNECTED；180 秒内没有确认，会自动关闭防火墙恢复原样。'
@@ -2494,7 +2502,7 @@ ssh_harden_stage() {
   deadline=$((SECONDS + 180))
   if ! ssh_reload; then warn 'sshd 重新加载失败；自动撤销计时器保持启用。'; module_result ssh failed 'sshd reload failed'; return 0; fi
   # Only a key login after the reload proves the new settings work.
-  since="$(date +%s)"
+  since="$(guard_since)"
   echo '已关闭 SSH 密码登录。请保留这个窗口不要关，再新开一个终端，用密钥登录一次：'
   echo "  ssh $user@服务器IP"
   if ((want_admin)); then echo '现在 root 直接登录应该被拒绝，这是正常的。'; fi
