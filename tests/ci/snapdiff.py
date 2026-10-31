@@ -36,7 +36,7 @@ INERT_FIREWALL = re.compile(
     r'|:ufw6?-[a-z-]+ - \[0:0\]|-A (INPUT|FORWARD|OUTPUT) -j ufw6?-[a-z-]+'
     r'|#.*|\}|table (ip|ip6|inet) filter \{|chain [A-Za-z0-9_-]+ \{'
     r'|type filter hook (input|forward|output) priority filter; policy accept;'
-    r'|(counter )?jump ufw6?-[a-z-]+)$')
+    r'|(counter )?jump ufw6?-[a-z-]+|)$')  # (and the blank lines of nft's listing)
 
 
 def load(path):

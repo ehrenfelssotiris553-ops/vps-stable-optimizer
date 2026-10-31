@@ -179,9 +179,16 @@ if ((old)); then
   printf 'After the drop: %s\n' "$(vm 'pgrep -a dpkg | head -n 2' || true)"
   ANSWER_TIMEOUT=2700 vm_drive tmux-return.rules setup-return vps || fail "return to tmux exited with $?"
   has setup-return '一键开荒已结束（退出码 0）'
-  has setup-return '已在系统日志里看到新窗口登录成功，自动确认'
-  plan_facts setup
-  ssh_facts setup-return
+  # tmux redraws the screen in pieces, which can split a line of text: the
+  # facts come from the tool's own run log and a plan outside tmux.
+  # shellcheck disable=SC2016
+  vm 'cat "$(ls -t /var/lib/vps-stable-opt/logs/run-*.log | head -n 1)"' |
+    sed -r 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\r//g' > "$LOGS/setup-runlog.log"
+  has setup-runlog '已在系统日志里看到新窗口登录成功，自动确认'
+  has setup-runlog '本次流程已完成'
+  ssh_facts setup-runlog
+  vm 'vps plan' > "$LOGS/plan.log" 2>&1 || fail 'plan failed'
+  plan_facts plan
 else
   group 'Recommended setup over SSH'
   vm_drive setup-vm.rules setup vps setup || fail "setup exited with $?"
