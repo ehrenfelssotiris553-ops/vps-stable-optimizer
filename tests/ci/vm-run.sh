@@ -148,6 +148,8 @@ group 'Recommended setup over SSH'
 vm_drive setup-vm.rules setup vps setup || fail "setup exited with $?"
 has setup '已在系统日志里看到新窗口登录成功，自动确认'
 has setup '本次流程已完成'
+vm 'bash -s' < "$CI/journal-probe.sh" > "$LOGS/journal-probe.log" 2>&1 || true
+notice "journal probe ($system)" "$LOGS/journal-probe.log"
 endgroup
 
 # `vps check` (after a command prefix such as sudo) with every item expected.

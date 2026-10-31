@@ -6,6 +6,13 @@ LOGS="${CI_LOGS:-${RUNNER_TEMP:-/tmp}/vps-ci-logs}"
 mkdir -p -- "$LOGS"
 
 fail() { printf '::error::%s\n' "$*"; exit 1; }
+# A notice annotation with the first 40 lines of FILE: GitHub shows
+# annotations without signing in, unlike the logs.
+notice() {
+  local text
+  text="$(head -n 40 -- "$2" | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')"
+  printf '::notice title=%s::%s\n' "$1" "$text"
+}
 group() { printf '::group::%s\n' "$*"; }
 endgroup() { printf '::endgroup::\n'; }
 
