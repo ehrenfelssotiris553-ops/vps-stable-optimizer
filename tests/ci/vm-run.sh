@@ -102,10 +102,11 @@ VM_OPS_HOST=ops@127.0.0.1
 VM_SSH_OPS="ssh ${VM_OPTS[*]} $VM_OPS_HOST"
 ADMIN_PW="$(openssl rand -hex 12)"
 VM_PUBKEY="$(cat "$WORK/key.pub")"
-# ops logs in with the key and uses sudo once, as the hardening asks.
+# ops logs in with the key and uses sudo once, as the hardening asks: in a
+# terminal like a person would (the tool looks for sudo's TTY= log line).
 cat > "$WORK/ops-sudo" <<EOF
 #!/bin/sh
-printf '%s\n' "\$ADMIN_PW" | $VM_SSH_OPS 'sudo -S -p "" true'
+printf '%s\n' "\$ADMIN_PW" | ssh ${VM_OPTS[*]} -tt $VM_OPS_HOST 'sudo -S -p "" true'
 EOF
 chmod +x "$WORK/ops-sudo"
 VM_OPS_SUDO="$WORK/ops-sudo"
@@ -187,8 +188,8 @@ group 'SSH hardening: a connection dropped mid-way puts the old settings back'
 vm_drive ssh-drop.rules ssh-drop vps ssh || fail "ssh hardening (dropped) exited with $?"
 has ssh-drop '系统日志确认 ops 已用密钥登录成功'
 has ssh-drop '已关闭 SSH 密码登录'
-# The guard timer (180 s) undoes it; ops logs in with the key all along.
-for ((i = 0; i < 60; i++)); do
+# The guard timer (240 s) undoes it; ops logs in with the key all along.
+for ((i = 0; i < 90; i++)); do
   if vm_ops "[ ! -e $KEYONLY ]" 2>/dev/null; then break; fi
   sleep 5
 done
