@@ -68,12 +68,19 @@ log_file -noappend $log_path
 spawn -noecho {*}$command
 catch {fconfigure $spawn_id -encoding utf-8}
 
+# A waiting question is on the last line of the output. Only blank space and
+# terminal control sequences may follow it, plus tmux's status line: a session
+# re-attached in tmux redraws the whole screen and draws its status line last.
+set ctl {(?:[\r \t]|\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Za-z0-9]|\x1b[78=>])}
+set noise {(?:(?:\n|}
+append noise $ctl {)*\[vps-setup[^\n]*)*} $ctl {*$}
 set clauses {}
 foreach rule $rules {
   lassign $rule pattern answer
-  lappend clauses -re "${pattern}\[^\n\]*$" [list respond $answer]
+  lappend clauses -re "${pattern}\[^\n\]*${noise}" [list respond $answer]
 }
-lappend clauses -re {(\[y/N\]|\[Y/n\]|请输入 \[[A-Z]+\]): $} {
+set unknown {(\[y/N\]|\[Y/n\]|请输入 \[[A-Z]+\]): }
+lappend clauses -re "${unknown}${noise}" {
   puts stderr "\nanswer.exp: a question no rule answers: [string range $expect_out(buffer) end-300 end]"
   exit 3
 }
