@@ -8,7 +8,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
-  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package
+  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 WARNINGS=0
@@ -278,17 +278,22 @@ value_baseline() {
   restore_record_fw_rule 'ufw allow 51820/udp'
   if restore_record_fw_rule 'ufw deny 22/tcp; rm -rf /'; then die 'unsafe rule text recorded'; fi
   if restore_record_fw_rule 'ufw allow 53/icmp'; then die 'unknown protocol recorded'; fi
-  expect "$(cat "$RESTORE_ROOT/fw_rules")" $'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 51820/udp'
-  ADDED=$'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 51820/udp\nufw allow 8080/tcp\nufw deny from 198.51.100.7 to any port 22 proto tcp'
+  # The SSH rate-limit exemption of the allowlisted address: one address only.
+  restore_record_fw_rule 'ufw allow from 203.0.113.9 to any port 22 proto tcp'
+  if restore_record_fw_rule 'ufw allow from 203.0.113.0/24 to any port 22 proto tcp'; then die 'a network recorded as an exemption'; fi
+  if restore_record_fw_rule 'ufw allow from 203.0.113.999 to any port 22 proto tcp'; then die 'an invalid address recorded'; fi
+  expect "$(cat "$RESTORE_ROOT/fw_rules")" $'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 51820/udp\nufw allow from 203.0.113.9 to any port 22 proto tcp'
+  ADDED=$'ufw allow from 203.0.113.9 to any port 22 proto tcp\nufw limit 22/tcp\nufw allow 80/tcp\nufw allow 51820/udp\nufw allow 8080/tcp\nufw deny from 198.51.100.7 to any port 22 proto tcp'
   ufw() {
     case "$*" in
       'show added') printf 'Added user rules:\n%s\n' "$ADDED" ;;
-      '--force delete allow 80/tcp'|'--force delete limit 22/tcp'|'--force delete allow 51820/udp') printf '%s\n' "$*" >> "$TRACE" ;;
+      '--force delete allow 80/tcp'|'--force delete limit 22/tcp'|'--force delete allow 51820/udp'|'--force delete allow from 203.0.113.9 to any port 22 proto tcp') printf '%s\n' "$*" >> "$TRACE" ;;
       *) die "unexpected fixture UFW: $*" ;;
     esac
   }
   restore_fw_rules_apply
-  expect "$(cat "$TRACE")" $'--force delete allow 80/tcp\n--force delete allow 51820/udp'
+  # The exemption goes even while UFW stays on: it is not the SSH access itself.
+  expect "$(cat "$TRACE")" $'--force delete allow 80/tcp\n--force delete allow 51820/udp\n--force delete allow from 203.0.113.9 to any port 22 proto tcp'
   expect "$RESTORE_PARTIAL" 1
   expect "$(cat "$RESTORE_ROOT/fw_rules")" 'ufw limit 22/tcp'
   RUNTIME=inactive RESTORE_PARTIAL=0; : > "$TRACE"

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners firewall_stage fail2ban_stage
+load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt firewall_stage fail2ban_stage
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -29,8 +29,14 @@ ufw_ipv6_check() { if ((FLIP_IPV6)); then IPV6_FLIPPED=1; fi; }
 ssh_login_seen() { ((LOGIN_SEEN)); }
 # Listening sockets as `ss -H -lntup` prints them; a case sets LISTEN.
 ss() { printf '%s' "$LISTEN"; }
-# The only [Y/n] question of the firewall step: allow the listed services too.
-confirm_default_yes() { record "ask $1"; ((LISTEN_YES)); }
+# [Y/n] questions of the firewall step: allow the listed services too, and
+# (turned on from the menus) the allowlist for Fail2ban and the SSH limit.
+confirm_default_yes() {
+  case "$1" in
+    *白名单*) record "ask-allowlist $1"; ((ALLOW_YES)) ;;
+    *) record "ask $1"; ((LISTEN_YES)) ;;
+  esac
+}
 
 reset_case() {
   CASE_DIR="$TEST_ROOT/$1"
@@ -60,6 +66,9 @@ reset_case() {
   SSH_PORTS=()
   LISTEN=''
   LISTEN_YES=1
+  F2B_IGNORE_CHOICE=''
+  F2B_FILE="$CASE_DIR/no-jail"
+  ALLOW_YES=0
   SECONDS=0
 }
 record() { printf '%s\n' "$*" >> "$CASE_DIR/calls"; }
@@ -74,6 +83,10 @@ ufw() {
       else printf 'Status: inactive\n'; fi ;;
     'show added') printf 'Added user rules:\n'; cat "$CASE_DIR/rules" ;;
     'limit 22/tcp'|'allow '[0-9]*/tcp|'allow '[0-9]*/udp) printf 'ufw %s\n' "$*" >> "$CASE_DIR/rules" ;;
+    # UFW lists a prepended rule in its own words, without the position.
+    'prepend allow proto tcp from '*)
+      [[ "$*" =~ ^prepend\ allow\ proto\ tcp\ from\ ([^\ ]+)\ to\ any\ port\ ([0-9]+)$ ]] || fail "unexpected prepend: $*"
+      printf 'ufw allow from %s to any port %s proto tcp\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >> "$CASE_DIR/rules" ;;
     'default deny incoming'|'default allow outgoing') : ;;
     '--force enable')
       if ((ENABLE_FAIL)); then return 1; fi
@@ -253,6 +266,59 @@ firewall_stage < "$CASE_DIR/input" > "$CASE_DIR/stdout"
 if grep -Eq 'ufw allow (8080|80)/tcp' "$CASE_DIR/rules"; then fail 'listed services allowed without consent'; fi
 grep -q '^  8080/tcp ' "$CASE_DIR/stdout" || fail 'declined services were not listed first'
 if grep -q '^  80/tcp ' "$CASE_DIR/stdout"; then fail 'port 80 listed although the web question decides it'; fi
+
+# The allowlisted administrator address skips the SSH rate limit, so several
+# connections at once (file transfer tools, editors) are not refused. It is the
+# same choice as Fail2ban's allowlist; everyone else stays rate limited.
+reset_case allowlist_exempt
+F2B_IGNORE_CHOICE=203.0.113.9
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > /dev/null
+[[ "$FIREWALL_READY" == 1 ]] || fail 'the exemption blocked the firewall'
+grep -Fxq 'ufw prepend allow proto tcp from 203.0.113.9 to any port 22' "$CASE_DIR/calls" || fail 'allowlisted address not exempted from the SSH rate limit'
+grep -Fxq 'ufw allow from 203.0.113.9 to any port 22 proto tcp' "$CASE_DIR/rules" || fail 'exemption rule not stored'
+grep -Fxq 'ufw limit 22/tcp' "$CASE_DIR/rules" || fail 'everyone else lost the SSH rate limit'
+if grep -q '^ask-allowlist' "$CASE_DIR/calls"; then fail 'allowlist asked again although setup decided it'; fi
+
+reset_case allowlist_key_only
+KEY_ONLY=1 F2B_IGNORE_CHOICE=203.0.113.9
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > /dev/null
+if grep -q '^ufw prepend' "$CASE_DIR/calls"; then fail 'exemption added although SSH is not rate limited'; fi
+
+reset_case allowlist_none
+F2B_IGNORE_CHOICE=none SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22'
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > /dev/null
+if grep -q '^ufw prepend\|^ask-allowlist' "$CASE_DIR/calls"; then fail 'declined allowlist still asked or exempted'; fi
+
+# Turned on from the menus: the allowlist question comes here, once, for both.
+reset_case allowlist_asked
+SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22' ALLOW_YES=1
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > /dev/null
+[[ "$(grep -c '^ask-allowlist' "$CASE_DIR/calls")" == 1 ]] || fail 'allowlist not asked exactly once'
+[[ "$F2B_IGNORE_CHOICE" == 203.0.113.9 ]] || fail 'allowlist answer not kept for Fail2ban'
+grep -Fxq 'ufw prepend allow proto tcp from 203.0.113.9 to any port 22' "$CASE_DIR/calls" || fail 'asked allowlist not exempted'
+
+# The address already in this tool's jail counts without asking.
+reset_case allowlist_from_jail
+SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22' ALLOW_YES=1
+F2B_FILE="$CASE_DIR/jail"; printf 'ignoreip = 127.0.0.1/8 ::1 198.51.100.4\n' > "$F2B_FILE"
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > /dev/null
+if grep -q '^ask-allowlist' "$CASE_DIR/calls"; then fail 'asked although the jail has an allowlist'; fi
+grep -Fxq 'ufw prepend allow proto tcp from 198.51.100.4 to any port 22' "$CASE_DIR/calls" || fail 'jail allowlist not exempted'
+
+# An active firewall (setup run again) gets the exemption too, without a question.
+reset_case allowlist_active
+printf '1\n' > "$CASE_DIR/ufw-active"
+printf 'ufw limit 22/tcp\n' > "$CASE_DIR/rules"
+WEB_YES=0 F2B_IGNORE_CHOICE=203.0.113.9
+firewall_stage < "$CASE_DIR/input" > /dev/null
+grep -Fxq 'ufw prepend allow proto tcp from 203.0.113.9 to any port 22' "$CASE_DIR/calls" || fail 'active firewall did not get the exemption'
+firewall_stage < "$CASE_DIR/input" > /dev/null
+[[ "$(grep -c '^ufw prepend' "$CASE_DIR/calls")" == 1 ]] || fail 'exemption added twice'
 
 reset_case leftover_timer
 LEFTOVER_TIMER=1

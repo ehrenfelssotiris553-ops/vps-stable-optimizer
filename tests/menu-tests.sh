@@ -71,6 +71,8 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
   # shellcheck disable=SC2034
   SCRIPT_VERSION=9.9.9
   menu_reboot_hint() { :; }
+  menu_pending_reboot_hint() { echo 'PENDING-REBOOT-HINT'; }
+  setup_tmux_running() { return 0; }
   menu_action() { printf '%s\n' "$2" >> "$TEST_ROOT/menu-actions"; }
   : > "$TEST_ROOT/menu-actions"
   for n in $(seq 1 13) 14; do printf '%s\n\n' "$n"; done > "$TEST_ROOT/menu-input"
@@ -81,8 +83,32 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
   grep -Fq '无效选项，请输入 0 至 13 或 h' "$TEST_ROOT/menu-out" || fail 'number 14 not rejected'
   grep -Fq '13. 检查更新' "$TEST_ROOT/menu-out" || fail 'update is not the last item'
   grep -Fq '3. 开荒验收' "$TEST_ROOT/menu-out" || fail 'acceptance check does not follow setup'
+  # Banners: an update waiting for a reboot, and a setup still running in tmux.
+  grep -Fq 'PENDING-REBOOT-HINT' "$TEST_ROOT/menu-out" || fail 'pending reboot not shown in the menu'
+  grep -Fq '一键开荒正在 tmux 里运行' "$TEST_ROOT/menu-out" || fail 'setup running in tmux not shown in the menu'
 )
 printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
+
+# The menu says when an update waits for a reboot, and for how long; a newer
+# kernel that was already there at boot (a provider kernel) is left to vps check.
+(
+  load_optimizer_functions menu_pending_reboot_hint boot_kernels
+  B="$TEST_ROOT/boot"; mkdir -p "$B"
+  : > "$B/vmlinuz-6.1.0-10-amd64"; : > "$B/vmlinuz-6.1.0-11-amd64"
+  RUNNING=6.1.0-10-amd64
+  uname() { echo "$RUNNING"; }
+  printf '100.00 50.00\n' > "$TEST_ROOT/up-short"
+  printf '0.00 0.00\n' > "$TEST_ROOT/up-zero"
+  out="$(menu_pending_reboot_hint "$B" "$TEST_ROOT/no-flag" "$TEST_ROOT/up-short")"
+  [[ "$out" == *'新内核 6.1.0-11-amd64 已经装好，重启后才会用上：方便时选 7 重启。'* ]] || fail "new kernel not announced: $out"
+  [[ -z "$(menu_pending_reboot_hint "$B" "$TEST_ROOT/no-flag" "$TEST_ROOT/up-zero")" ]] || fail 'a kernel present at boot was announced'
+  touch -d '3 days ago' "$TEST_ROOT/flag"
+  out="$(menu_pending_reboot_hint "$B" "$TEST_ROOT/flag" "$TEST_ROOT/up-zero")"
+  [[ "$out" == *'有系统更新要重启后才完全生效（已等 3 天）'* ]] || fail "reboot-required flag not announced with its age: $out"
+  RUNNING=6.1.0-11-amd64
+  [[ -z "$(menu_pending_reboot_hint "$B" "$TEST_ROOT/no-flag" "$TEST_ROOT/up-short")" ]] || fail 'announced although the newest kernel runs'
+)
+printf '%s\n' 'PASS: the menu announces an update that waits for a reboot.'
 
 LOG_DIR="$TEST_ROOT/logs"
 STATE_ROOT="$TEST_ROOT/state"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.7.7 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v2.7.8 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.7.7
+SCRIPT_VERSION=2.7.8
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 JOURNAL_LIMIT_GB=20           # Set journal caps only when root disk <= 20 GiB
@@ -70,7 +70,7 @@ case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|po
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V2.7.7 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+VPS 机器管家 V2.7.8 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps plan       给机器做体检（只检查）
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
@@ -95,7 +95,7 @@ VPS 机器管家 V2.7.7 — Debian 12/13、Ubuntu 22.04/24.04/26.04
              回到原来的窗口输入（不是新窗口）；180 秒内没有确认会自动撤销。
   NOCONSOLE  没有控制台密码时仍要关闭 SSH 密码登录（不推荐）。
   UNINSTALL  卸载本工具（会删除全部备份）。
-开荒建议在 tmux 或 screen 里运行，SSH 断线时不会中断。
+一键开荒会先问要不要在 tmux 里运行（回车就是要）：SSH 断线也不中断，重新登录输入 vps 选 2 就能回去。
 默认保留 SSH 端口、root 登录、DNS、IPv6、MTU；不自动重启整机。
 回退只会放宽访问（关防火墙、恢复密码登录），不会把你锁在外面。
 系统升级和新内核无法回退；需要整机还原请使用服务商快照。
@@ -616,7 +616,7 @@ setup_questions() {
   # Asked in the recommended set too: a mistyped password must not lock the
   # administrator out (bans start at one hour and double on repeat).
   if [[ -n "$ip" ]] && port_source_valid "$ip" &&
-     confirm_default_yes "把你当前的 IP $ip 加入 Fail2ban 白名单，避免输错几次就把自己封掉吗？（家庭宽带 IP 常会变化，换了就失效）"; then
+     confirm_default_yes "把你当前的 IP $ip 加入 Fail2ban 白名单吗？（输错密码也不会被封，连 SSH 也不限速；家庭宽带 IP 常会变化，换了就失效）"; then
     F2B_IGNORE_CHOICE="$ip"
   fi
   echo
@@ -640,15 +640,65 @@ in_terminal_multiplexer() {
   return 1
 }
 
+# The setup that setup_tmux_launch started is still there: running, or showing
+# its result until Enter is pressed.
+setup_tmux_running() {
+  command -v tmux >/dev/null && tmux has-session -t '=vps-setup' 2>/dev/null
+}
+
+# -u: this tool runs with LC_ALL=C, from which tmux would conclude that the
+# terminal cannot show UTF-8 and print every Chinese character as "_".
+setup_tmux_attach() {
+  tmux -u attach-session -t '=vps-setup' 8<&- 9>&- || true
+  if setup_tmux_running; then ok '一键开荒还在后台的 tmux 里继续运行；要回去时，再输入 vps 选 2。'; fi
+}
+
+# Installs tmux when missing (recorded like every package of this tool, so a
+# full rollback can offer to remove it), starts the setup in a detached session
+# that keeps the SSH address and the sudo user, and attaches to it. The window
+# stays open after the end until Enter, so a reconnect does not lose the result.
+setup_tmux_launch() {
+  local self
+  self="$(readlink -f -- "${BASH_SOURCE[0]}")" || return 1
+  if ! command -v tmux >/dev/null; then
+    tool_prepare_data
+    restore_prepare
+    apt_index_ready || return 1
+    if ! available tmux; then warn '软件源里找不到 tmux。'; return 1; fi
+    install_pkgs tmux || return 1
+    command -v tmux >/dev/null || return 1
+  fi
+  # The run inside tmux takes the tool's lock itself, and the tmux server
+  # outlives this process: neither may keep the lock descriptors.
+  tool_lock_release
+  # shellcheck disable=SC2016
+  tmux -u new-session -d -s vps-setup /usr/bin/env SSH_CONNECTION="${SSH_CONNECTION:-}" SUDO_USER="${SUDO_USER:-}" \
+    /bin/bash -c '/bin/bash "$1" setup; code=$?; printf "\n一键开荒已结束（退出码 %s）。按回车关闭这个窗口……" "$code"; read -r _; exit "$code"' \
+    bash "$self" 8<&- 9>&- || return 1
+  setup_tmux_attach
+}
+
+# Long runs are cut off when the SSH connection drops: the setup offers to run
+# in tmux, where a dropped connection only detaches it. Asked before the plan,
+# so a setup handed to tmux shows its plan there, once.
+# 0 = run the setup in this window; 1 = not here (it runs in tmux, or stopped).
 session_resilience_check() {
   if in_terminal_multiplexer; then ok '正在 tmux/screen 中运行：SSH 断线后脚本会继续执行。'; return 0; fi
-  warn '当前不在 tmux 或 screen 里：如果 SSH 中途断开，脚本会被中断，系统升级可能停在一半。'
-  if command -v tmux >/dev/null; then
-    echo '建议先输入 tmux new -s vps 进入 tmux，再运行 vps；断线后重新登录，输入 tmux attach -t vps 就能回到原来的界面。'
-  else
-    echo '建议先安装 tmux（apt-get install tmux），再在 tmux 里运行。'
+  if setup_tmux_running; then
+    echo '一键开荒已经在 tmux 里运行（可能是之前 SSH 断线了）。'
+    if confirm_default_yes '回到那个界面吗？'; then setup_tmux_attach
+    else ok '没有重复开始一键开荒；要回去时，再输入 vps 选 2。'; fi
+    return 1
   fi
-  confirm_yes '仍然在当前窗口继续吗？'
+  warn '当前不在 tmux 或 screen 里：如果 SSH 中途断开，脚本会被中断，系统升级可能停在一半。'
+  if [[ -n "${TERM:-}" && "$TERM" != dumb ]]; then
+    confirm_default_yes '在 tmux 里运行一键开荒吗？（推荐：断线也不会中断，重新登录输入 vps 就能回来；没有 tmux 会先自动装上）' || return 0
+    if setup_tmux_launch; then return 1; fi
+    warn '没能在 tmux 里启动一键开荒（原因见上方）。'
+  fi
+  if confirm_yes '仍然在当前窗口继续吗？'; then return 0; fi
+  ok '已取消，没有开始一键开荒。'
+  return 1
 }
 
 attention_banner() {
@@ -690,12 +740,31 @@ kernel_cleanup() {
   else warn '旧内核清理失败，请人工检查。'; fi
 }
 
+# A failed APT step stops with the next step to take: a dpkg left half-way
+# needs "dpkg --configure -a" first; otherwise it is usually the network or a
+# mirror, and running the same step again later is safe.
+apt_failure_stop() {
+  local what="$1" audit
+  audit="$(dpkg --audit 2>/dev/null || true)"
+  if [[ -n "$audit" ]]; then
+    warn "${what}没有完成，有软件包停在半安装状态（常见于中途断线或断网）。"
+    echo '修复：运行 dpkg --configure -a，等它结束（再用 dpkg --audit 确认没有输出），然后重新运行刚才的操作。'
+  else
+    warn "${what}没有完成：通常是网络或软件源暂时有问题，具体原因见上方 APT 的英文提示。"
+    echo '过几分钟重新运行刚才的操作即可，已经做好的设置会自动跳过；一直失败的话，检查 /etc/apt 里的软件源。'
+  fi
+  die "${what}失败，已停止；前面已经完成的设置保持不变。"
+}
+
 apt_upgrade_stage() {
   say '第5步：系统升级与组件安装'
   local packages=() pkg tools=()
   if ((UPGRADE_APPROVED)); then
     apt_wait_idle
-    apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+    if ! apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+      module_result upgrade failed 'apt-get upgrade failed'
+      apt_failure_stop '系统升级'
+    fi
     if ((KERNEL_UPDATE)); then module_result upgrade applied 'upgraded; new kernel needs reboot'
     else module_result upgrade applied 'upgraded'; fi
     ok '系统软件已升级；服务和内核是否生效，可用 vps check 验收。'
@@ -727,7 +796,7 @@ apt_upgrade_stage() {
   if [[ "$VNSTAT_CHOICE" == 1 ]]; then
     if available vnstat; then packages+=(vnstat); else warn '找不到 vnstat 软件包。'; fi
   fi
-  if ((${#packages[@]})); then install_pkgs "${packages[@]}"; fi
+  if ((${#packages[@]})) && ! install_pkgs "${packages[@]}"; then apt_failure_stop '安装组件（防火墙、自动更新、常用工具等）'; fi
   if (( INSTALL_TOOLS )); then module_result tools applied "${TOOLS_PACKAGES[*]}"
   else module_result tools declined 'not requested'; fi
   if [[ "$VNSTAT_CHOICE" == 1 ]]; then
@@ -755,7 +824,7 @@ packages_stage() {
     installed "$pkg" && continue
     if available "$pkg"; then wanted+=("$pkg"); else warn "找不到软件包：$pkg"; fi
   done
-  if ((${#wanted[@]})); then install_pkgs "${wanted[@]}"; else ok '需要的软件包都已经安装好了。'; fi
+  if ((${#wanted[@]})); then install_pkgs "${wanted[@]}" || apt_failure_stop '安装软件包'; else ok '需要的软件包都已经安装好了。'; fi
 }
 
 # A one-off upgrade inside the current release, outside the full setup.
@@ -770,7 +839,10 @@ upgrade_only_stage() {
   if upgrade_has_kernel "$simulation"; then KERNEL_UPDATE=1; echo '本次升级包含新内核：重启后才生效，旧内核会保留。'; fi
   if ! confirm_default_yes "升级这 $count 个软件包吗？（可能重启部分服务）"; then ok '没有升级。'; return 0; fi
   apt_wait_idle
-  apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+  if ! apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+    module_result upgrade failed 'apt-get upgrade failed'
+    apt_failure_stop '系统升级'
+  fi
   UPGRADE_APPROVED=1
   if ((KERNEL_UPDATE)); then module_result upgrade applied 'upgraded; new kernel needs reboot'
   else module_result upgrade applied 'upgraded'; fi
@@ -1133,7 +1205,7 @@ zram_stage() {
     warn '软件源里没有 systemd-zram-generator，跳过 ZRAM。'
     module_result zram unsupported 'package unavailable'; return 0
   fi
-  install_pkgs systemd-zram-generator
+  install_pkgs systemd-zram-generator || apt_failure_stop '安装 ZRAM 组件'
   # Debian 12 and Ubuntu install their default "[zram0]" right at ZRAM_FILE; an
   # unchanged copy is replaced (Debian 13 keeps that default in /usr/lib).
   if zram_file_packaged; then rm -f -- "$ZRAM_FILE"; fi
@@ -1535,7 +1607,7 @@ f2b_ignore_address() {
   case "${F2B_IGNORE_CHOICE:-}" in
     none) return 0 ;;
     '') [[ -n "$ip" ]] && port_source_valid "$ip" || return 0
-        confirm_default_yes "把你当前的 IP $ip 加入 Fail2ban 白名单，避免输错几次就把自己封掉吗？（家庭宽带 IP 常会变化，换了就失效）" || return 0
+        confirm_default_yes "把你当前的 IP $ip 加入 Fail2ban 白名单吗？（输错密码也不会被封，连 SSH 也不限速；家庭宽带 IP 常会变化，换了就失效）" || return 0
         printf '%s\n' "$ip" ;;
     *) port_source_valid "$F2B_IGNORE_CHOICE" && printf '%s\n' "$F2B_IGNORE_CHOICE" ;;
   esac
@@ -1868,6 +1940,42 @@ firewall_blocked_listeners() {
   done < <(ss -H -lntup 2>/dev/null || true)
 }
 
+# The allowlist choice for Fail2ban also decides who skips the SSH rate limit.
+# Still open (a firewall turned on from the menus): the address in this tool's
+# jail counts; otherwise the question is asked now, for both, unless --no-ask.
+ssh_allowlist_decide() {
+  local line
+  [[ -z "${F2B_IGNORE_CHOICE:-}" ]] || return 0
+  line="$(grep -m1 '^ignoreip = 127\.0\.0\.1/8 ::1 ' "$F2B_FILE" 2>/dev/null || true)"
+  if [[ -n "$line" ]]; then F2B_IGNORE_CHOICE="${line##* }"; return 0; fi
+  [[ "${1:-}" != --no-ask ]] || return 0
+  F2B_IGNORE_CHOICE="$(f2b_ignore_address)"
+  [[ -n "$F2B_IGNORE_CHOICE" ]] || F2B_IGNORE_CHOICE=none
+}
+
+# The allowlisted administrator address skips the SSH rate limit, so several
+# connections at once (file transfer tools, editors, reconnects) are not
+# refused. A single address only, placed before the limit rules (prepend) and
+# recorded for rollback like the other rules of this tool.
+ssh_limit_exempt() {
+  local ip="${F2B_IGNORE_CHOICE:-}" rules p rule
+  [[ "$ip" != none && "$ip" != */* ]] && port_source_valid "$ip" || return 0
+  rules="$(ufw show added 2>/dev/null || true)"
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    rule="ufw allow from $ip to any port $p proto tcp"
+    if grep -Fxq -- "$rule" <<< "$rules"; then continue; fi
+    if ufw prepend allow proto tcp from "$ip" to any port "$p" >/dev/null; then
+      ok "白名单 IP $ip 连 SSH 端口 $p 不限速。"
+      if declare -F restore_record_fw_rule >/dev/null; then
+        restore_record_fw_rule "$rule" || warn "无法记录规则 $rule，回退时它会被保留。"
+      fi
+    else
+      warn "没能让 $ip 免于 SSH 限速（端口 $p），它照常限速。"
+    fi
+  done < <(sed -n 's/^ufw limit \([0-9]*\)\/tcp$/\1/p' <<< "$rules")
+}
+
 host_has_global_ipv6() {
   command -v ip >/dev/null && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
 }
@@ -1957,6 +2065,7 @@ firewall_stage() {
         ufw_rule allow 80; ufw_rule allow 443
       else ok '网站端口规则保持不变。'; fi
     fi
+    if grep -Eq '^ufw limit [0-9]+/tcp$' <<< "$rules"; then ssh_allowlist_decide --no-ask; ssh_limit_exempt; fi
     ufw status numbered
     ufw_boot_enable
     FIREWALL_READY=1
@@ -1988,7 +2097,8 @@ firewall_stage() {
   if ssh_password_disabled; then ssh_verb=allow; fi
   printf '已确认 SSH 端口：%s\n' "${SSH_PORTS[*]}"
   if [[ "$ssh_verb" == limit ]]; then
-    echo 'SSH 仍允许密码登录：SSH 端口使用限速放行（同一 IP 30 秒内连接 6 次会被暂时拒绝）。'
+    echo 'SSH 仍允许密码登录：SSH 端口使用限速放行（同一 IP 30 秒内连接 6 次会被暂时拒绝；白名单 IP 不受限）。'
+    ssh_allowlist_decide
   else
     echo 'SSH 已关闭密码登录：SSH 端口使用普通放行，防爆破交给 Fail2ban。'
   fi
@@ -2017,6 +2127,7 @@ firewall_stage() {
   IPV6_FLIPPED=0
   ufw_ipv6_check
   for p in "${SSH_PORTS[@]}"; do ufw_rule "$ssh_verb" "$p"; done
+  if [[ "$ssh_verb" == limit ]]; then ssh_limit_exempt; fi
   if ((web)); then ufw_rule allow 80; ufw_rule allow 443; fi
   for p in "${extra[@]}"; do
     ufw_rule allow "${p%/*}" "${p#*/}" || warn "放行 $p 失败，开启后它会被挡住。"
@@ -3331,6 +3442,8 @@ menu() {
   while :; do
     say "VPS 机器管家 V$SCRIPT_VERSION"
     menu_reboot_hint
+    menu_pending_reboot_hint
+    if setup_tmux_running; then printf '\033[1;33m一键开荒正在 tmux 里运行（可能是之前 SSH 断线了）：选 2 回到那个界面。\033[0m\n'; fi
     cat <<'MENU_TEXT'
  开荒
    1. 给机器做体检（只检查，不修改）
@@ -3667,6 +3780,14 @@ tool_lifecycle_lock() {
   TOOL_LIFECYCLE_PID="$BASHPID"
   # Informational only (the lock itself is the flock above): names the holder.
   { printf '%s %s\n' "$MODE" "$BASHPID" > "$LOCK_OWNER_FILE"; } 2>/dev/null || true
+}
+
+# Gives the lifecycle lock up before another process takes over the work.
+tool_lock_release() {
+  [[ -n "${TOOL_LIFECYCLE_PID:-}" && "$TOOL_LIFECYCLE_PID" == "$BASHPID" ]] || return 0
+  exec 8<&-
+  rm -f -- "$LOCK_OWNER_FILE" 2>/dev/null || true
+  TOOL_LIFECYCLE_PID=''
 }
 
 LOCK_OWNER_FILE=/run/vps-stable-opt.owner
@@ -4073,7 +4194,12 @@ restore_record_packages() {
 restore_record_fw_rule() {
   local rule="$1" file="$RESTORE_ROOT/fw_rules"
   [[ "$RESTORE_READY" == 1 ]] || return 0
-  [[ "$rule" =~ ^ufw\ (allow|limit)\ [0-9]{1,5}/(tcp|udp)$ ]] || return 1
+  # A port rule, or the SSH rate-limit exemption of one allowlisted address.
+  if [[ "$rule" =~ ^ufw\ allow\ from\ ([0-9A-Fa-f:.]+)\ to\ any\ port\ [0-9]{1,5}\ proto\ tcp$ ]]; then
+    port_source_valid "${BASH_REMATCH[1]}" || return 1
+  elif [[ ! "$rule" =~ ^ufw\ (allow|limit)\ [0-9]{1,5}/(tcp|udp)$ ]]; then
+    return 1
+  fi
   [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
   if [[ -f "$file" ]] && grep -Fxq -- "$rule" "$file"; then return 0; fi
   printf '%s\n' "$rule" >> "$file" && chmod 600 -- "$file"
@@ -4404,8 +4530,8 @@ restore_fail2ban_group() {
 # Deletes exactly the rules this tool added. While UFW stays on, an SSH
 # allowance is never removed, so rollback cannot lock the session out.
 restore_fw_rules_apply() {
-  local file="$RESTORE_ROOT/fw_rules" rule verb port proto current ufw_on=0 ssh_ports temp
-  local -a remaining=()
+  local file="$RESTORE_ROOT/fw_rules" rule verb port proto src current ufw_on=0 ssh_ports temp
+  local -a remaining=() spec=()
   [[ -e "$file" || -L "$file" ]] || return 0
   restore_data_safe "$file" || { warn '防火墙规则记录不安全，已跳过。'; RESTORE_PARTIAL=1; return 0; }
   command -v ufw >/dev/null || { warn '找不到 ufw，无法删除本工具添加的规则。'; RESTORE_PARTIAL=1; return 0; }
@@ -4414,15 +4540,22 @@ restore_fw_rules_apply() {
   ssh_ports=" 22 $(ssh_candidates | sort -n -u | tr '\n' ' ') "
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    if [[ ! "$rule" =~ ^ufw\ (allow|limit)\ ([0-9]{1,5})/(tcp|udp)$ ]]; then
+    src=''
+    if [[ "$rule" =~ ^ufw\ allow\ from\ ([0-9A-Fa-f:.]+)\ to\ any\ port\ ([0-9]{1,5})\ proto\ tcp$ ]]; then
+      verb=allow; src="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; proto=tcp
+      spec=(allow from "$src" to any port "$port" proto tcp)
+    elif [[ "$rule" =~ ^ufw\ (allow|limit)\ ([0-9]{1,5})/(tcp|udp)$ ]]; then
+      verb="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; proto="${BASH_REMATCH[3]}"
+      spec=("$verb" "$port/$proto")
+    else
       warn "忽略格式异常的规则记录：$rule"; RESTORE_PARTIAL=1; continue
     fi
-    verb="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; proto="${BASH_REMATCH[3]}"
     if ! grep -Fxq -- "$rule" <<< "$current"; then ok "规则已不存在：$rule"; continue; fi
-    if ((ufw_on)) && [[ "$proto" == tcp && "$ssh_ports" == *" $port "* ]]; then
+    # One address's exemption from the rate limit is not the SSH access itself.
+    if ((ufw_on)) && [[ -z "$src" && "$proto" == tcp && "$ssh_ports" == *" $port "* ]]; then
       warn "防火墙仍处于开启状态，保留 SSH 端口规则：$rule"; remaining+=("$rule"); RESTORE_PARTIAL=1; continue
     fi
-    if ufw --force delete "$verb" "$port/$proto" >/dev/null; then ok "已删除本工具添加的规则：$rule"
+    if ufw --force delete "${spec[@]}" >/dev/null; then ok "已删除本工具添加的规则：$rule"
     else warn "删除规则失败：$rule"; remaining+=("$rule"); RESTORE_PARTIAL=1; fi
   done < "$file"
   if ((${#remaining[@]})); then
@@ -5321,6 +5454,31 @@ menu_reboot_hint() {
   printf '\033[1;33m检测到开荒后已经重启，建议选 3 做开荒验收，确认优化真的生效。\033[0m\n'
 }
 
+# Menu banner: an update waits for a reboot (a kernel installed after this
+# boot, or the system's reboot-required flag), and for how long. A newer kernel
+# that was already there at boot (a provider's own kernel, another boot
+# default) is left to vps check. Arguments allow isolated tests.
+menu_pending_reboot_hint() {
+  local boot="${1:-/boot}" flag="${2:-/var/run/reboot-required}" uptime_file="${3:-/proc/uptime}"
+  local newest up='' since='' text days=''
+  newest="$(boot_kernels "$boot" | tail -n 1)"
+  read -r up _ 2>/dev/null < "$uptime_file" || up=''
+  up="${up%%.*}"
+  if [[ -n "$newest" && "$newest" != "$(uname -r)" && "$up" =~ ^[0-9]+$ ]] &&
+     since="$(stat -c %Z -- "$boot/vmlinuz-$newest" 2>/dev/null)" && [[ "$since" =~ ^[0-9]+$ ]] &&
+     ((since > $(date +%s) - up)); then
+    text="新内核 $newest 已经装好，重启后才会用上"
+  elif [[ -e "$flag" ]]; then
+    text='有系统更新要重启后才完全生效'; since="$(stat -c %Y -- "$flag" 2>/dev/null || true)"
+  else
+    return 0
+  fi
+  if [[ "$since" =~ ^[0-9]+$ ]] && (( $(date +%s) - since >= 86400 )); then
+    days="（已等 $(( ($(date +%s) - since) / 86400 )) 天）"
+  fi
+  printf '\033[1;33m%s%s：方便时选 7 重启。\033[0m\n' "$text" "$days"
+}
+
 # ---- Port management ------------------------------------------------------
 # Input: 8080 | 443-600 | 8080,9000-9100. Output: one UFW port item per line
 # (8080 or 443:600). Anything else, including 1-65535, is rejected.
@@ -6159,11 +6317,9 @@ main() {
     bans) bans_main; return 0 ;;
   esac
   validate_vm
+  # Before the plan: a setup handed to tmux shows its plan there.
+  if [[ "$MODE" == setup ]] && ! session_resilience_check; then return 0; fi
   plan
-  if [[ "$MODE" == setup ]] && ! session_resilience_check; then
-    ok '已取消；进入 tmux 或 screen 后再运行 vps 即可。'
-    return 0
-  fi
   if ! confirm_yes '已拍好快照、确认服务商控制台可用，开始本次修改吗？'; then
     ok '已取消；未创建本次运行日志/备份，未执行优化。'
     return 0

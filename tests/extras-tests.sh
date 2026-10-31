@@ -357,6 +357,100 @@ unset TMUX; STY=123.pts-0; in_terminal_multiplexer || fail 'screen not detected'
 unset STY
 printf 'PASS: terminal multiplexer detection.\n'
 
+# One-click setup in tmux: offered outside tmux/screen; tmux is installed (and
+# recorded) when missing; the session keeps the SSH address and is attached
+# with -u (this tool runs with LC_ALL=C, so tmux would print Chinese as "_");
+# a setup still running is offered to return to instead of a second one.
+(
+  load_optimizer_functions session_resilience_check setup_tmux_running setup_tmux_attach setup_tmux_launch tool_lock_release
+  # A tmux binary on the test machine must not count: only TMUX_THERE decides.
+  command() { if [[ "${1:-}" == -v && "${2:-}" == tmux ]]; then ((TMUX_THERE)); else builtin command "$@"; fi; }
+  in_terminal_multiplexer() { ((IN_MUX)); }
+  tmux() {
+    record "tmux $*"
+    case "$*" in
+      *has-session*) ((SESSION)) ;;
+      *new-session*) if ((LAUNCH_FAIL)); then return 1; fi; SESSION=1 ;;
+      # The run ends while attached (Enter at its last line).
+      *attach-session*) SESSION=0 ;;
+      *) fail "unexpected tmux $*" ;;
+    esac
+  }
+  confirm_default_yes() { record "ask $1"; ((ANSWER_YES)); }
+  confirm_yes() { record "ask-here $1"; ((KEEP_HERE)); }
+  tool_prepare_data() { record 'prepare data'; }
+  restore_prepare() { record 'restore prepare'; }
+  apt_index_ready() { record 'apt index'; }
+  available() { [[ "$1" == tmux ]]; }
+  install_pkgs() { record "install $*"; TMUX_THERE=1; }
+  tcase() { reset; IN_MUX=0 SESSION=0 TMUX_THERE=1 ANSWER_YES=1 KEEP_HERE=0 LAUNCH_FAIL=0 TERM=xterm; }
+  SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22' SUDO_USER=''
+  tcase; IN_MUX=1
+  session_resilience_check > /dev/null || fail 'already inside tmux/screen did not continue here'
+  if grep -q '^tmux' "$TEST_ROOT/trace"; then fail 'tmux used although already inside tmux/screen'; fi
+  # tmux there: the setup starts in it, keeping the SSH address, then attaches.
+  tcase
+  if session_resilience_check > /dev/null; then fail 'setup continued here although it runs in tmux'; fi
+  grep -Fq 'tmux -u new-session -d -s vps-setup /usr/bin/env SSH_CONNECTION=203.0.113.9 50000 192.0.2.1 22 SUDO_USER= /bin/bash -c' "$TEST_ROOT/trace" || fail "setup session not started as expected: $(cat "$TEST_ROOT/trace")"
+  grep -Fxq 'tmux -u attach-session -t =vps-setup' "$TEST_ROOT/trace" || fail 'not attached with -u to the setup session'
+  if grep -q '^install\|^ask-here' "$TEST_ROOT/trace"; then fail 'installed tmux again or asked a second question'; fi
+  # tmux missing: installed (and recorded by install_pkgs) before the session.
+  tcase; TMUX_THERE=0
+  session_resilience_check > /dev/null || true
+  [[ "$(grep -v '^ask\|has-session\|attach' "$TEST_ROOT/trace" | tr '\n' '|')" == 'prepare data|restore prepare|apt index|install tmux|'* ]] || fail "tmux not installed first: $(tr '\n' '|' < "$TEST_ROOT/trace")"
+  grep -q '^tmux -u new-session' "$TEST_ROOT/trace" || fail 'setup not started after installing tmux'
+  # A setup still running in tmux: back to it, no second run.
+  tcase; SESSION=1
+  if session_resilience_check > /dev/null; then fail 'a second setup was started while one runs in tmux'; fi
+  grep -Fxq 'ask 回到那个界面吗？' "$TEST_ROOT/trace" || fail 'not offered to return to the running setup'
+  grep -Fxq 'tmux -u attach-session -t =vps-setup' "$TEST_ROOT/trace" || fail 'did not return to the running setup'
+  if grep -q 'new-session' "$TEST_ROOT/trace"; then fail 'a second setup session was started'; fi
+  # No to tmux: the setup runs here, without a second question.
+  tcase; ANSWER_YES=0
+  session_resilience_check > /dev/null || fail 'declining tmux did not continue here'
+  if grep -q '^ask-here\|new-session' "$TEST_ROOT/trace"; then fail 'declining tmux asked again or started it'; fi
+  # tmux failed: asked whether to go on here (no means stop).
+  tcase; LAUNCH_FAIL=1
+  if session_resilience_check > /dev/null; then fail 'stopped after a failed tmux start went on'; fi
+  grep -Fxq 'ask-here 仍然在当前窗口继续吗？' "$TEST_ROOT/trace" || fail 'failed tmux start not followed by the question'
+  tcase; LAUNCH_FAIL=1 KEEP_HERE=1
+  session_resilience_check > /dev/null || fail 'yes after a failed tmux start did not continue here'
+  # A terminal tmux cannot drive: only the old question.
+  tcase; TERM=dumb
+  session_resilience_check > /dev/null || true
+  if grep -q '^tmux -u new-session\|^ask 在 tmux' "$TEST_ROOT/trace"; then fail 'tmux offered on a dumb terminal'; fi
+  grep -q '^ask-here' "$TEST_ROOT/trace" || fail 'dumb terminal did not ask whether to continue'
+)
+printf 'PASS: the setup offers tmux first, installs it when missing, keeps the SSH address and returns to a running setup.\n'
+
+# A failed APT step names the next step: dpkg --configure -a for a half-done
+# dpkg, otherwise try again later. The stage stops with it.
+(
+  load_optimizer_functions apt_failure_stop apt_upgrade_stage
+  die() { printf 'DIE %s\n' "$*"; exit 9; }
+  warn() { printf 'WARN %s\n' "$*"; }
+  dpkg() { [[ "$1" == --audit ]] || fail "unexpected dpkg $*"; printf '%s' "$AUDIT"; }
+  AUDIT=' libc6                Package is in a very bad inconsistent state'
+  out="$(apt_failure_stop '系统升级' 2>&1)" && fail 'apt_failure_stop did not stop'
+  grep -Fq 'dpkg --configure -a' <<< "$out" || fail "half-done dpkg not explained: $out"
+  grep -Fq 'DIE 系统升级失败' <<< "$out" || fail 'no stop message'
+  AUDIT=''
+  out="$(apt_failure_stop '系统升级' 2>&1)" && fail 'apt_failure_stop did not stop'
+  grep -Fq '网络或软件源' <<< "$out" || fail "network hint missing: $out"
+  if grep -Fq 'dpkg --configure' <<< "$out"; then fail 'dpkg repair suggested without a half-done dpkg'; fi
+  # The upgrade stage records the failure and stops with this help.
+  UPGRADE_APPROVED=1 KERNEL_UPDATE=0 UPGRADE_COUNT=3 AUTO_UPDATES=0 NEED_TIMESYNCD=0 INSTALL_TOOLS=0 VNSTAT_CHOICE=0 KERNEL_CLEAN_CHOICE=0
+  apt_wait_idle() { :; }
+  apt-get() { record "apt-get $*"; return 100; }
+  apt_failure_stop() { record "stop $1"; exit 7; }
+  reset
+  ( apt_upgrade_stage ) > /dev/null 2>&1 && fail 'a failed upgrade went on'
+  grep -q '^result upgrade failed' "$TEST_ROOT/trace" || fail 'failed upgrade not recorded'
+  grep -Fxq 'stop 系统升级' "$TEST_ROOT/trace" || fail 'failed upgrade did not stop with help'
+  if grep -q '^result upgrade applied' "$TEST_ROOT/trace"; then fail 'failed upgrade recorded as applied'; fi
+)
+printf 'PASS: a failed APT step stops with the next step to take.\n'
+
 # Setup questions are all asked up front and stored.
 (
   confirm_yes() {

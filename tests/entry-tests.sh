@@ -123,12 +123,15 @@ order="$(awk '/^stage / {print $2}' "$CASE_DIR/calls" | tr '\n' ' ')"
 [[ "$order" == 'backup ntp apt_index questions zram apt_upgrade bbr sysctl tcp journal trim updates autoreboot timezone hosts ssh firewall verification ' ]] || fail "unexpected setup stage order: $order"
 [[ "$(grep -n -e '^banner$' -e '^stage ssh ' "$CASE_DIR/calls" | head -n 1)" == *banner ]] || fail 'attention banner not shown before the attended steps'
 grep -Fxq 'read session' "$CASE_DIR/calls" || fail 'setup did not check for tmux/screen'
+# Asked before the plan: a setup handed to tmux shows its plan there, once.
+[[ "$(grep -n -e '^read session$' -e '^read plan$' "$CASE_DIR/calls" | head -n 1)" == *'read session' ]] || fail 'setup showed the plan before offering tmux'
 
 # Declining to continue outside tmux/screen changes nothing.
 SESSION_OK=0 run_case setup_no_tmux setup 1 0 0
 [[ "$CASE_STATUS" == 0 ]] || fail 'declining outside tmux failed'
 assert_no_writes 'declined outside tmux'
 if grep -Fxq 'confirm APPLY' "$CASE_DIR/calls"; then fail 'APPLY asked after declining to continue'; fi
+if grep -Fxq 'read plan' "$CASE_DIR/calls"; then fail 'plan shown here although the setup went to tmux or was stopped'; fi
 run_case firewall_no_session_check firewall 1 0 0
 if grep -Fxq 'read session' "$CASE_DIR/calls"; then fail 'short firewall mode nagged about tmux'; fi
 run_case ssh_only ssh 1 0 0
