@@ -1,0 +1,3 @@
+# `sudo true` of the admin made by the SSH hardening (VM only); sudo-rs
+# (Ubuntu 26.04) asks "[sudo: authenticate] Password:".
+\[sudo[^]]*\] [Pp]assword ==> $ADMIN_PW

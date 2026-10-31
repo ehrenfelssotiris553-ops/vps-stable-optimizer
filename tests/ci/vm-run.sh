@@ -103,10 +103,11 @@ VM_SSH_OPS="ssh ${VM_OPTS[*]} $VM_OPS_HOST"
 ADMIN_PW="$(openssl rand -hex 12)"
 VM_PUBKEY="$(cat "$WORK/key.pub")"
 # ops logs in with the key and uses sudo once, as the hardening asks: in a
-# terminal like a person would (the tool looks for sudo's TTY= log line).
+# terminal like a person would (the tool looks for sudo's TTY= log line),
+# typing the password at sudo's prompt (sudo drops input typed earlier).
 cat > "$WORK/ops-sudo" <<EOF
 #!/bin/sh
-printf '%s\n' "\$ADMIN_PW" | ssh ${VM_OPTS[*]} -tt $VM_OPS_HOST 'sudo -S -p "" true'
+exec expect "$CI/answer.exp" "$CI/rules/sudo.rules" "$LOGS/ops-sudo.raw" ssh ${VM_OPTS[*]} -tt $VM_OPS_HOST 'sudo true'
 EOF
 chmod +x "$WORK/ops-sudo"
 VM_OPS_SUDO="$WORK/ops-sudo"
@@ -123,6 +124,11 @@ ssh_methods() {
     sed -n 's/.*Permission denied (\(.*\))\..*/\1/p' || true
 }
 KEYONLY=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
+# What sudo logged, for a hardening run that did not see the admin's sudo.
+sudo_journal() {
+  vm 'journalctl -q -t sudo -n 8 --no-pager -o cat; journalctl -q _UID=0 -t sudo -n 3 --no-pager -o cat | sed "s/^/as uid 0: /"' || true
+  cat "$LOGS/ops-sudo.raw" 2>/dev/null || true
+}
 
 group 'Boot and install'
 wait_ssh
@@ -185,7 +191,7 @@ if vm 'tmux has-session -t =vps-setup' 2>/dev/null; then fail 'the tmux session 
 endgroup
 
 group 'SSH hardening: a connection dropped mid-way puts the old settings back'
-vm_drive ssh-drop.rules ssh-drop vps ssh || fail "ssh hardening (dropped) exited with $?"
+vm_drive ssh-drop.rules ssh-drop vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (dropped) exited with $rc"; }
 has ssh-drop '系统日志确认 ops 已用密钥登录成功'
 has ssh-drop '已关闭 SSH 密码登录'
 # The guard timer (240 s) undoes it; ops logs in with the key all along.
@@ -199,7 +205,7 @@ vm true || fail 'root cannot log in again after the undo'
 endgroup
 
 group 'SSH hardening: key-only login, admin ops with sudo, no root login'
-vm_drive ssh-apply.rules ssh-apply vps ssh || fail "ssh hardening exited with $?"
+vm_drive ssh-apply.rules ssh-apply vps ssh || { rc=$?; sudo_journal; fail "ssh hardening exited with $rc"; }
 has ssh-apply '已在系统日志里看到新窗口登录成功，自动确认'
 has ssh-apply '新的 SSH 登录设置已保留'
 hardened() {
