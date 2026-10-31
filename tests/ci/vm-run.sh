@@ -84,6 +84,7 @@ export VM_SSH
 # Commands are given as strings and expand on the VM, not here.
 # shellcheck disable=SC2029
 vm() { ssh "${VM_OPTS[@]}" "$VM_HOST" "$@"; }
+on_target() { vm "$1"; }
 # An interactive command of the tool on the VM, answered by a rules file
 # (as root, or as VM_AS).
 vm_drive() {
@@ -156,6 +157,8 @@ group 'Recommended setup over SSH'
 vm_drive setup-vm.rules setup vps setup || fail "setup exited with $?"
 has setup '已在系统日志里看到新窗口登录成功，自动确认'
 has setup '本次流程已完成'
+plan_facts setup
+ssh_facts setup
 # The health report must raise no false alarm on a fresh machine.
 probe() {
   local rc=0
@@ -181,6 +184,18 @@ check_all() {
 }
 group 'Acceptance check'
 check_all check
+check_facts check
+# The check's own SSH connection really runs BBR, as it says.
+has check '当前 SSH 连接实际在用 bbr'
+[[ "$(vm 'ss -tinH state established "( sport = :22 )"')" == *bbr* ]] || fail 'SSH connections do not use bbr'
+if ((zram_kernel)); then
+  # Size and algorithm as zramctl reads them from the kernel.
+  read -r zbytes zalg < <(vm 'zramctl --noheadings --bytes --output DISKSIZE,ALGORITHM /dev/zram0')
+  zline="$(grep -m1 'ZRAM 内存缓冲：' "$LOGS/check.log")"
+  zsaid="$(sed -n 's/.*约 \([0-9]*\) MiB.*/\1/p' <<< "$zline")"
+  near "${zsaid:-0}" $((zbytes / 1048576)) || fail "ZRAM is $((zbytes / 1048576)) MiB, the check says $zsaid"
+  [[ "$zline" == *"压缩算法 $zalg"* ]] || fail "ZRAM uses $zalg, the check says: $zline"
+fi
 endgroup
 
 group 'Allowlisted address: no SSH rate limit'
@@ -257,6 +272,7 @@ endgroup
 group 'SSH hardening: a connection dropped mid-way puts the old settings back'
 vm_drive ssh-drop.rules ssh-drop vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (dropped) exited with $rc"; }
 has ssh-drop '系统日志确认 ops 已用密钥登录成功'
+has ssh-drop 'ops 当前已有 0 个公钥'
 has ssh-drop '已关闭 SSH 密码登录'
 # The guard timer (240 s) undoes it; ops logs in with the key all along.
 for ((i = 0; i < 90; i++)); do
@@ -272,6 +288,7 @@ group 'SSH hardening: key-only login, admin ops with sudo, no root login'
 vm_drive ssh-apply.rules ssh-apply vps ssh || { rc=$?; sudo_journal; fail "ssh hardening exited with $rc"; }
 has ssh-apply '已在系统日志里看到新窗口登录成功，自动确认'
 has ssh-apply '新的 SSH 登录设置已保留'
+has ssh-apply 'ops 当前已有 1 个公钥'
 hardened() {
   if vm true 2>/dev/null; then fail "$1: root can still log in over SSH"; fi
   [[ "$(ssh_methods ops)" == publickey ]] || fail "$1: sshd still offers $(ssh_methods ops)"

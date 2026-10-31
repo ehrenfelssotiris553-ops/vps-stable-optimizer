@@ -21,6 +21,7 @@ state() {
     net.ipv4.conf.all.accept_redirects 2>/dev/null | tr -s '\t\n' '  '
 }
 tz() { timedatectl show -p Timezone --value; }
+on_target() { sudo bash -c "$1"; }
 ufw_line() { sudo ufw status 2>/dev/null | head -n 1 || true; }
 ufw_added() { sudo ufw show added; }
 apt_has() { apt-config dump 2>/dev/null | grep -Fqx -- "$1"; }
@@ -90,11 +91,13 @@ else
   sudo vps plan > "$LOGS/plan.log" 2>&1 || fail 'plan failed'
   grep -F '根据本次体检，接下来准备怎么做' "$LOGS/plan.log" || fail 'plan has no decision report'
   [[ "$(state)" == "$before_state" ]] || fail 'plan changed kernel settings'
+  plan_facts plan
   endgroup
 
   group 'One-click setup (custom mode)'
   drive setup-custom.rules setup sudo vps setup || fail "setup exited with $?"
   has setup '本次流程已完成'
+  ssh_facts setup
   endgroup
 fi
 
@@ -120,6 +123,7 @@ check_all() {
 }
 group 'Acceptance check'
 check_all check
+check_facts check
 endgroup
 
 # NAME KEY CHOICE...: one `vps item` run that picks KEY in the menu, answers
