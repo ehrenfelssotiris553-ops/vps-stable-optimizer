@@ -25,6 +25,11 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm]
         mode: [fresh, upgrade]
+        include:
+          - {os: ubuntu-24.04, mode: alt}
+          - {os: ubuntu-26.04, mode: alt}
+          - {os: ubuntu-24.04, mode: docker}
+          - {os: ubuntu-22.04, mode: docker}
     steps:
       - uses: actions/checkout@v5
         with:

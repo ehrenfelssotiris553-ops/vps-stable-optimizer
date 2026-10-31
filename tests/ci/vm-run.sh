@@ -301,6 +301,31 @@ if ((!old)); then
   has tmux-return '一键开荒已结束（退出码 0）'
   if vm 'tmux has-session -t =vps-setup' 2>/dev/null; then fail 'the tmux session stayed after Enter'; fi
   endgroup
+
+  group 'Ctrl+C in the middle of a setup, then the setup once more'
+  vm_drive setup-vm.rules interrupt vps setup &
+  drive_pid=$!
+  # Once the questions are answered and the changes run.
+  for ((i = 0; i < 300; i++)); do
+    vm 'grep -qsxE "zram|apt_upgrade|bbr|sysctl|tcp|journal|trim|updates|autoreboot|timezone|hosts" /var/lib/vps-stable-opt/run-*/active_stage' 2>/dev/null && break
+    sleep 1
+  done
+  printf 'Interrupted in stage: %s\n' "$(vm 'cat /var/lib/vps-stable-opt/run-*/active_stage | grep -vx none' || true)"
+  # What Ctrl+C does: SIGINT to the whole foreground process group, apt and
+  # dpkg included.
+  # shellcheck disable=SC2016
+  vm 'pgid="$(ps -o pgid= -p "$(pgrep -o -f "vps-stable-opt.sh setup")" | tr -d " ")"; [ -n "$pgid" ] && kill -INT -- "-$pgid"'
+  if wait "$drive_pid"; then fail 'the interrupted setup ended as if nothing happened'; fi
+  if vm 'dpkg --audit | grep -q .'; then
+    # dpkg was cut off: the tool has to stop and say how to repair it.
+    vm_drive setup-vm.rules interrupt-blocked vps setup || true
+    has interrupt-blocked 'dpkg --configure -a'
+    vm 'dpkg --configure -a'
+  fi
+  vm_drive setup-vm.rules after-interrupt vps setup || fail "setup after Ctrl+C exited with $?"
+  has after-interrupt '本次流程已完成'
+  check_all check-after-interrupt
+  endgroup
 fi
 
 group 'SSH hardening: a connection dropped mid-way puts the old settings back'

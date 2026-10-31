@@ -4,16 +4,23 @@
 # item switched off and on again, port management, a second check, full
 # rollback with package removal, and uninstall. Each step is followed by checks
 # on what it must leave behind. Run from anywhere; needs sudo without a password.
-# Usage: real-run.sh [fresh|upgrade]
+# Usage: real-run.sh [fresh|upgrade|alt|docker]
 #   upgrade: install and set up with the previous release (the newest other
 #   version on origin/main, needs the git history), then upgrade in place;
 #   everything after that is done by this version, as on a machine that updates.
+#   alt: the setup answered the least recommended way (setup-alt.rules); what
+#   was declined must stay as it was. No single items.
+#   docker: a machine running a container service (docker-run.sh).
 set -Eeuo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 # shellcheck source=tests/ci/lib.sh
 source "$ROOT/tests/ci/lib.sh"
 mode="${1:-fresh}"
-case "$mode" in fresh | upgrade) ;; *) fail 'usage: real-run.sh [fresh|upgrade]' ;; esac
+case "$mode" in
+  fresh | upgrade | alt) ;;
+  docker) exec bash "$CI/docker-run.sh" ;;
+  *) fail 'usage: real-run.sh [fresh|upgrade|alt|docker]' ;;
+esac
 version="$(sed -n 's/^SCRIPT_VERSION=//p' "$ROOT/vps-stable-opt.sh")"
 
 state() {
@@ -50,20 +57,9 @@ snapshot_since="$(date '+%F %T')"
 # shellcheck disable=SC2024
 sudo bash "$CI/snapshot.sh" > "$LOGS/snapshot-before.txt"
 
-# The newest commit on origin/main whose tool has another version than this one.
-previous_release() {
-  local commit other
-  git -C "$ROOT" fetch -q --no-tags origin main 2>/dev/null || true
-  for commit in $(git -C "$ROOT" rev-list origin/main -- vps-stable-opt.sh); do
-    other="$(git -C "$ROOT" show "$commit:vps-stable-opt.sh" | sed -n 's/^SCRIPT_VERSION=//p' || true)"
-    if [[ -n "$other" && "$other" != "$version" ]]; then printf '%s %s\n' "$commit" "$other"; return 0; fi
-  done
-  return 1
-}
-
 if [[ "$mode" == upgrade ]]; then
   group 'Install the previous release'
-  previous="$(previous_release)" || fail 'no previous release on origin/main'
+  previous="$(previous_release "$version")" || fail 'no previous release on origin/main'
   read -r old_commit old_version <<< "$previous"
   printf 'Previous release: %s (%s)\n' "$old_version" "$old_commit"
   git -C "$ROOT" show "$old_commit:install.sh" > "$LOGS/old-install.sh"
@@ -94,8 +90,10 @@ else
   plan_facts plan
   endgroup
 
-  group 'One-click setup (custom mode)'
-  drive setup-custom.rules setup sudo vps setup || fail "setup exited with $?"
+  rules=setup-custom.rules
+  if [[ "$mode" == alt ]]; then rules=setup-alt.rules; fi
+  group "One-click setup ($rules)"
+  drive "$rules" setup sudo vps setup || fail "setup exited with $?"
   has setup '本次流程已完成'
   ssh_facts setup
   endgroup
@@ -121,6 +119,33 @@ check_all() {
   has "$name" '解封 192.0.2.123：拦截规则已删除'
   [[ "$(tz)" == Asia/Shanghai ]] || fail "$name: timezone is $(tz)"
 }
+if [[ "$mode" == alt ]]; then
+  group 'Acceptance check: what was declined stayed as it was'
+  rc=0; drive check.rules check sudo vps check || rc=$?
+  cat "$LOGS/check.log"
+  [[ "$rc" == 0 || "$rc" == 3 ]] || fail "check exited with $rc"
+  for item in '内核网络安全参数' 'TCP 缓冲区上限' '常用工具' '时区' '自动安全更新'; do
+    grep -Eq "^\[➖ 未处理\][[:space:]]+$item：" "$LOGS/check.log" || fail "declined $item is not reported as left alone"
+  done
+  passed check '防火墙'
+  passed check 'Fail2ban 防爆破'
+  check_facts check
+  [[ "$(sysctl -n kernel.kptr_restrict)" == "$before_kptr" ]] || fail 'declined security parameters changed kptr_restrict'
+  [[ "$(sysctl -n net.core.rmem_max)" == "$before_rmem" && "$(tcp_rmem_max)" == "$before_tcp_rmem" ]] || fail 'declined TCP buffers changed'
+  [[ "$(tz)" == "$before_tz" ]] || fail "the kept timezone changed: $(tz)"
+  [[ "$(tool_packages)" == "$before_tools" ]] || fail "declined tools were installed: $(tool_packages)"
+  if installed vnstat; then fail 'declined vnStat was installed'; fi
+  for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf \
+      /etc/apt/apt.conf.d/52-vps-stable-auto-upgrades /etc/apt/apt.conf.d/53-vps-stable-auto-reboot; do
+    if sudo test -e "$f"; then fail "$f written although declined"; fi
+  done
+  ufw_added > "$LOGS/ufw-added.log"
+  cat "$LOGS/ufw-added.log"
+  grep -Fxq 'ufw allow 80/tcp' "$LOGS/ufw-added.log" || fail 'website port 80 not opened'
+  grep -Fxq 'ufw allow 443/tcp' "$LOGS/ufw-added.log" || fail 'website port 443 not opened'
+  if grep -q '^ufw allow from ' "$LOGS/ufw-added.log"; then fail 'an allowlist rule although the allowlist was declined'; fi
+  endgroup
+else
 group 'Acceptance check'
 check_all check
 check_facts check
@@ -233,6 +258,7 @@ endgroup
 group 'Acceptance check after the single items'
 check_all check-again
 endgroup
+fi
 
 group 'Full rollback with package removal'
 drive rollback.rules rollback sudo vps rollback || fail "rollback exited with $?"

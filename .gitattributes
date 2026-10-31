@@ -5,4 +5,5 @@
 *.yml text eol=lf
 *.exp text eol=lf
 *.rules text eol=lf
+*.py text eol=lf
 SHA256SUMS text eol=lf

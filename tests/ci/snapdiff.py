@@ -19,7 +19,9 @@ import sys
 VOLATILE = re.compile(
     r'^(kernel\.random\.|fs\.(dentry-state|file-nr|inode-nr|inode-state|aio-nr)$|fs\.quota\.'
     r'|kernel\.ns_last_pid$|kernel\.pty\.nr$|net\.netfilter\.nf_conntrack_count$'
-    r'|kernel\.perf_event_max_sample_rate$|net\.core\.netdev_rss_key$)')
+    r'|kernel\.perf_event_max_sample_rate$|net\.core\.netdev_rss_key$'
+    # A container's virtual interface gets a new name whenever it starts.
+    r'|net\.ipv[46]\.(conf|neigh)\.veth[0-9a-f]+\.)')
 KERNEL_PKG = re.compile(r'^linux-(image|modules|modules-extra|headers|tools|cloud-tools)-')
 CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_congestion_control')
 USER_FILES = {'/etc/' + f + s for f in ('passwd', 'group', 'shadow', 'gshadow', 'subuid', 'subgid')

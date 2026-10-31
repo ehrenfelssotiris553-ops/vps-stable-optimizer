@@ -70,6 +70,18 @@ check_facts() {
   if on_target "getent hosts \"\$(hostname)\" >/dev/null"; then has "$1" "主机名 $host 可以正常解析"; fi
 }
 
+# The newest commit on origin/main whose tool has another version than
+# VERSION, printed as "COMMIT VERSION" (needs the git history).
+previous_release() {
+  local commit other
+  git -C "$ROOT" fetch -q --no-tags origin main 2>/dev/null || true
+  for commit in $(git -C "$ROOT" rev-list origin/main -- vps-stable-opt.sh); do
+    other="$(git -C "$ROOT" show "$commit:vps-stable-opt.sh" | sed -n 's/^SCRIPT_VERSION=//p' || true)"
+    if [[ -n "$other" && "$other" != "$1" ]]; then printf '%s %s\n' "$commit" "$other"; return 0; fi
+  done
+  return 1
+}
+
 # The menu number of single item KEY, from the tool's own list (item_keys).
 item_index() {
   awk -v key="$1" '

@@ -1,0 +1,34 @@
+# After a push to main: what users get from GitHub. The README's install
+# command, and `vps update` from the previous release. Also weekly.
+name: release-smoke
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # Weekly (Sunday 03:00 Beijing time) even without changes.
+  schedule:
+    - cron: '0 19 * * 6'
+permissions:
+  contents: read
+concurrency:
+  group: release-smoke
+  cancel-in-progress: true
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Prepare the runner like a fresh VPS
+        run: bash tests/ci/report.sh 'prepare' bash tests/ci/runner-prepare.sh
+      - name: Install and update from GitHub
+        run: bash tests/ci/report.sh 'release smoke' bash tests/ci/smoke-run.sh
+      - name: Keep the transcripts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-smoke
+          path: ${{ runner.temp }}/vps-ci-logs
+          if-no-files-found: ignore
