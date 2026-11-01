@@ -37,6 +37,9 @@ UFW_LAYOUT = re.compile(
 # snapd mounts each snap revision it refreshes to as a unit of its own.
 SNAPD = re.compile(r'^(/etc/systemd/system/(snapd\.mounts\.target\.wants|multi-user\.target\.wants)/)?snap-.*\.mount$'
                    r'|^/etc/systemd/system/snapd\.mounts\.target\.wants$')
+# update-ca-certificates rebuilds these whenever ca-certificates is upgraded;
+# the links belong to no package.
+CERTS = re.compile(r'^/etc/ssl/certs/')
 # Start/stop links of a SysV script that a removed package keeps.
 RC_LINK = re.compile(r'^/etc/rc[0-6S]\.d/[SK][0-9]+(.+)$')
 USER_FILES = {'/etc/' + f + s for f in ('passwd', 'group', 'shadow', 'gshadow', 'subuid', 'subgid')
@@ -159,7 +162,7 @@ def main():
         if fa.get(path) == fb.get(path):
             continue
         what = 'file added' if path not in fa else 'file removed' if path not in fb else 'file changed'
-        if path in ALWAYS_EXPLAINED or path in up_files:
+        if path in ALWAYS_EXPLAINED or path in up_files or (CERTS.match(path) and 'ca-certificates' in up_pkgs):
             explained.append(f'{what}: {path}')
         elif ufw_layout_only and path in ('/etc/ufw/user.rules', '/etc/ufw/user6.rules'):
             explained.append(f'{what}: {path} (UFW layout, see the warning)')
@@ -176,6 +179,9 @@ def main():
         rc_link = RC_LINK.match(path)
         unit = path.rsplit('/', 1)[-1]
         if SNAPD.match(path):
+            continue
+        if CERTS.match(path) and 'ca-certificates' in up_pkgs:
+            explained.append(f'certificate link rebuilt by the ca-certificates upgrade: {path}')
             continue
         if (path not in la and lb.get(path) == '/dev/null' and path.startswith('/etc/systemd/system/')
                 and unit.rsplit('.', 1)[0] in set(b.get('pkgconf', []))):
