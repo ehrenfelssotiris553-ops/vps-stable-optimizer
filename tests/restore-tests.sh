@@ -742,8 +742,9 @@ printf 'PASS: SSH drop-in rollback (key-only and key-login switch) reloads sshd 
   restore_record_sysctl net.ipv6.conf.vps-gone0.accept_redirects 1
   restore_record_sysctl net.ipv6.conf.vps-gone0.accept_redirects 0
   restore_record_sysctl net.ipv6.conf.xvps-gone0.accept_redirects 1
+  restore_record_sysctl net.ipv4.conf.vps-gone0.send_redirects 1
   restore_record_sysctl kernel.dmesg_restrict 0
-  expect "$(cut -d= -f1 "$RESTORE_ROOT/sysctl_runtime" | tr '\n' ' ')" 'net.ipv6.conf.vps-gone0.accept_redirects net.ipv6.conf.xvps-gone0.accept_redirects kernel.dmesg_restrict '
+  expect "$(cut -d= -f1 "$RESTORE_ROOT/sysctl_runtime" | tr '\n' ' ')" 'net.ipv6.conf.vps-gone0.accept_redirects net.ipv6.conf.xvps-gone0.accept_redirects net.ipv4.conf.vps-gone0.send_redirects kernel.dmesg_restrict '
   expect "$(grep -c '^net.ipv6.conf.vps-gone0.accept_redirects=1$' "$RESTORE_ROOT/sysctl_runtime")" 1
   restore_sysctl_runtime
   expect "$(cat "$TMP/sysctl/trace")" 'kernel.dmesg_restrict=0'

@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_config_files sysctl_key_configured sysctl_hardening_stage tcp_buffer_max tcp_buffer_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_ipv4_iface_values sysctl_config_files sysctl_key_configured sysctl_hardening_stage tcp_buffer_max tcp_buffer_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -123,6 +123,9 @@ sysctl() {
 CONFIGURED=kernel.dmesg_restrict
 sysctl_key_configured() { [[ "$1" == "$CONFIGURED" ]]; }
 restore_record_sysctl() { record "orig $1=$2"; }
+# Every interface's IPv4 values (one interface, eth0, here).
+IPV4_IFACES=1
+sysctl_ipv4_iface_values() { if ((IPV4_IFACES)); then printf 'net.ipv4.conf.eth0.%s=1\n' "$1"; fi; }
 OURS=0
 restore_file_ours() { [[ "$1" == sysctl_file ]] && ((OURS)); }
 reset; SYSCTL_CHOICE=1
@@ -132,6 +135,14 @@ if grep -Fq dmesg_restrict "$SYSCTL_HARDENING_FILE"; then fail 'key configured e
 if grep -Fq 'icmp_echo_ignore_broadcasts' "$SYSCTL_HARDENING_FILE"; then fail 'key absent on this kernel was written'; fi
 grep -Fxq 'orig kernel.kptr_restrict=0' "$TEST_ROOT/trace" || fail 'original running value not recorded'
 if grep -q 'ip_forward' "$SYSCTL_HARDENING_FILE"; then fail 'forwarding must not be changed (Docker/WireGuard)'; fi
+# The interfaces' own IPv4 values come from the default ones at boot: only
+# where the file sets that default are they recorded, and never changed now.
+reset; rm -f "$SYSCTL_HARDENING_FILE"; SYSVAL[net.ipv4.conf.default.send_redirects]=1
+sysctl_hardening_stage
+grep -Fxq 'orig net.ipv4.conf.eth0.send_redirects=1' "$TEST_ROOT/trace" || fail 'interface IPv4 original not recorded for rollback'
+if grep -Fq 'orig net.ipv4.conf.eth0.accept_redirects' "$TEST_ROOT/trace"; then fail 'interface recorded for a default the file does not set'; fi
+if grep -q 'sysctl -w net.ipv4' "$TEST_ROOT/trace"; then fail 'IPv4 interface values changed directly'; fi
+unset 'SYSVAL[net.ipv4.conf.default.send_redirects]'
 reset; SYSCTL_CHOICE=0; rm -f "$SYSCTL_HARDENING_FILE"
 sysctl_hardening_stage
 [[ ! -e "$SYSCTL_HARDENING_FILE" ]] || fail 'sysctl changed without consent'
@@ -174,6 +185,13 @@ grep -q '^result sysctl preserved' "$TEST_ROOT/trace" || fail 'foreign file not 
 rm -f "$SYSCTL_HARDENING_FILE"
 unset 'SYSVAL[net.ipv6.conf.all.accept_redirects]' 'SYSVAL[net.ipv6.conf.default.accept_redirects]'
 unset -f sysctl_ipv6_iface_redirects
+(
+  load_optimizer_functions sysctl_ipv4_iface_values
+  P="$TEST_ROOT/proc4"
+  for i in all default eth0 lo eth0.100; do mkdir -p "$P/$i"; echo 1 > "$P/$i/send_redirects"; done
+  out="$(sysctl_ipv4_iface_values send_redirects "$P" | sort | tr '\n' ' ')"
+  [[ "$out" == 'net.ipv4.conf.eth0.send_redirects=1 net.ipv4.conf.lo.send_redirects=1 ' ]] || fail "IPv4 interface values: $out"
+)
 (
   load_optimizer_functions sysctl_ipv6_iface_redirects
   P="$TEST_ROOT/proc-ipv6"

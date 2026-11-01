@@ -23,5 +23,6 @@ pkgs="$(awk -v since="${1:-}" '
 ' "$history" | sort -u)"
 for p in $pkgs; do
   printf 'upgradepkg %s\n' "$p"
-  { dpkg -L "$p" 2>/dev/null || true; } | awk '/^\/etc\// {print "upgradefile " $0}'
+  { dpkg -L "$p" 2>/dev/null || true; } |
+    awk -F/ '/^\/etc\// {print "upgradefile " $0} /\/systemd\/system\/[^\/]+\.(service|timer|socket|path|target|mount)$/ {print "upgradeunit " $NF}'
 done | sort -u

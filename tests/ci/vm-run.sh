@@ -373,7 +373,14 @@ for ((i = 0; i < 90; i++)); do
   if vm_ops "[ ! -e $KEYONLY ]" 2>/dev/null; then break; fi
   sleep 5
 done
-vm_ops "[ ! -e $KEYONLY ]" || fail 'key-only login stayed after the dropped connection'
+if ! vm_ops "[ ! -e $KEYONLY ]"; then
+  # Present, or no SSH at all? Then what the guard did.
+  seen="$(vm_ops "if [ -e $KEYONLY ]; then echo present; else echo absent; fi" 2>&1 || true)"
+  vm_ops_sudo 'sh -c "systemctl list-units --all --no-legend \"vps-stable-ssh-revert-*\"; journalctl -n 30 --no-pager -o short -u ssh.service -u ssh.socket; ss -H -lntp \"( sport = :22 )\""' \
+    > "$LOGS/ssh-drop-undo.log" 2>&1 || true
+  notice "SSH undo after the drop ($system)" "$LOGS/ssh-drop-undo.log"
+  fail "key-only login stayed after the dropped connection (ops sees the file: ${seen:-no SSH})"
+fi
 # The undo removes the file, then reloads sshd: give the reload a moment.
 for ((i = 0; i < 60; i++)); do vm true 2>/dev/null && break; sleep 5; done
 if ! vm true 2>/dev/null; then

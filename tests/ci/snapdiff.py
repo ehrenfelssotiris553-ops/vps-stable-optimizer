@@ -19,13 +19,17 @@ import sys
 VOLATILE = re.compile(
     r'^(kernel\.random\.|fs\.(dentry-state|file-nr|inode-nr|inode-state|aio-nr)$|fs\.quota\.'
     r'|kernel\.ns_last_pid$|kernel\.pty\.nr$|net\.netfilter\.nf_conntrack_count$'
-    r'|kernel\.perf_event_max_sample_rate$|net\.core\.netdev_rss_key$'
+    r'|kernel\.perf_event_max_sample_rate$|net\.core\.netdev_rss_key$|net\.ipv4\.tcp_fastopen_key$'
     # A container's virtual interface gets a new name whenever it starts.
     r'|net\.ipv[46]\.(conf|neigh)\.veth[0-9a-f]+\.)')
 KERNEL_PKG = re.compile(r'^linux-(image|modules|modules-extra|headers|tools|cloud-tools)-')
 # Lists that grow when a module loads: congestion control, upper layer protocols.
 CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_congestion_control',
            'net.ipv4.tcp_available_ulp')
+# What the tool itself sets: compared even across a kernel change.
+TOOL_KEYS = re.compile(r'^(net\.ipv[46]\.conf\.|net\.ipv4\.(tcp_congestion_control|tcp_syncookies|icmp_)'
+                       r'|net\.core\.(default_qdisc|rmem_max|wmem_max)|vm\.(swappiness|page-cluster)'
+                       r'|kernel\.(kptr_restrict|dmesg_restrict))')
 # A loaded logging module fills in its slot ("NONE" before).
 NF_LOG = re.compile(r'^net\.netfilter\.nf_log\.[0-9]+$')
 # The layout UFW writes into user.rules/user6.rules the first time it starts:
@@ -38,6 +42,9 @@ UFW_LAYOUT = re.compile(
 # writes services and udev rules for the snaps.
 SNAPD = re.compile(r'^(/etc/systemd/system/((snapd\.mounts|multi-user)\.target\.wants/)?)?snap[-.].*\.(mount|service)$'
                    r'|^/etc/systemd/system/snapd\.mounts\.target\.wants$|^/etc/udev/rules\.d/70-snap\.')
+# Directories a removed package's leftovers may not explain anything in.
+SHARED_RC_DIRS = {'/etc', '/etc/default', '/etc/sysctl.d', '/etc/apt/apt.conf.d', '/etc/systemd', '/etc/systemd/system',
+                  '/etc/ssh', '/etc/ssh/sshd_config.d', '/etc/init.d', '/etc/logrotate.d', '/etc/cron.d'}
 SHARED_DIRS = {'/etc', '/etc/sysctl.d', '/etc/apt/apt.conf.d', '/etc/ssh/sshd_config.d', '/etc/systemd/system',
                '/etc/systemd/journald.conf.d', '/etc/default', '/etc/fail2ban/jail.d', '/etc/fail2ban/action.d',
                '/etc/ufw', '/etc/modules-load.d', '/etc/systemd'}
@@ -101,10 +108,17 @@ def main():
     up_pkgs, up_files = set(up.get('upgradepkg', [])), set(up.get('upgradefile', []))
     unexplained, explained, warnings = [], [], []
 
-    # Kernel parameters.
+    # Kernel parameters. After a reboot into a newer kernel its own defaults
+    # (from memory sizes, its version) differ; the network settings the tool
+    # changes do not, so those are still compared.
     sa, sb = pairs(a, 'sysctl', ' = '), pairs(b, 'sysctl', ' = ')
+    new_kernel = sa.get('kernel.osrelease') != sb.get('kernel.osrelease')
+    if new_kernel:
+        explained.append(f"kernel {sa.get('kernel.osrelease')} -> {sb.get('kernel.osrelease')} after the reboot")
     for key in sorted(set(sa) | set(sb)):
         if VOLATILE.match(key) or sa.get(key) == sb.get(key):
+            continue
+        if new_kernel and not TOOL_KEYS.match(key):
             continue
         if key not in sa:
             explained.append(f'new kernel parameter (module loaded): {key} = {sb[key]}')
@@ -182,6 +196,8 @@ def main():
             explained.append(f'{what}: {path} (users above)')
         elif what in ('file added', 'file changed') and path in rc_files:
             continue  # listed with the package warning
+        elif what == 'file added' and path.rsplit('/', 1)[0] in rc_dirs - SHARED_RC_DIRS:
+            continue  # in the configuration directory a removed package keeps
         else:
             unexplained.append(f'{what}: {path}')
     la, lb = pairs(a, 'link', ' -> '), pairs(b, 'link', ' -> ')
@@ -224,11 +240,15 @@ def main():
 
     # Everything else must be exactly as before.
     ua_units, ub_units = pairs(a, 'unit', ' '), pairs(b, 'unit', ' ')
+    up_units = set(up.get('upgradeunit', []))
     rc_pkgs = set(b.get('pkgconf', []))
     for name in sorted(set(ua_units) | set(ub_units)):
         if 'transient' in (ua_units.get(name), ub_units.get(name)) or SNAPD.match(name):
             continue  # login sessions and snapd's own mounts come and go
         if ua_units.get(name) != ub_units.get(name):
+            if name in up_units:
+                explained.append(f'unit {name}: {ua_units.get(name, "(none)")} -> {ub_units.get(name, "(none)")} (its package was upgraded)')
+                continue
             if up_pkgs and (name not in ua_units or name not in ub_units):
                 explained.append(f'unit {name}: {ua_units.get(name, "(none)")} -> {ub_units.get(name, "(none)")} (package upgrades)')
                 continue

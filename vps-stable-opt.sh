@@ -1418,6 +1418,17 @@ sysctl_key_configured() {
 # IPv6 reads accept_redirects only from each interface: all/default never reach
 # an interface that already exists (eth0 comes up before systemd-sysctl at
 # boot). Prints "key=value" for every existing interface (not all/default).
+# The running net.ipv4.conf.<interface>.KEY of every interface, as KEY=VALUE.
+sysctl_ipv4_iface_values() {
+  local key="$1" f iface
+  for f in "${2:-/proc/sys/net/ipv4/conf}"/*/"$key"; do
+    [[ -f "$f" ]] || continue
+    iface="${f%/"$key"}"; iface="${iface##*/}"
+    [[ "$iface" =~ ^[A-Za-z0-9_-]+$ && "$iface" != all && "$iface" != default ]] || continue
+    printf 'net.ipv4.conf.%s.%s=%s\n' "$iface" "$key" "$(cat -- "$f" 2>/dev/null || true)"
+  done
+}
+
 sysctl_ipv6_iface_redirects() {
   local f iface
   for f in "${1:-/proc/sys/net/ipv6/conf}"/*/accept_redirects; do
@@ -1451,6 +1462,15 @@ sysctl_hardening_stage() {
       ifaces+=("${pair%%=*}"); originals+=("$pair")
     done < <(sysctl_ipv6_iface_redirects)
   fi
+  # After a reboot every interface comes up with the file's default values;
+  # their running values now are recorded too (not changed: "all" already
+  # applies), so a rollback after a reboot needs no second reboot.
+  for key in accept_redirects send_redirects accept_source_route; do
+    [[ "$text" == *"net.ipv4.conf.default.$key = 0"* ]] || continue
+    while IFS= read -r pair; do
+      if [[ "${pair#*=}" =~ ^[0-9]+$ ]]; then originals+=("$pair"); fi
+    done < <(sysctl_ipv4_iface_values "$key")
+  done
   if ((${#kept[@]})); then ok "已有其他配置的参数保持不变：${kept[*]}"; fi
   if [[ -z "$text" ]]; then module_result sysctl preserved 'all keys configured elsewhere'; return 0; fi
   content="# VPS Stable Optimizer v2.6: network hardening"$'\n'"${text%$'\n'}"
@@ -4337,8 +4357,8 @@ restore_sysctl_runtime() {
   while IFS= read -r line; do
     key="${line%%=*}"; value="${line#*=}"
     if [[ ! "$key" =~ ^[a-z][A-Za-z0-9_.-]*$ || ! "$value" =~ ^-?[0-9]+(\ [0-9]+)*$ ]]; then warn "忽略格式异常的记录：$line"; failed=1; continue; fi
-    if [[ "$key" =~ ^net\.ipv6\.conf\.([^.]+)\.accept_redirects$ && "${BASH_REMATCH[1]}" != all && "${BASH_REMATCH[1]}" != default &&
-          ! -d "/proc/sys/net/ipv6/conf/${BASH_REMATCH[1]}" ]]; then continue; fi
+    if [[ "$key" =~ ^net\.ipv([46])\.conf\.([^.]+)\.[a-z_]+$ && "${BASH_REMATCH[2]}" != all && "${BASH_REMATCH[2]}" != default &&
+          ! -d "/proc/sys/net/ipv${BASH_REMATCH[1]}/conf/${BASH_REMATCH[2]}" ]]; then continue; fi
     if [[ "$keep " == *" $key "* ]]; then continue; fi
     sysctl -w "$key=$value" >/dev/null || { warn "无法恢复 $key=$value"; failed=1; }
   done < "$file"
