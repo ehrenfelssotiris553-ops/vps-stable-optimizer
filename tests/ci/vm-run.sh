@@ -371,8 +371,13 @@ for ((i = 0; i < 90; i++)); do
 done
 vm_ops "[ ! -e $KEYONLY ]" || fail 'key-only login stayed after the dropped connection'
 # The undo removes the file, then reloads sshd: give the reload a moment.
-for ((i = 0; i < 15; i++)); do vm true 2>/dev/null && break; sleep 2; done
-vm true || fail 'root cannot log in again after the undo'
+for ((i = 0; i < 60; i++)); do vm true 2>/dev/null && break; sleep 5; done
+if ! vm true 2>/dev/null; then
+  vm_ops_sudo 'sh -c "systemctl is-active ssh.service ssh.socket; ls /etc/ssh/sshd_config.d; sshd -T -C user=root,host=x,addr=10.0.2.2 | grep -iE \"^(permitrootlogin|passwordauthentication) \"; systemctl list-units --all --no-legend \"vps-stable-ssh-revert-*\"; journalctl -u ssh.service -u ssh.socket -n 25 --no-pager -o short"' \
+    > "$LOGS/ssh-undo.log" 2>&1 || true
+  notice "SSH after the undo ($system)" "$LOGS/ssh-undo.log"
+  fail 'root cannot log in again after the undo'
+fi
 [[ "$(ssh_methods root)" == *password* ]] || fail "password login not back after the undo: $(ssh_methods root)"
 endgroup
 

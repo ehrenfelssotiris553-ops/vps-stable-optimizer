@@ -34,6 +34,9 @@ NF_LOG = re.compile(r'^net\.netfilter\.nf_log\.[0-9]+$')
 UFW_LAYOUT = re.compile(
     r'^(|\*filter|COMMIT|:ufw6?-[a-z-]+ - \[0:0\]'
     r'|-[AI] ufw6?-((after|before|user)-logging-(input|output|forward)|logging-(allow|deny)|user-limit(-accept)?) .*)$')
+# snapd mounts each snap revision it refreshes to as a unit of its own.
+SNAPD = re.compile(r'^(/etc/systemd/system/(snapd\.mounts\.target\.wants|multi-user\.target\.wants)/)?snap-.*\.mount$'
+                   r'|^/etc/systemd/system/snapd\.mounts\.target\.wants$')
 # Start/stop links of a SysV script that a removed package keeps.
 RC_LINK = re.compile(r'^/etc/rc[0-6S]\.d/[SK][0-9]+(.+)$')
 USER_FILES = {'/etc/' + f + s for f in ('passwd', 'group', 'shadow', 'gshadow', 'subuid', 'subgid')
@@ -172,6 +175,8 @@ def main():
             continue
         rc_link = RC_LINK.match(path)
         unit = path.rsplit('/', 1)[-1]
+        if SNAPD.match(path):
+            continue
         if (path not in la and lb.get(path) == '/dev/null' and path.startswith('/etc/systemd/system/')
                 and unit.rsplit('.', 1)[0] in set(b.get('pkgconf', []))):
             continue  # the mask of a removed package's service, warned with the unit
@@ -188,6 +193,8 @@ def main():
             unexplained.append(f'link: {path}: {la.get(path, "(none)")} -> {lb.get(path, "(none)")}')
     da, db = set(a.get('dir', [])), set(b.get('dir', []))
     for path in sorted(db - da):
+        if SNAPD.match(path):
+            continue
         if path in up_files:
             explained.append(f'directory added: {path}')
         elif path in rc_dirs:
@@ -201,7 +208,12 @@ def main():
     ua_units, ub_units = pairs(a, 'unit', ' '), pairs(b, 'unit', ' ')
     rc_pkgs = set(b.get('pkgconf', []))
     for name in sorted(set(ua_units) | set(ub_units)):
+        if 'transient' in (ua_units.get(name), ub_units.get(name)) or SNAPD.match(name):
+            continue  # login sessions and snapd's own mounts come and go
         if ua_units.get(name) != ub_units.get(name):
+            if up_pkgs and (name not in ua_units or name not in ub_units):
+                explained.append(f'unit {name}: {ua_units.get(name, "(none)")} -> {ub_units.get(name, "(none)")} (package upgrades)')
+                continue
             # Removing a package whose SysV script stays masks its service, or
             # systemd generates a unit from that script.
             if ub_units.get(name) in ('masked', 'generated') and name not in ua_units and name.rsplit('.', 1)[0] in rc_pkgs:

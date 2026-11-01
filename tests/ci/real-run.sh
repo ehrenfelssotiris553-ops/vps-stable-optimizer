@@ -22,6 +22,9 @@ case "$mode" in
   *) fail 'usage: real-run.sh [fresh|upgrade|alt|docker]' ;;
 esac
 version="$(sed -n 's/^SCRIPT_VERSION=//p' "$ROOT/vps-stable-opt.sh")"
+# No step here waits long for its next question: a stuck one fails with its
+# transcript well before the job's time limit.
+export ANSWER_TIMEOUT="${ANSWER_TIMEOUT:-900}"
 
 state() {
   sysctl -n net.ipv4.tcp_congestion_control net.core.rmem_max net.ipv4.tcp_rmem kernel.kptr_restrict \
@@ -94,6 +97,8 @@ else
   if [[ "$mode" == alt ]]; then rules=setup-alt.rules; fi
   group "One-click setup ($rules)"
   drive "$rules" setup sudo vps setup || fail "setup exited with $?"
+  sed -n '/第15步：Fail2ban/,/^=== /p' "$LOGS/setup.log" > "$LOGS/setup-fail2ban.log"
+  notice "Fail2ban step of the setup ($mode, $(uname -m))" "$LOGS/setup-fail2ban.log"
   has setup '本次流程已完成'
   ssh_facts setup
   endgroup
