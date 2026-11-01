@@ -7,8 +7,9 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_health_units param_value param_read param_recommended param_check param_mode verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
-  trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health
+  trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health audit_clean_text f2b_jail_text f2b_jail_values_text
 TEST_ROOT="$(mktemp -d)"
+PARAMS_FILE="$TEST_ROOT/params"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 die() { fail "$*"; }
@@ -197,6 +198,7 @@ fail2ban-client() {
   case "$*" in
     'status sshd') printf 'Status for the jail: sshd\n|- Filter\n|  |- Total failed:\t3\n|- Actions\n   |- Total banned:\t1\n' ;;
     'get sshd actions') echo vps-stable-ufw-sshd ;;
+    'get sshd maxretry') echo 5 ;; 'get sshd findtime') echo 600 ;; 'get sshd bantime') echo 3600 ;;
   esac
 }
 active() { [[ "$1" == fail2ban ]]; }
@@ -205,6 +207,11 @@ check_fail2ban ''
 UFW_ON=1
 check_fail2ban ''
 [[ "$VERIFY_STATUS" == pass ]] || fail 'Fail2ban with a running firewall failed'
+# A parameter changed and not applied yet: the values in force are shown.
+printf 'f2b_maxretry=3\n' >> "$PARAMS_FILE"
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == update && "$VERIFY_TEXT" == *'5 600 3600'*'3 600 3600'* ]] || fail "a changed Fail2ban parameter: $VERIFY_STATUS $VERIFY_TEXT"
+sed -i '/^f2b_maxretry=/d' "$PARAMS_FILE"
 
 # UFW running now but not enabled at boot: after a reboot it would be gone.
 ufw() {
@@ -271,7 +278,6 @@ UFW_BOOT=enabled
 printf 'PASS: Fail2ban needs a running UFW; the firewall must also load at boot.\n'
 
 # The usage sentence ends with ".", which must not be taken for the size.
-PARAMS_FILE="$TEST_ROOT/params"
 systemd-analyze() { printf '[Journal]\nSystemMaxUse=100M\nMaxRetentionSec=%s\n' "${DAYS:-90day}"; }
 journalctl() { echo 'Archived and active journals take up 24.0M in the file system.'; }
 check_journal 'SystemMaxUse=100M'
@@ -331,3 +337,26 @@ printf 'PASS: the acceptance exit code is set after the optional live test.\n'
   [[ "$VERIFY_FAIL" == 1 && "$VERIFY_NOTICE" == 1 ]] || fail "counts: fail=$VERIFY_FAIL notice=$VERIFY_NOTICE"
 )
 printf 'PASS: failed services are named in the health check.\n'
+
+# The SSH configuration as sshd would read it at its next start: a failure
+# says why (cleaned, one line) and is counted; no sshd, no line.
+(
+  getent() { return 0; }
+  timeout() { shift; "$@"; }
+  systemctl() { :; }
+  OS=debian SSHD_OUT='' SSHD_RC=0
+  sshd() { [[ "$1" == -t ]] || fail "unexpected sshd $*"; printf '%s' "$SSHD_OUT"; return "$SSHD_RC"; }
+  VERIFY_FAIL=0
+  verify_health > "$TEST_ROOT/health"
+  grep -Fq '✔ 正常  SSH 配置：sshd -t 检查通过' "$TEST_ROOT/health" && ((VERIFY_FAIL == 0)) || fail "a valid SSH configuration: $(cat "$TEST_ROOT/health")"
+  SSHD_OUT=$'/etc/ssh/sshd_config line 12: Bad configuration option: ChallengeResponseAuthentication\e[31m\n/etc/ssh/sshd_config: terminating, 1 bad configuration options\n' SSHD_RC=255
+  verify_health > "$TEST_ROOT/health"
+  grep -Fq '✖ 未生效  SSH 配置：sshd -t 没有通过（/etc/ssh/sshd_config line 12: Bad configuration option: ChallengeResponseAuthentication[31m）' "$TEST_ROOT/health" ||
+    fail "a refused SSH configuration: $(cat "$TEST_ROOT/health")"
+  ((VERIFY_FAIL == 1)) || fail "a refused SSH configuration not counted: $VERIFY_FAIL"
+  if grep -q $'\e' "$TEST_ROOT/health"; then fail 'a control character from sshd reached the report'; fi
+  unset -f sshd
+  PATH=/nonexistent verify_health > "$TEST_ROOT/health" 2>/dev/null || true
+  if grep -q 'SSH 配置' "$TEST_ROOT/health"; then fail 'an SSH configuration line without sshd'; fi
+)
+printf 'PASS: the acceptance check tests the SSH configuration with sshd -t.\n'

@@ -5,7 +5,8 @@ set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test-common.sh
 source "$HERE/test-common.sh"
-load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_replace_owned_file f2b_jail_ready fail2ban_stage
+load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_replace_owned_file f2b_jail_ready fail2ban_stage \
+  f2b_jail_values_text f2b_policy_text f2b_db_text f2b_db_apply f2b_optional ssh_effective_value param_value param_read param_recommended param_check
 # Backup policy is exercised by backup-tests.sh and entry-tests.sh. This test
 # replaces only that dependency while testing the actual Fail2ban transition.
 backup_config_path() { :; }
@@ -23,6 +24,7 @@ new_case() {
   F2B_DIR="$CASE_DIR/etc/fail2ban"
   F2B_FILE="$F2B_DIR/jail.d/99-vps-stable-sshd.local"
   F2B_ACTION_FILE="$F2B_DIR/action.d/vps-stable-ufw-sshd.conf"
+  F2B_DB_FILE="$F2B_DIR/fail2ban.d/99-vps-stable.local" PARAMS_FILE="$CASE_DIR/params" DB_OURS=0 F2B_CHOICE=1
   : > "$CASE_DIR/conffiles"; : > "$CASE_DIR/events"; : > "$CASE_DIR/ok"; : > "$CASE_DIR/warn"; : > "$CASE_DIR/results"
   FIREWALL_READY=1 UFW_ACTIVE=1 SSH_OK=1 PKG_FAIL2BAN=0 PKG_SYSTEMD=0 SERVICE_ACTIVE=0 TEST_STATUS=0 JAIL_STATUS=0
   EXPECT_JAIL="$(f2b_jail_text '22,2222')" F2B_IGNORE_CHOICE='' ALLOW_YES=0 SSH_CONNECTION=''
@@ -36,6 +38,9 @@ default_file() {
   printf ' %s %s\n' "$file" "${checksum%% *}" >> "$CASE_DIR/conffiles"
 }
 dpkg-query() { cat "$CASE_DIR/conffiles"; }
+restore_file_ours() { [[ "$1" == f2b_db_file ]] && ((DB_OURS)); }
+PASSWORD_LOGIN=yes MEM_MIB=4096
+ssh_effective() { printf 'passwordauthentication %s\nkbdinteractiveauthentication no\n' "$PASSWORD_LOGIN"; }
 say() { :; }
 ok() { printf '%s\n' "$*" >> "$CASE_DIR/ok"; }
 warn() { printf '%s\n' "$*" >> "$CASE_DIR/warn"; }
@@ -123,7 +128,11 @@ expected=$'install:guard\ntest\nenable\nstart\nstatus'
 grep -Fxq 'actionban = /usr/sbin/ufw prepend deny proto tcp from <ip> to any port <port>' "$F2B_ACTION_FILE" || fail 'port-specific prepend ban command missing'
 if grep -Fq 'insert 1' "$F2B_ACTION_FILE"; then fail 'IPv6-incompatible insert position remains'; fi
 grep -Fq 'Fail2ban 已就绪' "$CASE_DIR/ok" || fail 'ready status missing'
+grep -Fq '输错 5 次（10 分钟内）封 1 小时，同一 IP 再犯时间加倍，最长 7 天' "$CASE_DIR/ok" || fail "policy not described: $(cat "$CASE_DIR/ok")"
 grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'applied Fail2ban result missing'
+# Bans are remembered for a week (Fail2ban's own default is a day), or a
+# "banned again" after that would start over at an hour.
+grep -Fxq 'dbpurgeage = 604800' "$F2B_DB_FILE" && grep -Fxq '[DEFAULT]' "$F2B_DB_FILE" || fail "ban history: $(cat "$F2B_DB_FILE" 2>&1)"
 passed 'first install is guarded, port-specific and tested before service start'
 
 : > "$CASE_DIR/events"
@@ -198,5 +207,55 @@ fail2ban_stage
 [[ "$(cat "$F2B_FILE")" == "$legacy" ]] || fail 'failed test did not restore the earlier jail'
 [[ "$(cat "$CASE_DIR/events")" == 'test' ]] || fail 'service restarted after a failed test'
 passed 'a failed test after the upgrade restores the earlier jail'
+
+# Parameters changed: this tool's jail with any values is still its own and
+# is written again with the new ones; back to the recommendation, again.
+new_case params
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
+f2b_jail_text '22,2222' > "$F2B_FILE"
+printf 'f2b_maxretry=3\nf2b_bantime_min=30\nf2b_increment=no\nf2b_maxtime_days=30\n' > "$PARAMS_FILE"
+EXPECT_JAIL="$(f2b_jail_text '22,2222')"
+fail2ban_stage
+grep -Fxq 'maxretry = 3' "$F2B_FILE" && grep -Fxq 'bantime = 1800' "$F2B_FILE" && grep -Fxq 'bantime.increment = false' "$F2B_FILE" &&
+  grep -Fxq 'bantime.maxtime = 2592000' "$F2B_FILE" || fail "new parameters not written: $(cat "$F2B_FILE")"
+grep -Fq '输错 3 次（10 分钟内）封 30 分钟。' "$CASE_DIR/ok" || fail "new policy not described: $(cat "$CASE_DIR/ok")"
+# The history follows the longest ban when that is over a week.
+grep -Fxq 'dbpurgeage = 2592000' "$F2B_DB_FILE" || fail "history not as long as the longest ban: $(cat "$F2B_DB_FILE")"
+[[ "$(cat "$CASE_DIR/events")" == $'test\nenable\nrestart\nstatus' ]] || fail "parameter change sequence: $(tr '\n' ' ' < "$CASE_DIR/events")"
+: > "$PARAMS_FILE"; : > "$CASE_DIR/events"; DB_OURS=1
+EXPECT_JAIL="$(f2b_jail_text '22,2222')"
+fail2ban_stage
+[[ "$(cat "$F2B_FILE")" == "$EXPECT_JAIL" ]] || fail "a jail with other values was not recognised: $(cat "$F2B_FILE")"
+grep -Fxq 'dbpurgeage = 604800' "$F2B_DB_FILE" || fail 'own history file not written again'
+f2b_jail_is_ours "$(f2b_jail_values_text 22 8 300 7200 true 864000)" 22 || fail 'a jail with other values is not ours'
+if f2b_jail_is_ours "$(f2b_jail_values_text 22 5 600 3600 true 604800; echo 'findtime = 60')" 22; then fail 'a jail with an extra line counted as ours'; fi
+if f2b_jail_is_ours "$(f2b_jail_text 22 | sed 's/^maxretry = 5$/maxretry = 5 # mine/')" 22; then fail 'a jail with an edited line counted as ours'; fi
+passed 'changed parameters rewrite the jail, which stays recognised with any values'
+
+# A history length the administrator set is kept.
+new_case db_admin
+mkdir -p "$F2B_DIR/fail2ban.d"; printf '[DEFAULT]\ndbpurgeage = 2d\n' > "$F2B_DIR/fail2ban.local"
+fail2ban_stage
+[[ ! -e "$F2B_DB_FILE" ]] && grep -Fq 'fail2ban.local 里已经设置了封禁历史的保留时间' "$CASE_DIR/ok" || fail 'an administrator history length was overridden'
+grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'Fail2ban not configured next to an own history length'
+passed 'a ban history length set by the administrator is kept'
+
+# Not chosen: key-only login under 1 GiB; still installed when the password
+# login stayed on (the hardening was not done after all).
+new_case declined
+F2B_CHOICE=0 MEM_MIB=512 PASSWORD_LOGIN=no
+fail2ban_stage
+[[ ! -e "$F2B_FILE" && ! -s "$CASE_DIR/events" ]] && grep -Fxq 'fail2ban declined' "$CASE_DIR/results" || fail 'a declined Fail2ban was configured'
+new_case declined_password
+F2B_CHOICE=0 MEM_MIB=512 PASSWORD_LOGIN=yes
+fail2ban_stage
+grep -Fxq 'fail2ban applied' "$CASE_DIR/results" && grep -Fq '仍允许密码登录' "$CASE_DIR/ok" || fail 'Fail2ban skipped although passwords still work'
+MEM_MIB=4096 PASSWORD_LOGIN=yes
+f2b_optional 1 && fail 'optional with 4 GiB'
+MEM_MIB=512; f2b_optional 1 || fail 'not optional below 1 GiB when the hardening makes the login key-only'
+PASSWORD_LOGIN=yes; if f2b_optional 0; then fail 'optional with password login'; fi
+PASSWORD_LOGIN=no; f2b_optional 0 || fail 'not optional with key-only login below 1 GiB'
+MEM_MIB=4096 PASSWORD_LOGIN=yes
+passed 'Fail2ban is optional only with key-only login below 1 GiB'
 
 printf '%s Fail2ban mock cases passed.\n' "$PASS"

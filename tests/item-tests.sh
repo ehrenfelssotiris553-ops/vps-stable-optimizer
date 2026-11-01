@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action param_list param_names item_firewall_pause item_ask_reboot_time reboot_time_normalize restore_tool_package item_menu guard_confirm coreutils_selfcheck release_info
+load_optimizer_functions f2b_optional ssh_effective_value confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action param_list param_names item_firewall_pause item_ask_reboot_time reboot_time_normalize restore_tool_package item_menu guard_confirm coreutils_selfcheck release_info
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -77,6 +77,8 @@ printf 'PASS: the recommended set is one question and still respects an empty up
   swap_exists() { return 1; }
   IPV6_BROKEN=0
   ipv6_broken() { ((IPV6_BROKEN)); }
+  PASSWORD_LOGIN=yes
+  ssh_effective() { printf 'passwordauthentication %s\nkbdinteractiveauthentication no\n' "$PASSWORD_LOGIN"; }
   RECOMMENDED=1 UPGRADE_APPROVED=1 AUTO_UPDATES=1 MEM_MIB=4096 INSTALL_TOOLS=0 SSH_CONNECTION='203.0.113.9 1 192.0.2.1 22'
   TOOLS_PACKAGES=(curl)
   setup_questions < /dev/null > "$TEST_ROOT/q-out"
@@ -93,7 +95,15 @@ printf 'PASS: the recommended set is one question and still respects an empty up
   setup_questions < /dev/null > "$TEST_ROOT/q-out"
   [[ "$IPV4_CHOICE" == 1 ]] || fail 'IPv4 first not recommended with a broken IPv6'
   [[ "$SSH_CHOICE" == 0 && "$WEB_CHOICE" == 0 ]] || fail 'SSH/web questions were not asked separately'
-  [[ "$F2B_IGNORE_CHOICE" == 203.0.113.9 ]] || fail "recommended mode did not offer the Fail2ban allowlist: $F2B_IGNORE_CHOICE"
+  [[ "$F2B_IGNORE_CHOICE" == 203.0.113.9 && "$F2B_CHOICE" == 1 ]] || fail "recommended mode did not offer the Fail2ban allowlist: $F2B_IGNORE_CHOICE"
+  # Key-only login below 1 GiB: Fail2ban is left out, and so is its allowlist.
+  PASSWORD_LOGIN=no
+  setup_questions < /dev/null > "$TEST_ROOT/q-out"
+  [[ "$F2B_CHOICE" == 0 && "$F2B_IGNORE_CHOICE" == none ]] || fail "Fail2ban recommended with key-only login below 1 GiB: $F2B_CHOICE $F2B_IGNORE_CHOICE"
+  grep -Fq 'Fail2ban 防的是猜密码' "$TEST_ROOT/q-out" || fail 'leaving Fail2ban out not explained'
+  PASSWORD_LOGIN=yes MEM_MIB=4096
+  setup_questions < /dev/null > "$TEST_ROOT/q-out"
+  [[ "$F2B_CHOICE" == 1 ]] || fail 'Fail2ban left out with 4 GiB'
 )
 printf 'PASS: recommended mode sets only the low-risk items and still asks about SSH, web ports and the Fail2ban allowlist.\n'
 

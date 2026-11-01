@@ -50,6 +50,7 @@ SYSCTL_HARDENING_FILE=/etc/sysctl.d/98-vps-stable-hardening.conf
 # Larger socket buffer ceilings for fast long-distance flows (optional).
 TCP_BUFFER_FILE=/etc/sysctl.d/99-vps-stable-tcp.conf
 F2B_ACTION_FILE=/etc/fail2ban/action.d/vps-stable-ufw-sshd.conf
+F2B_DB_FILE=/etc/fail2ban/fail2ban.d/99-vps-stable.local
 # sshd keeps the FIRST value it reads; 01- sorts before cloud-init's 50- file.
 SSH_DROPIN=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
 # Only written when a provider image ships "PubkeyAuthentication no".
@@ -910,11 +911,20 @@ setup_questions() {
     SSH_CHOICE=0
   fi
   if confirm_yes '防火墙同时放行网站端口 TCP 80、443 吗？（只做代理或跳板可以不开，以后可用端口管理再放行）'; then WEB_CHOICE=1; else WEB_CHOICE=0; fi
+  F2B_CHOICE=1
+  if f2b_optional "$SSH_CHOICE"; then
+    if [[ "${RECOMMENDED:-0}" == 1 ]]; then
+      F2B_CHOICE=0
+      echo '只允许密钥登录、内存不到 1 GiB：Fail2ban 防的是猜密码，这里猜不中，按推荐不装（省约 30 MB 内存；以后可在单项设置里开启）。'
+    elif ! confirm_yes '只允许密钥登录、内存不到 1 GiB：Fail2ban 防的是猜密码，这里猜不中。仍然装 Fail2ban 吗？（约占 30 MB 内存；不装的话扫描请求照样打过来，日志会多一些）'; then
+      F2B_CHOICE=0
+    fi
+  fi
   F2B_IGNORE_CHOICE=none
   ip="${SSH_CONNECTION:-}"; ip="${ip%% *}"
   # Asked in the recommended set too: a mistyped password must not lock the
   # administrator out (bans start at one hour and double on repeat).
-  if [[ -n "$ip" ]] && port_source_valid "$ip" &&
+  if ((F2B_CHOICE)) && [[ -n "$ip" ]] && port_source_valid "$ip" &&
      confirm_default_yes "把你当前的 IP $ip 加入 Fail2ban 白名单吗？（输错密码也不会被封，连 SSH 也不限速；家庭宽带 IP 常会变化，换了就失效）"; then
     F2B_IGNORE_CHOICE="$ip"
   fi
@@ -1970,13 +1980,18 @@ param_list() {
     conntrack_hours conntrack '已建立连接的保留时间' 小时 \
     ssh_keepalive_seconds keepalive 'SSH 保活间隔' 秒 \
     apt_upgrade_time updates '每天自动安全更新的时间' '' \
-    tools_list tools '常用工具清单' ''
+    tools_list tools '常用工具清单' '' \
+    f2b_maxretry fail2ban 'Fail2ban 允许输错的次数' 次 \
+    f2b_findtime_min fail2ban 'Fail2ban 统计输错的时间窗口' 分钟 \
+    f2b_bantime_min fail2ban 'Fail2ban 首次封禁时长' 分钟 \
+    f2b_increment fail2ban 'Fail2ban 再犯加倍' '' \
+    f2b_maxtime_days fail2ban 'Fail2ban 最长封禁时长' 天
 }
 
 # NAME: "int" (a whole number) or "word" (one of a few names).
 param_kind() {
   case "$1" in
-    zram_algorithm|apt_upgrade_time|tools_list) echo word ;;
+    zram_algorithm|apt_upgrade_time|tools_list|f2b_increment) echo word ;;
     *) echo int ;;
   esac
 }
@@ -2009,6 +2024,11 @@ param_recommended() {
     # The distribution's own time (apt-daily-upgrade.timer: 06:00, up to an hour later).
     apt_upgrade_time) echo 06:00 ;;
     tools_list) echo 'curl wget ca-certificates vim htop unzip lsof tmux' ;;
+    f2b_maxretry) echo 5 ;;
+    f2b_findtime_min) echo 10 ;;
+    f2b_bantime_min) echo 60 ;;
+    f2b_increment) echo yes ;;
+    f2b_maxtime_days) echo 7 ;;
     *) return 1 ;;
   esac
 }
@@ -2036,6 +2056,11 @@ param_reason() {
     ssh_keepalive_seconds) echo '60 秒：比常见的路由器和防火墙丢掉空闲连接的时间（几分钟）短，连接放着不动也不会卡死；断网后约 3 分钟服务器会清掉死连接。' ;;
     apt_upgrade_time) echo '系统默认每天 06:00（服务器时间）左右，随机推迟最多一小时；改到业务最闲的时候，可以避开高峰。' ;;
     tools_list) echo '装几个排查问题时常用的小工具：下载（curl、wget）、编辑（vim）、看进程（htop）、解压（unzip）、看端口（lsof）、防断线（tmux）。' ;;
+    f2b_maxretry) echo '10 分钟里输错 5 次才封：自己偶尔输错不会被封，猜密码的程序试几次就被挡住。' ;;
+    f2b_findtime_min) echo '只数最近 10 分钟的输错：几天前的输错不会算上，连着猜的程序很快就数满。' ;;
+    f2b_bantime_min) echo '首次封 1 小时：自己输错了等一会儿还能登录，猜密码的程序多半就换别的目标了。' ;;
+    f2b_increment) echo 'yes：同一个 IP 再犯，封禁时间加倍（1 小时、2 小时、4 小时……），反复来的越封越久。封禁历史至少保留 7 天，才认得出再犯。' ;;
+    f2b_maxtime_days) echo '最长封 7 天：反复来的扫描基本挡住了，又不会把以后分给别人的 IP 一直封着。' ;;
   esac
 }
 
@@ -2080,6 +2105,21 @@ param_check() {
       done
       if ((n >= 1 && n <= 30)); then return 0; fi
       echo '请输入 1 到 30 个软件包名，用空格隔开。' ;;
+    f2b_maxretry)
+      if [[ "$2" =~ ^[0-9]{1,2}$ ]] && ((10#$2 >= 2 && 10#$2 <= 20)); then return 0; fi
+      echo '请输入 2 到 20 之间的整数（次）。' ;;
+    f2b_findtime_min)
+      if [[ "$2" =~ ^[0-9]{1,4}$ ]] && ((10#$2 >= 1 && 10#$2 <= 1440)); then return 0; fi
+      echo '请输入 1 到 1440 之间的整数（分钟）。' ;;
+    f2b_bantime_min)
+      if [[ "$2" =~ ^[0-9]{1,5}$ ]] && ((10#$2 >= 1 && 10#$2 <= 10080)); then return 0; fi
+      echo '请输入 1 到 10080 之间的整数（分钟，最多 7 天）。' ;;
+    f2b_increment)
+      case "$2" in yes|no) return 0 ;; esac
+      echo '请输入 yes（再犯加倍）或 no（每次都封首次那么久）。' ;;
+    f2b_maxtime_days)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 1 && 10#$2 <= 365)); then return 0; fi
+      echo '请输入 1 到 365 之间的整数（天）。' ;;
     *) echo "没有这个参数：$1" ;;
   esac
   return 1
@@ -2113,6 +2153,17 @@ param_caution() {
       if ((10#$2 > 300)); then echo '超过 5 分钟：有些路由器会先把空闲连接丢掉，连接还是可能卡死。'; fi ;;
     tools_list)
       if [[ " $2 " != *' tmux '* ]]; then echo '去掉了 tmux：一键开荒防断线要用它，开荒时仍会单独问你装不装。'; fi ;;
+    f2b_maxretry)
+      if ((10#$2 < 3)); then echo '少于 3 次：自己输错一两次就会被封（白名单里的 IP 不受影响）。'
+      elif ((10#$2 > 10)); then echo '超过 10 次：猜密码的程序每轮能多试不少密码。'; fi ;;
+    f2b_findtime_min)
+      if ((10#$2 < 5)); then echo '不到 5 分钟：放慢速度猜密码的程序很难数满次数，基本不会被封。'; fi ;;
+    f2b_bantime_min)
+      if ((10#$2 < 10)); then echo '不到 10 分钟：猜密码的程序等一会儿就能接着试。'; fi ;;
+    f2b_increment)
+      if [[ "$2" == no ]]; then echo '不加倍：反复来的扫描每次只封首次那么久。'; fi ;;
+    f2b_maxtime_days)
+      if ((10#$2 > 30)); then echo '超过 30 天：这个 IP 以后分给别人，别人也连不上；封禁历史也要保留这么久，数据库会大一些。'; fi ;;
   esac
 }
 
@@ -2652,16 +2703,76 @@ f2b_bootstrap_text() {
     '[sshd]' 'enabled = false'
 }
 
-# Bans start at one hour and double for an address banned again (Fail2ban
-# 0.11+ looks up earlier bans in its database), up to one week. A mistyped
-# password costs the administrator an hour; persistent scanners stay out.
+# PORTS [IGNORE]: the jail from the parameters. Bans start at the first ban
+# time (an hour) and, with the doubling on, double for an address banned again
+# (Fail2ban 0.11+ looks up earlier bans in its database), up to the longest
+# (a week). A mistyped password costs the administrator an hour; persistent
+# scanners stay out.
 f2b_jail_text() {
+  local ban max increment=false
+  ban=$(($(param_value f2b_bantime_min) * 60)) max=$(($(param_value f2b_maxtime_days) * 86400))
+  ((max >= ban)) || max="$ban"
+  if [[ "$(param_value f2b_increment)" == yes ]]; then increment=true; fi
+  f2b_jail_values_text "$1" "$(param_value f2b_maxretry)" $(($(param_value f2b_findtime_min) * 60)) "$ban" "$increment" "$max" "${2:-}"
+}
+
+# PORTS MAXRETRY FINDTIME BANTIME INCREMENT MAXTIME [IGNORE]: times in seconds,
+# INCREMENT true or false.
+f2b_jail_values_text() {
   printf '%s\n' '# VPS Stable Optimizer v2.6 managed SSH jail' \
     '[sshd]' 'enabled = true' "port = $1" 'backend = systemd' \
     'action = vps-stable-ufw-sshd[port="%(port)s"]' \
-    'maxretry = 5' 'findtime = 600' 'bantime = 3600' \
-    'bantime.increment = true' 'bantime.maxtime = 604800'
-  if [[ -n "${2:-}" ]]; then printf 'ignoreip = 127.0.0.1/8 ::1 %s\n' "$2"; fi
+    "maxretry = $2" "findtime = $3" "bantime = $4" \
+    "bantime.increment = $5" "bantime.maxtime = $6"
+  if [[ -n "${7:-}" ]]; then printf 'ignoreip = 127.0.0.1/8 ::1 %s\n' "$7"; fi
+}
+
+# What the parameters say, in words: "输错 5 次（10 分钟内）封 1 小时，再犯加倍，最长 7 天".
+f2b_policy_text() {
+  local ban
+  ban="$(param_value f2b_bantime_min)"
+  if ((ban % 60 == 0)); then ban="$((ban / 60)) 小时"; else ban="$ban 分钟"; fi
+  printf '输错 %s 次（%s 分钟内）封 %s' "$(param_value f2b_maxretry)" "$(param_value f2b_findtime_min)" "$ban"
+  if [[ "$(param_value f2b_increment)" == yes ]]; then printf '，同一 IP 再犯时间加倍，最长 %s 天' "$(param_value f2b_maxtime_days)"; fi
+}
+
+# Fail2ban keeps bans in its database for a day by default: an address banned
+# again later starts over at the first ban time. Kept for the longest ban, at
+# least a week.
+f2b_db_text() {
+  local age=604800 max
+  max=$(($(param_value f2b_maxtime_days) * 86400))
+  ((max <= age)) || age="$max"
+  printf '%s\n' '# VPS Stable Optimizer v2.8: how long bans are remembered ("banned again" doubles)' '[DEFAULT]' "dbpurgeage = $age"
+}
+
+# Writes (or writes again, after a parameter change) this tool's file; a
+# history length set in another file is kept.
+f2b_db_apply() {
+  local f text
+  text="$(f2b_db_text)"
+  for f in "$F2B_DIR/fail2ban.local" "$F2B_DIR"/fail2ban.d/*.conf "$F2B_DIR"/fail2ban.d/*.local; do
+    [[ -f "$f" && "$f" != "$F2B_DB_FILE" ]] || continue
+    if grep -Eq '^[[:space:]]*dbpurgeage[[:space:]]*=' "$f"; then ok "$f 里已经设置了封禁历史的保留时间，保持不变。"; return 0; fi
+  done
+  if [[ -e "$F2B_DB_FILE" || -L "$F2B_DB_FILE" ]]; then
+    [[ "$(cat -- "$F2B_DB_FILE" 2>/dev/null || true)" != "$text" ]] || return 0
+    restore_file_ours f2b_db_file || { warn "$F2B_DB_FILE 不是本工具写的，保持不变。"; return 0; }
+    rm -f -- "$F2B_DB_FILE"
+  fi
+  put_file "$F2B_DB_FILE" "$text" || warn "没能写入 $F2B_DB_FILE：再犯加倍只认得最近 1 天里封过的 IP。"
+}
+
+# Fail2ban only guards against guessed passwords: with key-only login on a
+# machine under 1 GiB it is offered, not recommended (it takes about 30 MB).
+# HARDEN: 1 when this setup is about to make the login key-only.
+f2b_optional() {
+  local effective
+  ((${MEM_MIB:-0} < 1024)) || return 1
+  [[ "${1:-0}" == 1 ]] && return 0
+  effective="$(ssh_effective root)" || return 1
+  [[ "$(ssh_effective_value "$effective" passwordauthentication)" == no &&
+     "$(ssh_effective_value "$effective" kbdinteractiveauthentication)" != yes ]]
 }
 
 # Up to 2.7.5 every ban lasted 12 hours. Such a jail is upgraded in place.
@@ -2672,12 +2783,18 @@ f2b_jail_legacy_text() {
     'maxretry = 5' 'findtime = 600' 'bantime = 43200'
 }
 
-# The managed jail (current or earlier) with or without an ignoreip line
-# still belongs to this tool.
+# The managed jail (current or earlier, with any parameters) with or without
+# an ignoreip line still belongs to this tool: its values are read back, and
+# the jail made from them must be the same text.
 f2b_jail_is_ours() {
   local body
+  local -a values=()
   body="$(grep -v '^ignoreip = ' <<< "$1" || true)"
-  [[ "$body" == "$(f2b_jail_text "$2")" || "$body" == "$(f2b_jail_legacy_text "$2")" ]]
+  [[ "$body" == "$(f2b_jail_legacy_text "$2")" ]] && return 0
+  read -r -a values < <(awk -F' = ' '$1 == "maxretry" || $1 == "findtime" || $1 == "bantime" || $1 == "bantime.increment" || $1 == "bantime.maxtime" {v[$1] = $2}
+    END {print v["maxretry"], v["findtime"], v["bantime"], v["bantime.increment"], v["bantime.maxtime"]}' <<< "$body") || return 1
+  ((${#values[@]} == 5)) || return 1
+  [[ "$body" == "$(f2b_jail_values_text "$2" "${values[@]}")" ]]
 }
 
 # The allowlist: the addresses on this tool's jail ignoreip line, one per line
@@ -2850,6 +2967,15 @@ f2b_jail_ready() {
 
 fail2ban_stage() {
   step 15 'Fail2ban（防火墙生效后，只封 SSH 端口）'
+  # Not chosen (key-only login under 1 GiB), unless password login is still
+  # on after all (the SSH hardening was not done).
+  if [[ "${F2B_CHOICE:-1}" == 0 ]]; then
+    if f2b_optional; then
+      ok '只允许密钥登录、内存不到 1 GiB：按你的选择不装 Fail2ban（以后可在单项设置里开启）。'
+      module_result fail2ban declined 'key-only login, RAM < 1 GiB'; return 0
+    fi
+    ok 'SSH 仍允许密码登录：Fail2ban 还是要装。'
+  fi
   if [[ "${FIREWALL_READY:-0}" != 1 ]]; then
     warn '防火墙没有确认生效，跳过 Fail2ban。'
     module_result fail2ban skipped 'firewall not ready'; return 0
@@ -2912,6 +3038,7 @@ fail2ban_stage() {
   if ! command -v fail2ban-client >/dev/null || ! installed python3-systemd; then
     warn '缺少 Fail2ban 或它读取系统日志的组件，不启用规则。'; return 0
   fi
+  f2b_db_apply
   if foreign_f2b_config; then
     warn '安装过程中出现了其他 Fail2ban 配置，保持不变，规则保持停用。'; return 0
   fi
@@ -2939,7 +3066,7 @@ fail2ban_stage() {
     if ! systemctl start fail2ban; then warn '无法启动 Fail2ban。'; return 0; fi
   fi
   if f2b_jail_ready; then
-    ok "Fail2ban 已就绪：只封禁 SSH 端口 $joined 的 TCP 连接；首次封 1 小时，同一 IP 再犯时间加倍，最长 7 天。"
+    ok "Fail2ban 已就绪：只封禁 SSH 端口 $joined 的 TCP 连接；$(f2b_policy_text)。"
     module_result fail2ban applied "sshd jail on $joined"
   else
     warn 'Fail2ban 已启动，但 SSH 规则没有加载，请查看状态和日志。'
@@ -4540,7 +4667,7 @@ backup_config_group() {
 backup_configs() {
   local file unit
   say '保存配置快照与优化前状态'
-  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
+  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
       /etc/ssh/sshd_config /etc/default/ssh /etc/default/ufw \
       /etc/ufw/ufw.conf /etc/ufw/sysctl.conf /etc/ufw/before.rules /etc/ufw/before6.rules \
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
@@ -5449,13 +5576,13 @@ restore_ids() {
     hostname) printf '%s\n' hostname cloud_hostname_file ;;
     ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     firewall) printf '%s\n' ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw ;;
-    fail2ban) printf '%s\n' f2b_jail f2b_action svc_fail2ban ;;
+    fail2ban) printf '%s\n' f2b_jail f2b_action f2b_db_file svc_fail2ban ;;
   esac
   return 0
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban
 }
 
 restore_label() {
@@ -5473,7 +5600,7 @@ restore_label() {
     tz) echo '时区' ;; ssh_dropin) echo 'SSH 仅密钥登录配置' ;; ssh_pubkey_dropin) echo 'SSH 公钥登录开关' ;;
     ufw_policy_in) echo '防火墙入站默认策略' ;; ufw_policy_out) echo '防火墙出站默认策略' ;;
     ufw_runtime) echo '防火墙开关' ;; svc_ufw) echo '防火墙服务' ;;
-    f2b_jail) echo 'Fail2ban SSH 规则' ;; f2b_action) echo 'Fail2ban 封禁动作' ;;
+    f2b_jail) echo 'Fail2ban SSH 规则' ;; f2b_action) echo 'Fail2ban 封禁动作' ;; f2b_db_file) echo 'Fail2ban 封禁历史的保留时间' ;;
     svc_fail2ban) echo 'Fail2ban 服务' ;; sysctl_file) echo '内核网络安全参数' ;;
     tcp_file) echo 'TCP 缓冲区上限' ;;
     apt_reboot_file) echo '自动更新的重启时间' ;; hosts_file) echo '/etc/hosts 主机名' ;;
@@ -5490,6 +5617,7 @@ restore_path() {
     apt_file) printf '%s\n' "$APT_FILE" ;; f2b_jail) printf '%s\n' "$F2B_FILE" ;;
     apt_auto_file) echo /etc/apt/apt.conf.d/20auto-upgrades ;;
     f2b_action) printf '%s\n' "$F2B_ACTION_FILE" ;;
+    f2b_db_file) printf '%s\n' "$F2B_DB_FILE" ;;
     ssh_dropin) printf '%s\n' "$SSH_DROPIN" ;;
     ssh_pubkey_dropin) printf '%s\n' "$SSH_PUBKEY_DROPIN" ;;
     sysctl_file) printf '%s\n' "$SYSCTL_HARDENING_FILE" ;;
@@ -6048,7 +6176,7 @@ f2b_action_referenced_elsewhere() {
 restore_fail2ban_group() {
   local id ips ip pending=0
   local -a banned=()
-  for id in f2b_jail f2b_action svc_fail2ban; do
+  for id in f2b_jail f2b_action f2b_db_file svc_fail2ban; do
     if restore_needed "$id"; then pending=1; fi
   done
   ((pending)) || return 0
@@ -6072,6 +6200,7 @@ restore_fail2ban_group() {
   restore_resource svc_fail2ban
   restore_resource f2b_jail
   restore_resource f2b_action
+  restore_resource f2b_db_file
   # Still running after its service state was restored: it ran before this tool.
   if active fail2ban; then
     if systemctl restart fail2ban; then ok '原有 Fail2ban 已按它自己的配置重新加载。'
@@ -6431,7 +6560,7 @@ restore_group_label() {
 restore_group_ids() {
   case "$1" in
     firewall) printf '%s\n' ufw_runtime ufw_policy_in ufw_policy_out ufw_ipv6 svc_ufw ;;
-    fail2ban) printf '%s\n' f2b_jail f2b_action svc_fail2ban ;;
+    fail2ban) printf '%s\n' f2b_jail f2b_action f2b_db_file svc_fail2ban ;;
     ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     swap) printf '%s\n' swap_unit swap_file ;;
@@ -6957,7 +7086,7 @@ check_firewall() {
 }
 
 check_fail2ban() {
-  local status failed banned actions
+  local status failed banned actions want have key
   if ! active fail2ban || ! command -v fail2ban-client >/dev/null; then verify_set fail 'Fail2ban 服务没有运行'; return 0; fi
   # This tool's ban action is a UFW rule: without a running UFW nothing is blocked.
   if ! ufw_active; then verify_set fail '防火墙没有运行：Fail2ban 的封禁要靠防火墙执行，现在封不住任何 IP'; return 0; fi
@@ -6966,6 +7095,12 @@ check_fail2ban() {
   banned="$(awk -F: '/Total banned/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
   actions="$(fail2ban-client get sshd actions 2>/dev/null || true)"
   if [[ "$actions" != *vps-stable-ufw-sshd* ]]; then verify_set fail 'sshd 规则没有使用本工具的 UFW 封禁动作'; return 0; fi
+  # The values in force against the parameters (changed and not applied yet).
+  want="$(f2b_jail_text x | awk -F' = ' '$1 == "maxretry" || $1 == "findtime" || $1 == "bantime" {printf "%s ", $2}')"
+  have="$(for key in maxretry findtime bantime; do printf '%s ' "$(fail2ban-client get sshd "$key" 2>/dev/null | tr -d '[:space:]')"; done)"
+  if [[ "$have" != "$want" ]]; then
+    verify_set update "生效的是（次数 时间窗口 封禁秒数）${have% }，参数要求 ${want% }：选 5 单项设置 → Fail2ban 防爆破 → 1 开启，就会按新值应用"; return 0
+  fi
   if [[ "${failed:-0}" == 0 ]]; then
     verify_set pass '规则已加载；暂无失败登录记录（刚开机或还没被扫描，过一阵再查）'
   else
@@ -7085,7 +7220,7 @@ verify_health_units() {
 }
 
 verify_health() {
-  local failed host units names failed_tool='' failed_other='' unit count=0
+  local failed host units names failed_tool='' failed_other='' unit count=0 out
   units="$(systemctl list-units --state=failed --type=service --no-legend --no-pager --plain 2>/dev/null | awk '{print $1}' || true)"
   failed="$(grep -c . <<< "$units" || true)"
   if [[ "$failed" == 0 ]]; then verify_line healthy '系统服务' '本次启动没有失败的服务'
@@ -7101,6 +7236,17 @@ verify_health() {
       names="$(tr ' ' '\n' <<< "${failed_other# }" | head -n 3 | tr '\n' ' ')"; names="${names% }"
       if ((count > 3)); then names+=' 等'; fi
       verify_line notice '系统服务' "有 ${count} 个其他服务失败：${names}。不是本工具设置的，不影响上面的结论；用 systemctl status 加服务名查看原因（系统升级时被重启过的服务偶尔会这样，重启后再看一次）"
+    fi
+  fi
+  # A running sshd keeps working with a configuration it would now refuse (an
+  # option dropped by a major upgrade, a typo): found here, not at the next
+  # restart, when SSH would not come up.
+  if command -v sshd >/dev/null; then
+    sshd_runtime_dir
+    if out="$(sshd -t 2>&1)"; then verify_line healthy 'SSH 配置' 'sshd -t 检查通过，SSH 服务重启后能正常起来'
+    else
+      out="$(head -n 1 <<< "$out" | audit_clean_text | cut -c1-200)"
+      verify_line fail 'SSH 配置' "sshd -t 没有通过（${out:-没有说明}）：现在的连接不受影响，但 SSH 服务下次重启（包括重启服务器）时会起不来。先改好配置，再用 sshd -t 确认"
     fi
   fi
   if [[ "$OS" == ubuntu ]]; then host=archive.ubuntu.com; else host=deb.debian.org; fi
@@ -7898,13 +8044,17 @@ item_action() {
     firewall) echo '1. 开启（需要新开 SSH 窗口确认）   2. 临时关闭   3. 撤销本工具的防火墙设置   0. 返回' ;;
     timezone) echo '1. 修改时区   2. 恢复成原来的时区   0. 返回' ;;
     hostname) echo '1. 修改显示名   2. 修改主机名   3. 撤销主机名修改（恢复原来的名字）   0. 返回' ;;
-    fail2ban) echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 管理白名单（不会被封的 IP）   0. 返回' ;;
+    fail2ban) echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 管理白名单（不会被封的 IP）   4. 调整参数   5. 恢复推荐值   0. 返回' ;;
     autoreboot) echo '1. 设置自动重启时间   2. 取消（撤销本工具的设置）   0. 返回' ;;
     ssh) echo '1. 加固（只允许密钥登录，可选禁止 root）   2. 撤销（恢复密码和 root 登录）   0. 返回' ;;
     *) if [[ -n "$(param_names "$key")" ]]; then echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 调整参数   4. 恢复推荐值   0. 返回'
        else echo '1. 开启   2. 关闭（撤销本工具的修改）   0. 返回'; fi ;;
   esac
   read -r -p '请选择: ' choice || return 0
+  # Fail2ban's 3 is the allowlist: its parameters are 4 and 5.
+  if [[ "$key" == fail2ban ]]; then
+    case "$choice" in 4) choice=3 ;; 5) choice=4 ;; 3) f2b_allowlist_menu; return 0 ;; esac
+  fi
   if [[ ( "$choice" == 3 || "$choice" == 4 ) && -n "$(param_names "$key")" ]]; then
     if [[ "$choice" == 3 ]]; then param_adjust "$key"; else param_reset "$key"; fi
     return 0
@@ -7914,7 +8064,6 @@ item_action() {
     hostname:2) item_turn_on hostname ;;
     hostname:3) item_turn_off hostname ;;
     hostname:*) return 0 ;;
-    fail2ban:3) f2b_allowlist_menu ;;
     firewall:2) item_firewall_pause ;;
     firewall:3) item_turn_off firewall ;;
     upgrade:1|kernel:1) item_turn_on "$key" ;;
