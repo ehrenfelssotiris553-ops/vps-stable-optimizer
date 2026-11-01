@@ -1,5 +1,6 @@
 # Layer 3: an official cloud image of every supported release as a VM with
-# 512 MiB inside the runner. Covers SSH from outside, a reboot, setup in tmux
+# 512 MiB inside the runner (and Ubuntu 24.04 once more with 1.5 GiB, the
+# middle size most VPSs have). Covers SSH from outside, a reboot, setup in tmux
 # after a dropped connection and the SSH hardening for real. Runs before a
 # release (push to a release/ branch), weekly, or by hand.
 name: vm-run
@@ -25,6 +26,9 @@ jobs:
       matrix:
         system: [debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, ubuntu-26.04,
                  debian-12-old, ubuntu-22.04-old, ubuntu-24.04-old]
+        memory: [512]
+        include:
+          - {system: ubuntu-24.04, memory: 1536}
     steps:
       - uses: actions/checkout@v5
       - name: KVM for the nested VM
@@ -38,12 +42,12 @@ jobs:
           sudo apt-get update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils expect openssh-client
-      - name: ${{ matrix.system }} VM
-        run: bash tests/ci/report.sh '${{ matrix.system }} VM' bash tests/ci/vm-run.sh ${{ matrix.system }} 512
+      - name: ${{ matrix.system }} VM (${{ matrix.memory }} MiB)
+        run: bash tests/ci/report.sh '${{ matrix.system }} VM ${{ matrix.memory }} MiB' bash tests/ci/vm-run.sh ${{ matrix.system }} ${{ matrix.memory }}
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: vm-run-${{ matrix.system }}
+          name: vm-run-${{ matrix.system }}-${{ matrix.memory }}
           path: ${{ runner.temp }}/vps-ci-logs
           if-no-files-found: ignore

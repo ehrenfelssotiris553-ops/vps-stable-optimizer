@@ -30,6 +30,8 @@ CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_co
            'net.ipv4.tcp_available_ulp')
 # What the tool itself sets: compared even across a kernel change.
 TOOL_KEYS = re.compile(r'^(net\.ipv[46]\.conf\.|net\.ipv4\.(tcp_congestion_control|tcp_syncookies|icmp_)'
+                       r'|net\.ipv4\.tcp_(slow_start_after_idle|mtu_probing)$|net\.ipv6\.icmp\.'
+                       r'|net\.netfilter\.nf_conntrack_tcp_timeout_established$'
                        r'|net\.core\.(default_qdisc|rmem_max|wmem_max)|vm\.(swappiness|page-cluster)'
                        r'|kernel\.(kptr_restrict|dmesg_restrict))')
 # Defaults the kernel works out from the free memory at boot: after a reboot
@@ -246,10 +248,11 @@ def main():
             # useradd/userdel keep the previous copy: a package that added its
             # system user and removed it again with its purge (vnstat).
             explained.append(f'{what}: {path} (backup copy; {path[:-1]} itself is exactly as before)')
-        elif what in ('file added', 'file changed') and path in rc_files:
+        elif what in ('file added', 'file changed') and path in rc_files and 'vps-stable' not in path:
             continue  # listed with the package warning
-        elif what == 'file added' and path.rsplit('/', 1)[0] in rc_dirs - SHARED_RC_DIRS:
-            continue  # in the configuration directory a removed package keeps
+        elif (what == 'file added' and path.rsplit('/', 1)[0] in rc_dirs - SHARED_RC_DIRS
+              and 'vps-stable' not in path):
+            continue  # in the configuration directory a removed package keeps (not one of the tool's files)
         else:
             unexplained.append(f'{what}: {path}')
     la, lb = pairs(a, 'link', ' -> '), pairs(b, 'link', ' -> ')

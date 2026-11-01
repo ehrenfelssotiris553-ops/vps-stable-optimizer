@@ -30,6 +30,14 @@ for locale in C "$(locale -a 2>/dev/null | grep -im1 '^c\.utf-\?8$' || echo C)";
 done
 printf 'PASS: display widths count CJK, full-width punctuation and symbols as two columns.\n'
 
+# VPS_ASCII on the command line wins over the saved setting either way (the
+# help text offers VPS_ASCII=1 for terminals that draw the symbols as boxes).
+# The tool's first message without a terminal is a stop with the failure mark.
+first_mark() { env "$@" NO_COLOR=1 bash "$TEST_SCRIPT" menu < /dev/null 2>&1 | head -n 1 | cut -d' ' -f1; }
+[[ "$(first_mark VPS_ASCII=1)" == '[X]' ]] || fail "VPS_ASCII=1 does not switch to ASCII: $(first_mark VPS_ASCII=1)"
+[[ "$(first_mark VPS_ASCII=0)" == '✖' ]] || fail "VPS_ASCII=0 does not keep the symbols: $(first_mark VPS_ASCII=0)"
+printf 'PASS: VPS_ASCII=1 and VPS_ASCII=0 decide the symbols.\n'
+
 # Setup steps show how far the setup is; a single item shows its title only.
 UI_STEPS=0
 [[ "$(step 10 '自动安全更新')" == 'SAY 自动安全更新' ]] || fail 'a step outside a setup was numbered'

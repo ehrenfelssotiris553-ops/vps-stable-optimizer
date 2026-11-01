@@ -9,6 +9,8 @@
 # Disk swap next to the runner's own swap.
 仍然加一个吗？ ==> y
 仍然禁止 ping 吗？ ==> y
+# Preferring IPv4 from the single item (the setup itself answers n).
+改成优先使用 IPv4 吗？ ==> y
 # TG (a stand-in on 127.0.0.1 answers), the traffic alert, Docker's log limit.
 Bot Token ==> $TG_TOKEN
 发好了按回车 ==>

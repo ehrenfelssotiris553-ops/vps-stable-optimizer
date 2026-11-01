@@ -2,7 +2,8 @@
 # CI only, layer 3: the real tool on an official cloud image of each
 # supported release, as a small VM inside the runner (QEMU, with KVM when the
 # runner offers it). It covers what the runner itself cannot:
-# - every supported release on a small-memory machine;
+# - every supported release on a small-memory machine, and one with 1.5 GiB
+#   (from 1 GiB on the recommended set raises the TCP buffers);
 # - SSH logins from outside (the new-login confirmation, and fast repeated
 #   logins from the allowlisted address);
 # - the real effect from outside: a port the firewall blocks, opens and
@@ -179,6 +180,14 @@ lc_mark 'after the install'
 zram_kernel=1
 vm 'modinfo zram >/dev/null 2>&1' || zram_kernel=0
 printf 'zram module in this kernel: %s\n' "$zram_kernel"
+# From 1 GiB of RAM the recommended set raises the TCP buffers (16 MiB below
+# 1 GiB, 32 below 4 GiB, 64 above): the kernel's value from before the tool,
+# for the rollback.
+# shellcheck disable=SC2016
+vm_mem="$(vm 'awk "/^MemTotal:/ {printf \"%d\", \$2 / 1024}" /proc/meminfo')"
+tcp_want=64; if ((vm_mem < 4096)); then tcp_want=32; fi; if ((vm_mem < 1024)); then tcp_want=16; fi
+tcp_before="$(vm "sysctl -n net.ipv4.tcp_rmem | awk '{print \$3}'")"
+printf 'RAM %s MiB: TCP buffers %s, receive cap before the tool %s\n' "$vm_mem" "$(if ((vm_mem >= 1024)); then echo "raised to $tcp_want MiB"; else echo 'left alone'; fi)" "$tcp_before"
 endgroup
 
 if ((old)); then
@@ -263,6 +272,11 @@ check_all() {
   if (($# == 0)); then
     vm "mkdir -p /run/sshd; sshd -T 2>/dev/null | grep -qx 'clientaliveinterval ${ka_kept:-60}'" ||
       fail "$name: sshd does not use a keepalive of ${ka_kept:-60} seconds"
+  fi
+  if ((vm_mem >= 1024)); then
+    passed "$name" 'TCP 缓冲区上限'
+    ssh "${VM_OPTS[@]}" "${VM_AS:-$VM_HOST}" 'sysctl -n net.ipv4.tcp_rmem' | awk -v w=$((tcp_want * 1048576)) '$3 == w {f = 1} END {exit !f}' ||
+      fail "$name: the kernel's TCP receive cap is not $tcp_want MiB"
   fi
   if ((zram_kernel)); then passed "$name" 'ZRAM 内存缓冲'
   else
@@ -404,6 +418,20 @@ sleep 30
 reachable || fail 'the stranger is still blocked after the unban'
 endgroup
 
+group 'From outside: the SSH rate limit holds for everyone else (what the allowlisted address skips)'
+vm 'ufw show added' | grep -Fx 'ufw limit 22/tcp' > /dev/null || fail 'SSH is not rate limited although password login is on'
+# Kept off Fail2ban's books for this (at runtime only, the jail file stays), so
+# that only UFW decides: from the 6th new connection within 30 seconds it
+# refuses the address. A ban would refuse them too and prove nothing.
+vm 'fail2ban-client set sshd addignoreip 10.0.3.2' > /dev/null || fail 'cannot keep the stranger off Fail2ban for the test'
+sleep 31
+refused=0
+for ((i = 0; i < 10; i++)); do reachable || refused=$((refused + 1)); done
+vm 'fail2ban-client set sshd delignoreip 10.0.3.2' > /dev/null || true
+printf 'Quick connections from the stranger refused by the rate limit: %s of 10\n' "$refused"
+((refused >= 3)) || fail "the SSH rate limit did not hold: $refused of 10 quick connections refused"
+endgroup
+
 group 'Rename the machine; the display name in Chinese'
 old_name="$(vm hostname)"
 # The single item from the tool's own list: 2 renames, then 1 sets the display name.
@@ -469,10 +497,11 @@ fi
 lc_mark 'after the reboot and the setups again'
 
 group 'SSH port: 22 to 2244 from outside (the old port closed only after a login on the new one), then back'
-# Single item 30; the login that confirms stays a few seconds on the new port
-# ($VM_SSH_NEW is expanded by the shell answer.exp starts).
+# The single item from the tool's own list; the login that confirms stays a
+# few seconds on the new port ($VM_SSH_NEW is expanded by the shell answer.exp starts).
+index="$(item_index sshport)" || fail 'no single item sshport'
 # shellcheck disable=SC2016
-printf '%s\n' '请选择要修改的项目 ==> @seq 30 0' '请选择: ==> 1' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
   '等待确认（剩余 ==> !$VM_SSH_NEW sleep 10' > "$LOGS/sshport-on.rules"
 vm_drive "$LOGS/sshport-on.rules" sshport-on vps item || fail "the port change exited with $?"
 has sshport-on 'SSH 端口已改成 2244'
@@ -485,7 +514,7 @@ if ! grep -Fxq 'Port 2244' "$LOGS/sshport-state.txt" || ! grep -Fxq 'ufw limit 2
 fi
 if grep -Eq '^ufw (allow|limit) 22/tcp$' "$LOGS/sshport-state.txt"; then fail "the firewall still lets the old port in"; fi
 # Back, logged in on the new port: the old port is let in again first.
-printf '%s\n' '请选择要修改的项目 ==> @seq 30 0' '请选择: ==> 2' '撤销本工具对 ==> y' > "$LOGS/sshport-off.rules"
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 2' '撤销本工具对 ==> y' > "$LOGS/sshport-off.rules"
 drive "$LOGS/sshport-off.rules" sshport-off ssh "${VM_NEW_OPTS[@]}" -tt "$VM_HOST" 'TERM=xterm vps item' || fail "putting the port back exited with $?"
 vm true || fail 'no login on port 22 after putting the port back'
 if ssh "${VM_NEW_OPTS[@]}" -o ConnectTimeout=5 "$VM_HOST" true 2>/dev/null; then fail 'port 2244 still lets logins in after putting the port back'; fi
@@ -552,9 +581,14 @@ vm true || fail 'root cannot log in after the rollback'
 lc_mark 'after the rollback (packages removed)'
 [[ "$(ssh_methods root)" == *password* ]] || fail "password login not restored by the rollback: $(ssh_methods root)"
 # shellcheck disable=SC2016
-vm 'for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-bbr.conf /etc/systemd/zram-generator.conf /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/systemd/journald.conf.d/99-vps-stable.conf; do [ ! -e "$f" ] || { echo "left: $f"; exit 1; }; done' ||
+vm 'for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-bbr.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/systemd/zram-generator.conf /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/fail2ban/action.d/vps-stable-ufw-sshd.conf /etc/fail2ban/fail2ban.d/99-vps-stable.local /etc/systemd/journald.conf.d/99-vps-stable.conf; do [ ! -e "$f" ] || { echo "left: $f"; exit 1; }; done' ||
   fail 'files left after rollback'
 vm 'swapon --noheadings | grep -q zram' && fail 'ZRAM still on after rollback'
+# The value the tool recorded before raising it (below 1 GiB it was never
+# raised, and the kernel works its default out from the free memory at boot).
+if ((vm_mem >= 1024)); then
+  [[ "$(vm "sysctl -n net.ipv4.tcp_rmem | awk '{print \$3}'")" == "$tcp_before" ]] || fail "the TCP receive cap is not back to $tcp_before after the rollback"
+fi
 vm '! grep -q login-hook /etc/pam.d/common-session && [ ! -e /usr/share/pam-configs/vps-stable-login ]' || fail 'the login record stayed after the rollback'
 [[ "$(vm hostname)" == "$old_name" ]] || fail "the rollback did not bring the name $old_name back: $(vm hostname)"
 vm '[ ! -e /swapfile ] && ! grep -q "^/swapfile " /proc/swaps' || fail 'the disk swap stayed after the rollback'

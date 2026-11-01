@@ -4,12 +4,14 @@
 # item switched off and on again, port management, a second check, full
 # rollback with package removal, and uninstall. Each step is followed by checks
 # on what it must leave behind. Run from anywhere; needs sudo without a password.
-# Usage: real-run.sh [fresh|upgrade|alt|docker]
+# Usage: real-run.sh [fresh|upgrade|alt|keep|docker]
 #   upgrade: install and set up with the previous release (the newest other
 #   version on origin/main, needs the git history), then upgrade in place;
 #   everything after that is done by this version, as on a machine that updates.
 #   alt: the setup answered the least recommended way (setup-alt.rules); what
 #   was declined must stay as it was. No single items.
+#   keep: uninstalled without the rollback (the settings stay, nothing of the
+#   tool keeps running or is called by PAM), then installed and set up again.
 #   docker: a machine running a container service (docker-run.sh).
 set -Eeuo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
@@ -17,9 +19,9 @@ ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 source "$ROOT/tests/ci/lib.sh"
 mode="${1:-fresh}"
 case "$mode" in
-  fresh | upgrade | alt) ;;
+  fresh | upgrade | alt | keep) ;;
   docker) exec bash "$CI/docker-run.sh" ;;
-  *) fail 'usage: real-run.sh [fresh|upgrade|alt|docker]' ;;
+  *) fail 'usage: real-run.sh [fresh|upgrade|alt|keep|docker]' ;;
 esac
 version="$(sed -n 's/^SCRIPT_VERSION=//p' "$ROOT/vps-stable-opt.sh")"
 # No step here waits long for its next question: a stuck one fails with its
@@ -178,6 +180,48 @@ check_all() {
   has "$name" '解封 192.0.2.123：拦截规则已删除'
   [[ "$(tz)" == Asia/Shanghai ]] || fail "$name: timezone is $(tz)"
 }
+if [[ "$mode" == keep ]]; then
+  group 'Uninstall without the rollback: the settings stay, nothing of the tool runs or is called any more'
+  item_do item-quota-on quota 1
+  grep -Fq /var/lib/vps-stable-opt/login-hook /etc/pam.d/common-session || fail 'the login record is not on before the uninstall'
+  systemctl is-active -q vps-stable-check.timer || fail 'the check timer does not run before the uninstall'
+  drive uninstall.rules uninstall sudo vps uninstall || fail "uninstall exited with $?"
+  if command -v vps > /dev/null; then fail 'vps command left after uninstall'; fi
+  if grep -Fq login-hook /etc/pam.d/common-session; then fail 'common-session still calls the login hook of the removed tool'; fi
+  for f in /usr/share/pam-configs/vps-stable-login /etc/profile.d/zz-vps-stable-login.sh /etc/systemd/system/vps-stable-check.timer \
+      /etc/systemd/system/vps-stable-check.service /var/lib/vps-stable-opt /var/backups/vps-stable-opt /usr/local/lib/vps-stable-opt; do
+    if sudo test -e "$f"; then fail "$f left after uninstall"; fi
+  done
+  if systemctl is-active -q vps-stable-check.timer; then fail 'the check timer still runs after uninstall'; fi
+  # A login session goes through common-session (root needs no password for su).
+  sudo su -l "$(id -un)" -c true || fail 'a login session fails after the uninstall'
+  # The optimizations themselves stay.
+  [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == bbr ]] || fail 'BBR went with the uninstall'
+  [[ "$(ufw_line)" == 'Status: active' ]] || fail 'the firewall went with the uninstall'
+  systemctl is-active -q fail2ban || fail 'Fail2ban stopped with the uninstall'
+  [[ -e /etc/sysctl.d/98-vps-stable-hardening.conf ]] || fail 'the security parameters went with the uninstall'
+  endgroup
+  group 'Installed again and set up again over the kept settings'
+  sudo bash "$ROOT/install.sh" --local-file "$ROOT/vps-stable-opt.sh" --no-run
+  [[ "$(sudo vps --version)" == "$version" ]] || fail 'the second install is not this version'
+  drive setup-custom.rules setup-again sudo vps setup || fail "setup again exited with $?"
+  has setup-again '本次流程已完成'
+  rc=0; drive check.rules check-again sudo vps check || rc=$?
+  cat "$LOGS/check-again.log"
+  [[ "$rc" == 0 || "$rc" == 3 ]] || fail "check after the setup again exited with $rc"
+  # Its own earlier files with exactly its text are taken up again; without the
+  # records it cannot tell the others (TCP buffers) from an administrator's.
+  for item in 'BBR 网络优化' '内核网络安全参数' '常用工具' '防火墙' 'Fail2ban 防爆破' '自动安全更新' '登录记录和提醒'; do passed check-again "$item"; done
+  has check-again '封禁 192.0.2.123：UFW 中出现了对应的拦截规则'
+  has check-again '解封 192.0.2.123：拦截规则已删除'
+  grep -Fq /var/lib/vps-stable-opt/login-hook /etc/pam.d/common-session || fail 'the login record is not on again'
+  (($(tcp_rmem_max) > before_tcp_rmem)) || fail 'the TCP buffers are not raised any more'
+  [[ "$(tz)" == Asia/Shanghai ]] || fail "timezone: $(tz)"
+  endgroup
+  printf 'PASS: real run (keep) on %s: uninstalled with the settings kept, nothing left running, installed and set up again.\n' \
+    "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"
+  exit 0
+fi
 if [[ "$mode" == alt ]]; then
   group 'Acceptance check: what was declined stayed as it was'
   rc=0; drive check.rules check sudo vps check || rc=$?
@@ -243,8 +287,15 @@ item_do item-tcp-on tcp 1
 
 item_do item-journal-off journal 2
 [[ ! -e /etc/systemd/journald.conf.d/99-vps-stable.conf ]] || fail 'journal limit off: file left'
+journal_since="$(date '+%F %T')"
 item_do item-journal-on journal 1
 [[ -e /etc/systemd/journald.conf.d/99-vps-stable.conf ]] || fail 'journal limit on: no file'
+# What journald uses, as it says when it starts: "System Journal (...) is X, max 100.0M, ..."
+# (or the runtime journal's half, where nothing is kept on disk).
+# shellcheck disable=SC2024
+sudo journalctl -q --since "$journal_since" -t systemd-journald -o cat --no-pager > "$LOGS/journald-limit.log" 2>&1 || true
+grep -Eq '^(System Journal .* max 100\.0M|Runtime Journal .* max 50\.0M)' "$LOGS/journald-limit.log" ||
+  fail "journal limit on: journald does not use 100 MiB: $(tail -n 5 "$LOGS/journald-limit.log" | tr '\n' ' ')"
 
 item_do item-trim-off trim 2
 [[ "$(systemctl is-enabled fstrim.timer 2>/dev/null || true)" == "$before_trim" ]] || fail 'TRIM off: timer not back'
@@ -325,6 +376,17 @@ item_do item-ping-off ping 2
 if sudo test -e /etc/sysctl.d/99-vps-stable-noping.conf; then fail 'ping back: file left'; fi
 item_do item-ping-on-again ping 1
 
+# Preferring IPv4 (/etc/gai.conf): the line in, then the file exactly as it
+# was; left on for the rollback.
+gai_before=''
+if [[ -e /etc/gai.conf ]]; then gai_before="$LOGS/gai.conf.before"; cp -- /etc/gai.conf "$gai_before"; fi
+item_do item-ipv4-on ipv4 1
+grep -Fxq 'precedence ::ffff:0:0/96  100' /etc/gai.conf || fail "IPv4 first on: not in /etc/gai.conf: $(grep -v '^#' /etc/gai.conf | tr '\n' ' ')"
+item_do item-ipv4-off ipv4 2
+if [[ -n "$gai_before" ]]; then cmp -s /etc/gai.conf "$gai_before" || fail 'IPv4 first off: /etc/gai.conf is not as it was'
+elif [[ -e /etc/gai.conf ]]; then fail 'IPv4 first off: /etc/gai.conf left'; fi
+item_do item-ipv4-on-again ipv4 1
+
 # SSH keepalive, where the runner has an SSH server: what sshd itself uses,
 # and the image's own interval kept without a file of this tool.
 if sudo test -x /usr/sbin/sshd; then
@@ -399,15 +461,42 @@ if sudo test -e /var/lib/vps-stable-opt/notify.conf || [[ -e /etc/systemd/system
 kill "$tg_pid" 2>/dev/null || true
 trap - EXIT
 
-# The traffic alert: every 5 minutes; left on for the rollback.
+# The traffic alert: every 5 minutes; left on for the rollback. 1000 GB are
+# 1000000 MB (decimal, as traffic is billed), and 5 GB used already.
 item_do item-quota-on quota 1
-if ! sudo grep -Fxq 'quota_mb=1024000' /var/lib/vps-stable-opt/quota.conf || ! sudo grep -Fxq 'mode=both' /var/lib/vps-stable-opt/quota.conf; then
+if ! sudo grep -Fxq 'quota_mb=1000000' /var/lib/vps-stable-opt/quota.conf || ! sudo grep -Fxq 'mode=both' /var/lib/vps-stable-opt/quota.conf ||
+   ! sudo grep -Fxq 'used_mb=5000' /var/lib/vps-stable-opt/quota.conf; then
   fail "traffic alert settings: $(sudo cat /var/lib/vps-stable-opt/quota.conf 2>&1)"
 fi
 grep -Fxq 'OnCalendar=*:0/5' /etc/systemd/system/vps-stable-check.timer || fail 'the traffic alert alone does not run every 5 minutes'
-sudo systemctl start vps-stable-check.service
-sudo systemctl start vps-stable-check.service
-sudo test -s /var/lib/vps-stable-opt/notify/traffic-used || fail 'no traffic counted'
+# What it counts must be what the network card counted (in and out, MB of
+# 10^6 bytes): 30 MB downloaded between two checks. A check of the timer at
+# the same moment makes ours skip, so it runs until the count is newer.
+iface="$(sudo sed -n 's/^iface=//p' /var/lib/vps-stable-opt/quota.conf)"
+nic_bytes() { awk -v i="$iface:" '$1 == i {print $2 + $10}' /proc/net/dev; }
+counted() { sudo cat /var/lib/vps-stable-opt/notify/traffic-used; }
+check_now() {
+  local since i
+  sleep 1; since="$(date +%s)"
+  for ((i = 0; i < 5; i++)); do
+    sudo systemctl start vps-stable-check.service
+    (($(sudo stat -c %Y /var/lib/vps-stable-opt/notify/traffic 2>/dev/null || echo 0) >= since)) && return 0
+    sleep 2
+  done
+  fail 'the traffic check did not run'
+}
+check_now
+used0="$(counted)" bytes0="$(nic_bytes)"
+if [[ ! "$used0" =~ ^[0-9]+$ ]] || ((used0 < 5000)); then fail "traffic counted at the start: $used0 MB (5000 MB were used already)"; fi
+curl -fsS --max-time 180 --max-filesize 40000000 -r 0-29999999 -o /dev/null \
+  https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img || fail 'the test download failed'
+bytes1="$(nic_bytes)"
+check_now
+used1="$(counted)"
+want=$(((bytes1 - bytes0) / 1000000)) got=$((used1 - used0))
+printf 'Traffic through %s: %s MB by the card, %s MB by the alert\n' "$iface" "$want" "$got"
+((want >= 25)) || fail "only $want MB went through $iface for the 30 MB download"
+((got >= want - 2 && got <= want + 5)) || fail "the traffic alert counted $got MB, the network card $want MB"
 
 # Docker's log limit, where the runner has Docker: the rest of daemon.json kept,
 # and back exactly as it was when turned off.
@@ -533,7 +622,8 @@ has rollback '撤销完成'
 [[ "$(tz)" == "$before_tz" ]] || fail "timezone not restored: $(tz)"
 [[ "$(ufw_line)" == "$before_ufw" ]] || fail 'firewall not back to how it was'
 for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/sysctl.d/99-vps-stable-bbr.conf \
-    /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
+    /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/fail2ban/action.d/vps-stable-ufw-sshd.conf /etc/fail2ban/fail2ban.d/99-vps-stable.local \
+    /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
     /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf \
     /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login /etc/profile.d/zz-vps-stable-login.sh \
     /etc/systemd/system/vps-stable-check.timer /etc/systemd/system/vps-stable-check.service; do

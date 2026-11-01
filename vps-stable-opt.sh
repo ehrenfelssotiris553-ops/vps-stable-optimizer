@@ -163,7 +163,7 @@ fi
 UI_COLOR=0
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then UI_COLOR=1; fi
 # VPS_ASCII=0 or 1 wins over the setting saved from the single-item menu.
-if [[ "${VPS_ASCII:-}" == 1 ]] || [[ -z "${VPS_ASCII:-}" ]] && grep -qsx 'ui_ascii=1' "$PARAMS_FILE" 2>/dev/null; then
+if [[ "${VPS_ASCII:-}" == 1 ]] || { [[ -z "${VPS_ASCII:-}" ]] && grep -qsx 'ui_ascii=1' "$PARAMS_FILE" 2>/dev/null; }; then
   SYM_OK='[OK]' SYM_WARN='[!]' SYM_FAIL='[X]' SYM_SKIP='[-]' SYM_NEXT='>' UI_OPEN='== ' UI_CLOSE=' =='
 else
   SYM_OK='✔' SYM_WARN='⚠' SYM_FAIL='✖' SYM_SKIP='○' SYM_NEXT='›' UI_OPEN='【' UI_CLOSE='】'
@@ -629,7 +629,7 @@ plan() {
     *)
       echo '选择“一键开荒”时，会重新读取机器状态并检查，不沿用旧报告直接修改。'
       echo '系统更新、自动更新、常用工具、时区、SSH 加固、防火墙分别确认；BBR/ZRAM 等按检测结果决定。'
-      echo '默认保留 SSH 端口、root 登录、IPv6、MTU、DNS；不重装系统、不建磁盘 Swap、不换第三方内核。' ;;
+      echo '默认保留 SSH 端口、root 登录、IPv6、MTU、DNS；不重装系统、不换第三方内核；硬盘 Swap 只在内存不到 2GiB、又用不了 ZRAM 时才建。' ;;
   esac
   preflight_report
   security_audit
@@ -686,7 +686,8 @@ apt_index_stage() {
   fi
   echo '只在当前大版本内升级（不会升到新的系统大版本，例如 Debian 12 → 13、Ubuntu 24.04 → 26.04），也不会删除任何已安装的软件包。'
   echo
-  echo '推荐设置：升级系统、开启自动安全更新、安装常用工具、启用内核网络安全参数、升级后清理旧内核、主机名无法解析时补上。'
+  printf '推荐设置：升级系统、开启自动安全更新、安装常用工具、启用内核网络安全参数%s、SSH 保活、登录记录和提醒、升级后清理旧内核、主机名无法解析时补上；IPv6 连不通外网时改成优先使用 IPv4。\n' \
+    "$(if ((${MEM_MIB:-0} >= 1024)); then echo '、TCP 调优'; fi)"
   echo '（SSH 加固、防火墙和 Fail2ban 白名单不在推荐设置里，后面会单独问你。）'
   if confirm_default_yes '使用推荐设置吗？'; then
     RECOMMENDED=1
@@ -1622,10 +1623,6 @@ zram_stage() {
       vendor=1
       echo '现在只有 systemd-zram-generator 软件包自带的默认 ZRAM 配置（约内存一半），改用本工具的配置。'
     elif restore_file_ours zram_file && ! swapon --noheadings 2>/dev/null | grep -q .; then
-      if ! zram_module_available; then
-        warn '本工具的 ZRAM 配置还在，但这个内核没有 zram 模块，ZRAM 无法启动；可以在撤销里撤销 ZRAM。'
-        module_result zram unsupported 'kernel has no zram module'; return 0
-      fi
       echo '本工具的 ZRAM 配置还在，但 ZRAM 没有运行（可能上次启动失败）：重新启动它。'
       if zram_start; then zram_tune; module_result zram applied 'zram0 restarted'
       else warn 'ZRAM 仍然没有启动，请运行 systemctl status systemd-zram-setup@zram0 查看原因。'; module_result zram failed 'dev-zram0.swap did not start'; fi
@@ -1655,10 +1652,6 @@ zram_stage() {
     module_result zram skipped 'RAM >= 2GiB'; return 0
   fi
   size="$(zram_size_expr)"
-  if ! zram_module_available; then
-    warn '这个内核没有 zram 模块，跳过 ZRAM（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里，占几百 MB，且每次升级内核都要跟着装，本工具不自动安装）。'
-    module_result zram unsupported 'kernel has no zram module'; return 0
-  fi
   if ! available systemd-zram-generator; then
     warn '软件源里没有 systemd-zram-generator，跳过 ZRAM。'
     module_result zram unsupported 'package unavailable'; return 0
@@ -2509,7 +2502,7 @@ sysctl_owned_apply() {
 # SSH keepalive: the server checks an idle session every N seconds and drops
 # it after 3 answers missing. Only this tool's file; sshd checks it first.
 keepalive_stage() {
-  say 'SSH 保活'
+  step 12 'SSH 保活'
   local seconds content current
   if [[ "${KEEPALIVE_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改 SSH 保活。'; module_result keepalive declined 'not requested'; return 0; fi
   seconds="$(param_value ssh_keepalive_seconds)"
@@ -2554,7 +2547,7 @@ ipv6_broken() {
 # Prefers IPv4 in getaddrinfo (/etc/gai.conf; glibc programs only, IPv6 stays
 # on). A precedence policy set by someone else is kept.
 ipv4_stage() {
-  say '优先使用 IPv4'
+  step 12 '优先使用 IPv4'
   local line='precedence ::ffff:0:0/96  100'
   if [[ "${IPV4_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改地址优先顺序。'; module_result ipv4 declined 'not requested'; return 0; fi
   if [[ -f "$GAI_FILE" ]] && grep -Eq '^[[:space:]]*precedence[[:space:]]' "$GAI_FILE"; then
@@ -2702,7 +2695,7 @@ login_pam_enabled() {
 }
 
 login_stage() {
-  say '登录记录和提醒'
+  step 12 '登录记录和提醒'
   local hook pam profile
   if [[ "${LOGIN_CHOICE:-}" != 1 ]]; then ok '按你的选择不开启登录记录。'; module_result login declined 'not requested'; return 0; fi
   if ! command -v pam-auth-update >/dev/null; then warn '找不到 pam-auth-update，不能开启登录记录。'; module_result login unsupported 'no pam-auth-update'; return 0; fi
@@ -5557,6 +5550,8 @@ fi
 
 # Monthly traffic: the interface's counters added up between runs (they
 # start again from 0 after a reboot); a new period starts on the reset day.
+# MB and GB are decimal (10^6 and 10^9 bytes), as traffic is usually billed:
+# where a provider counts in 2^30 instead, the alerts only come a little early.
 if [ -s "$tconf" ]; then
   iface="$(setting iface "$tconf")" quota="$(setting quota_mb "$tconf")" day="$(setting reset_day "$tconf")" mode="$(setting mode "$tconf")"
   set -- $(awk -v i="$iface:" '$1 == i {print $2, $10}' /proc/net/dev)
@@ -5583,7 +5578,7 @@ if [ -s "$tconf" ]; then
   printf '%s %s %s %s %s\n' "$period" "$rx" "$tx" "$arx" "$atx" > "$dir/traffic"
   case "$mode" in both) used=$((arx + atx)) ;; max) if [ "$arx" -gt "$atx" ]; then used="$arx"; else used="$atx"; fi ;; *) used="$atx" ;; esac
   base="$(setting used_mb "$tconf")"
-  used=$((used / 1048576 + ${base:-0}))
+  used=$((used / 1000000 + ${base:-0}))
   printf '%s\n' "$used" > "$dir/traffic-used"
   for p in $(param quota_alerts '80 90 100' | tr -cd '0-9 '); do
     if [ $((used * 100)) -ge $((quota * p)) ] && once "traffic-$p" true; then
@@ -5736,10 +5731,10 @@ quota_stage() {
   read -r -p '这个周期已经用了多少 GB（看服务商面板，不知道就回车）: ' used || used=''
   if [[ -n "$used" ]]; then
     [[ "$used" =~ ^[0-9]{1,7}(\.[0-9]{1,2})?$ ]] || { warn '已用量要写数字（GB）。'; module_result quota declined 'bad used'; return 0; }
-    used="$(awk -v g="$used" 'BEGIN {printf "%d", g * 1024}')"
+    used="$(awk -v g="$used" 'BEGIN {printf "%d", g * 1000}')"
   fi
   temp="$(mktemp "$STATE_ROOT/.quota.XXXXXX")" || return 0
-  if ! printf 'iface=%s\nquota_mb=%s\nreset_day=%s\nmode=%s\nused_mb=%s\n' "$iface" "$((10#$quota * 1024))" "$((10#$day))" "$mode" "${used:-0}" > "$temp" ||
+  if ! printf 'iface=%s\nquota_mb=%s\nreset_day=%s\nmode=%s\nused_mb=%s\n' "$iface" "$((10#$quota * 1000))" "$((10#$day))" "$mode" "${used:-0}" > "$temp" ||
      ! chmod 600 -- "$temp" || ! mv -f -- "$temp" "$conf"; then
     rm -f -- "$temp"; warn '没能保存流量提醒的设置。'; module_result quota failed 'config not written'; return 0
   fi
@@ -5767,7 +5762,7 @@ menu_quota_alert() {
   low="$(param_value quota_alerts 2>/dev/null | tr ' ' '\n' | sort -n | head -n 1)"
   ((used * 100 >= quota * ${low:-80})) || return 0
   printf '%s%s 这个周期的流量已用 %s GB，是额度 %s GB 的 %s%%（数字以服务商面板为准）。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" \
-    "$((used / 1024))" "$((quota / 1024))" "$((used * 100 / quota))" "${C_RESET-}"
+    "$((used / 1000))" "$((quota / 1000))" "$((used * 100 / quota))" "${C_RESET-}"
 }
 
 # Docker's default keeps every line a container writes: a size per log file
@@ -8225,17 +8220,30 @@ check_quota() {
   local used quota
   [[ -s "$STATE_ROOT/quota.conf" ]] || { verify_set fail '流量提醒的设置不见了'; return 0; }
   check_timer_ok || return 0
-  if read -r used quota < <(quota_status); then verify_set pass "这个周期已用 $((used / 1024)) GB / 额度 $((quota / 1024)) GB"
+  if read -r used quota < <(quota_status); then verify_set pass "这个周期已用 $((used / 1000)) GB / 额度 $((quota / 1000)) GB"
   else verify_set pass '已开启，还没统计（每 5 分钟累计一次）'; fi
 }
 
+# Docker reads daemon.json only when it starts, so the limits are in force once
+# it started after the file was written. Its log driver says nothing: json-file
+# is Docker's default whether or not it read the file.
 check_dockerlog() {
-  local driver
+  local limits mono up changed started
   [[ "$(cat -- "$DOCKER_DAEMON_FILE" 2>/dev/null)" == *"\"max-size\": \"$(param_value docker_log_max_mb)m\""* ]] ||
     { verify_set update "$DOCKER_DAEMON_FILE 里的上限和参数不一样：选 5 单项设置 → Docker 容器日志上限 → 1 开启，就会更新"; return 0; }
-  driver="$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)"
-  if [[ "$driver" == json-file ]]; then verify_set pass "每个容器的日志最多 $(param_value docker_log_max_mb) MiB × $(param_value docker_log_files) 个（只对新建的容器生效）"
-  else verify_set update 'Docker 还没重启，设置还没生效：systemctl restart docker（容器会停一下）'; fi
+  limits="每个容器的日志最多 $(param_value docker_log_max_mb) MiB × $(param_value docker_log_files) 个（只对新建的容器生效）"
+  if ! active docker; then verify_set pass "$limits；Docker 现在没在运行，启动时就会用上"; return 0; fi
+  mono="$(systemctl show docker -p ActiveEnterTimestampMonotonic --value 2>/dev/null || true)"
+  read -r up _ 2>/dev/null < /proc/uptime || up=''
+  up="${up%%.*}"
+  changed="$(stat -c %Y -- "$DOCKER_DAEMON_FILE" 2>/dev/null || true)"
+  if [[ ! "$mono" =~ ^[1-9][0-9]*$ || ! "$up" =~ ^[0-9]+$ || ! "$changed" =~ ^[0-9]+$ ]]; then
+    verify_set unknown "$limits；读不到 Docker 是什么时候启动的，无法确认它读到了这个设置"; return 0
+  fi
+  # Seconds since the epoch; uptime is whole seconds, hence the margin.
+  started=$(($(date +%s) - up + mono / 1000000))
+  if ((changed > started + 2)); then verify_set update 'Docker 在改了设置之后还没重启，设置还没生效：systemctl restart docker（容器会停一下）'
+  else verify_set pass "$limits"; fi
 }
 
 check_login() {
@@ -9251,7 +9259,7 @@ item_status() {
     login) if login_pam_enabled; then echo "已开启，记下了 $(login_recent 20000 | grep -c . || true) 次登录"; else echo '未开启'; fi ;;
     notify) if [[ -s "$STATE_ROOT/notify.conf" ]]; then echo '已开启'; else echo '未开启'; fi ;;
     quota)
-      if read -r value total < <(quota_status); then echo "本周期已用 $((value / 1024)) GB / $((total / 1024)) GB"
+      if read -r value total < <(quota_status); then echo "本周期已用 $((value / 1000)) GB / $((total / 1000)) GB"
       elif [[ -s "$STATE_ROOT/quota.conf" ]]; then echo '已开启，还没统计'; else echo '未开启'; fi ;;
     sshport)
       if [[ -f "$SSH_PORT_DROPIN" ]]; then echo "$(sed -n 's/^Port //p' "$SSH_PORT_DROPIN" | tr '\n' ' ')（原来是 $(sed -n 's/^port=//p' "$STATE_ROOT/restore-v2/sshport" 2>/dev/null || echo '?')）"
@@ -9553,7 +9561,7 @@ reboot_reason() {
   else echo '目前没有需要重启才能生效的更新，不重启也可以。'; fi
 }
 
-# Menu 11 / vps reboot. Refuses while an SSH protection timer is pending (a
+# Menu 8 / vps reboot. Refuses while an SSH protection timer is pending (a
 # reboot would drop the timer and keep an unconfirmed change) or APT is busy.
 reboot_main() {
   [[ $EUID -eq 0 ]] || die '重启需要 root：请用 sudo vps reboot。'
@@ -9573,7 +9581,7 @@ reboot_main() {
   systemctl reboot
 }
 
-# ---- Update (menu 12 / vps update) -------------------------------------------------
+# ---- Update (menu 14 / vps update) -------------------------------------------------
 # Same source and checks as the one-line install in the README: install.sh and
 # the main script from the repository's main branch over HTTPS; the script must
 # match the hash pinned in that install.sh, which then installs it in place
@@ -9643,7 +9651,7 @@ update_main() {
   ok "已更新到 $latest。重新输入 vps 打开新版本。"
 }
 
-# ---- Fail2ban ban records (menu 13 / vps bans) -------------------------------------
+# ---- Fail2ban ban records (menu 6 / vps bans) --------------------------------------
 # Recent sshd-jail ban and unban events from Fail2ban's log file (the current
 # and the previous one), or from the journal when Fail2ban logs there, oldest
 # first, as "time<TAB>event<TAB>address".

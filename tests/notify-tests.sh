@@ -9,7 +9,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove tg_call notify_stage \
-  quota_status menu_quota_alert dockerlog_text dockerlog_merge check_notify check_quota check_timer_ok verify_set audit_when audit_clean_text \
+  quota_status menu_quota_alert dockerlog_text dockerlog_merge check_dockerlog check_notify check_quota check_timer_ok verify_set audit_when audit_clean_text \
   param_list param_kind param_recommended param_check param_read param_value param_caution
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -140,17 +140,18 @@ rm -f "$T/main.sh"; printf '%s\troot\t203.0.113.6\tpublickey\tssh\t0\n' "$(($(da
 printf 'PASS: without the tool the check does nothing.\n'
 
 # Traffic: counters added up between runs, a reboot's reset counted, each
-# alert once, a new period started on the reset day.
+# alert once, a new period started on the reset day. MB are decimal (10^6
+# bytes): 2 000 000 bytes are 2 MB, not 1.
 printf 'iface=eth0\nquota_mb=10\nreset_day=1\nmode=both\nused_mb=7\n' > "$STATE_ROOT/quota.conf"
 rm -f "$D"/traffic*; run
-mib=1048576
-printf 'Inter-|\n face |\n  eth0: %s 0 0 0 0 0 0 0 %s 0 0 0 0 0 0 0\n' $((1000 + mib)) $((2000 + mib)) > "$F/proc/net/dev"
+mb=1000000
+printf 'Inter-|\n face |\n  eth0: %s 0 0 0 0 0 0 0 %s 0 0 0 0 0 0 0\n' $((1000 + mb)) $((2000 + mb)) > "$F/proc/net/dev"
 : > "$T/sent"; run
 [[ "$(cat "$D/traffic-used")" == 9 ]] && sent | grep -Fq '到了额度 10 MB 的 80%' && sent | grep -Fq '的 90%' || fail "traffic 80/90%: $(cat "$D/traffic-used") $(sent)"
 : > "$T/sent"; run
 [[ -z "$(sent)" ]] || fail "a traffic alert told twice: $(sent)"
 # A reboot: the counters start again from 0.
-printf 'Inter-|\n face |\n  eth0: %s 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n' "$mib" > "$F/proc/net/dev"
+printf 'Inter-|\n face |\n  eth0: %s 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n' "$mb" > "$F/proc/net/dev"
 : > "$T/sent"; run
 [[ "$(cat "$D/traffic-used")" == 10 ]] && sent | grep -Fq '的 100%' || fail "after a reboot: $(cat "$D/traffic-used") $(sent)"
 read -r used quota < <(quota_status)
@@ -234,7 +235,7 @@ eval "$(awk '$0 == "quota_stage() {" {c = 1} c {print} c && $0 == "}" {exit}' "$
 ip() { echo '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.2 uid 0'; }
 reset; QUOTA_CHOICE=1
 quota_stage <<< $'1000\n15\n2\n12.5' > /dev/null
-[[ "$(cat "$STATE_ROOT/quota.conf")" == $'iface=eth0\nquota_mb=1024000\nreset_day=15\nmode=both\nused_mb=12800' ]] || fail "quota settings: $(cat "$STATE_ROOT/quota.conf")"
+[[ "$(cat "$STATE_ROOT/quota.conf")" == $'iface=eth0\nquota_mb=1000000\nreset_day=15\nmode=both\nused_mb=12500' ]] || fail "quota settings: $(cat "$STATE_ROOT/quota.conf")"
 reset; quota_stage <<< $'1000\n32\n1\n' > /dev/null
 grep -q '^result quota declined bad day' "$TEST_ROOT/trace" || fail 'reset day 32 accepted'
 printf 'PASS: the traffic alert takes the quota, the reset day, the mode and what is used already.\n'
@@ -255,6 +256,27 @@ if command -v python3 > /dev/null && python3 -c 1 > /dev/null 2>&1; then
 else
   printf 'PASS (partly): Docker log limits follow the parameters; no python3 here for the merge.\n'
 fi
+
+# Docker's acceptance line: in force only once Docker started after daemon.json
+# was written (its default log driver, json-file, proves nothing).
+DOCKER_DAEMON_FILE="$T/daemon.json"; dockerlog_text > "$DOCKER_DAEMON_FILE"
+read -r up _ < /proc/uptime; boot=$(($(date +%s) - ${up%%.*}))
+DOCKER_ON=1 DOCKER_MONO=''
+active() { [[ "$1" == docker ]] && ((DOCKER_ON)); }
+systemctl() { if [[ "$*" == 'show docker -p ActiveEnterTimestampMonotonic --value' ]]; then echo "$DOCKER_MONO"; fi; }
+docker() { if [[ "$*" == 'info --format {{.LoggingDriver}}' ]]; then echo json-file; fi; }
+# Docker started SECONDS ago (its start time since the boot, in microseconds).
+docker_since() { DOCKER_MONO=$((($(date +%s) - $1 - boot) * 1000000)); }
+docker_since 600; touch -d "@$(($(date +%s) - 60))" "$DOCKER_DAEMON_FILE"
+check_dockerlog; [[ "$VERIFY_STATUS" == update && "$VERIFY_TEXT" == *'还没重启'* ]] || fail "written after Docker started: $VERIFY_STATUS $VERIFY_TEXT"
+touch -d "@$(($(date +%s) - 1200))" "$DOCKER_DAEMON_FILE"
+check_dockerlog; [[ "$VERIFY_STATUS" == pass ]] || fail "Docker started after the file was written: $VERIFY_STATUS $VERIFY_TEXT"
+DOCKER_ON=0
+check_dockerlog; [[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'启动时就会用上'* ]] || fail "Docker not running: $VERIFY_STATUS $VERIFY_TEXT"
+DOCKER_ON=1 DOCKER_MONO=''
+check_dockerlog; [[ "$VERIFY_STATUS" == unknown ]] || fail "no start time: $VERIFY_STATUS $VERIFY_TEXT"
+unset -f active systemctl docker
+printf 'PASS: the Docker line is in force only once Docker started after daemon.json was written.\n'
 
 # The new parameters.
 for good in 'notify_services xray nginx' 'notify_services none' 'quota_alerts 50 100' 'notify_summary_time 23:59' 'notify_disk_percent 80' 'docker_log_files 5'; do
