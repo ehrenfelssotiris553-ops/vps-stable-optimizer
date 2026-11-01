@@ -35,7 +35,18 @@ tz() { timedatectl show -p Timezone --value; }
 on_target() { sudo bash -c "$1"; }
 ufw_line() { sudo ufw status 2>/dev/null | head -n 1 || true; }
 ufw_added() { sudo ufw show added; }
-apt_has() { apt-config dump 2>/dev/null | grep -Fqx -- "$1"; }
+# APT's policy as root sees it: apt-daily and unattended-upgrade run as root.
+# On Ubuntu 26.04 this CI user saw less of it than root did, without any new
+# unreadable file; that the run leaves none is checked apart, by apt_readable.
+apt_has() { sudo apt-config dump 2>/dev/null | grep -Fqx -- "$1"; }
+# NAME: the periodic policy as root and as this user, and the files behind it.
+apt_views() {
+  { echo '-- as root:'; sudo apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true
+    echo '-- as the CI user:'; apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true
+    echo '-- files setting it:'; sudo grep -lrs 'Periodic' /etc/apt/apt.conf /etc/apt/apt.conf.d | xargs -r sudo ls -l --
+  } > "$LOGS/apt-views-$1.txt" 2>&1 || true
+  notice "periodic APT policy, $1 ($mode, $(uname -m))" "$LOGS/apt-views-$1.txt"
+}
 installed() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == 'install ok installed' ]]; }
 tool_packages() {
   local p
@@ -50,7 +61,8 @@ before_trim="$(systemctl is-enabled fstrim.timer 2>/dev/null || true)"
 before_updates=0 before_reboot=0
 if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then before_updates=1; fi
 if apt_has 'Unattended-Upgrade::Automatic-Reboot "true";'; then before_reboot=1; fi
-before_periodic="$(apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true)"
+before_periodic="$(sudo apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true)"
+apt_views before
 # apt's configuration stays readable for every user (checked as this CI user):
 # package scripts inherit the umask of whoever runs apt, and the tool's is 077.
 apt_unreadable() { find /etc/apt -xdev ! -readable -print 2>/dev/null | sort || true; }
@@ -239,9 +251,10 @@ apt_has 'Unattended-Upgrade::Automatic-Reboot-Time "04:30";' || fail 'automatic 
 item_do item-updates-off updates 2
 now=0; if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then now=1; fi
 [[ "$now" == "$before_updates" ]] || fail 'automatic updates off: not back'
-[[ "$(apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true)" == "$before_periodic" ]] ||
+[[ "$(sudo apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true)" == "$before_periodic" ]] ||
   fail 'automatic updates off: the periodic policy is not as it was'
 item_do item-updates-on updates 1
+apt_views 'after automatic updates on'
 # GitHub's images set only Update-Package-Lists "1": the tool fills in the
 # missing key. A value other than "1" would be kept (see extras-tests.sh).
 if grep -E '^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) ' <<< "$before_periodic" | grep -vqF ' "1";'; then
