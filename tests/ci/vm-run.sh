@@ -369,14 +369,16 @@ has ssh-drop '系统日志确认 ops 已用密钥登录成功'
 has ssh-drop 'ops 当前已有 0 个公钥'
 has ssh-drop '已关闭 SSH 密码登录'
 # The guard timer (240 s) undoes it; ops logs in with the key all along.
-for ((i = 0; i < 90; i++)); do
+drop_at=$SECONDS
+for ((i = 0; i < 120; i++)); do
   if vm_ops "[ ! -e $KEYONLY ]" 2>/dev/null; then break; fi
   sleep 5
 done
+printf 'Key-only login undone %s s after the drop.\n' "$((SECONDS - drop_at))"
 if ! vm_ops "[ ! -e $KEYONLY ]"; then
-  # Present, or no SSH at all? Then what the guard did.
+  # Present, or no SSH at all? Then when the undo timer was made and ran.
   seen="$(vm_ops "if [ -e $KEYONLY ]; then echo present; else echo absent; fi" 2>&1 || true)"
-  vm_ops_sudo 'sh -c "systemctl list-units --all --no-legend \"vps-stable-ssh-revert-*\"; journalctl -n 30 --no-pager -o short -u ssh.service -u ssh.socket; ss -H -lntp \"( sport = :22 )\""' \
+  vm_ops_sudo 'sh -c "date; systemctl list-units --all --no-legend \"vps-stable-ssh-revert-*\"; journalctl -b --no-pager -o short-precise | grep -E \"vps-stable-ssh-revert|Reload\" | tail -n 15; journalctl -n 8 --no-pager -o short -u ssh.service"' \
     > "$LOGS/ssh-drop-undo.log" 2>&1 || true
   notice "SSH undo after the drop ($system)" "$LOGS/ssh-drop-undo.log"
   fail "key-only login stayed after the dropped connection (ops sees the file: ${seen:-no SSH})"
