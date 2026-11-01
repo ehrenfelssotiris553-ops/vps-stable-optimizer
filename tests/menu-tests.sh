@@ -117,6 +117,13 @@ printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
 )
 printf '%s\n' 'PASS: the menu is two aligned columns when wide and one when narrow.'
 
+# After an update the new version's menu opens (exec), unless it does not parse.
+grep -A4 'if \[\[ "$action" == update && "$(sha256sum' "$TEST_SCRIPT" | grep -Fq 'exec /bin/bash -- "$self" menu' ||
+  fail 'an update does not open the new menu'
+grep -A3 'if \[\[ "$action" == update && "$(sha256sum' "$TEST_SCRIPT" | grep -Fq 'bash -n -- "$self"' ||
+  fail 'the updated script is not checked before it replaces the menu'
+printf '%s\n' 'PASS: after an update the new version of the menu opens.'
+
 # The menu says when an update waits for a reboot, and for how long; a newer
 # kernel that was already there at boot (a provider kernel) is left to vps check.
 (

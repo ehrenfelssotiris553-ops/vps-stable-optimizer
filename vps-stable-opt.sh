@@ -4354,9 +4354,13 @@ menu() {
     if [[ -n "$action" ]]; then menu_action "$self" "$action"; fi
     # Uninstall may remove the installed source and launcher in its child.
     if [[ ! -f "$self" ]]; then echo '本工具已卸载，菜单退出。'; return 0; fi
-    # This menu is still the old version in memory: start the new one fresh.
+    # This menu is still the old version in memory: the new one replaces it.
     if [[ "$action" == update && "$(sha256sum -- "$self" 2>/dev/null || true)" != "$before" ]]; then
-      echo '本工具已更新，菜单先退出；重新输入 vps 打开新版本。'; return 0
+      if bash -n -- "$self" 2>/dev/null; then
+        echo '本工具已更新，正在打开新版本的菜单……'
+        exec /bin/bash -- "$self" menu
+      fi
+      warn '更新后的脚本读不通，菜单先退出：请重新运行安装命令。'; return 0
     fi
     if [[ "$action" == uninstall ]]; then
       # Uploaded source copies are user files and are intentionally not removed.
@@ -5999,6 +6003,7 @@ VERIFY_NA=0
 VERIFY_UNKNOWN=0
 VERIFY_REBOOT=0
 VERIFY_UPDATE=0
+VERIFY_NOTICE=0
 VERIFY_ISSUES=()
 # STATUS LABEL TEXT: one line of the acceptance report. What needs a look
 # (failed, waiting for a reboot, unknown) is also kept for the conclusion.
@@ -6009,6 +6014,8 @@ verify_line() {
     healthy) VERIFY_PASS=$((VERIFY_PASS + 1)) mark="${SYM_OK-✔}" color="${C_OK-}" word='正常' ;;
     fail) VERIFY_FAIL=$((VERIFY_FAIL + 1)) mark="${SYM_FAIL-✖}" color="${C_FAIL-}" word='未生效' ;;
     na) VERIFY_NA=$((VERIFY_NA + 1)) mark="${SYM_SKIP-○}" word='未处理' ;;
+    # Something to look at that is not this tool's (another service failing).
+    notice) VERIFY_NOTICE=$((${VERIFY_NOTICE:-0} + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='注意' ;;
     # In force, but a parameter now asks for another value: not a failure.
     update) VERIFY_UPDATE=$((${VERIFY_UPDATE:-0} + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='可更新' ;;
     # Expected to take effect with the next boot: not a failure.
@@ -6016,7 +6023,7 @@ verify_line() {
     *) VERIFY_UNKNOWN=$((VERIFY_UNKNOWN + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='无法确认' ;;
   esac
   printf '%s%s %s%s  %s：%s\n' "$color" "$mark" "$word" "${C_RESET-}" "$2" "$3"
-  case "$1" in fail|reboot|unknown|update) VERIFY_ISSUES+=("$color$mark $word${C_RESET-}  $2：$3") ;; esac
+  case "$1" in fail|reboot|unknown|update|notice) VERIFY_ISSUES+=("$color$mark $word${C_RESET-}  $2：$3") ;; esac
 }
 
 # Applies the recorded expectation: only applied/present results are checked
@@ -6336,15 +6343,32 @@ verify_kernel() {
 
 # Failed services are named (found on a real VPS: a system upgrade restarted
 # systemd-networkd and its wait-online unit timed out until the next boot).
+# Services this tool sets up or that keep the machine reachable: one of them
+# failing is a failure here; any other failed service is a notice.
+verify_health_units() {
+  printf '%s\n' ssh.service sshd.service ufw.service fail2ban.service systemd-timesyncd.service chrony.service \
+    vnstat.service unattended-upgrades.service apt-daily.service apt-daily-upgrade.service \
+    systemd-zram-setup@zram0.service systemd-journald.service
+}
+
 verify_health() {
-  local failed host units names
+  local failed host units names failed_tool='' failed_other='' unit count=0
   units="$(systemctl list-units --state=failed --type=service --no-legend --no-pager --plain 2>/dev/null | awk '{print $1}' || true)"
   failed="$(grep -c . <<< "$units" || true)"
   if [[ "$failed" == 0 ]]; then verify_line healthy '系统服务' '本次启动没有失败的服务'
   else
-    names="$(head -n 3 <<< "$units" | tr '\n' ' ')"; names="${names% }"
-    if ((failed > 3)); then names+=' 等'; fi
-    verify_line fail '系统服务' "有 ${failed} 个失败的服务：${names}。用 systemctl status 加服务名查看原因；系统升级时被重启过的服务偶尔会这样，重启服务器后再验收一次"
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] || continue
+      if grep -Fxq -- "$unit" <(verify_health_units); then failed_tool+=" $unit"; else failed_other+=" $unit"; count=$((count + 1)); fi
+    done <<< "$units"
+    if [[ -n "$failed_tool" ]]; then
+      verify_line fail '系统服务' "失败的服务：${failed_tool# }。它们和本工具的设置或远程登录有关：用 systemctl status 加服务名查看原因"
+    fi
+    if [[ -n "$failed_other" ]]; then
+      names="$(tr ' ' '\n' <<< "${failed_other# }" | head -n 3 | tr '\n' ' ')"; names="${names% }"
+      if ((count > 3)); then names+=' 等'; fi
+      verify_line notice '系统服务' "有 ${count} 个其他服务失败：${names}。不是本工具设置的，不影响上面的结论；用 systemctl status 加服务名查看原因（系统升级时被重启过的服务偶尔会这样，重启后再看一次）"
+    fi
   fi
   if [[ "$OS" == ubuntu ]]; then host=archive.ubuntu.com; else host=deb.debian.org; fi
   if command -v timeout >/dev/null && timeout 6s getent ahosts "$host" >/dev/null 2>&1; then
@@ -6404,6 +6428,7 @@ verify_summary() {
   printf '结论：%s 项正常，%s 项未生效，%s 项按计划未处理，%s 项无法确认' "$VERIFY_PASS" "$VERIFY_FAIL" "$VERIFY_NA" "$VERIFY_UNKNOWN"
   if ((${VERIFY_REBOOT:-0})); then printf '，%s 项等重启后生效' "$VERIFY_REBOOT"; fi
   if ((${VERIFY_UPDATE:-0})); then printf '，%s 项可以按新的参数更新' "$VERIFY_UPDATE"; fi
+  if ((${VERIFY_NOTICE:-0})); then printf '；另有 %s 条提醒' "$VERIFY_NOTICE"; fi
   echo '。'
   if ((${#VERIFY_ISSUES[@]})); then
     echo '需要你看一下：'

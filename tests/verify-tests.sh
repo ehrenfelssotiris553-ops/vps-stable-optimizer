@@ -6,7 +6,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
+load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_health_units verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
   trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -296,6 +296,8 @@ printf 'PASS: the acceptance exit code is set after the optional live test.\n'
 # Failed services are named, so the user knows which one to look at.
 (
   getent() { return 0; }
+  # The DNS line runs getent under timeout: the mock above is used.
+  timeout() { shift; "$@"; }
   OS=debian
   FAILED_UNITS=''
   systemctl() {
@@ -304,12 +306,22 @@ printf 'PASS: the acceptance exit code is set after the optional live test.\n'
   }
   out="$(verify_health)"
   grep -Fq '本次启动没有失败的服务' <<< "$out" || fail "no failed service not reported: $out"
+  # Another service failing: named, a notice, not counted as a failure.
   FAILED_UNITS='systemd-networkd-wait-online.service loaded failed failed Wait for Network to be Configured
 '
-  out="$(verify_health)"
-  grep -Fq '有 1 个失败的服务：systemd-networkd-wait-online.service。' <<< "$out" || fail "failed service not named: $out"
+  VERIFY_FAIL=0 VERIFY_NOTICE=0
+  verify_health > "$TEST_ROOT/health"
+  grep -Fq '⚠ 注意  系统服务：有 1 个其他服务失败：systemd-networkd-wait-online.service。' "$TEST_ROOT/health" || fail "other failed service: $(cat "$TEST_ROOT/health")"
+  [[ "$VERIFY_FAIL" == 0 && "$VERIFY_NOTICE" == 1 ]] || fail "another service failing counted as a failure: fail=$VERIFY_FAIL notice=$VERIFY_NOTICE"
   FAILED_UNITS="$(printf 'u%s.service loaded failed failed x\n' 1 2 3 4)"
   out="$(verify_health)"
-  grep -Fq '有 4 个失败的服务：u1.service u2.service u3.service 等。' <<< "$out" || fail "long list not shortened: $out"
+  grep -Fq '有 4 个其他服务失败：u1.service u2.service u3.service 等。' <<< "$out" || fail "long list not shortened: $out"
+  # One of this tool's (or SSH): a failure, named apart from the others.
+  FAILED_UNITS="$(printf '%s loaded failed failed x\n' fail2ban.service other.service)"
+  VERIFY_FAIL=0 VERIFY_NOTICE=0
+  verify_health > "$TEST_ROOT/health"
+  grep -Fq '✖ 未生效  系统服务：失败的服务：fail2ban.service。' "$TEST_ROOT/health" || fail "a failed service of this tool: $(cat "$TEST_ROOT/health")"
+  grep -Fq '有 1 个其他服务失败：other.service。' "$TEST_ROOT/health" || fail 'the other one not listed apart'
+  [[ "$VERIFY_FAIL" == 1 && "$VERIFY_NOTICE" == 1 ]] || fail "counts: fail=$VERIFY_FAIL notice=$VERIFY_NOTICE"
 )
 printf 'PASS: failed services are named in the health check.\n'
