@@ -34,9 +34,15 @@ NF_LOG = re.compile(r'^net\.netfilter\.nf_log\.[0-9]+$')
 UFW_LAYOUT = re.compile(
     r'^(|\*filter|COMMIT|:ufw6?-[a-z-]+ - \[0:0\]'
     r'|-[AI] ufw6?-((after|before|user)-logging-(input|output|forward)|logging-(allow|deny)|user-limit(-accept)?) .*)$')
-# snapd mounts each snap revision it refreshes to as a unit of its own.
-SNAPD = re.compile(r'^(/etc/systemd/system/(snapd\.mounts\.target\.wants|multi-user\.target\.wants)/)?snap-.*\.mount$'
-                   r'|^/etc/systemd/system/snapd\.mounts\.target\.wants$')
+# snapd mounts each snap revision it refreshes to as a unit of its own, and
+# writes services and udev rules for the snaps.
+SNAPD = re.compile(r'^(/etc/systemd/system/((snapd\.mounts|multi-user)\.target\.wants/)?)?snap[-.].*\.(mount|service)$'
+                   r'|^/etc/systemd/system/snapd\.mounts\.target\.wants$|^/etc/udev/rules\.d/70-snap\.')
+SHARED_DIRS = {'/etc', '/etc/sysctl.d', '/etc/apt/apt.conf.d', '/etc/ssh/sshd_config.d', '/etc/systemd/system',
+               '/etc/systemd/journald.conf.d', '/etc/default', '/etc/fail2ban/jail.d', '/etc/fail2ban/action.d',
+               '/etc/ufw', '/etc/modules-load.d', '/etc/systemd'}
+# Rebuilt by package triggers whenever packages come or go.
+TRIGGERED = {'/etc/mailcap'}
 # update-ca-certificates rebuilds these whenever ca-certificates is upgraded;
 # the links belong to no package.
 CERTS = re.compile(r'^/etc/ssl/certs/')
@@ -158,10 +164,16 @@ def main():
     fa, fb = files(a), files(b)
     dangling = set(b.get('dangling', [])) - set(a.get('dangling', []))
     rc_dirs = {p.rsplit('/', i)[0] for p in rc_files for i in range(1, p.count('/'))}
+    # Directories of upgraded packages, but never the shared drop-in ones the
+    # tool writes into, and never a file of the tool itself.
+    up_dirs = {p.rsplit('/', 1)[0] for p in up_files} - SHARED_DIRS
     for path in sorted(set(fa) | set(fb)):
-        if fa.get(path) == fb.get(path):
+        if fa.get(path) == fb.get(path) or SNAPD.match(path):
             continue
         what = 'file added' if path not in fa else 'file removed' if path not in fb else 'file changed'
+        if up_pkgs and 'vps-stable' not in path and (path in TRIGGERED or path.rsplit('/', 1)[0] in up_dirs):
+            explained.append(f'{what}: {path} (package upgrades)')
+            continue
         if path in ALWAYS_EXPLAINED or path in up_files or (CERTS.match(path) and 'ca-certificates' in up_pkgs):
             explained.append(f'{what}: {path}')
         elif ufw_layout_only and path in ('/etc/ufw/user.rules', '/etc/ufw/user6.rules'):

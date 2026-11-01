@@ -18,8 +18,10 @@ export LC_ALL=C
   done
   apt-mark showauto 2>/dev/null | sed 's/^/autopkg /' || true
   systemctl list-unit-files --no-legend --no-pager 2>/dev/null | awk 'NF >= 2 {print "unit " $1 " " $2}' || true
-  find /etc -xdev -type f -print0 | sort -z | xargs -0 -r sha256sum |
-    awk '{h = $1; sub(/^[0-9a-f]+  /, ""); print "file " $0 " " h}'
+  while IFS= read -r -d '' f; do
+    h="$(sha256sum < "$f" 2>/dev/null || echo unreadable)"
+    printf 'file %s %s\n' "$f" "${h%% *}"
+  done < <(find /etc -xdev -type f -print0 | sort -z)
   find /etc -xdev -type l -printf 'link %p -> %l\n'
   find /etc -xdev -xtype l -printf 'dangling %p\n'
   find /etc -xdev -type d -printf 'dir %p\n'

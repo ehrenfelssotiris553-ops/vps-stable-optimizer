@@ -30,6 +30,11 @@ done
 # installs packages, and Docker would put its firewall rules back.
 sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
 sudo systemctl mask docker.socket docker.service containerd.service 2>/dev/null || true
+# The runner refreshes snaps and installs updates in the background, which
+# changes /etc between the two snapshots: snapd goes, and the APT timers are
+# stopped for this boot (not disabled, so the tool still finds them as they are).
+sudo systemctl mask --now snapd.socket snapd.service snapd.seeded.service 2>/dev/null || true
+sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 # The Azure agent puts its own rules (for the metadata address) back now and
 # then; the tool rightly keeps a firewall it did not make, so it goes too.
 sudo systemctl stop walinuxagent.service 2>/dev/null || true
