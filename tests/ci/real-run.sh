@@ -363,8 +363,12 @@ item_do item-login-on-again login 1
 # message, then a sudo and a login reach it; the check leaves nothing in the
 # journal although it runs every minute.
 export TG_TOKEN='123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq'
-python3 "$CI/fake-tg.py" "$LOGS/tg-sent.log" 8443 &
+# Its output goes to a file of its own: report.sh reads this script through a
+# pipe and would wait for anything left holding it (a stand-in still running
+# after a failed check kept a whole job waiting until its time limit).
+python3 "$CI/fake-tg.py" "$LOGS/tg-sent.log" 8443 > "$LOGS/fake-tg.out" 2>&1 < /dev/null &
 tg_pid=$!
+trap 'kill "$tg_pid" 2>/dev/null || true' EXIT
 sleep 1
 index="$(item_index notify)" || fail 'no single item notify'
 { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq 1\n' "$index"; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/item-notify-on.rules"
@@ -393,6 +397,7 @@ fi
 item_do item-notify-off notify 2
 if sudo test -e /var/lib/vps-stable-opt/notify.conf || [[ -e /etc/systemd/system/vps-stable-check.timer ]]; then fail 'TG off: the settings or the timer stayed'; fi
 kill "$tg_pid" 2>/dev/null || true
+trap - EXIT
 
 # The traffic alert: every 5 minutes; left on for the rollback.
 item_do item-quota-on quota 1

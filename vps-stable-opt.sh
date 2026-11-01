@@ -5783,7 +5783,9 @@ dockerlog_stage() {
   else
     put_file "$DOCKER_DAEMON_FILE" "$(dockerlog_text)" || { module_result dockerlog preserved 'daemon.json conflict'; return 0; }
   fi
-  if dockerd --help 2>&1 | grep -q -- '--validate' && ! dockerd --validate --config-file "$DOCKER_DAEMON_FILE" >/dev/null 2>&1; then
+  # grep reads all of the help: with -q it would stop early, and under pipefail
+  # dockerd's SIGPIPE would read as "no --validate".
+  if dockerd --help 2>&1 | grep -- '--validate' > /dev/null && ! dockerd --validate --config-file "$DOCKER_DAEMON_FILE" >/dev/null 2>&1; then
     warn "Docker 不认这个配置，已经撤回：$DOCKER_DAEMON_FILE。"
     restore_resource dockerlog_file || true
     module_result dockerlog failed 'dockerd --validate'; return 0
