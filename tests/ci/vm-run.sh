@@ -249,7 +249,7 @@ check_all() {
   vm_drive check.rules "$name" "$@" vps check || rc=$?
   cat "$LOGS/$name.log"
   [[ "$rc" == 0 || "$rc" == 3 ]] || fail "$name exited with $rc"
-  for item in 'BBR 网络优化' '内核网络安全参数' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破'; do
+  for item in 'BBR 网络优化' '内核网络安全参数' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破' '登录记录和提醒'; do
     passed "$name" "$item"
   done
   # SSH keepalive is in the recommended set: the image's own interval kept,
@@ -285,6 +285,17 @@ if ((zram_kernel)); then
   near "${zsaid:-0}" $((zbytes / 1048576)) || fail "ZRAM is $((zbytes / 1048576)) MiB, the check says $zsaid"
   [[ "$zline" == *"压缩算法 $zalg"* ]] || fail "ZRAM uses $zalg, the check says: $zline"
 fi
+endgroup
+
+group 'Login record: real SSH logins are recorded, an interactive one shows the note'
+# Every vm command above was an SSH login from the host side (10.0.2.2).
+vm 'tail -n 1 /var/lib/vps-stable-opt/logins' > "$LOGS/logins-tail.txt" || true
+grep -q $'\troot\t10.0.2.2\tpublickey\tssh\t' "$LOGS/logins-tail.txt" || fail "an SSH login was not recorded: $(cat "$LOGS/logins-tail.txt")"
+# A login without a command (sshd shows PAM's messages only then); the shell is left at once.
+printf '%s\n' ':~# ==> exit' > "$LOGS/login-shell.rules"
+drive "$LOGS/login-shell.rules" login-shell ssh "${VM_OPTS[@]}" -tt "$VM_HOST" || fail "the interactive login exited with $?"
+has login-shell '—— VPS 机器管家：登录记录 ——'
+has login-shell '上次登录：'
 endgroup
 
 group 'SSH with the listening socket only (as right after an OpenSSH update)'
@@ -509,6 +520,7 @@ lc_mark 'after the rollback (packages removed)'
 vm 'for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-bbr.conf /etc/systemd/zram-generator.conf /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/systemd/journald.conf.d/99-vps-stable.conf; do [ ! -e "$f" ] || { echo "left: $f"; exit 1; }; done' ||
   fail 'files left after rollback'
 vm 'swapon --noheadings | grep -q zram' && fail 'ZRAM still on after rollback'
+vm '! grep -q login-hook /etc/pam.d/common-session && [ ! -e /usr/share/pam-configs/vps-stable-login ]' || fail 'the login record stayed after the rollback'
 [[ "$(vm hostname)" == "$old_name" ]] || fail "the rollback did not bring the name $old_name back: $(vm hostname)"
 vm '[ ! -e /swapfile ] && ! grep -q "^/swapfile " /proc/swaps' || fail 'the disk swap stayed after the rollback'
 vm_drive uninstall.rules uninstall vps uninstall || fail "uninstall exited with $?"

@@ -6,7 +6,7 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width display_name_get
+load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width display_name_get menu_login_alert login_recent
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 # No display name stored (the header shows the hostname).

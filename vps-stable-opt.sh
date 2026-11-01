@@ -96,6 +96,11 @@ HOSTS_CHOICE=''
 HOSTNAME_CHOICE=''
 KEEPALIVE_CHOICE=''
 IPV4_CHOICE=''
+LOGIN_CHOICE=''
+# The PAM profile pam-auth-update reads (a file of this tool, outside /etc).
+LOGIN_PAM_FILE=/usr/share/pam-configs/vps-stable-login
+# Never written here: pam-auth-update changes it (tracked as login_pam).
+PAM_COMMON_SESSION=/etc/pam.d/common-session
 
 case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
@@ -860,10 +865,10 @@ setup_questions() {
     INSTALL_TOOLS=1 SYSCTL_CHOICE=1 TCP_BUFFER_CHOICE=0 VNSTAT_CHOICE=0 ZRAM_CHOICE=0 AUTO_REBOOT_TIME=''
     # Only raised ceilings and two safe switches: in the set from 1 GiB of RAM.
     if ((MEM_MIB >= 1024)); then TCP_BUFFER_CHOICE=1; fi
-    KERNEL_CLEAN_CHOICE="$UPGRADE_APPROVED" HOSTS_CHOICE=1 TZ_CHOICE='' TZ_ASKED=1 KEEPALIVE_CHOICE=1 IPV4_CHOICE=0
+    KERNEL_CLEAN_CHOICE="$UPGRADE_APPROVED" HOSTS_CHOICE=1 TZ_CHOICE='' TZ_ASKED=1 KEEPALIVE_CHOICE=1 IPV4_CHOICE=0 LOGIN_CHOICE=1
     # Preferring IPv4 only where IPv6 is broken here.
     if ipv6_broken; then IPV4_CHOICE=1; fi
-    printf '已按推荐设置记下：安装常用工具、启用内核网络安全参数%s、SSH 保活%s、升级后清理旧内核、需要时修复主机名；时区保持不变。\n' \
+    printf '已按推荐设置记下：安装常用工具、启用内核网络安全参数%s、SSH 保活、登录记录和提醒%s、升级后清理旧内核、需要时修复主机名；时区保持不变。\n' \
       "$(if ((TCP_BUFFER_CHOICE)); then echo '、TCP 调优'; fi)" "$(if ((IPV4_CHOICE)); then echo '、优先使用 IPv4（这里的 IPv6 连不通）'; fi)"
   else
     if confirm_yes "安装常用工具（${TOOLS_PACKAGES[*]}）吗？"; then INSTALL_TOOLS=1; fi
@@ -891,6 +896,7 @@ setup_questions() {
     if confirm_default_yes "开启 SSH 保活吗？（SSH 连接放着不动时每 $(param_value ssh_keepalive_seconds) 秒检测一次，不会因为路由器丢掉空闲连接而卡死）"; then KEEPALIVE_CHOICE=1; else KEEPALIVE_CHOICE=0; fi
     IPV4_CHOICE=0
     if ipv6_broken && confirm_default_yes '这台机器的 IPv6 连不通外网（IPv4 正常）：改成优先使用 IPv4 吗？（不关闭 IPv6，只是先试 IPv4，免得程序卡在 IPv6 上）'; then IPV4_CHOICE=1; fi
+    if confirm_default_yes '开启登录记录和提醒吗？（每次登录记一行、保存一年，包括服务商控制台的登录；登录时显示上次登录，第一次出现的 IP 标红）'; then LOGIN_CHOICE=1; else LOGIN_CHOICE=0; fi
     timezone_ask
     TZ_ASKED=1
   fi
@@ -2483,6 +2489,162 @@ ipv4_stage() {
   record_config_change "$GAI_FILE" line-appended || die '无法记录这次配置变更。'
   ok '已改成优先使用 IPv4（IPv6 照常可用）。xray、sing-box 这类用 Go 写的程序不读这个设置，要在它们自己的配置里指定。'
   module_result ipv4 applied 'precedence set'
+}
+
+# Login record and note. PAM runs the hook as root when a session opens, through
+# a profile of pam-auth-update (Debian's own way to add a line to
+# common-session, so no file of a package is edited). The line is "optional":
+# a missing or failing hook never stops a login, and timeout ends it after 3 s.
+login_pam_text() {
+  printf '%s\n' 'Name: VPS Stable Optimizer: login record and note' 'Default: yes' 'Priority: 0' \
+    'Session-Interactive-Only: yes' 'Session-Type: Additional' 'Session:' \
+    "	optional	pam_exec.so quiet stdout /usr/bin/timeout 3 /bin/bash $STATE_ROOT/login-hook"
+}
+
+# The hook: one line per login in logins (time, account, address or console
+# line, method, ssh or console, 1 for an address never seen before), a year
+# and at most 20000 lines. sshd's own lines of the last 10 minutes are read
+# too, so a login that opened no PAM session is not missed. An interactive
+# login is shown the previous one, the others of the last 10 minutes and, in
+# red, an address that logs in for the first time.
+login_hook_text() {
+  sed "s#@STATE@#$STATE_ROOT#g" <<'HOOK'
+#!/bin/bash
+# VPS Stable Optimizer v2.8: login record and note (run by PAM as root).
+[ "${PAM_TYPE:-}" = open_session ] || exit 0
+case "${PAM_SERVICE:-}" in sshd) kind=ssh ;; login) kind=console ;; *) exit 0 ;; esac
+state='@STATE@'
+[ -d "$state" ] && [ ! -L "$state" ] || exit 0
+umask 077
+export LC_ALL=C.UTF-8
+record="$state/logins" known="$state/known"
+exec 7>> "$state/logins.lock" && flock -w 1 7 || exit 0
+now="$(date +%s)"
+user="$(printf '%s' "${PAM_USER:-}" | tr -cd 'A-Za-z0-9._-' | cut -c1-32)"
+if [ "$kind" = ssh ]; then from="$(printf '%s' "${PAM_RHOST:-}" | tr -cd 'A-Za-z0-9.:-' | cut -c1-64)"
+else from="console:$(printf '%s' "${PAM_TTY:-}" | tr -cd 'A-Za-z0-9/_-' | cut -c1-20)"; fi
+[ -n "$user" ] && [ -n "$from" ] || exit 0
+# sshd's successful logins of the last 10 minutes: time, method, account, address.
+recent="$(journalctl -q --since=-600s _UID=0 -t sshd -t sshd-session -o short-unix --no-pager 2>/dev/null |
+  awk '$4 == "Accepted" && $6 == "for" && $8 == "from" {sub(/\..*/, "", $1); print $1, $5, $7, $9}' | tail -n 50)"
+method=console
+if [ "$kind" = ssh ]; then
+  method="$(printf '%s\n' "$recent" | awk -v u="$user" -v ip="$from" '$3 == u && $4 == ip {m = $2} END {print m}' | tr -cd 'a-z-')"
+  [ -n "$method" ] || method=unknown
+fi
+is_new() {
+  [ "${1#console:}" = "$1" ] || return 1
+  if [ -f "$record" ] && awk -F'\t' -v ip="$1" '$3 == ip {f = 1} END {exit !f}' "$record"; then return 1; fi
+  if [ -f "$known" ] && grep -Fxq "ip $1" "$known"; then return 1; fi
+  return 0; }
+previous="$(tail -n 1 "$record" 2>/dev/null)"
+# Logins sshd wrote that are not in the record (and are not this one).
+missed="$( { tail -n 300 "$record" 2>/dev/null; printf '%s\n' "--"; printf '%s\n' "$recent"; } | awk -F'\t' -v u="$user" -v ip="$from" -v now="$now" '
+  $0 == "--" {r = 1; next}
+  !r {t[NR] = $1; who[NR] = $2 " " $3; next}
+  {split($0, f, " "); if (f[3] == u && f[4] == ip && now - f[1] <= 120) next
+   for (i in t) if (who[i] == f[3] " " f[4] && (t[i] - f[1] <= 5 && f[1] - t[i] <= 5)) next
+   print f[1] "\t" f[3] "\t" f[4] "\t" f[2]}')"
+while IFS="$(printf '\t')" read -r t u ip m; do
+  [ -n "$t" ] || continue
+  u="$(printf '%s' "$u" | tr -cd 'A-Za-z0-9._-' | cut -c1-32)" ip="$(printf '%s' "$ip" | tr -cd 'A-Za-z0-9.:-' | cut -c1-64)"
+  m="$(printf '%s' "$m" | tr -cd 'a-z-')"
+  n=0; if is_new "$ip"; then n=1; fi
+  printf '%s\t%s\t%s\t%s\tssh\t%s\n' "$t" "$u" "$ip" "${m:-unknown}" "$n" >> "$record"
+done <<EOF
+$missed
+EOF
+new=0; if is_new "$from"; then new=1; fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$user" "$from" "$method" "$kind" "$new" >> "$record"
+# A year, at most 20000 lines.
+first="$(head -n 1 "$record" | cut -f1)"
+if [ "$(wc -l < "$record")" -gt 20000 ] || [ "${first:-$now}" -lt $((now - 31622400)) ] 2>/dev/null; then
+  awk -F'\t' -v cut=$((now - 31622400)) '$1 >= cut' "$record" | tail -n 20000 > "$record.new" && mv -f "$record.new" "$record"
+fi
+# The note: interactive logins only (a terminal line).
+case "${PAM_TTY:-}" in /dev/*|tty*) ;; *) exit 0 ;; esac
+say_method() { case "$1" in publickey) echo 密钥 ;; password) echo 密码 ;; keyboard-interactive) echo 密码 ;; console) echo 控制台 ;; *) echo 其他方式 ;; esac; }
+show() {
+  when="$(date -d "@$1" '+%m-%d %H:%M' 2>/dev/null)"
+  case "$3" in console:*) where="服务商控制台（${3#console:}）" ;; *) where="来自 $3" ;; esac
+  if [ "$6" = 1 ]; then printf '\033[31m%s  %s %s（%s）  ← 第一次从这个 IP 登录\033[0m\n' "$when" "$2" "$where" "$(say_method "$4")"
+  else printf '%s  %s %s（%s）\n' "$when" "$2" "$where" "$(say_method "$4")"; fi; }
+echo '—— VPS 机器管家：登录记录 ——'
+if [ -n "$previous" ]; then
+  IFS="$(printf '\t')" read -r t u ip m k n <<EOF
+$previous
+EOF
+  printf '上次登录：'; show "$t" "$u" "$ip" "$m" "$k" 0
+else echo '这是本工具记下的第一次登录。'; fi
+# The others of the last 10 minutes (not this one, not the previous one shown
+# above); red for a first-time address other than this login's own.
+others="$(awk -F'\t' -v cut=$((now - 600)) '$1 >= cut' "$record" | head -n -1 | grep -vFx -- "$previous")"
+if [ -n "$others" ]; then
+  echo '最近 10 分钟还有：'
+  printf '%s\n' "$others" | while IFS="$(printf '\t')" read -r t u ip m k n; do
+    [ "$ip" != "$from" ] || n=0
+    printf '  '; show "$t" "$u" "$ip" "$m" "$k" "$n"
+  done
+fi
+if [ "$new" = 1 ]; then
+  printf '\033[31m这是第一次从 %s 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 7 安全排查。是你自己就不用管，下次不再标红。\033[0m\n' "$from"
+fi
+exit 0
+HOOK
+}
+
+# Enabled: common-session has this tool's line.
+login_pam_enabled() {
+  grep -Fq "$STATE_ROOT/login-hook" "$PAM_COMMON_SESSION" 2>/dev/null
+}
+
+login_stage() {
+  say '登录记录和提醒'
+  local hook pam
+  if [[ "${LOGIN_CHOICE:-}" != 1 ]]; then ok '按你的选择不开启登录记录。'; module_result login declined 'not requested'; return 0; fi
+  if ! command -v pam-auth-update >/dev/null; then warn '找不到 pam-auth-update，不能开启登录记录。'; module_result login unsupported 'no pam-auth-update'; return 0; fi
+  hook="$(login_hook_text)" pam="$(login_pam_text)"
+  # Written again when this tool has a newer text.
+  if [[ -f "$STATE_ROOT/login-hook" && "$(cat -- "$STATE_ROOT/login-hook" 2>/dev/null || true)" != "$hook" ]] && restore_file_ours login_hook_file; then
+    rm -f -- "$STATE_ROOT/login-hook"
+  fi
+  if [[ -f "$LOGIN_PAM_FILE" && "$(cat -- "$LOGIN_PAM_FILE" 2>/dev/null || true)" != "$pam" ]] && restore_file_ours login_pam_file; then
+    rm -f -- "$LOGIN_PAM_FILE"
+  fi
+  put_file "$STATE_ROOT/login-hook" "$hook" || { module_result login preserved 'hook path conflict'; return 0; }
+  chmod 600 -- "$STATE_ROOT/login-hook" || true
+  put_file "$LOGIN_PAM_FILE" "$pam" || { module_result login preserved 'PAM profile conflict'; return 0; }
+  if ! login_pam_enabled; then
+    # A common-session edited by hand is not touched (pam-auth-update refuses).
+    pam-auth-update --package --enable vps-stable-login || true
+  fi
+  if login_pam_enabled; then
+    ok '登录记录和提醒已开启：下次登录起每次记一行（vps 选 7 安全排查里能看到），登录时显示上次登录。'
+    module_result login applied 'pam_exec in common-session'
+  else
+    warn "$PAM_COMMON_SESSION 被手动改过，pam-auth-update 不会再修改它：登录记录没有开启。"
+    module_result login failed 'common-session not updated'
+  fi
+}
+
+# NUMBER of the last logins in the record, newest last, as "time account
+# address method kind new" (tab-separated); nothing when there is no record.
+login_recent() {
+  [[ -f "$STATE_ROOT/logins" && ! -L "$STATE_ROOT/logins" ]] || return 0
+  tail -n "${1:-20}" -- "$STATE_ROOT/logins" | awk -F'\t' 'NF == 6 && $1 ~ /^[0-9]+$/'
+}
+
+# The menu's red line: first-time addresses of the last 3 days that were not
+# marked as normal since.
+menu_login_alert() {
+  local now when user ip
+  now="$(date +%s)"
+  while IFS=$'\t' read -r when user ip; do
+    [[ -n "$ip" ]] || continue
+    if [[ -f "$STATE_ROOT/known" ]] && grep -Fxq "ip $ip" "$STATE_ROOT/known"; then continue; fi
+    printf '%s%s 陌生 IP 登录过：%s（%s，%s）。不是你的话马上处理；是你自己就在 7 安全排查里标记为正常。%s\n' \
+      "${C_FAIL-}" "${SYM_WARN-⚠}" "$ip" "$user" "$(date -d "@$when" '+%m-%d %H:%M' 2>/dev/null || echo '?')" "${C_RESET-}"
+  done < <(login_recent 2000 | awk -F'\t' -v cut=$((now - 259200)) '$1 >= cut && $6 == 1 {print $1 "\t" $2 "\t" $3}' | tail -n 3)
 }
 
 # The daily security upgrade at the time asked for (a timer drop-in), or the
@@ -4667,7 +4829,7 @@ backup_config_group() {
 backup_configs() {
   local file unit
   say '保存配置快照与优化前状态'
-  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
+  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$LOGIN_PAM_FILE" "$PAM_COMMON_SESSION" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
       /etc/ssh/sshd_config /etc/default/ssh /etc/default/ufw \
       /etc/ufw/ufw.conf /etc/ufw/sysctl.conf /etc/ufw/before.rules /etc/ufw/before6.rules \
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
@@ -5041,6 +5203,7 @@ menu() {
     # The alerts: what is waiting for the user.
     menu_reboot_hint
     menu_pending_reboot_hint
+    menu_login_alert
     if setup_tmux_running; then printf '%s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" '一键开荒正在 tmux 里运行（可能是之前 SSH 断线了）：选 2 回到那个界面。' "${C_RESET-}"; fi
     echo
     width="$(stty size 2>/dev/null < /dev/tty | awk '{print $2}' || true)"
@@ -5522,6 +5685,13 @@ tool_uninstall() {
     ok '已取消卸载。'; return 0
   fi
   tool_uninstall_validate
+  # The login hook goes with the tool's data: PAM must stop calling it first.
+  if login_pam_enabled; then
+    pam-auth-update --package --remove vps-stable-login || true
+    login_pam_enabled && die "$PAM_COMMON_SESSION 里的登录记录那一行去不掉，停止卸载：请先在单项设置里关闭登录记录。"
+    ok '登录记录和提醒已关闭（它的脚本和记录随本工具一起删除）。'
+  fi
+  if [[ -f "$LOGIN_PAM_FILE" ]] && grep -Fq "$STATE_ROOT/login-hook" "$LOGIN_PAM_FILE"; then rm -f -- "$LOGIN_PAM_FILE"; fi
   # Each recursive target is a literal member of the fixed allowlist and was
   # validated twice. --one-file-system adds protection if a mount races us.
   for directory in /var/log/vps-stable-opt /var/backups/vps-stable-opt /var/lib/vps-stable-opt; do
@@ -5564,6 +5734,7 @@ restore_ids() {
     ping) printf '%s\n' ping_file ;;
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
+    login) printf '%s\n' login_pam login_pam_file login_hook_file ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     journal) printf '%s\n' journal_file ;;
     trim) printf '%s\n' svc_trim ;;
@@ -5582,7 +5753,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file
 }
 
 restore_label() {
@@ -5593,6 +5764,7 @@ restore_label() {
     swap_unit) echo '硬盘 Swap 的启动配置' ;; swap_file) echo '硬盘 Swap 文件' ;;
     conntrack_file) echo '连接跟踪参数' ;; conntrack_module) echo '连接跟踪模块的开机加载' ;; ping_file) echo '禁止 ping 的参数' ;;
     keepalive_file) echo 'SSH 保活配置' ;; gai_file) echo '地址优先顺序（/etc/gai.conf）' ;; apt_time_file) echo '每天自动更新的时间' ;;
+    login_pam) echo '登录记录（common-session 里的那一行）' ;; login_pam_file) echo '登录记录的 PAM 设置' ;; login_hook_file) echo '登录记录脚本' ;;
     journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
@@ -5629,6 +5801,7 @@ restore_path() {
     conntrack_file) printf '%s\n' "$CONNTRACK_FILE" ;; conntrack_module) printf '%s\n' "$CONNTRACK_MODULE_FILE" ;;
     ping_file) printf '%s\n' "$PING_FILE" ;;
     keepalive_file) printf '%s\n' "$KEEPALIVE_FILE" ;; gai_file) printf '%s\n' "$GAI_FILE" ;;
+    login_pam_file) printf '%s\n' "$LOGIN_PAM_FILE" ;; login_hook_file) printf '%s\n' "$STATE_ROOT/login-hook" ;;
     apt_time_file) printf '%s\n' "$APT_TIME_FILE" ;;
     *) return 1 ;;
   esac
@@ -5707,6 +5880,7 @@ restore_value() {
     # The static name (what a reboot comes back with).
     hostname) value="$(head -n 1 /etc/hostname 2>/dev/null)" || return 1
         [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]] || return 1; printf '%s\n' "$value" ;;
+    login_pam) if login_pam_enabled; then echo enabled; else echo absent; fi ;;
     ufw_policy_in) ufw_policy_value INPUT ;;
     ufw_policy_out) ufw_policy_value OUTPUT ;;
     ufw_ipv6)
@@ -6058,6 +6232,11 @@ restore_apply_one() {
     cc) [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1; sysctl -w "net.ipv4.tcp_congestion_control=$value" ;;
     qdisc) [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1; sysctl -w "net.core.default_qdisc=$value" ;;
     ntp) case "$value" in yes) timedatectl set-ntp true ;; no) timedatectl set-ntp false ;; *) return 1 ;; esac ;;
+    # Taken out the way it went in (the profile file is still there for it).
+    login_pam)
+      [[ "$value" == absent ]] || return 1
+      pam-auth-update --package --remove vps-stable-login || return 1
+      ! login_pam_enabled ;;
     tz) [[ "$value" =~ ^[A-Za-z0-9_+/-]+$ ]] || return 1; timedatectl set-timezone "$value" ;;
     hostname) [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]] || return 1
       hostnamectl --static --transient set-hostname "$value" ;;
@@ -6539,7 +6718,7 @@ restore_packages_record() {
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
 restore_groups() {
-  printf '%s\n' fail2ban firewall ssh keepalive zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
+  printf '%s\n' fail2ban firewall ssh keepalive login zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
 }
 
 restore_group_label() {
@@ -6547,7 +6726,7 @@ restore_group_label() {
     firewall) echo '防火墙（本工具加的规则、默认策略、开关）' ;; fail2ban) echo 'Fail2ban 防爆破' ;;
     ssh) echo 'SSH 登录加固（恢复密码和 root 登录）' ;; zram) echo 'ZRAM 内存缓冲' ;; swap) echo '硬盘 Swap' ;;
     conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;;
-    keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;;
+    keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; login) echo '登录记录和提醒（记录本身保留）' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; tcp) echo 'TCP 缓冲区上限' ;;
     journal) echo '日志空间限制' ;;
     updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
@@ -6568,6 +6747,7 @@ restore_group_ids() {
     ping) printf '%s\n' ping_file ;;
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
+    login) printf '%s\n' login_pam login_pam_file login_hook_file ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
     tcp) printf '%s\n' tcp_file ;;
@@ -6866,6 +7046,16 @@ check_keepalive() {
   if [[ "$current" == "${1% s}" ]]; then verify_set pass "每 $current 秒检测一次空闲连接"
   elif [[ -z "$current" ]]; then verify_set unknown '读不到 sshd 实际生效的配置'
   else verify_set fail "生效的保活间隔是 ${current} 秒，不是 ${1% s} 秒"; fi
+}
+
+check_login() {
+  local count
+  if ! login_pam_enabled; then verify_set fail "$PAM_COMMON_SESSION 里没有本工具的那一行了：登录不会再记录"; return 0; fi
+  if [[ ! -f "$STATE_ROOT/login-hook" || "$(cat -- "$STATE_ROOT/login-hook" 2>/dev/null)" != "$(login_hook_text)" ]]; then
+    verify_set update '登录记录脚本不是这个版本的：选 5 单项设置 → 登录记录和提醒 → 1 开启，就会更新'; return 0
+  fi
+  count="$(login_recent 20000 | grep -c . || true)"
+  verify_set pass "已开启，记下了 ${count} 次登录"
 }
 
 check_ipv4() {
@@ -7284,6 +7474,7 @@ verify_checks() {
   verify_module ping '禁止 ping' check_ping
   verify_module keepalive 'SSH 保活' check_keepalive
   verify_module ipv4 '优先使用 IPv4' check_ipv4
+  verify_module login '登录记录和提醒' check_login
   verify_module ntp '时间同步' check_ntp
   verify_module journal '日志限制' check_journal
   verify_module trim '磁盘 TRIM' check_trim
@@ -7798,7 +7989,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4
+  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4 login
 }
 
 item_label() {
@@ -7808,6 +7999,7 @@ item_label() {
     journal) echo '日志空间限制' ;; trim) echo '定期 TRIM' ;; ntp) echo '时间同步' ;; timezone) echo '时区' ;;
     hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; swap) echo '硬盘 Swap' ;; tools) echo '常用工具' ;;
     conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;; keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
+    login) echo '登录记录和提醒' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
     tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
     *) printf '%s\n' "$1" ;;
@@ -7860,6 +8052,7 @@ item_status() {
       value="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"
       if [[ -n "$value" && "$value" != 0 ]]; then echo "每 $value 秒"; else echo '未开启'; fi ;;
     ipv4) if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' "$GAI_FILE" 2>/dev/null; then echo '已优先 IPv4'; else echo '默认（IPv6 优先）'; fi ;;
+    login) if login_pam_enabled; then echo "已开启，记下了 $(login_recent 20000 | grep -c . || true) 次登录"; else echo '未开启'; fi ;;
     swap)
       value="$(awk -v n="$SWAP_FILE" 'NR > 1 && $1 == n {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
       if [[ -n "$value" ]]; then echo "已开启，${value} MiB"; else echo '未开启'; fi ;;
@@ -7961,6 +8154,8 @@ item_turn_on() {
       confirm_yes '改成优先使用 IPv4 吗？' || return 0
       IPV4_CHOICE=1
       stage_run ipv4 ipv4_stage ;;
+    login) LOGIN_CHOICE=1
+      stage_run login login_stage ;;
     ping)
       echo '禁止 ping 只挡最基础的扫描（真正的攻击者不靠 ping 找机器）。代价：服务商或你自己用 ping 做的监控会把机器当成宕机，排查网络时也看不到 ping 的结果。'
       confirm_yes '仍然禁止 ping 吗？' || return 0
@@ -8400,6 +8595,7 @@ main() {
     stage_run hosts hosts_stage
     stage_run keepalive keepalive_stage
     stage_run ipv4 ipv4_stage
+    stage_run login login_stage
     attention_banner
     stage_run ssh ssh_harden_stage
     stage_run firewall firewall_stage

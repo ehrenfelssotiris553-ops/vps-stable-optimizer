@@ -120,7 +120,7 @@ done
 # upgrade, the attended SSH/firewall steps last.
 run_case setup_order setup 1 0 0
 order="$(awk '/^stage / {print $2}' "$CASE_DIR/calls" | tr '\n' ' ')"
-[[ "$order" == 'backup ntp apt_index questions zram swap apt_upgrade bbr sysctl tcp journal trim updates autoreboot timezone hosts keepalive ipv4 ssh firewall verification ' ]] || fail "unexpected setup stage order: $order"
+[[ "$order" == 'backup ntp apt_index questions zram swap apt_upgrade bbr sysctl tcp journal trim updates autoreboot timezone hosts keepalive ipv4 login ssh firewall verification ' ]] || fail "unexpected setup stage order: $order"
 [[ "$(grep -n -e '^banner$' -e '^stage ssh ' "$CASE_DIR/calls" | head -n 1)" == *banner ]] || fail 'attention banner not shown before the attended steps'
 grep -Fxq 'read session' "$CASE_DIR/calls" || fail 'setup did not check for tmux/screen'
 # Asked before the plan: a setup handed to tmux shows its plan there, once.

@@ -23,6 +23,10 @@ while IFS='=' read -r name value; do
   PATHS[$name]="$value"
   printf -v "$name" '%s' "$value"
 done < <(grep -E '^[A-Z][A-Z0-9_]*(_FILE|_DROPIN)=/etc/' "$TEST_SCRIPT")
+# The other top-level paths (state, /usr/share), which restore_path names too.
+while IFS='=' read -r name value; do
+  [[ -n "${PATHS[$name]:-}" ]] || printf -v "$name" '%s' "$value"
+done < <(grep -E '^[A-Z][A-Z0-9_]*=/[^ ]*$' "$TEST_SCRIPT")
 ((${#PATHS[@]} >= 13)) || fail "only ${#PATHS[@]} managed file paths found"
 
 # Stages with rollback tracking: the case labels of restore_ids.
@@ -114,7 +118,10 @@ printf 'PASS: every apt-get that changes the system runs with umask 022.\n'
 
 # Colours and state symbols come only from the interface block at the top, so
 # NO_COLOR, a log or a saved report, and VPS_ASCII=1 reach every line.
-raw="$(grep -nF '\033[' "$TEST_SCRIPT" | grep -vF "C_OK=\$'" | grep -vF '\r\033[K' || true)"
+# The login hook's text is left out by position: PAM runs it as a script of its
+# own, which has no C_ variables and writes only to a login terminal.
+raw="$(awk '/^login_hook_text\(\) \{$/ {skip = 1} !skip {print NR ":" $0} $0 == "HOOK" {skip = 0}' "$TEST_SCRIPT" |
+  grep -F '\033[' | grep -vF "C_OK=\$'" | grep -vF '\r\033[K' || true)"
 [[ -z "$raw" ]] || fail "a colour written out instead of a C_ variable: $raw"
 # The help text is left out by position, and a line naming the set itself
 # ("✔ ⚠ ...", in the symbols setting) is not a state either.

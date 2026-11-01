@@ -341,6 +341,21 @@ else
   printf '::notice::%s\n' 'SSH keepalive not tested here: no SSH server on this runner'
 fi
 
+# Login record: nobody logs in to a runner over SSH, so the hook is run the
+# way PAM runs it when a session opens (vm-run has real logins).
+item_do item-login-on login 1
+grep -Fq /var/lib/vps-stable-opt/login-hook /etc/pam.d/common-session || fail 'login record on: not in common-session'
+# shellcheck disable=SC2024
+sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PAM_TYPE=open_session PAM_SERVICE=sshd PAM_USER=runner PAM_RHOST=192.0.2.7 PAM_TTY=/dev/pts/9 \
+  /usr/bin/timeout 3 /bin/bash /var/lib/vps-stable-opt/login-hook > "$LOGS/login-note.log" 2>&1 || fail "the login hook exited with $?"
+cat "$LOGS/login-note.log"
+has login-note '这是第一次从 192.0.2.7 登录'
+sudo tail -n 1 /var/lib/vps-stable-opt/logins | grep -q $'\trunner\t192.0.2.7\tunknown\tssh\t1$' || fail "login record: $(sudo tail -n 1 /var/lib/vps-stable-opt/logins)"
+item_do item-login-off login 2
+if grep -Fq login-hook /etc/pam.d/common-session; then fail 'login record off: still in common-session'; fi
+# Left on: the full rollback takes it out as well.
+item_do item-login-on-again login 1
+
 item_do item-vnstat-off vnstat 2
 if installed vnstat; then fail 'vnStat off: still installed'; fi
 item_do item-vnstat-on vnstat 1
@@ -442,9 +457,10 @@ has rollback '撤销完成'
 for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/sysctl.d/99-vps-stable-bbr.conf \
     /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
     /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf \
-    /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf; do
+    /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login; do
   if sudo test -e "$f"; then fail "$f left after rollback"; fi
 done
+if grep -Fq login-hook /etc/pam.d/common-session; then fail 'the login record is still in common-session after the rollback'; fi
 if [[ -n "${ct_before:-}" && -n "$(ct_max)" ]]; then
   [[ "$(ct_max)" == "$ct_before" ]] || fail "connection tracking not restored: $(ct_max) (was $ct_before)"
 fi
