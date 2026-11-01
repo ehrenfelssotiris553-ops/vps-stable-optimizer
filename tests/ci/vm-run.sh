@@ -318,12 +318,29 @@ sleep 30
 reachable || fail 'the stranger is still blocked after the unban'
 endgroup
 
+group 'Rename the machine; the display name in Chinese'
+old_name="$(vm hostname)"
+# The single item from the tool's own list: 2 renames, then 1 sets the display name.
+index="$(item_index hostname)" || fail 'no single item hostname'
+printf '%s\n' "请选择要修改的项目 ==> @seq $index $index 0" '请选择: ==> @seq 2 1' \
+  '新的主机名（直接回车取消） ==> vps-ci-renamed' '把主机名从 ==> y' '新的显示名 ==> 测试机-一号' > "$WORK/rename.rules"
+vm_drive "$WORK/rename.rules" rename vps item || fail "rename exited with $?"
+[[ "$(vm hostname)" == vps-ci-renamed ]] || fail "hostname after the rename: $(vm hostname)"
+[[ "$(vm 'head -n 1 /etc/hostname')" == vps-ci-renamed ]] || fail '/etc/hostname not renamed'
+vm 'getent hosts vps-ci-renamed' > /dev/null || fail 'the new name does not resolve'
+vm "grep -Fxq 'hostname: vps-ci-renamed' /etc/cloud/cloud.cfg.d/99-vps-stable-hostname.cfg" || fail 'cloud-init not told to keep the name'
+vm "grep -Fxq 'display_name=测试机-一号' /var/lib/vps-stable-opt/params" || fail 'display name not saved'
+endgroup
+
 group 'Reboot'
 vm 'systemctl reboot' || true
 sleep 20
 wait_ssh
 check_all check-after-reboot
 has check-after-reboot '开荒之后已经重启过'
+# cloud-init sets the name from the seed at every boot unless told otherwise.
+[[ "$(vm hostname)" == vps-ci-renamed ]] || fail "the name was changed back at boot: $(vm hostname)"
+passed check-after-reboot '主机名'
 probe journal-probe-after-reboot
 endgroup
 
@@ -427,6 +444,7 @@ vm true || fail 'root cannot log in after the rollback'
 vm 'for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-bbr.conf /etc/systemd/zram-generator.conf /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/systemd/journald.conf.d/99-vps-stable.conf; do [ ! -e "$f" ] || { echo "left: $f"; exit 1; }; done' ||
   fail 'files left after rollback'
 vm 'swapon --noheadings | grep -q zram' && fail 'ZRAM still on after rollback'
+[[ "$(vm hostname)" == "$old_name" ]] || fail "the rollback did not bring the name $old_name back: $(vm hostname)"
 vm_drive uninstall.rules uninstall vps uninstall || fail "uninstall exited with $?"
 vm 'command -v vps' && fail 'vps command left after uninstall'
 endgroup

@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action item_firewall_pause item_ask_reboot_time reboot_time_normalize restore_tool_package item_menu guard_confirm coreutils_selfcheck release_info
+load_optimizer_functions confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action param_list param_names item_firewall_pause item_ask_reboot_time reboot_time_normalize restore_tool_package item_menu guard_confirm coreutils_selfcheck release_info
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -105,6 +105,7 @@ restore_created_dirs() { :; }
 restore_fail2ban_group() { record 'group fail2ban'; }
 restore_ssh_group() { record 'group ssh'; }
 restore_zram_group() { record 'group zram'; }
+restore_hostname_group() { record 'group hostname'; }
 restore_resource() { record "resource $1"; }
 restore_sysctl_runtime() { record 'sysctl runtime'; }
 restore_packages_offer() { record "packages $*"; }
@@ -114,6 +115,8 @@ restore_tool_packages() { :; }
 reset; restore_all_groups
 [[ "$(head -n 2 "$TEST_ROOT/trace" | tr '\n' ' ')" == 'group fail2ban group firewall ' ]] || fail 'full rollback order'
 grep -Fxq 'resource bbr_file' "$TEST_ROOT/trace" || fail 'plain group resources not restored'
+# A rename is undone with its own handler (cloud-init, the name, its hosts line).
+grep -Fxq 'group hostname' "$TEST_ROOT/trace" || fail 'the rename was not undone by the full rollback'
 grep -Fxq 'packages ' "$TEST_ROOT/trace" || fail 'full rollback did not offer package removal'
 # The package default can bring ZRAM back: settled after the package question.
 [[ "$(tail -n 1 "$TEST_ROOT/trace")" == 'zram settle' ]] || fail 'ZRAM not settled after the package question'
@@ -178,9 +181,10 @@ item_action ports < /dev/null > /dev/null
 reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-[[ "$(item_keys | wc -l | tr -d ' ')" == 19 ]] || fail 'item count'
+[[ "$(item_keys | wc -l | tr -d ' ')" == 20 ]] || fail 'item count'
 # New items are appended: the numbers the user knows stay the same.
 [[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
+[[ "$(item_keys | sed -n '20p')" == hostname ]] || fail 'the hostname item is not appended last'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

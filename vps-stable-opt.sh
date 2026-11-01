@@ -36,6 +36,8 @@ F2B_ACTION_FILE=/etc/fail2ban/action.d/vps-stable-ufw-sshd.conf
 SSH_DROPIN=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
 # Only written when a provider image ships "PubkeyAuthentication no".
 SSH_PUBKEY_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-pubkey.conf
+# Tells cloud-init to keep a hostname set with vps (it sets the provider's at boot).
+CLOUD_HOSTNAME_FILE=/etc/cloud/cloud.cfg.d/99-vps-stable-hostname.cfg
 WARNINGS=0
 # This run's log (set by start_logging); apt writes its full output there.
 RUN_LOG=''
@@ -69,6 +71,7 @@ KERNEL_CLEAN_CHOICE=''
 VNSTAT_CHOICE=''
 ZRAM_CHOICE=''
 HOSTS_CHOICE=''
+HOSTNAME_CHOICE=''
 
 case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
@@ -650,6 +653,123 @@ apt_index_stage() {
 
 hostname_resolves() {
   getent hosts "$(hostname 2>/dev/null || echo localhost)" >/dev/null 2>&1
+}
+
+# A hostname this tool sets: lowercase letters, digits and hyphens, dots
+# between labels, at most 63 characters (the kernel keeps 64).
+hostname_valid() {
+  local re='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+  ((${#1} <= 63)) && [[ "$1" =~ $re ]]
+}
+
+# Asks for the new hostname; sets HOSTNAME_CHOICE.
+hostname_ask() {
+  local answer old
+  old="$(hostname 2>/dev/null || true)"
+  printf '现在的主机名：%s\n' "${old:-未知}"
+  echo '主机名只能用小写字母、数字和连字符（-），最长 63 位。改名不会断开 SSH；监控面板之类按主机名认机器的，要自己同步。'
+  while :; do
+    read -r -p '新的主机名（直接回车取消）: ' answer || return 1
+    [[ -n "$answer" ]] || { ok '已取消。'; return 1; }
+    answer="${answer,,}"
+    if ! hostname_valid "$answer"; then echo '格式不对：只能用小写字母、数字和连字符，开头结尾不能是连字符。'; continue; fi
+    if [[ "$answer" == "$old" ]]; then ok "主机名已经是 $old。"; return 1; fi
+    confirm_yes "把主机名从 ${old:-未知} 改成 $answer 吗？" || { ok '已取消。'; return 1; }
+    HOSTNAME_CHOICE="$answer"
+    return 0
+  done
+}
+
+# OLD NEW: the line this tool added for the old name goes, and the new name
+# gets one (127.0.1.1, as on Debian) when it does not resolve.
+hostname_hosts_update() {
+  local from="$1" to="$2" drop="$RESTORE_ROOT/.hostname-drop" record="$RESTORE_ROOT/hostname_hosts_line" temp
+  if [[ -n "$from" && -f "$record" && ! -L "$record" ]] && grep -Fxq -- "127.0.1.1"$'\t'"$from" "$record"; then
+    printf '%s\n' "127.0.1.1"$'\t'"$from" > "$drop" && chmod 600 -- "$drop"
+    if restore_hosts_lines_apply .hostname-drop && temp="$(mktemp "$RESTORE_ROOT/.hostname-record.XXXXXX")"; then
+      { grep -vxF -- "127.0.1.1"$'\t'"$from" "$record" > "$temp" || true; }
+      if ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$record"; then rm -f -- "$temp"; fi
+    fi
+    rm -f -- "$drop"
+  fi
+  if hostname_resolves; then return 0; fi
+  if [[ ! -f /etc/hosts || -L /etc/hosts ]]; then warn "/etc/hosts 不是普通文件：新主机名 $to 解析不了，sudo 会报 unable to resolve host。"; return 0; fi
+  backup_config_path /etc/hosts || die '无法备份 /etc/hosts'
+  if append_line_safely /etc/hosts "127.0.1.1"$'\t'"$to" && hostname_resolves; then
+    record_config_change /etc/hosts line-appended || die '无法记录 /etc/hosts 变更。'
+    restore_record_hosts_line "127.0.1.1"$'\t'"$to" hostname_hosts_line || warn '无法记录为新主机名加的 /etc/hosts 行；撤销时请人工删掉它。'
+    ok "已在 /etc/hosts 加入：127.0.1.1 $to"
+  else
+    warn "新主机名 $to 加进 /etc/hosts 后仍解析不了，请人工检查。"
+  fi
+}
+
+# On some images (Debian's) cloud-init writes /etc/hosts from its template at
+# every boot, with the hostname it is configured with; the file says so.
+cloud_hosts_managed() {
+  command -v cloud-init >/dev/null && grep -qsF "configured 'manage_etc_hosts' as True" /etc/hosts
+}
+
+# Has cloud-init write /etc/hosts again now, from its configuration as it is.
+cloud_hosts_refresh() {
+  cloud-init single --name update_etc_hosts --frequency always >/dev/null 2>&1
+}
+
+# Renames this machine: the static and the running name, cloud-init told to
+# keep it (and to write /etc/hosts with it, where it does that), and a line in
+# /etc/hosts when the new name still does not resolve.
+hostname_stage() {
+  say '修改主机名'
+  local from to content
+  from="$(hostname 2>/dev/null || true)" to="${HOSTNAME_CHOICE:-}"
+  if ! hostname_valid "$to"; then warn "主机名格式不对：$to，没有修改。"; module_result hostname failed 'invalid name'; return 0; fi
+  if ! hostnamectl --static --transient set-hostname "$to"; then
+    warn '修改主机名失败（hostnamectl），保持原样。'; module_result hostname failed 'hostnamectl failed'; return 0
+  fi
+  # Most provider images run cloud-init, which sets the provider's name at
+  # every boot unless told to keep this one.
+  if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+    content="# VPS Stable Optimizer v2.8: keep the hostname set with vps (cloud-init would set the provider's name again at boot)"$'\n'"preserve_hostname: true"$'\n'"hostname: $to"$'\n'"fqdn: $to"
+    if [[ -f "$CLOUD_HOSTNAME_FILE" && "$(cat -- "$CLOUD_HOSTNAME_FILE" 2>/dev/null || true)" != "$content" ]] && restore_file_ours cloud_hostname_file; then
+      rm -f -- "$CLOUD_HOSTNAME_FILE"
+    fi
+    if ! put_file "$CLOUD_HOSTNAME_FILE" "$content"; then
+      warn "没能写入 $CLOUD_HOSTNAME_FILE：重启后 cloud-init 可能把主机名改回服务商设置的名字。"
+    elif cloud_hosts_managed && ! cloud_hosts_refresh; then
+      warn 'cloud-init 没能马上按新名字重写 /etc/hosts；下次开机时会写好。'
+    fi
+  fi
+  hostname_hosts_update "$from" "$to"
+  ok "主机名已改成 $to（原来是 ${from:-未知}）。新开的 SSH 窗口里，提示符会显示新名字。"
+  module_result hostname applied "$to"
+}
+
+# The display name: free text (Chinese too), at most 24 columns, for the menu
+# and notifications; a per-machine setting, never exported.
+display_name_get() {
+  local value
+  [[ -f "$PARAMS_FILE" && ! -L "$PARAMS_FILE" ]] || return 1
+  value="$(awk -F= '$1 == "display_name" {v = substr($0, 14)} END {print v}' "$PARAMS_FILE" | LC_ALL=C tr -d '\000-\037\177')"
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+display_name_ask() {
+  local answer width
+  printf '现在的显示名：%s\n' "$(display_name_get || echo '没有设置（菜单里显示主机名）')"
+  echo '显示名只用在本工具的菜单和通知里，可以写中文，例如「东京-1」；不会改系统的主机名。'
+  while :; do
+    read -r -p '新的显示名（直接回车不改，输入 - 删除）: ' answer || return 0
+    answer="$(LC_ALL=C tr -d '\000-\037\177' <<< "$answer")"
+    answer="${answer#"${answer%%[! ]*}"}" answer="${answer%"${answer##*[! ]}"}"
+    [[ -n "$answer" ]] || { ok '显示名没有改动。'; return 0; }
+    if [[ "$answer" == - ]]; then param_store display_name '' || die '无法保存设置。'; ok '显示名已删除，菜单里显示主机名。'; return 0; fi
+    ui_width width "$answer"
+    if ((width > 24)); then echo "太长了（$width 列）：最多 24 列，一个汉字算两列。"; continue; fi
+    param_store display_name "$answer" || die '无法保存设置。'
+    ok "显示名已改成：$answer"
+    return 0
+  done
 }
 
 # Prints the canonical zone for an exact or case-insensitive name.
@@ -3790,7 +3910,7 @@ backup_configs() {
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
       /etc/sysctl.conf /etc/systemd/journald.conf /etc/default/zramswap \
       /etc/apt/apt.conf /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/sources.list /etc/fail2ban/jail.conf /etc/fail2ban/jail.local \
-      /etc/systemd/timesyncd.conf; do
+      /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE"; do
     backup_config_path "$file"
   done
   backup_config_group /etc/ssh/sshd_config.d '*.conf'
@@ -4022,8 +4142,9 @@ menu_ip() {
 # Who this machine is and how it stands: the title, a machine line and a
 # status line. Only cheap reads, since it is drawn before every choice.
 menu_header() {
-  local name ram cores report='' file conclusion setup check fw f2b
+  local name display ram cores report='' file conclusion setup check fw f2b
   name="$(hostname -s 2>/dev/null || true)"
+  if display="$(display_name_get)"; then name="$display（${name:-?}）"; fi
   ram="$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo 2>/dev/null || true)"
   cores="$(nproc 2>/dev/null || echo '?')"
   printf '\n%s%sVPS 机器管家 %s%s%s\n' "${C_TITLE-}" "${UI_OPEN-【}" "${SCRIPT_VERSION:-}" "${UI_CLOSE-】}" "${C_RESET-}"
@@ -4571,6 +4692,7 @@ restore_ids() {
     sysctl) printf '%s\n' sysctl_file ;;
     tcp) printf '%s\n' tcp_file ;;
     hosts) printf '%s\n' hosts_file ;;
+    hostname) printf '%s\n' hostname cloud_hostname_file ;;
     ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     firewall) printf '%s\n' ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw ;;
     fail2ban) printf '%s\n' f2b_jail f2b_action svc_fail2ban ;;
@@ -4579,7 +4701,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
 }
 
 restore_label() {
@@ -4598,6 +4720,7 @@ restore_label() {
     svc_fail2ban) echo 'Fail2ban 服务' ;; sysctl_file) echo '内核网络安全参数' ;;
     tcp_file) echo 'TCP 缓冲区上限' ;;
     apt_reboot_file) echo '自动更新的重启时间' ;; hosts_file) echo '/etc/hosts 主机名' ;;
+    hostname) echo '主机名' ;; cloud_hostname_file) echo 'cloud-init 的主机名设置' ;;
     ufw_ipv6) echo '防火墙 IPv6 防护开关' ;; *) printf '%s\n' "$1" ;;
   esac
 }
@@ -4616,6 +4739,7 @@ restore_path() {
     tcp_file) printf '%s\n' "$TCP_BUFFER_FILE" ;;
     apt_reboot_file) printf '%s\n' "$APT_REBOOT_FILE" ;;
     hosts_file) echo /etc/hosts ;;
+    cloud_hostname_file) printf '%s\n' "$CLOUD_HOSTNAME_FILE" ;;
     *) return 1 ;;
   esac
 }
@@ -4690,6 +4814,9 @@ restore_value() {
         case "$value" in yes|no) printf '%s\n' "$value" ;; *) return 1 ;; esac ;;
     tz) value="$(timedatectl show -p Timezone --value 2>/dev/null)" || return 1
         [[ "$value" =~ ^[A-Za-z0-9_+/-]+$ ]] || return 1; printf '%s\n' "$value" ;;
+    # The static name (what a reboot comes back with).
+    hostname) value="$(head -n 1 /etc/hostname 2>/dev/null)" || return 1
+        [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]] || return 1; printf '%s\n' "$value" ;;
     ufw_policy_in) ufw_policy_value INPUT ;;
     ufw_policy_out) ufw_policy_value OUTPUT ;;
     ufw_ipv6)
@@ -4929,8 +5056,9 @@ restore_capture_failure() {
 
 # /etc/hosts is shared with the administrator and cloud-init, so only the lines
 # this tool appended are recorded and removed; nothing else in it is touched.
+# LINE [RECORD]: RECORD is hosts_line (the setup's) or hostname_hosts_line (a rename's).
 restore_record_hosts_line() {
-  local line="$1" file="$RESTORE_ROOT/hosts_line" re=$'^127\\.0\\.1\\.1\t[A-Za-z0-9.-]+$'
+  local line="$1" file="$RESTORE_ROOT/${2:-hosts_line}" re=$'^127\\.0\\.1\\.1\t[A-Za-z0-9.-]+$'
   [[ "$RESTORE_READY" == 1 ]] || return 0
   [[ "$line" =~ $re ]] || return 1
   [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
@@ -4939,13 +5067,13 @@ restore_record_hosts_line() {
 }
 
 restore_hosts_line_present() {
-  local record="$RESTORE_ROOT/hosts_line" file
+  local record="$RESTORE_ROOT/${1:-hosts_line}" file
   file="$(restore_path hosts_file)" || return 1
   restore_data_safe "$record" && [[ -f "$file" ]] && grep -qxF -f "$record" -- "$file"
 }
 
 restore_hosts_lines_apply() {
-  local record="$RESTORE_ROOT/hosts_line" file temp rc=0
+  local record="$RESTORE_ROOT/${1:-hosts_line}" file temp rc=0
   file="$(restore_path hosts_file)" || return 1
   restore_data_safe "$record" && [[ -f "$file" && ! -L "$file" ]] || return 1
   temp="$(mktemp "${file%/*}/.vps-restore.XXXXXX")" || return 1
@@ -5034,6 +5162,8 @@ restore_apply_one() {
     qdisc) [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1; sysctl -w "net.core.default_qdisc=$value" ;;
     ntp) case "$value" in yes) timedatectl set-ntp true ;; no) timedatectl set-ntp false ;; *) return 1 ;; esac ;;
     tz) [[ "$value" =~ ^[A-Za-z0-9_+/-]+$ ]] || return 1; timedatectl set-timezone "$value" ;;
+    hostname) [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]] || return 1
+      hostnamectl --static --transient set-hostname "$value" ;;
     svc_ufw)
       # Starting ufw.service loads the firewall when ufw.conf says ENABLED=yes;
       # like the firewall switch, rollback never turns it on (now or at boot).
@@ -5301,6 +5431,21 @@ restore_zram_group() {
 # it is back within moments, not only after a reboot. Once the package is gone
 # such a ZRAM is switched off for good; while the package stays, its ZRAM is
 # started now, so what is shown is what the next boot will have.
+# The rename goes: cloud-init's setting, the old name, and the /etc/hosts line
+# added for the new one (the setup's own hosts line stays with the hosts group).
+restore_hostname_group() {
+  restore_resource cloud_hostname_file
+  restore_resource hostname
+  # Where cloud-init writes /etc/hosts, it writes it again with the old name.
+  if cloud_hosts_managed && ! cloud_hosts_refresh; then
+    warn 'cloud-init 没能马上按原来的名字重写 /etc/hosts；下次开机时会恢复。'
+  fi
+  if [[ -s "$RESTORE_ROOT/hostname_hosts_line" ]]; then
+    if restore_hosts_lines_apply hostname_hosts_line; then rm -f -- "$RESTORE_ROOT/hostname_hosts_line"
+    else warn '无法从 /etc/hosts 删掉本工具为新主机名加的那一行，请人工检查。'; RESTORE_PARTIAL=1; fi
+  fi
+}
+
 restore_zram_settle() {
   [[ -d "$RESTORE_ROOT/zram_swap" && ! -e "$ZRAM_FILE" ]] || return 0
   [[ "$(restore_read zram_swap origin_value 2>/dev/null || true)" == absent ]] || return 0
@@ -5474,7 +5619,7 @@ restore_packages_record() {
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
 restore_groups() {
-  printf '%s\n' fail2ban firewall ssh zram bbr sysctl tcp journal updates autoreboot ntp trim timezone hosts
+  printf '%s\n' fail2ban firewall ssh zram bbr sysctl tcp journal updates autoreboot ntp trim timezone hostname hosts
 }
 
 restore_group_label() {
@@ -5485,6 +5630,7 @@ restore_group_label() {
     journal) echo '日志空间限制' ;;
     updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
     trim) echo '定期 TRIM' ;; timezone) echo '时区' ;; hosts) echo '/etc/hosts 主机名' ;;
+    hostname) echo '主机名（恢复原来的名字）' ;;
     *) printf '%s\n' "$1" ;;
   esac
 }
@@ -5505,6 +5651,7 @@ restore_group_ids() {
     trim) printf '%s\n' svc_trim ;;
     timezone) printf '%s\n' tz ;;
     hosts) printf '%s\n' hosts_file ;;
+    hostname) printf '%s\n' hostname cloud_hostname_file ;;
   esac
 }
 
@@ -5522,6 +5669,7 @@ restore_group_pending() {
     sysctl) [[ -s "$RESTORE_ROOT/sysctl_runtime" ]] && return 0 ;;
     tcp) [[ -s "$RESTORE_ROOT/tcp_sysctl_runtime" ]] && return 0 ;;
     zram) [[ -s "$RESTORE_ROOT/zram_sysctl_runtime" ]] && return 0 ;;
+    hostname) [[ -s "$RESTORE_ROOT/hostname_hosts_line" ]] && return 0 ;;
   esac
   return 1
 }
@@ -5535,6 +5683,7 @@ restore_group_apply() {
     fail2ban) restore_fail2ban_group ;;
     ssh) restore_ssh_group ;;
     zram) restore_zram_group ;;
+    hostname) restore_hostname_group ;;
     sysctl)
       restore_resource sysctl_file
       if [[ "$(restore_read sysctl_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime; fi ;;
@@ -5762,6 +5911,18 @@ verify_ssh_connection_cc() {
   [[ "$lport" =~ ^[0-9]+$ && "$rport" =~ ^[0-9]+$ ]] || return 1
   command -v ss >/dev/null || return 1
   ss -tinH state established "( sport = :$lport and dport = :$rport )" 2>/dev/null | grep -qw bbr
+}
+
+# NAME: the hostname this tool set, still in force (after a reboot too) and resolving.
+check_hostname() {
+  local now static=''
+  now="$(hostname 2>/dev/null || true)"
+  static="$(head -n 1 /etc/hostname 2>/dev/null || true)"
+  if [[ "$now" != "$1" || "$static" != "$1" ]]; then
+    verify_set fail "主机名现在是 ${now:-未知}（/etc/hostname：${static:-未知}），不是改好的 $1：可能被服务商的初始化程序改回去了"
+  elif ! hostname_resolves; then verify_set fail "主机名 $1 解析不了：sudo 会报 unable to resolve host"
+  elif [[ -f "$CLOUD_HOSTNAME_FILE" ]]; then verify_set pass "$1（能解析；cloud-init 开机时不会改回）"
+  else verify_set pass "$1（能解析）"; fi
 }
 
 check_bbr() {
@@ -6085,6 +6246,7 @@ verify_checks() {
   verify_module traffic '流量统计' check_traffic
   verify_module timezone '时区' check_timezone
   verify_module hosts '主机名解析' check_hosts
+  verify_module hostname '主机名' check_hostname
   verify_module ssh 'SSH 登录加固' check_ssh
   verify_module firewall '防火墙' check_firewall
   verify_module fail2ban 'Fail2ban 防爆破' check_fail2ban
@@ -6587,7 +6749,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp
+  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname
 }
 
 item_label() {
@@ -6595,7 +6757,7 @@ item_label() {
     upgrade) echo '系统升级（立即升级一次）' ;; updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; zram) echo 'ZRAM 内存缓冲' ;;
     journal) echo '日志空间限制' ;; trim) echo '定期 TRIM' ;; ntp) echo '时间同步' ;; timezone) echo '时区' ;;
-    hosts) echo '主机名解析' ;; tools) echo '常用工具' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
+    hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; tools) echo '常用工具' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
     tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
     *) printf '%s\n' "$1" ;;
@@ -6634,6 +6796,9 @@ item_status() {
     ntp) if ntp_synced; then echo '已同步'; else echo '未同步'; fi ;;
     timezone) timedatectl show -p Timezone --value 2>/dev/null || echo '未知' ;;
     hosts) if hostname_resolves; then echo '正常'; else echo '无法解析'; fi ;;
+    hostname)
+      value="$(hostname 2>/dev/null || echo 未知)"
+      if dump="$(display_name_get)"; then echo "$value，显示名 $dump"; else echo "$value，没设显示名"; fi ;;
     tools)
       for pkg in "${TOOLS_PACKAGES[@]}"; do total=$((total + 1)); if installed "$pkg"; then count=$((count + 1)); fi; done
       echo "已安装 $count/$total" ;;
@@ -6718,6 +6883,8 @@ item_turn_on() {
       stage_run timezone timezone_stage ;;
     hosts) HOSTS_CHOICE=1
       stage_run hosts hosts_stage ;;
+    hostname) hostname_ask || return 0
+      stage_run hostname hostname_stage ;;
     tools) apt_index_ready || return 0
       stage_run tools tools_item_stage ;;
     vnstat) apt_index_ready || return 0
@@ -6791,6 +6958,7 @@ item_action() {
     tools|vnstat) echo '1. 安装   2. 卸载（只卸载本工具装的）   0. 返回' ;;
     firewall) echo '1. 开启（需要新开 SSH 窗口确认）   2. 临时关闭   3. 撤销本工具的防火墙设置   0. 返回' ;;
     timezone) echo '1. 修改时区   2. 恢复成原来的时区   0. 返回' ;;
+    hostname) echo '1. 修改显示名   2. 修改主机名   3. 撤销主机名修改（恢复原来的名字）   0. 返回' ;;
     autoreboot) echo '1. 设置自动重启时间   2. 取消（撤销本工具的设置）   0. 返回' ;;
     ssh) echo '1. 加固（只允许密钥登录，可选禁止 root）   2. 撤销（恢复密码和 root 登录）   0. 返回' ;;
     *) if [[ -n "$(param_names "$key")" ]]; then echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 调整参数   4. 恢复推荐值   0. 返回'
@@ -6802,6 +6970,10 @@ item_action() {
     return 0
   fi
   case "$key:$choice" in
+    hostname:1) display_name_ask ;;
+    hostname:2) item_turn_on hostname ;;
+    hostname:3) item_turn_off hostname ;;
+    hostname:*) return 0 ;;
     firewall:2) item_firewall_pause ;;
     firewall:3) item_turn_off firewall ;;
     upgrade:1|kernel:1) item_turn_on "$key" ;;
