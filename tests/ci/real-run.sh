@@ -469,12 +469,16 @@ if ! sudo grep -Fxq 'quota_mb=1000000' /var/lib/vps-stable-opt/quota.conf || ! s
   fail "traffic alert settings: $(sudo cat /var/lib/vps-stable-opt/quota.conf 2>&1)"
 fi
 grep -Fxq 'OnCalendar=*:0/5' /etc/systemd/system/vps-stable-check.timer || fail 'the traffic alert alone does not run every 5 minutes'
-# What it counts must be what the network card counted (in and out, MB of
-# 10^6 bytes): 30 MB downloaded between two checks. A check of the timer at
-# the same moment makes ours skip, so it runs until the count is newer.
+# What it counts is what the kernel counts for that network card, in and out:
+# its counters (read between the test's own reads around each check), exactly
+# what they grew by, and that as MB of 10^6 bytes on top of the 5000 MB. The
+# size of a download proves nothing here: on GitHub's Azure machines (their
+# accelerated card, driver mana) 30 MB left the kernel's counters of both cards
+# almost unchanged (seen in CI), which the tool warns of. A check of the timer
+# at the same moment makes ours skip, so it runs until the count is newer.
 iface="$(sudo sed -n 's/^iface=//p' /var/lib/vps-stable-opt/quota.conf)"
-nic_bytes() { awk -v i="$iface:" '$1 == i {print $2 + $10}' /proc/net/dev; }
-counted() { sudo cat /var/lib/vps-stable-opt/notify/traffic-used; }
+nic() { awk -v i="$iface:" '$1 == i {print $2, $10}' /proc/net/dev; }
+tool_traffic() { sudo cat /var/lib/vps-stable-opt/notify/traffic; }
 check_now() {
   local since i
   sleep 1; since="$(date +%s)"
@@ -485,30 +489,38 @@ check_now() {
   done
   fail 'the traffic check did not run'
 }
+for d in /sys/class/net/*; do
+  if [[ "$(readlink -f "$d/master" 2>/dev/null || true)" == */"$iface" && "$(readlink -f "$d/device/driver" 2>/dev/null || true)" == */mana ]]; then
+    has item-quota-on '加速网卡（mana）'
+  fi
+done
 check_now
-used0="$(counted)" bytes0="$(nic_bytes)"
-cat /proc/net/dev > "$LOGS/net-dev-before.txt" 2>&1 || true
-if [[ ! "$used0" =~ ^[0-9]+$ ]] || ((used0 < 5000)); then fail "traffic counted at the start: $used0 MB (5000 MB were used already)"; fi
-curl -fsS --max-time 180 --max-filesize 40000000 -r 0-29999999 -o /dev/null \
-  https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img || fail 'the test download failed'
-bytes1="$(nic_bytes)"
-cat /proc/net/dev > "$LOGS/net-dev-after.txt" 2>&1 || true
+read -r _ rx1 tx1 arx1 atx1 < <(tool_traffic)
+read -r krx0 ktx0 < <(nic)
+curl -fsS --max-time 60 -o /dev/null https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS || fail 'the test download failed'
+read -r krx1 ktx1 < <(nic)
 check_now
-used1="$(counted)"
-want=$(((bytes1 - bytes0) / 1000000)) got=$((used1 - used0))
-printf 'Traffic through %s: %s MB by the card, %s MB by the alert\n' "$iface" "$want" "$got"
-{ printf 'iface %s: bytes %s -> %s, counted %s -> %s MB\n' "$iface" "${bytes0:-none}" "${bytes1:-none}" "$used0" "$used1"
-  echo '-- /proc/net/dev before:'; cat "$LOGS/net-dev-before.txt"; echo '-- after:'; cat "$LOGS/net-dev-after.txt"
-  echo '-- links:'; ip -o link 2>&1 | cut -c1-160
-  echo '-- masters:'; for d in /sys/class/net/*; do if [[ -e "$d/master" ]]; then printf '%s -> %s\n' "${d##*/}" "$(readlink -f "$d/master")"; fi; done
-  echo '-- drivers:'; for d in /sys/class/net/*; do printf '%s %s\n' "${d##*/}" "$(readlink -f "$d/device/driver" 2>/dev/null || echo none)"; done
-  echo '-- route:'; ip route get "$(getent ahostsv4 cloud-images.ubuntu.com | awk 'NR == 1 {print $1}')" 2>&1
-  echo '-- the tool:'; sudo cat /var/lib/vps-stable-opt/notify/traffic /var/lib/vps-stable-opt/quota.conf 2>&1
+read -r _ rx2 tx2 arx2 atx2 < <(tool_traffic)
+read -r krx2 ktx2 < <(nic)
+shown="$(sudo cat /var/lib/vps-stable-opt/notify/traffic-used)"
+{ printf 'kernel %s before the first check, then %s/%s; tool %s/%s, added %s/%s\n' "$iface" "$krx0" "$ktx0" "$rx1" "$tx1" "$arx1" "$atx1"
+  printf 'kernel before the second check %s/%s, after %s/%s; tool %s/%s, added %s/%s; shown %s MB\n' "$krx1" "$ktx1" "$krx2" "$ktx2" "$rx2" "$tx2" "$arx2" "$atx2" "$shown"
+  cat /proc/net/dev
 } > "$LOGS/traffic-diagnosis.txt" 2>&1
 notice "traffic count ($mode, $(uname -m))" "$LOGS/traffic-diagnosis.txt"
 traffic_problem=''
-if ((want < 25)); then traffic_problem="only $want MB went through $iface for the 30 MB download (see the traffic count notice)"
-elif ((got < want - 2 || got > want + 5)); then traffic_problem="the traffic alert counted $got MB, the network card $want MB"; fi
+for v in "$rx1" "$tx1" "$arx1" "$atx1" "$rx2" "$tx2" "$arx2" "$atx2" "$krx0" "$ktx0" "$krx1" "$ktx1" "$krx2" "$ktx2" "$shown"; do
+  [[ "$v" =~ ^[0-9]+$ ]] || traffic_problem='a traffic count could not be read (see the traffic count notice)'
+done
+if [[ -n "$traffic_problem" ]]; then :
+elif ! ((rx1 <= krx0 && krx1 <= rx2 && rx2 <= krx2 && tx1 <= ktx0 && ktx1 <= tx2 && tx2 <= ktx2)); then
+  traffic_problem="the traffic alert did not read the kernel's counters of $iface (see the traffic count notice)"
+elif ((rx2 - rx1 + tx2 - tx1 <= 0)); then traffic_problem="the counters of $iface did not move between the two checks"
+elif ((arx2 - arx1 != rx2 - rx1 || atx2 - atx1 != tx2 - tx1)); then
+  traffic_problem="the traffic alert added $((arx2 - arx1))/$((atx2 - atx1)) bytes, the counters grew by $((rx2 - rx1))/$((tx2 - tx1))"
+elif ((shown != (arx2 + atx2) / 1000000 + 5000)); then
+  traffic_problem="the traffic alert shows $shown MB for $((arx2 + atx2)) bytes and 5000 MB used already"
+fi
 if [[ -n "$traffic_problem" ]]; then printf '::error::%s\n' "$traffic_problem"; fi
 
 # Docker's log limit, where the runner has Docker: the rest of daemon.json kept,
