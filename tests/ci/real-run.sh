@@ -66,6 +66,11 @@ if [[ "$mode" == upgrade ]]; then
   previous="$(previous_release "$version")" || fail 'no previous release on origin/main'
   read -r old_commit old_version <<< "$previous"
   printf 'Previous release: %s (%s)\n' "$old_version" "$old_commit"
+  # The previous release starts stopped APT timers at once, and their catch-up
+  # upgrade holds the package lock for the rest of the run here (hundreds of
+  # updates; fixed in this version). Mark their last run as now, as this
+  # version would; the other modes leave it to the tool.
+  sudo touch /var/lib/systemd/timers/stamp-apt-daily.timer /var/lib/systemd/timers/stamp-apt-daily-upgrade.timer 2>/dev/null || true
   git -C "$ROOT" show "$old_commit:install.sh" > "$LOGS/old-install.sh"
   git -C "$ROOT" show "$old_commit:vps-stable-opt.sh" > "$LOGS/old-vps-stable-opt.sh"
   sudo bash "$LOGS/old-install.sh" --local-file "$LOGS/old-vps-stable-opt.sh" --no-run
