@@ -4304,8 +4304,10 @@ restore_sshport_group() {
   local port verb
   restore_needed sshport_dropin || return 0
   port="$(sed -n 's/^port=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)" verb="$(sed -n 's/^verb=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)"
-  if [[ "$port" =~ ^[0-9]{1,5}$ ]] && ufw_active && ! ufw_rule "${verb:-allow}" "$port"; then
-    warn "防火墙没能放行原来的 SSH 端口 $port：SSH 端口保持不变。"; RESTORE_PARTIAL=1; return 0
+  if [[ "$port" =~ ^[0-9]{1,5}$ ]] && ufw_active; then
+    if ! ufw_rule "${verb:-allow}" "$port"; then warn "防火墙没能放行原来的 SSH 端口 $port：SSH 端口保持不变。"; RESTORE_PARTIAL=1; return 0; fi
+    # The change took the old port's exemptions away with its rules.
+    if [[ "$verb" == limit ]]; then ssh_limit_exempt; fi
   fi
   restore_resource sshport_dropin
   if ! ssh_port_reload; then warn 'SSH 重新加载失败：重启 SSH 后才回到原来的端口。'; RESTORE_PARTIAL=1; fi
@@ -5683,7 +5685,7 @@ notify_stage() {
   if [[ ! "$token" =~ ^[0-9]{5,15}:[A-Za-z0-9_-]{30,64}$ ]]; then warn 'Token 的格式不对（应该像 123456789:AA… 这样）。'; module_result notify failed 'bad token'; return 0; fi
   read -r -p '给机器人发过一句话了吗？发好了按回车: ' _ || true
   updates="$(tg_call "$api" "$token" getUpdates 2>/dev/null || true)"
-  chat="$(grep -o '"chat":{"id":-\{0,1\}[0-9]\{1,20\}' <<< "$updates" | tail -n 1 | grep -o -- '-\{0,1\}[0-9]*$' || true)"
+  chat="$(tr -d ' \n\t' <<< "$updates" | grep -o '"chat":{"id":-\{0,1\}[0-9]\{1,20\}' | tail -n 1 | grep -o -- '-\{0,1\}[0-9]*$' || true)"
   if [[ -z "$chat" ]]; then
     warn '没找到你发给机器人的消息（Token 不对，或者还没发）。'
     read -r -p '直接输入 chat id（不知道就回车取消）: ' chat || chat=''
@@ -5734,9 +5736,11 @@ quota_stage() {
   else module_result quota failed 'check timer'; fi
 }
 
-# This period's use, "USED QUOTA" in MB, when the alert is on.
+# This period's use, "USED QUOTA" in MB, when the alert is on; nothing (and
+# no failure: it is read through < <(...), where the error trap would report a
+# function that returns 1) when not.
 quota_status() {
-  [[ -s "$STATE_ROOT/quota.conf" && -s "$STATE_ROOT/notify/traffic-used" ]] || return 1
+  [[ -s "$STATE_ROOT/quota.conf" && -s "$STATE_ROOT/notify/traffic-used" ]] || return 0
   printf '%s %s\n' "$(cat -- "$STATE_ROOT/notify/traffic-used")" "$(sed -n 's/^quota_mb=//p' "$STATE_ROOT/quota.conf")"
 }
 

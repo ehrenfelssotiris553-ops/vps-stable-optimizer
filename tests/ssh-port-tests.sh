@@ -120,9 +120,9 @@ restore_needed() { return 0; }
 restore_resource() { record "resource $1"; rm -f "$SSH_PORT_DROPIN"; }
 : > "$TEST_ROOT/trace"; RESTORE_PARTIAL=0
 restore_sshport_group
-order="$(grep -nE '^(ufw limit 22/tcp|resource sshport_dropin|ssh reload)' "$TEST_ROOT/trace" | cut -d: -f2- | tr '\n' '|')"
-[[ "$order" == 'ufw limit 22/tcp|resource sshport_dropin|ssh reload|' && "$LISTEN" == 22 ]] || fail "rollback order: $order"
-printf 'PASS: rollback lets the original port in before SSH goes back to it.\n'
+order="$(grep -nE '^(ufw limit 22/tcp|exempt|resource sshport_dropin|ssh reload)' "$TEST_ROOT/trace" | cut -d: -f2- | tr '\n' '|')"
+[[ "$order" == 'ufw limit 22/tcp|exempt|resource sshport_dropin|ssh reload|' && "$LISTEN" == 22 ]] || fail "rollback order: $order"
+printf 'PASS: rollback lets the original port in (allowlisted addresses unlimited again) before SSH goes back to it.\n'
 
 # vps check: sshd listens on the ports of the file, the firewall lets them in.
 printf 'Port 2244\n' > "$SSH_PORT_DROPIN"; LISTEN='2244 '; printf 'ufw limit 2244/tcp\n' > "$TEST_ROOT/ufw"

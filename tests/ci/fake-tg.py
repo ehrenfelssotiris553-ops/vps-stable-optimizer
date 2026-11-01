@@ -28,7 +28,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out = {'ok': True, 'result': {}}
         else:
             out = {'ok': False, 'description': 'Not Found'}
-        data = json.dumps(out).encode('utf-8')
+        # Compact, as Telegram writes it.
+        data = json.dumps(out, separators=(',', ':')).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))

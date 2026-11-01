@@ -155,6 +155,10 @@ printf 'Inter-|\n face |\n  eth0: %s 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n' "$mib" > "
 [[ "$(cat "$D/traffic-used")" == 10 ]] && sent | grep -Fq '的 100%' || fail "after a reboot: $(cat "$D/traffic-used") $(sent)"
 read -r used quota < <(quota_status)
 [[ "$used" == 10 && "$quota" == 10 ]] || fail "quota status: $used $quota"
+# Without the alert: nothing, and no failure (it is read through < <(...)).
+mv "$STATE_ROOT/quota.conf" "$T/quota.conf.saved"
+[[ -z "$(quota_status)" ]] && quota_status || fail 'quota status without the alert'
+mv "$T/quota.conf.saved" "$STATE_ROOT/quota.conf"
 [[ "$(menu_quota_alert)" == *'是额度 0 GB 的 100%'* ]] || fail "menu: $(menu_quota_alert)"
 # A new period: from 0, the starting value gone, the alerts ready again.
 read -r period rest < "$D/traffic"; printf '1999-01-01 %s\n' "$rest" > "$D/traffic"
@@ -216,6 +220,10 @@ grep -Fxq 'chat=987654' "$STATE_ROOT/notify.conf" && grep -Fxq 'token=123456789:
   grep -q '^result notify applied' "$TEST_ROOT/trace" && grep -Fxq reconcile "$TEST_ROOT/trace" || fail "TG on: $(cat "$TEST_ROOT/trace")"
 [[ "$(stat -c %a "$STATE_ROOT/notify.conf")" == 600 ]] || [[ "$(uname -o 2>/dev/null)" == Msys ]] || fail 'the TG settings are readable by others'
 if grep -Fq AAbbccdd "$T/out"; then fail 'the token was shown'; fi
+# The chat is found in any JSON layout.
+rm -f "$STATE_ROOT/notify.conf"; TG_UPDATES='{"ok": true, "result": [{"update_id": 2, "message": {"chat": {"id": -100123, "type": "group"}}}]}'
+reset; printf '123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq\n\n' | notify_stage > /dev/null
+grep -Fxq 'chat=-100123' "$STATE_ROOT/notify.conf" || fail "chat in spaced JSON: $(cat "$STATE_ROOT/notify.conf" 2>&1)"
 rm -f "$STATE_ROOT/notify.conf"; TG_SEND=1
 reset; printf '123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq\n\n' | notify_stage > /dev/null
 grep -q '^result notify failed test message failed' "$TEST_ROOT/trace" && [[ ! -e "$STATE_ROOT/notify.conf" ]] || fail 'a failed test message still saved the settings'
