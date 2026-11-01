@@ -125,7 +125,9 @@ raw="$(awk '/^login_hook_text\(\) \{$/ {skip = 1} !skip {print NR ":" $0} $0 == 
 [[ -z "$raw" ]] || fail "a colour written out instead of a C_ variable: $raw"
 # The help text is left out by position, and a line naming the set itself
 # ("✔ ⚠ ...", in the symbols setting) is not a state either.
-symbols="$(awk '/<<.HELP.$/ {skip = 1} !skip {print NR ":" $0} $0 == "HELP" {skip = 0}' "$TEST_SCRIPT" |
+# The check script's text is left out too: its messages go to Telegram, not
+# to a terminal.
+symbols="$(awk '/<<.(HELP|CHECK).$/ {skip = 1} !skip {print NR ":" $0} $0 == "HELP" || $0 == "CHECK" {skip = 0}' "$TEST_SCRIPT" |
   grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vF "SYM_OK='" | grep -vF '✔ ⚠' |
   sed -E 's/\$\{SYM_[A-Z]+-[^}]*\}//g' | grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' || true)"
 [[ -z "$symbols" ]] || fail "a state symbol written out instead of a SYM_ variable: $symbols"

@@ -129,6 +129,10 @@ restore_ssh_group() { record 'group ssh'; }
 restore_zram_group() { record 'group zram'; }
 restore_hostname_group() { record 'group hostname'; }
 restore_swap_group() { record 'group swap'; }
+check_reconcile() { record 'check reconcile'; }
+check_remove() { record 'check remove'; }
+# No Docker running here (the Docker log group only warns when it runs).
+active() { return 1; }
 ssh_reload() { record 'ssh reload'; }
 restore_resource() { record "resource $1"; }
 restore_sysctl_runtime() { record 'sysctl runtime'; }
@@ -141,6 +145,9 @@ reset; restore_all_groups
 grep -Fxq 'resource bbr_file' "$TEST_ROOT/trace" || fail 'plain group resources not restored'
 # A rename is undone with its own handler (cloud-init, the name, its hosts line).
 grep -Fxq 'group hostname' "$TEST_ROOT/trace" || fail 'the rename was not undone by the full rollback'
+# TG and the traffic alert: their settings, then the shared timer is taken away.
+grep -Fxq 'resource notify_conf' "$TEST_ROOT/trace" && grep -Fxq 'resource quota_conf' "$TEST_ROOT/trace" && grep -Fxq 'check remove' "$TEST_ROOT/trace" ||
+  fail "notifications not undone: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
 grep -Fxq 'packages ' "$TEST_ROOT/trace" || fail 'full rollback did not offer package removal'
 # The package default can bring ZRAM back: settled after the package question.
 [[ "$(tail -n 1 "$TEST_ROOT/trace")" == 'zram settle' ]] || fail 'ZRAM not settled after the package question'
@@ -205,10 +212,10 @@ item_action ports < /dev/null > /dev/null
 reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-[[ "$(item_keys | wc -l | tr -d ' ')" == 26 ]] || fail 'item count'
+[[ "$(item_keys | wc -l | tr -d ' ')" == 29 ]] || fail 'item count'
 # New items are appended: the numbers the user knows stay the same.
 [[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
-[[ "$(item_keys | sed -n '20,26p' | tr '\n' ' ')" == 'hostname swap conntrack ping keepalive ipv4 login ' ]] || fail 'new items are not appended in order'
+[[ "$(item_keys | sed -n '20,29p' | tr '\n' ' ')" == 'hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog ' ]] || fail 'new items are not appended in order'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

@@ -359,6 +359,68 @@ if grep -Fq login-hook /etc/pam.d/common-session; then fail 'login record off: s
 # Left on: the full rollback takes it out as well.
 item_do item-login-on-again login 1
 
+# TG notifications against a stand-in for the Bot API on 127.0.0.1: the test
+# message, then a sudo and a login reach it; the check leaves nothing in the
+# journal although it runs every minute.
+export TG_TOKEN='123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq'
+python3 "$CI/fake-tg.py" "$LOGS/tg-sent.log" 8443 &
+tg_pid=$!
+sleep 1
+index="$(item_index notify)" || fail 'no single item notify'
+{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq 1\n' "$index"; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/item-notify-on.rules"
+drive "$LOGS/item-notify-on.rules" item-notify-on sudo VPS_TG_API=http://127.0.0.1:8443 vps item || fail "TG on exited with $?"
+if ! grep -Fq 'TG 通知已开启' "$LOGS/tg-sent.log" || ! grep -Fxq 'chat=424242' "$LOGS/tg-sent.log"; then fail "no test message: $(cat "$LOGS/tg-sent.log" 2>&1)"; fi
+[[ "$(sudo stat -c %a /var/lib/vps-stable-opt/notify.conf)" == 600 ]] || fail 'the TG settings are readable by others'
+systemctl is-active -q vps-stable-check.timer || fail 'the check timer is not running'
+grep -Fxq 'OnCalendar=*:0/1' /etc/systemd/system/vps-stable-check.timer || fail 'the check does not run every minute with TG'
+check_started="$(date '+%F %T')"
+sudo systemctl start vps-stable-check.service
+sudo rm -f /var/lib/vps-stable-opt/notify/five
+sudo true
+sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PAM_TYPE=open_session PAM_SERVICE=sshd PAM_USER=runner PAM_RHOST=192.0.2.8 PAM_TTY=/dev/pts/9 \
+  /usr/bin/timeout 3 /bin/bash /var/lib/vps-stable-opt/login-hook || fail "the login hook exited with $?"
+sudo systemctl start vps-stable-check.service
+cat "$LOGS/tg-sent.log"
+grep -Fq 'sudo：runner 运行了 /usr/bin/true' "$LOGS/tg-sent.log" || fail 'a sudo did not reach TG'
+grep -Fq '登录：runner 来自 192.0.2.8' "$LOGS/tg-sent.log" || fail 'a login did not reach TG'
+# As root: the CI user may not read the system journal (an empty answer then proves nothing).
+# shellcheck disable=SC2024
+sudo journalctl -u vps-stable-check.service --since "$check_started" --no-pager -q > "$LOGS/check-journal.log" 2>&1 || true
+sudo journalctl --since "$check_started" --no-pager -q -n 1 > /dev/null || fail 'the journal cannot be read'
+if [[ -s "$LOGS/check-journal.log" ]]; then
+  cat "$LOGS/check-journal.log"; fail 'the check writes to the journal every time it runs'
+fi
+item_do item-notify-off notify 2
+if sudo test -e /var/lib/vps-stable-opt/notify.conf || [[ -e /etc/systemd/system/vps-stable-check.timer ]]; then fail 'TG off: the settings or the timer stayed'; fi
+kill "$tg_pid" 2>/dev/null || true
+
+# The traffic alert: every 5 minutes; left on for the rollback.
+item_do item-quota-on quota 1
+if ! sudo grep -Fxq 'quota_mb=1024000' /var/lib/vps-stable-opt/quota.conf || ! sudo grep -Fxq 'mode=both' /var/lib/vps-stable-opt/quota.conf; then
+  fail "traffic alert settings: $(sudo cat /var/lib/vps-stable-opt/quota.conf 2>&1)"
+fi
+grep -Fxq 'OnCalendar=*:0/5' /etc/systemd/system/vps-stable-check.timer || fail 'the traffic alert alone does not run every 5 minutes'
+sudo systemctl start vps-stable-check.service
+sudo systemctl start vps-stable-check.service
+sudo test -s /var/lib/vps-stable-opt/notify/traffic-used || fail 'no traffic counted'
+
+# Docker's log limit, where the runner has Docker: the rest of daemon.json kept,
+# and back exactly as it was when turned off.
+if command -v dockerd > /dev/null; then
+  dj_before=()
+  if sudo test -e /etc/docker/daemon.json; then sudo cp /etc/docker/daemon.json "$LOGS/daemon.json.before"; dj_before=("$LOGS/daemon.json.before"); fi
+  item_do item-dockerlog-on dockerlog 1
+  sudo python3 -c 'import json, sys
+d = json.load(open("/etc/docker/daemon.json"))
+assert d["log-opts"] == {"max-size": "10m", "max-file": "3"} and d["log-driver"] == "json-file", d
+before = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else {}
+assert all(d[k] == v for k, v in before.items() if not k.startswith("log-")), (before, d)' "${dj_before[@]}" ||
+    fail "daemon.json: $(sudo cat /etc/docker/daemon.json)"
+  item_do item-dockerlog-off dockerlog 2
+  if [[ -e "$LOGS/daemon.json.before" ]]; then sudo cmp -s /etc/docker/daemon.json "$LOGS/daemon.json.before" || fail 'Docker log limit off: daemon.json not as it was'
+  elif sudo test -e /etc/docker/daemon.json; then fail 'Docker log limit off: daemon.json left'; fi
+fi
+
 item_do item-vnstat-off vnstat 2
 if installed vnstat; then fail 'vnStat off: still installed'; fi
 item_do item-vnstat-on vnstat 1
@@ -468,7 +530,8 @@ has rollback '撤销完成'
 for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/sysctl.d/99-vps-stable-bbr.conf \
     /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
     /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf \
-    /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login /etc/profile.d/zz-vps-stable-login.sh; do
+    /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login /etc/profile.d/zz-vps-stable-login.sh \
+    /etc/systemd/system/vps-stable-check.timer /etc/systemd/system/vps-stable-check.service; do
   if sudo test -e "$f"; then fail "$f left after rollback"; fi
 done
 if grep -Fq login-hook /etc/pam.d/common-session; then fail 'the login record is still in common-session after the rollback'; fi

@@ -9,6 +9,14 @@
 # Disk swap next to the runner's own swap.
 仍然加一个吗？ ==> y
 仍然禁止 ping 吗？ ==> y
+# TG (a stand-in on 127.0.0.1 answers), the traffic alert, Docker's log limit.
+Bot Token ==> $TG_TOKEN
+发好了按回车 ==>
+每月流量额度 ==> 1000
+每月几号重置 ==> 1
+计费方式 ==> 2
+这个周期已经用了 ==> 5
+现在重启 Docker 让设置生效吗？ ==> n
 请输入端口 ==> 8080
 # A parameter, asked after "3. 调整参数" (the TCP cap, in MiB).
 新的值（直接回车不改 ==> 40

@@ -104,6 +104,11 @@ PAM_COMMON_SESSION=/etc/pam.d/common-session
 # Shows the note the hook left for the account, when its shell starts.
 LOGIN_PROFILE_FILE=/etc/profile.d/zz-vps-stable-login.sh
 LOGIN_NOTE_DIR=/run/vps-stable-login
+# The check behind TG notifications and the traffic alert (a timer).
+CHECK_SERVICE_FILE=/etc/systemd/system/vps-stable-check.service
+CHECK_TIMER_FILE=/etc/systemd/system/vps-stable-check.timer
+DOCKER_DAEMON_FILE=/etc/docker/daemon.json
+NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE=''
 
 case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|audit|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|audit|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
@@ -1995,13 +2000,20 @@ param_list() {
     f2b_findtime_min fail2ban 'Fail2ban 统计输错的时间窗口' 分钟 \
     f2b_bantime_min fail2ban 'Fail2ban 首次封禁时长' 分钟 \
     f2b_increment fail2ban 'Fail2ban 再犯加倍' '' \
-    f2b_maxtime_days fail2ban 'Fail2ban 最长封禁时长' 天
+    f2b_maxtime_days fail2ban 'Fail2ban 最长封禁时长' 天 \
+    notify_summary_time notify 'TG 每日汇总的时间' '' \
+    notify_disk_percent notify '系统盘用到多少时提醒' % \
+    notify_sudo_args notify 'sudo 通知里显示整条命令' '' \
+    notify_services notify '停了要提醒的服务' '' \
+    quota_alerts quota '流量到额度的百分之几时提醒' '' \
+    docker_log_max_mb dockerlog '每个容器日志文件的上限' MiB \
+    docker_log_files dockerlog '每个容器保留的日志文件数' 个
 }
 
 # NAME: "int" (a whole number) or "word" (one of a few names).
 param_kind() {
   case "$1" in
-    zram_algorithm|apt_upgrade_time|tools_list|f2b_increment) echo word ;;
+    zram_algorithm|apt_upgrade_time|tools_list|f2b_increment|notify_summary_time|notify_sudo_args|notify_services|quota_alerts) echo word ;;
     *) echo int ;;
   esac
 }
@@ -2039,6 +2051,13 @@ param_recommended() {
     f2b_bantime_min) echo 60 ;;
     f2b_increment) echo yes ;;
     f2b_maxtime_days) echo 7 ;;
+    notify_summary_time) echo 09:00 ;;
+    notify_disk_percent) echo 90 ;;
+    notify_sudo_args) echo no ;;
+    notify_services) echo none ;;
+    quota_alerts) echo '80 90 100' ;;
+    docker_log_max_mb) echo 10 ;;
+    docker_log_files) echo 3 ;;
     *) return 1 ;;
   esac
 }
@@ -2071,6 +2090,13 @@ param_reason() {
     f2b_bantime_min) echo '首次封 1 小时：自己输错了等一会儿还能登录，猜密码的程序多半就换别的目标了。' ;;
     f2b_increment) echo 'yes：同一个 IP 再犯，封禁时间加倍（1 小时、2 小时、4 小时……），反复来的越封越久。封禁历史至少保留 7 天，才认得出再犯。' ;;
     f2b_maxtime_days) echo '最长封 7 天：反复来的扫描基本挡住了，又不会把以后分给别人的 IP 一直封着。' ;;
+    notify_summary_time) echo '每天 09:00（服务器时间）发前一天的汇总：登录、失败的登录、封禁、硬盘、内存、流量。' ;;
+    notify_disk_percent) echo '用到 90% 提醒：还来得及清理；再晚满了会出各种奇怪的错误。' ;;
+    notify_sudo_args) echo 'no：只说运行了哪个程序。整条命令里可能有密码，发到 Telegram 就收不回来了。' ;;
+    notify_services) echo 'none：不盯任何服务。写上你自己的服务名（例如 xray nginx，用空格隔开），它们停了、恢复了都会提醒。' ;;
+    quota_alerts) echo '用到 80%、90%、100% 各提醒一次：有时间换套餐或者省着用。数字以服务商面板为准。' ;;
+    docker_log_max_mb) echo '每个文件 10 MiB、留 3 个：一个容器的日志最多 30 MiB，Docker 默认不设上限，日志多的容器能把硬盘写满。' ;;
+    docker_log_files) echo '3 个：轮换时留下最近的几个，出了问题还能往回看一点。' ;;
   esac
 }
 
@@ -2130,6 +2156,38 @@ param_check() {
     f2b_maxtime_days)
       if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 1 && 10#$2 <= 365)); then return 0; fi
       echo '请输入 1 到 365 之间的整数（天）。' ;;
+    notify_summary_time)
+      if [[ "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then return 0; fi
+      echo '请输入 24 小时制的时间，例如 09:00。' ;;
+    notify_disk_percent)
+      if [[ "$2" =~ ^[0-9]{2}$ ]] && ((10#$2 >= 50 && 10#$2 <= 99)); then return 0; fi
+      echo '请输入 50 到 99 之间的整数（%）。' ;;
+    notify_sudo_args)
+      case "$2" in yes|no) return 0 ;; esac
+      echo '请输入 yes（显示整条命令）或 no（只显示程序）。' ;;
+    notify_services)
+      local unit count=0
+      [[ "$2" == none ]] && return 0
+      for unit in $2; do
+        count=$((count + 1))
+        [[ "$unit" =~ ^[A-Za-z0-9][A-Za-z0-9@._-]{0,63}$ ]] || { echo "服务名不对：$unit"; return 1; }
+      done
+      if ((count >= 1 && count <= 20)); then return 0; fi
+      echo '请输入 1 到 20 个服务名（用空格隔开），或者 none。' ;;
+    quota_alerts)
+      local pct count=0
+      for pct in $2; do
+        count=$((count + 1))
+        if [[ ! "$pct" =~ ^[0-9]{1,3}$ ]] || ((10#$pct < 1 || 10#$pct > 100)); then echo "百分比不对：$pct"; return 1; fi
+      done
+      if ((count >= 1 && count <= 5)); then return 0; fi
+      echo '请输入 1 到 5 个 1–100 的数（用空格隔开），例如 80 90 100。' ;;
+    docker_log_max_mb)
+      if [[ "$2" =~ ^[0-9]{1,4}$ ]] && ((10#$2 >= 1 && 10#$2 <= 1024)); then return 0; fi
+      echo '请输入 1 到 1024 之间的整数（MiB）。' ;;
+    docker_log_files)
+      if [[ "$2" =~ ^[0-9]{1,2}$ ]] && ((10#$2 >= 1 && 10#$2 <= 20)); then return 0; fi
+      echo '请输入 1 到 20 之间的整数（个）。' ;;
     *) echo "没有这个参数：$1" ;;
   esac
   return 1
@@ -2174,6 +2232,10 @@ param_caution() {
       if [[ "$2" == no ]]; then echo '不加倍：反复来的扫描每次只封首次那么久。'; fi ;;
     f2b_maxtime_days)
       if ((10#$2 > 30)); then echo '超过 30 天：这个 IP 以后分给别人，别人也连不上；封禁历史也要保留这么久，数据库会大一些。'; fi ;;
+    notify_sudo_args)
+      if [[ "$2" == yes ]]; then echo '整条命令会发到 Telegram：命令里带密码或 Token 时（例如 mysql -p密码），它们也会发出去，而且收不回来。'; fi ;;
+    docker_log_max_mb)
+      if ((10#$2 < 2)); then echo '太小：日志轮换得很快，出了问题往回看不到多少。'; fi ;;
   esac
 }
 
@@ -4857,7 +4919,7 @@ backup_config_group() {
 backup_configs() {
   local file unit
   say '保存配置快照与优化前状态'
-  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$LOGIN_PAM_FILE" "$LOGIN_PROFILE_FILE" "$PAM_COMMON_SESSION" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
+  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$LOGIN_PAM_FILE" "$LOGIN_PROFILE_FILE" "$PAM_COMMON_SESSION" "$CHECK_SERVICE_FILE" "$CHECK_TIMER_FILE" "$DOCKER_DAEMON_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
       /etc/ssh/sshd_config /etc/default/ssh /etc/default/ufw \
       /etc/ufw/ufw.conf /etc/ufw/sysctl.conf /etc/ufw/before.rules /etc/ufw/before6.rules \
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
@@ -5109,6 +5171,478 @@ resources_main() {
       printf '%s%s Fail2ban 的封禁规则有 %s 条：每次封禁、解封都要让 UFW 重新加载规则，攻击很多时会占不少 CPU。可以缩短封禁时间，或者让来源 IP 多的服务只对需要的人开放。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$rules" "${C_RESET-}"
     else printf '防火墙里的封禁规则：%s 条。\n' "$rules"; fi
   fi
+}
+
+# TG notifications and the monthly traffic alert share one check: a script
+# this tool writes (STATE_ROOT/notify-check) that a systemd timer runs every
+# minute (with TG; logins arrive within a minute) or every 5 minutes, and that
+# exits when done. It is gone when neither is on.
+notify_check_text() {
+  sed -e "s#@STATE@#$STATE_ROOT#g" -e 's#@MAIN@#/usr/local/lib/vps-stable-opt/vps-stable-opt.sh#g' <<'CHECK'
+#!/bin/bash
+# VPS Stable Optimizer v2.8: the check behind TG notifications and the traffic
+# alert. A systemd timer runs it (every minute with TG, else every 5 minutes);
+# it reads what changed since its last run, sends what is due, and exits.
+state='@STATE@'
+# The tool is gone (uninstalled without taking this away): stop quietly.
+[ -f '@MAIN@' ] && [ -d "$state" ] && [ ! -L "$state" ] || exit 0
+umask 077
+export LC_ALL=C.UTF-8
+dir="$state/notify"
+mkdir -p "$dir" || exit 0
+# A run still busy (a send that hangs): this one is skipped, never stacked.
+exec 8> "$dir/lock"
+flock -n 8 || exit 0
+now="$(date +%s)"
+conf="$state/notify.conf" tconf="$state/quota.conf"
+tab="$(printf '\t')" us="$(printf '\037')"
+first=0; [ -f "$dir/last-run" ] || first=1
+setting() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1; }
+param() {
+  v="$(awk -F= -v k="$1" '$1 == k {v = substr($0, length(k) + 2)} END {print v}' "$state/params" 2>/dev/null)"
+  printf '%s' "${v:-$2}"; }
+# Anything read from a log or a file: no control characters, not too long.
+clean() { LC_ALL=C tr -d '\000-\037\177' | cut -c1-"${1:-120}"; }
+when() { date -d "@$1" '+%m-%d %H:%M' 2>/dev/null || echo '?'; }
+tg=0; [ -s "$conf" ] && tg=1
+# TEXT: queued for TG (newlines kept as one line), at most 200 waiting.
+queue() {
+  [ "$tg" = 1 ] || return 0
+  { printf '%s' "$1" | tr '\n' "$us"; echo; } >> "$dir/queue"
+  if [ "$(wc -l < "$dir/queue")" -gt 200 ]; then tail -n 200 "$dir/queue" > "$dir/queue.new" && mv -f "$dir/queue.new" "$dir/queue"; fi; }
+# Each message one request; the token goes in through stdin, never on the
+# command line. Sent ones leave the queue at once, so a run cut short never
+# sends one twice; a failure keeps the rest for the next run (offline).
+send_queue() {
+  [ "$tg" = 1 ] && [ -s "$dir/queue" ] || return 0
+  token="$(setting token "$conf")" chat="$(setting chat "$conf")" api="$(setting api "$conf")"
+  head="【$(param display_name "$(hostname -s 2>/dev/null)" | clean 40) · $(setting ip "$conf")】"
+  n=0
+  while [ -s "$dir/queue" ] && [ "$n" -lt 10 ]; do
+    { echo "$head"; head -n 1 "$dir/queue" | tr "$us" '\n'; } > "$dir/message"
+    printf 'url = "%s/bot%s/sendMessage"\n' "${api:-https://api.telegram.org}" "$token" |
+      curl -fsS --max-time 15 -o /dev/null -K - --data-urlencode "chat_id=$chat" --data-urlencode "text@$dir/message" \
+        --data disable_web_page_preview=true 2>/dev/null || break
+    sed -i '1d' "$dir/queue"
+    n=$((n + 1))
+  done; }
+# NAME FILTER...: journal lines since NAME's cursor, as "time ident message".
+# The first time it starts from now; a cursor the journal no longer has
+# (cleared) falls back to the time of the last run.
+journal_new() {
+  name="$1"; shift
+  cur="$(cat "$dir/$name.cursor" 2>/dev/null)"
+  if [ -z "$cur" ]; then
+    journalctl -q -n 1 --show-cursor -o cat --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p' > "$dir/$name.cursor"; return 0
+  fi
+  out="$(journalctl -q --after-cursor="$cur" --show-cursor -o short-unix --no-pager "$@" 2>/dev/null)" ||
+    out="$(journalctl -q --since="@$(cat "$dir/last-run" 2>/dev/null || echo "$now")" --show-cursor -o short-unix --no-pager "$@" 2>/dev/null)"
+  new="$(printf '%s\n' "$out" | sed -n 's/^-- cursor: //p' | tail -n 1)"
+  [ -z "$new" ] || printf '%s\n' "$new" > "$dir/$name.cursor"
+  printf '%s\n' "$out" | grep -v '^-- cursor: ' | awk '{t = $1; sub(/\..*/, "", t); id = $3; sub(/\[.*/, "", id); sub(/:$/, "", id); $1 = $2 = $3 = ""; sub(/^ +/, ""); print t "\t" id "\t" $0}'; }
+# NAME: the lines of a list (made by the command after it) that were not in
+# it last time; the first time only remembered.
+new_lines() {
+  name="$1"; shift
+  "$@" 2>/dev/null | LC_ALL=C sort -u > "$dir/$name.now"
+  if [ -f "$dir/$name" ]; then LC_ALL=C comm -13 "$dir/$name" "$dir/$name.now"; fi
+  mv -f "$dir/$name.now" "$dir/$name"; }
+# FLAG CONDITION...: true once when CONDITION becomes true (FLAG remembers).
+once() {
+  flag="$dir/flag-$1"; shift
+  if "$@"; then [ -f "$flag" ] && return 1; : > "$flag"; return 0; fi
+  rm -f "$flag"; return 1; }
+say_method() { case "$1" in publickey) echo 密钥 ;; password|keyboard-interactive) echo 密码 ;; console) echo 控制台 ;; *) echo 其他方式 ;; esac; }
+
+# Started again since the last run.
+boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+if [ -f "$dir/boot" ] && [ "$(cat "$dir/boot")" != "$boot" ]; then
+  queue "开机了：上次检查在 $(when "$(cat "$dir/last-run" 2>/dev/null || echo 0)")，之后关机或重启过。"
+fi
+printf '%s\n' "$boot" > "$dir/boot"
+
+# Logins, every run: from the login record (it knows first-time addresses
+# and console logins), or from sshd's own lines.
+if [ "$tg" = 1 ]; then
+  if [ -s "$state/logins" ]; then
+    last="$(cat "$dir/login-ts" 2>/dev/null || echo "$now")"
+    awk -F'\t' -v t="$last" 'NF == 6 && $1 > t' "$state/logins" | tail -n 20 > "$dir/logins.new"
+    while IFS="$tab" read -r t u from m _ n; do
+      u="$(printf '%s' "$u" | clean 32)" from="$(printf '%s' "$from" | clean 64)"
+      case "$from" in
+        console:*) queue "服务商控制台登录：$u（${from#console:}，$(when "$t")）。不是你登录的，先改服务商面板的密码。" ;;
+        *) if [ "$n" = 1 ]; then queue "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）
+⚠ 第一次从这个 IP 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 7 安全排查。"
+           else queue "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）"; fi ;;
+      esac
+    done < "$dir/logins.new"
+    t="$(awk -F'\t' 'END {print $1}' "$dir/logins.new")"
+    if [ -n "$t" ]; then printf '%s\n' "$t" > "$dir/login-ts"; elif [ ! -f "$dir/login-ts" ]; then printf '%s\n' "$now" > "$dir/login-ts"; fi
+  else
+    journal_new logins -t sshd -t sshd-session | awk -F'\t' '{split($3, f, " "); if (f[1] == "Accepted" && f[3] == "for" && f[5] == "from") print f[4] "\t" f[6] "\t" f[2]}' |
+      while IFS="$tab" read -r u from m; do
+        queue "登录：$(printf '%s' "$u" | clean 32) 来自 $(printf '%s' "$from" | clean 64)（$(say_method "$m")）"
+      done
+  fi
+fi
+
+# Every 5 minutes: what was done on the machine and how it is.
+five="$(cat "$dir/five" 2>/dev/null || echo 0)"
+if [ "$tg" = 1 ] && [ $((now - five)) -ge 290 ]; then
+  printf '%s\n' "$now" > "$dir/five"
+  journal_new events -t useradd -t passwd -t chpasswd -t sudo -t kernel -t sshd -t sshd-session > "$dir/events"
+  awk -F'\t' '$2 == "useradd" && $3 ~ /^new user: name=/ {s = $3; sub(/^new user: name=/, "", s); sub(/,.*/, "", s); print s}' "$dir/events" | sort -u |
+    while read -r u; do queue "新建了账户：$(printf '%s' "$u" | clean 32)"; done
+  awk -F'\t' '($2 == "passwd" || $2 == "chpasswd") && $3 ~ /password changed for/ {s = $3; sub(/.*password changed for /, "", s); sub(/ .*/, "", s); print s}' "$dir/events" | sort -u |
+    while read -r u; do queue "改了密码：账户 $(printf '%s' "$u" | clean 32)"; done
+  # sudo: the program only, unless asked for the whole command (it can hold a password).
+  awk -F'\t' -v full="$(param notify_sudo_args no)" '$2 == "sudo" && index($3, "COMMAND=") {u = $3; sub(/ *:.*/, "", u); c = substr($3, index($3, "COMMAND=") + 8); if (full != "yes") sub(/ .*/, "", c); n[u " 运行了 " c]++}
+    END {for (k in n) print k (n[k] > 1 ? "（" n[k] " 次）" : "")}' "$dir/events" | head -n 10 |
+    while IFS= read -r line; do queue "sudo：$(printf '%s' "$line" | clean 200)"; done
+  awk -F'\t' '$2 == "kernel" && $3 ~ /Out of memory: Killed process/ {s = $3; sub(/.*Killed process [0-9]+ \(/, "", s); sub(/\).*/, "", s); print s}' "$dir/events" | sort -u |
+    while read -r p; do queue "内存不够：系统杀掉了进程 $(printf '%s' "$p" | clean 40)。"; done
+  failed="$(awk -F'\t' '($2 == "sshd" || $2 == "sshd-session") && $3 ~ /^(Failed password|Invalid user)/' "$dir/events" | wc -l)"
+  printf '%s\n' $(($(cat "$dir/failed" 2>/dev/null || echo 0) + failed)) > "$dir/failed"
+  # Packages put on or taken off.
+  size="$(stat -c %s /var/log/dpkg.log 2>/dev/null || echo 0)" off="$(cat "$dir/dpkg.off" 2>/dev/null || echo "$size")"
+  [ "$size" -ge "$off" ] || off=0
+  tail -c +$((off + 1)) /var/log/dpkg.log 2>/dev/null | awk '$3 == "install" || $3 == "remove" || $3 == "purge" {sub(/:.*/, "", $4); w[$3] = w[$3] " " $4}
+    END {if (w["install"] != "") print "装了软件包：" substr(w["install"], 2); if (w["remove"] w["purge"] != "") print "删了软件包：" substr(w["remove"] w["purge"], 2)}' |
+    while IFS= read -r line; do queue "$(printf '%s' "$line" | clean 300)"; done
+  printf '%s\n' "$size" > "$dir/dpkg.off"
+  # Keys that can log in, listening ports, things that start by themselves.
+  keys() {
+    getent passwd | while IFS=: read -r name _ uid _ _ home _; do
+      [ "$name" = root ] || { [ "$uid" -ge 1000 ] 2>/dev/null && [ "$uid" -lt 60000 ]; } || continue
+      for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+        [ -f "$f" ] && ssh-keygen -l -f "$f" 2>/dev/null | awk -v a="$name" '$2 ~ /^SHA256:/ {c = $3; print a " " $2 " " c}'
+      done
+    done; }
+  new_lines keys keys | while read -r a fp c; do queue "加了公钥：账户 $(printf '%s' "$a" | clean 32)，$fp（$(printf '%s' "$c" | clean 60)）"; done
+  ports() { ss -H -tulpn | awk '$5 !~ /^(127\.|\[::1\]|::1)/ {n = split($5, a, ":"); match($0, /\("[^"]*"/); p = substr($0, RSTART + 2, RLENGTH - 3); print a[n] "/" $1 (p != "" ? "（" p "）" : "")}'; }
+  new_lines ports ports | while read -r p; do queue "新开了端口：$(printf '%s' "$p" | clean 60)"; done
+  autostart() {
+    find /etc/systemd/system -maxdepth 2 \( -name '*.service' -o -name '*.timer' \) ! -name 'vps-stable-*' -printf '%p\n'
+    find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron/crontabs -maxdepth 1 -type f -printf '%p\n'; }
+  new_lines autostart autostart | head -n 10 | while read -r p; do queue "新加了开机自启或定时任务：$(printf '%s' "$p" | clean 120)"; done
+  # The CPU busy for 10 minutes and more (two checks in a row).
+  set -- $(awk '$1 == "cpu" {print $2 + $3 + $4 + $6 + $7 + $8 + $9, $5}' /proc/stat)
+  busy="$1" idle="$2"
+  if read -r b0 i0 2>/dev/null < "$dir/cpu" && [ $((busy + idle - b0 - i0)) -gt 0 ]; then
+    pct=$(((busy - b0) * 100 / (busy + idle - b0 - i0)))
+    hot="$(cat "$dir/cpu-hot" 2>/dev/null || echo 0)"
+    if [ "$pct" -ge 90 ]; then hot=$((hot + 1)); elif [ "$pct" -lt 70 ]; then hot=0; fi
+    printf '%s\n' "$hot" > "$dir/cpu-hot"
+    if once cpu [ "$hot" -ge 2 ]; then
+      queue "CPU 已经连续 10 分钟以上被吃满（${pct}%）。最忙的进程：$(ps -eo comm=,pid= --sort=-pcpu | head -n 1 | clean 40)"
+    fi
+  fi
+  printf '%s %s\n' "$busy" "$idle" > "$dir/cpu"
+  # The system disk, memory, a reboot that updates wait for.
+  limit="$(param notify_disk_percent 90)"
+  disk="$(df -P / | awk 'NR == 2 {sub(/%/, "", $5); print $5}')"
+  # Told once; again only after it went well below the line (no repeats while it hovers).
+  if [ "${disk:-0}" -ge "$limit" ] && [ ! -f "$dir/flag-disk" ]; then
+    : > "$dir/flag-disk"; queue "系统盘快满了：已用 ${disk}%。满了会出各种奇怪的错误，先清理日志、备份和不用的文件。"
+  elif [ "${disk:-0}" -lt $((limit - 5)) ]; then rm -f "$dir/flag-disk"; fi
+  mem="$(awk '$1 == "MemTotal:" {t = $2} $1 == "MemAvailable:" {a = $2} END {printf "%d", a * 100 / t}' /proc/meminfo)"
+  if [ "${mem:-100}" -lt 5 ] && [ ! -f "$dir/flag-memory" ]; then
+    : > "$dir/flag-memory"; queue "内存快不够了：只剩 ${mem}% 可用，再多一点就可能有进程被杀。"
+  elif [ "${mem:-100}" -ge 15 ]; then rm -f "$dir/flag-memory"; fi
+  if once reboot [ -f /var/run/reboot-required ]; then
+    queue "有更新要重启才生效：$(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null | clean 120)。方便时 vps 选 8 重启。"
+  fi
+  # The services you named.
+  for unit in $(param notify_services none); do
+    [ "$unit" != none ] || continue
+    unit="$(printf '%s' "$unit" | tr -cd 'A-Za-z0-9@._-')"
+    st="$(systemctl is-active "$unit" 2>/dev/null)"
+    was="$(cat "$dir/service-$unit" 2>/dev/null || echo "$st")"
+    if [ "$was" = active ] && [ "$st" != active ]; then queue "服务停了：$unit（现在是 ${st:-unknown}）"; fi
+    if [ "$was" != active ] && [ "$st" = active ]; then queue "服务恢复了：$unit"; fi
+    printf '%s\n' "$st" > "$dir/service-$unit"
+  done
+fi
+
+# Monthly traffic: the interface's counters added up between runs (they
+# start again from 0 after a reboot); a new period starts on the reset day.
+if [ -s "$tconf" ]; then
+  iface="$(setting iface "$tconf")" quota="$(setting quota_mb "$tconf")" day="$(setting reset_day "$tconf")" mode="$(setting mode "$tconf")"
+  set -- $(awk -v i="$iface:" '$1 == i {print $2, $10}' /proc/net/dev)
+  rx="${1:-0}" tx="${2:-0}"
+  # This period's first day: the reset day of this month or of the month before.
+  y="$(date +%Y)" m="$(date +%m)" d="$(date +%d)"
+  last_day() { date -d "$1-$2-01 +1 month -1 day" +%d; }
+  rd="$day"; [ "$rd" -le "$(last_day "$y" "$m")" ] || rd="$(last_day "$y" "$m")"
+  if [ "${d#0}" -ge "$rd" ]; then period="$y-$m-$(printf '%02d' "$rd")"
+  else
+    py="$(date -d "$y-$m-01 -1 month" +%Y)" pm="$(date -d "$y-$m-01 -1 month" +%m)"
+    rd="$day"; [ "$rd" -le "$(last_day "$py" "$pm")" ] || rd="$(last_day "$py" "$pm")"
+    period="$py-$pm-$(printf '%02d' "$rd")"
+  fi
+  if read -r p0 lrx ltx arx atx 2>/dev/null < "$dir/traffic"; then
+    drx=$((rx - lrx)) dtx=$((tx - ltx))
+    [ "$drx" -ge 0 ] || drx="$rx"; [ "$dtx" -ge 0 ] || dtx="$tx"
+    arx=$((arx + drx)) atx=$((atx + dtx))
+    if [ "$p0" != "$period" ]; then
+      queue "新的流量周期从 $period 开始；上个周期用了 $(cat "$dir/traffic-used" 2>/dev/null || echo '?') MB。"
+      arx=0 atx=0; rm -f "$dir"/flag-traffic-*; sed -i '/^used_mb=/d' "$tconf"
+    fi
+  else p0="$period" arx=0 atx=0; fi
+  printf '%s %s %s %s %s\n' "$period" "$rx" "$tx" "$arx" "$atx" > "$dir/traffic"
+  case "$mode" in both) used=$((arx + atx)) ;; max) if [ "$arx" -gt "$atx" ]; then used="$arx"; else used="$atx"; fi ;; *) used="$atx" ;; esac
+  base="$(setting used_mb "$tconf")"
+  used=$((used / 1048576 + ${base:-0}))
+  printf '%s\n' "$used" > "$dir/traffic-used"
+  for p in $(param quota_alerts '80 90 100' | tr -cd '0-9 '); do
+    if [ $((used * 100)) -ge $((quota * p)) ] && once "traffic-$p" true; then
+      queue "流量提醒：这个周期（从 $period 起）已用 $used MB，到了额度 $quota MB 的 ${p}%。数字以服务商面板为准。"
+    fi
+  done
+fi
+
+# Once a day: the summary, with the failed logins (never sent one by one).
+at="$(param notify_summary_time 09:00)"
+today="$(date +%F)"
+if [ "$tg" = 1 ] && [ "$(cat "$dir/summary-date" 2>/dev/null)" != "$today" ] && [[ ! "$(date +%H:%M)" < "$at" ]]; then
+  if [ "$first" = 0 ] && [ -f "$dir/summary-date" ]; then
+    logins="$(awk -F'\t' -v t=$((now - 86400)) 'NF == 6 && $1 > t {n++; ip[$3] = 1} END {c = 0; for (i in ip) c++; printf "%d 次（%d 个 IP）", n, c}' "$state/logins" 2>/dev/null)"
+    bans="$(fail2ban-client get sshd banip 2>/dev/null | wc -w)"
+    disk="$(df -P / | awk 'NR == 2 {print $5}')"
+    mem="$(awk '$1 == "MemTotal:" {t = $2} $1 == "MemAvailable:" {a = $2} END {printf "%d%%", (t - a) * 100 / t}' /proc/meminfo)"
+    line="每日汇总（过去 24 小时）
+登录：${logins:-没有登录记录}
+失败的登录：$(cat "$dir/failed" 2>/dev/null || echo 0) 次；Fail2ban 正在封禁 ${bans:-0} 个 IP
+系统盘已用 $disk，内存已用 $mem，已运行 $(awk '{printf "%d", $1 / 86400}' /proc/uptime) 天"
+    if [ -s "$dir/traffic-used" ]; then line="$line
+本周期流量：$(cat "$dir/traffic-used") MB / $(setting quota_mb "$tconf") MB"; fi
+    queue "$line"
+  fi
+  printf '0\n' > "$dir/failed"
+  printf '%s\n' "$today" > "$dir/summary-date"
+fi
+
+send_queue
+printf '%s\n' "$now" > "$dir/last-run"
+exit 0
+CHECK
+}
+
+check_service_text() {
+  printf '%s\n' '# VPS Stable Optimizer v2.8: the notification and traffic check' '[Unit]' 'Description=VPS Stable Optimizer check' '[Service]' 'Type=oneshot' \
+    "ExecStart=/usr/bin/timeout 50 /bin/bash $STATE_ROOT/notify-check" 'Nice=10' 'IOSchedulingClass=idle' \
+    '# It runs every minute or five: nothing of it in the journal.' 'LogLevelMax=notice'
+}
+
+# MINUTES: how often.
+check_timer_text() {
+  printf '%s\n' '# VPS Stable Optimizer v2.8: the notification and traffic check' '[Unit]' 'Description=VPS Stable Optimizer check' '[Timer]' \
+    "OnCalendar=*:0/$1" 'AccuracySec=5s' '[Install]' 'WantedBy=timers.target'
+}
+
+# ID PATH TEXT: this tool's file written (again when its text changed); one
+# that is not this tool's stays.
+check_file_write() {
+  if [[ -f "$2" && "$(cat -- "$2" 2>/dev/null || true)" != "$3" ]] && restore_file_ours "$1"; then rm -f -- "$2"; fi
+  put_file "$2" "$3"
+}
+
+# The timer as TG and the traffic alert need it now: on (every minute with
+# TG, else every 5), or taken away.
+check_reconcile() {
+  local interval=5 id
+  if [[ ! -s "$STATE_ROOT/notify.conf" && ! -s "$STATE_ROOT/quota.conf" ]]; then check_remove; return; fi
+  [[ ! -s "$STATE_ROOT/notify.conf" ]] || interval=1
+  check_file_write check_script_file "$STATE_ROOT/notify-check" "$(notify_check_text)" || return 1
+  chmod 600 -- "$STATE_ROOT/notify-check" || true
+  check_file_write check_service_file "$CHECK_SERVICE_FILE" "$(check_service_text)" || return 1
+  check_file_write check_timer_file "$CHECK_TIMER_FILE" "$(check_timer_text "$interval")" || return 1
+  systemctl daemon-reload || true
+  if ! systemctl enable --now vps-stable-check.timer >/dev/null 2>&1; then warn '检查定时任务没能启动。'; return 1; fi
+  # Changed outside a stage (an item turned off): still this tool's own.
+  if [[ -z "${RESTORE_STAGE:-}" ]]; then
+    for id in check_timer check_service_file check_timer_file check_script_file; do restore_adopt "$id" || true; done
+  fi
+}
+
+check_remove() {
+  local file id
+  if [[ "$(systemctl is-enabled vps-stable-check.timer 2>/dev/null || true)" == enabled ]] || systemctl is-active -q vps-stable-check.timer 2>/dev/null; then
+    systemctl disable --now vps-stable-check.timer >/dev/null 2>&1 || warn '检查定时任务没能停下。'
+  fi
+  for file in "$CHECK_TIMER_FILE" "$CHECK_SERVICE_FILE" "$STATE_ROOT/notify-check"; do
+    [[ -f "$file" ]] || continue
+    case "$(cat -- "$file")" in
+      "$(check_timer_text 1)"|"$(check_timer_text 5)"|"$(check_service_text)"|"$(notify_check_text)") rm -f -- "$file" ;;
+      *) warn "$file 被改过，保持不变。" ;;
+    esac
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -rf --one-file-system -- "${STATE_ROOT:?}/notify"
+  if [[ -z "${RESTORE_STAGE:-}" ]]; then
+    for id in check_timer check_service_file check_timer_file check_script_file; do restore_adopt "$id" || true; done
+  fi
+}
+
+# API TOKEN METHOD [CURL ARGS...]: a call to the Bot API; the token reaches
+# curl through stdin, never on its command line (other users could read it).
+tg_call() {
+  local api="$1" token="$2" method="$3"
+  shift 3
+  printf 'url = "%s/bot%s/%s"\n' "$api" "$token" "$method" | curl -fsS --max-time 15 -K - "$@"
+}
+
+notify_stage() {
+  say 'TG 通知'
+  local token chat updates api="${VPS_TG_API:-https://api.telegram.org}" conf="$STATE_ROOT/notify.conf" temp
+  if [[ "${NOTIFY_CHOICE:-}" != 1 ]]; then ok '按你的选择不开启 TG 通知。'; module_result notify declined 'not requested'; return 0; fi
+  if ! command -v curl >/dev/null; then warn '没有 curl，发不了 TG 消息：先在单项设置里装常用工具。'; module_result notify unsupported 'no curl'; return 0; fi
+  if [[ -s "$conf" ]] && ! confirm_yes '已经设置过 TG 通知：要换一个机器人或者聊天吗？'; then
+    check_reconcile && { ok 'TG 通知保持原来的设置。'; module_result notify applied 'telegram'; }; return 0
+  fi
+  echo '1. 在 Telegram 里找 @BotFather，发 /newbot，按提示起名字，最后它会给你一串 Token（像 123456789:AA…）。'
+  echo '2. 打开你的新机器人，随便发一句话给它（这样它才能给你发消息）。'
+  echo '只发通知，不接收命令；多台机器可以用同一个机器人，每条消息都带显示名和 IP。'
+  read -r -s -p 'Bot Token（输入时不显示，直接回车取消）: ' token || token=''
+  echo
+  if [[ -z "$token" ]]; then ok '已取消。'; module_result notify declined 'cancelled'; return 0; fi
+  if [[ ! "$token" =~ ^[0-9]{5,15}:[A-Za-z0-9_-]{30,64}$ ]]; then warn 'Token 的格式不对（应该像 123456789:AA… 这样）。'; module_result notify failed 'bad token'; return 0; fi
+  read -r -p '给机器人发过一句话了吗？发好了按回车: ' _ || true
+  updates="$(tg_call "$api" "$token" getUpdates 2>/dev/null || true)"
+  chat="$(grep -o '"chat":{"id":-\{0,1\}[0-9]\{1,20\}' <<< "$updates" | tail -n 1 | grep -o -- '-\{0,1\}[0-9]*$' || true)"
+  if [[ -z "$chat" ]]; then
+    warn '没找到你发给机器人的消息（Token 不对，或者还没发）。'
+    read -r -p '直接输入 chat id（不知道就回车取消）: ' chat || chat=''
+  fi
+  if [[ ! "$chat" =~ ^-?[0-9]{1,20}$ ]]; then ok '已取消。'; module_result notify declined 'no chat'; return 0; fi
+  if ! tg_call "$api" "$token" sendMessage -o /dev/null --data-urlencode "chat_id=$chat" \
+       --data-urlencode "text=【$(display_name_get || hostname -s) · $(menu_ip)】TG 通知已开启：以后登录、重要操作和异常会发到这里。" 2>/dev/null; then
+    warn '测试消息没发出去：检查 Token、网络（这台机器能不能连上 api.telegram.org）。'; module_result notify failed 'test message failed'; return 0
+  fi
+  temp="$(mktemp "$STATE_ROOT/.notify.XXXXXX")" || return 0
+  if ! printf 'token=%s\nchat=%s\napi=%s\nip=%s\n' "$token" "$chat" "$api" "$(menu_ip)" > "$temp" || ! chmod 600 -- "$temp" || ! mv -f -- "$temp" "$conf"; then
+    rm -f -- "$temp"; warn '没能保存 TG 的设置。'; module_result notify failed 'config not written'; return 0
+  fi
+  if check_reconcile; then
+    ok '测试消息已发出，TG 通知已开启（每分钟检查一次）。Token 只有 root 能读；万一泄露，在 @BotFather 里发 /revoke 作废它，再回这里重新开启。'
+    module_result notify applied 'telegram'
+  else module_result notify failed 'check timer'; fi
+}
+
+quota_stage() {
+  say '月流量提醒'
+  local iface quota day mode used temp conf="$STATE_ROOT/quota.conf"
+  if [[ "${QUOTA_CHOICE:-}" != 1 ]]; then ok '按你的选择不开启流量提醒。'; module_result quota declined 'not requested'; return 0; fi
+  iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}' || true)"
+  if [[ ! "$iface" =~ ^[A-Za-z0-9._-]+$ ]] || ! grep -q "^ *$iface:" /proc/net/dev; then warn '找不到上网用的网卡，不能统计流量。'; module_result quota unsupported 'no interface'; return 0; fi
+  echo "统计网卡 $iface 的流量（每 5 分钟累计一次，重启后接着算）。只提醒，不断网；数字以服务商面板为准。"
+  read -r -p '每月流量额度（GB，例如 1000）: ' quota || return 0
+  if [[ ! "$quota" =~ ^[0-9]{1,7}$ ]] || ((10#$quota < 1)); then warn '额度要写整数（GB）。'; module_result quota declined 'bad quota'; return 0; fi
+  read -r -p '每月几号重置（1–31，月份没这一天就算最后一天）: ' day || return 0
+  if [[ ! "$day" =~ ^[0-9]{1,2}$ ]] || ((10#$day < 1 || 10#$day > 31)); then warn '重置日要写 1 到 31。'; module_result quota declined 'bad day'; return 0; fi
+  read -r -p '计费方式：1) 只算出站   2) 进出都算   3) 进、出取大的那个 [1]: ' mode || mode=1
+  case "${mode:-1}" in 1) mode=out ;; 2) mode=both ;; 3) mode=max ;; *) warn '只能选 1、2、3。'; module_result quota declined 'bad mode'; return 0 ;; esac
+  read -r -p '这个周期已经用了多少 GB（看服务商面板，不知道就回车）: ' used || used=''
+  if [[ -n "$used" ]]; then
+    [[ "$used" =~ ^[0-9]{1,7}(\.[0-9]{1,2})?$ ]] || { warn '已用量要写数字（GB）。'; module_result quota declined 'bad used'; return 0; }
+    used="$(awk -v g="$used" 'BEGIN {printf "%d", g * 1024}')"
+  fi
+  temp="$(mktemp "$STATE_ROOT/.quota.XXXXXX")" || return 0
+  if ! printf 'iface=%s\nquota_mb=%s\nreset_day=%s\nmode=%s\nused_mb=%s\n' "$iface" "$((10#$quota * 1024))" "$((10#$day))" "$mode" "${used:-0}" > "$temp" ||
+     ! chmod 600 -- "$temp" || ! mv -f -- "$temp" "$conf"; then
+    rm -f -- "$temp"; warn '没能保存流量提醒的设置。'; module_result quota failed 'config not written'; return 0
+  fi
+  # A new setting: counted again from this period.
+  rm -f -- "$STATE_ROOT/notify/traffic" "$STATE_ROOT/notify/traffic-used" "$STATE_ROOT"/notify/flag-traffic-*
+  if check_reconcile; then
+    ok "流量提醒已开启：额度 ${quota} GB、每月 ${day} 号重置，到 $(param_value quota_alerts | sed 's/ /%、/g')% 时提醒$(if [[ -s "$STATE_ROOT/notify.conf" ]]; then echo '（发到 TG，菜单顶部也显示）'; else echo '（显示在菜单顶部；开了 TG 通知还会发到 TG）'; fi)。"
+    module_result quota applied "$quota GB"
+  else module_result quota failed 'check timer'; fi
+}
+
+# This period's use, "USED QUOTA" in MB, when the alert is on.
+quota_status() {
+  [[ -s "$STATE_ROOT/quota.conf" && -s "$STATE_ROOT/notify/traffic-used" ]] || return 1
+  printf '%s %s\n' "$(cat -- "$STATE_ROOT/notify/traffic-used")" "$(sed -n 's/^quota_mb=//p' "$STATE_ROOT/quota.conf")"
+}
+
+# The menu's yellow line: past the lowest alert.
+menu_quota_alert() {
+  local used quota low
+  read -r used quota < <(quota_status 2>/dev/null) || return 0
+  [[ "$used" =~ ^[0-9]+$ && "$quota" =~ ^[1-9][0-9]*$ ]] || return 0
+  low="$(param_value quota_alerts 2>/dev/null | tr ' ' '\n' | sort -n | head -n 1)"
+  ((used * 100 >= quota * ${low:-80})) || return 0
+  printf '%s%s 这个周期的流量已用 %s GB，是额度 %s GB 的 %s%%（数字以服务商面板为准）。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" \
+    "$((used / 1024))" "$((quota / 1024))" "$((used * 100 / quota))" "${C_RESET-}"
+}
+
+# Docker's default keeps every line a container writes: a size per log file
+# and a number of files, for containers made from now on.
+dockerlog_text() {
+  printf '{\n  "log-driver": "json-file",\n  "log-opts": {\n    "max-size": "%sm",\n    "max-file": "%s"\n  }\n}\n' "$(param_value docker_log_max_mb)" "$(param_value docker_log_files)"
+}
+
+dockerlog_stage() {
+  say 'Docker 容器日志上限'
+  local mb files current file name size total=0
+  if [[ "${DOCKERLOG_CHOICE:-}" != 1 ]]; then module_result dockerlog declined 'not requested'; return 0; fi
+  if ! command -v dockerd >/dev/null; then ok '没有装 Docker，不需要。'; module_result dockerlog skipped 'no docker'; return 0; fi
+  mb="$(param_value docker_log_max_mb)" files="$(param_value docker_log_files)"
+  echo '各容器的日志现在有多大：'
+  for file in /var/lib/docker/containers/*/*-json.log; do
+    [[ -f "$file" ]] || continue
+    name="$(sed -n 's/.*"Name":"\/\([^"]*\)".*/\1/p' "${file%/*}/config.v2.json" 2>/dev/null | head -n 1 | audit_clean_text | cut -c1-40)"
+    size="$(stat -c %s -- "$file")"; total=$((total + size))
+    printf '  %s：%s MiB\n' "${name:-${file%/*}}" "$((size / 1048576))"
+  done
+  printf '  合计 %s MiB\n' "$((total / 1048576))"
+  if [[ -e "$DOCKER_DAEMON_FILE" || -L "$DOCKER_DAEMON_FILE" ]]; then
+    current="$(cat -- "$DOCKER_DAEMON_FILE" 2>/dev/null || true)"
+    if restore_file_ours dockerlog_file || [[ "$current" == "$(dockerlog_text)" ]]; then
+      dockerlog_merge || { module_result dockerlog failed 'daemon.json not written'; return 0; }
+    elif grep -Eq '"log-(driver|opts)"' <<< "$current"; then
+      ok "$DOCKER_DAEMON_FILE 里已经有日志设置，保持不变。"; module_result dockerlog preserved 'own log settings'; return 0
+    else
+      dockerlog_merge || { module_result dockerlog preserved 'daemon.json not merged'; return 0; }
+    fi
+  else
+    put_file "$DOCKER_DAEMON_FILE" "$(dockerlog_text)" || { module_result dockerlog preserved 'daemon.json conflict'; return 0; }
+  fi
+  if dockerd --help 2>&1 | grep -q -- '--validate' && ! dockerd --validate --config-file "$DOCKER_DAEMON_FILE" >/dev/null 2>&1; then
+    warn "Docker 不认这个配置，已经撤回：$DOCKER_DAEMON_FILE。"
+    restore_resource dockerlog_file || true
+    module_result dockerlog failed 'dockerd --validate'; return 0
+  fi
+  ok "已设置：每个容器的日志文件最多 ${mb} MiB、留 ${files} 个。"
+  echo '只对新建的容器生效：已有的容器要重建才会用上（docker compose up -d --force-recreate，或者删掉再 docker run）。'
+  if active docker && confirm_yes '现在重启 Docker 让设置生效吗？（所有容器会停一下；设了 restart 策略的会自动起来）'; then
+    if systemctl restart docker; then ok 'Docker 已重启。'; else warn 'Docker 重启失败，请看 systemctl status docker。'; fi
+  else echo 'Docker 下次重启（或者重启服务器）后生效。'; fi
+  module_result dockerlog applied "${mb}m x $files"
+}
+
+# Writes the two log settings into daemon.json, keeping everything else in it
+# (python3 reads and writes the JSON; without it an existing file stays).
+dockerlog_merge() {
+  local temp
+  if [[ ! -s "$DOCKER_DAEMON_FILE" ]]; then
+    rm -f -- "$DOCKER_DAEMON_FILE"; put_file "$DOCKER_DAEMON_FILE" "$(dockerlog_text)"; return
+  fi
+  if ! command -v python3 >/dev/null; then warn "没有 python3，不能安全地改 $DOCKER_DAEMON_FILE，保持不变。"; return 1; fi
+  backup_config_path "$DOCKER_DAEMON_FILE" || return 1
+  temp="$(mktemp "$DOCKER_DAEMON_FILE.tmp.XXXXXX")" || return 1
+  if ! python3 -I -c 'import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+d["log-driver"] = "json-file"
+d["log-opts"] = {"max-size": sys.argv[2] + "m", "max-file": sys.argv[3]}
+with open(sys.argv[4], "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")' "$DOCKER_DAEMON_FILE" "$(param_value docker_log_max_mb)" "$(param_value docker_log_files)" "$temp" 2>/dev/null; then
+    rm -f -- "$temp"; warn "$DOCKER_DAEMON_FILE 不是有效的 JSON，保持不变。"; return 1
+  fi
+  chmod 644 -- "$temp" && mv -f -- "$temp" "$DOCKER_DAEMON_FILE"
 }
 
 # Security audit (vps audit, menu 7): read-only. Six parts, each line ✔, ⚠ or
@@ -5577,6 +6111,7 @@ menu() {
     menu_reboot_hint
     menu_pending_reboot_hint
     menu_login_alert
+    menu_quota_alert
     if setup_tmux_running; then printf '%s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" '一键开荒正在 tmux 里运行（可能是之前 SSH 断线了）：选 2 回到那个界面。' "${C_RESET-}"; fi
     echo
     width="$(stty size 2>/dev/null < /dev/tty | awk '{print $2}' || true)"
@@ -6067,6 +6602,7 @@ tool_uninstall() {
   if [[ -f "$LOGIN_PAM_FILE" ]] && grep -Fq "$STATE_ROOT/login-hook" "$LOGIN_PAM_FILE"; then rm -f -- "$LOGIN_PAM_FILE"; fi
   if [[ -f "$LOGIN_PROFILE_FILE" && "$(cat -- "$LOGIN_PROFILE_FILE")" == "$(login_profile_text)" ]]; then rm -f -- "$LOGIN_PROFILE_FILE"; fi
   rm -rf --one-file-system -- "$LOGIN_NOTE_DIR"
+  if [[ -e "$CHECK_TIMER_FILE" ]]; then check_remove; ok 'TG 通知和流量提醒已停止（它们的脚本随本工具一起删除）。'; fi
   # Each recursive target is a literal member of the fixed allowlist and was
   # validated twice. --one-file-system adds protection if a mount races us.
   for directory in /var/log/vps-stable-opt /var/backups/vps-stable-opt /var/lib/vps-stable-opt; do
@@ -6110,6 +6646,9 @@ restore_ids() {
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
     login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
+    notify) printf '%s\n' notify_conf check_timer check_service_file check_timer_file check_script_file ;;
+    quota) printf '%s\n' quota_conf check_timer check_service_file check_timer_file check_script_file ;;
+    dockerlog) printf '%s\n' dockerlog_file ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     journal) printf '%s\n' journal_file ;;
     trim) printf '%s\n' svc_trim ;;
@@ -6128,7 +6667,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file notify_conf quota_conf check_timer check_service_file check_timer_file check_script_file dockerlog_file
 }
 
 restore_label() {
@@ -6140,6 +6679,9 @@ restore_label() {
     conntrack_file) echo '连接跟踪参数' ;; conntrack_module) echo '连接跟踪模块的开机加载' ;; ping_file) echo '禁止 ping 的参数' ;;
     keepalive_file) echo 'SSH 保活配置' ;; gai_file) echo '地址优先顺序（/etc/gai.conf）' ;; apt_time_file) echo '每天自动更新的时间' ;;
     login_pam) echo '登录记录（common-session 里的那一行）' ;; login_pam_file) echo '登录记录的 PAM 设置' ;; login_hook_file) echo '登录记录脚本' ;; login_profile_file) echo '登录时显示提示的脚本' ;;
+    notify_conf) echo 'TG 通知的设置' ;; quota_conf) echo '月流量提醒的设置' ;; check_timer) echo '检查定时任务（开关）' ;;
+    check_service_file) echo '检查定时任务的服务' ;; check_timer_file) echo '检查定时任务的时间' ;; check_script_file) echo '检查脚本' ;;
+    dockerlog_file) echo 'Docker 的 daemon.json' ;;
     journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
@@ -6178,6 +6720,9 @@ restore_path() {
     keepalive_file) printf '%s\n' "$KEEPALIVE_FILE" ;; gai_file) printf '%s\n' "$GAI_FILE" ;;
     login_pam_file) printf '%s\n' "$LOGIN_PAM_FILE" ;; login_hook_file) printf '%s\n' "$STATE_ROOT/login-hook" ;;
     login_profile_file) printf '%s\n' "$LOGIN_PROFILE_FILE" ;;
+    notify_conf) printf '%s\n' "$STATE_ROOT/notify.conf" ;; quota_conf) printf '%s\n' "$STATE_ROOT/quota.conf" ;;
+    check_service_file) printf '%s\n' "$CHECK_SERVICE_FILE" ;; check_timer_file) printf '%s\n' "$CHECK_TIMER_FILE" ;;
+    check_script_file) printf '%s\n' "$STATE_ROOT/notify-check" ;; dockerlog_file) printf '%s\n' "$DOCKER_DAEMON_FILE" ;;
     apt_time_file) printf '%s\n' "$APT_TIME_FILE" ;;
     *) return 1 ;;
   esac
@@ -6257,6 +6802,7 @@ restore_value() {
     hostname) value="$(head -n 1 /etc/hostname 2>/dev/null)" || return 1
         [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]] || return 1; printf '%s\n' "$value" ;;
     login_pam) if login_pam_enabled; then echo enabled; else echo absent; fi ;;
+    check_timer) if [[ "$(systemctl is-enabled vps-stable-check.timer 2>/dev/null || true)" == enabled ]]; then echo enabled; else echo absent; fi ;;
     ufw_policy_in) ufw_policy_value INPUT ;;
     ufw_policy_out) ufw_policy_value OUTPUT ;;
     ufw_ipv6)
@@ -6609,6 +7155,9 @@ restore_apply_one() {
     qdisc) [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1; sysctl -w "net.core.default_qdisc=$value" ;;
     ntp) case "$value" in yes) timedatectl set-ntp true ;; no) timedatectl set-ntp false ;; *) return 1 ;; esac ;;
     # Taken out the way it went in (the profile file is still there for it).
+    check_timer)
+      [[ "$value" == absent ]] || return 1
+      systemctl disable --now vps-stable-check.timer >/dev/null 2>&1 || return 1 ;;
     login_pam)
       [[ "$value" == absent ]] || return 1
       pam-auth-update --package --remove vps-stable-login || return 1
@@ -7094,7 +7643,7 @@ restore_packages_record() {
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
 restore_groups() {
-  printf '%s\n' fail2ban firewall ssh keepalive login zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
+  printf '%s\n' fail2ban firewall ssh keepalive login notify quota check dockerlog zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
 }
 
 restore_group_label() {
@@ -7103,6 +7652,8 @@ restore_group_label() {
     ssh) echo 'SSH 登录加固（恢复密码和 root 登录）' ;; zram) echo 'ZRAM 内存缓冲' ;; swap) echo '硬盘 Swap' ;;
     conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;;
     keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; login) echo '登录记录和提醒（记录本身保留）' ;;
+    notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; check) echo '检查定时任务（TG 通知和流量提醒共用）' ;;
+    dockerlog) echo 'Docker 容器日志上限（重启 Docker 后恢复）' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; tcp) echo 'TCP 缓冲区上限' ;;
     journal) echo '日志空间限制' ;;
     updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
@@ -7124,6 +7675,10 @@ restore_group_ids() {
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
     login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
+    notify) printf '%s\n' notify_conf ;;
+    quota) printf '%s\n' quota_conf ;;
+    check) printf '%s\n' check_timer check_service_file check_timer_file check_script_file ;;
+    dockerlog) printf '%s\n' dockerlog_file ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
     tcp) printf '%s\n' tcp_file ;;
@@ -7180,6 +7735,15 @@ restore_group_apply() {
       restore_resource conntrack_file
       restore_resource conntrack_module
       if [[ "$(restore_read conntrack_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime conntrack_sysctl_runtime; fi ;;
+    notify|quota)
+      restore_resource "${group}_conf"
+      check_reconcile || RESTORE_PARTIAL=1 ;;
+    check)
+      check_remove
+      while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids check) ;;
+    dockerlog)
+      restore_resource dockerlog_file
+      if active docker; then warn 'Docker 重启后才会回到原来的日志设置（systemctl restart docker，容器会停一下）。'; fi ;;
     keepalive)
       restore_resource keepalive_file
       ssh_reload || warn 'SSH 服务没能重新加载：新连接要等 SSH 重启后才恢复原来的保活设置。' ;;
@@ -7424,6 +7988,42 @@ check_keepalive() {
   if [[ "$current" == "${1% s}" ]]; then verify_set pass "每 $current 秒检测一次空闲连接"
   elif [[ -z "$current" ]]; then verify_set unknown '读不到 sshd 实际生效的配置'
   else verify_set fail "生效的保活间隔是 ${current} 秒，不是 ${1% s} 秒"; fi
+}
+
+# The timer runs and the script is this version's.
+check_timer_ok() {
+  if ! systemctl is-active -q vps-stable-check.timer 2>/dev/null; then verify_set fail '检查定时任务没有运行'; return 1; fi
+  if [[ "$(cat -- "$STATE_ROOT/notify-check" 2>/dev/null)" != "$(notify_check_text)" ]]; then
+    verify_set update '检查脚本不是这个版本的：选 5 单项设置里这一项 → 1 开启，就会更新'; return 1
+  fi
+}
+
+check_notify() {
+  local last waiting
+  [[ -s "$STATE_ROOT/notify.conf" ]] || { verify_set fail 'TG 的设置不见了'; return 0; }
+  check_timer_ok || return 0
+  last="$(cat -- "$STATE_ROOT/notify/last-run" 2>/dev/null || echo 0)"
+  waiting="$(grep -c . "$STATE_ROOT/notify/queue" 2>/dev/null || true)"
+  if (($(date +%s) - last > 600)); then verify_set fail "检查已经超过 10 分钟没跑了（上次：$(audit_when "$last")）"
+  elif ((${waiting:-0} > 20)); then verify_set fail "有 ${waiting} 条消息发不出去：检查网络，或者 Token 是不是被作废了"
+  else verify_set pass "每分钟检查一次，上次在 $(audit_when "$last")$(if ((${waiting:-0})); then echo "，${waiting} 条等着发"; fi)"; fi
+}
+
+check_quota() {
+  local used quota
+  [[ -s "$STATE_ROOT/quota.conf" ]] || { verify_set fail '流量提醒的设置不见了'; return 0; }
+  check_timer_ok || return 0
+  if read -r used quota < <(quota_status); then verify_set pass "这个周期已用 $((used / 1024)) GB / 额度 $((quota / 1024)) GB"
+  else verify_set pass '已开启，还没统计（每 5 分钟累计一次）'; fi
+}
+
+check_dockerlog() {
+  local driver
+  [[ "$(cat -- "$DOCKER_DAEMON_FILE" 2>/dev/null)" == *"\"max-size\": \"$(param_value docker_log_max_mb)m\""* ]] ||
+    { verify_set update "$DOCKER_DAEMON_FILE 里的上限和参数不一样：选 5 单项设置 → Docker 容器日志上限 → 1 开启，就会更新"; return 0; }
+  driver="$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)"
+  if [[ "$driver" == json-file ]]; then verify_set pass "每个容器的日志最多 $(param_value docker_log_max_mb) MiB × $(param_value docker_log_files) 个（只对新建的容器生效）"
+  else verify_set update 'Docker 还没重启，设置还没生效：systemctl restart docker（容器会停一下）'; fi
 }
 
 check_login() {
@@ -7854,6 +8454,9 @@ verify_checks() {
   verify_module keepalive 'SSH 保活' check_keepalive
   verify_module ipv4 '优先使用 IPv4' check_ipv4
   verify_module login '登录记录和提醒' check_login
+  verify_module notify 'TG 通知' check_notify
+  verify_module quota '月流量提醒' check_quota
+  verify_module dockerlog 'Docker 容器日志上限' check_dockerlog
   verify_module ntp '时间同步' check_ntp
   verify_module journal '日志限制' check_journal
   verify_module trim '磁盘 TRIM' check_trim
@@ -8368,7 +8971,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4 login
+  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog
 }
 
 item_label() {
@@ -8379,6 +8982,7 @@ item_label() {
     hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; swap) echo '硬盘 Swap' ;; tools) echo '常用工具' ;;
     conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;; keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
     login) echo '登录记录和提醒' ;;
+    notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; dockerlog) echo 'Docker 容器日志上限' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
     tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
     *) printf '%s\n' "$1" ;;
@@ -8432,6 +9036,14 @@ item_status() {
       if [[ -n "$value" && "$value" != 0 ]]; then echo "每 $value 秒"; else echo '未开启'; fi ;;
     ipv4) if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' "$GAI_FILE" 2>/dev/null; then echo '已优先 IPv4'; else echo '默认（IPv6 优先）'; fi ;;
     login) if login_pam_enabled; then echo "已开启，记下了 $(login_recent 20000 | grep -c . || true) 次登录"; else echo '未开启'; fi ;;
+    notify) if [[ -s "$STATE_ROOT/notify.conf" ]]; then echo '已开启'; else echo '未开启'; fi ;;
+    quota)
+      if read -r value total < <(quota_status); then echo "本周期已用 $((value / 1024)) GB / $((total / 1024)) GB"
+      elif [[ -s "$STATE_ROOT/quota.conf" ]]; then echo '已开启，还没统计'; else echo '未开启'; fi ;;
+    dockerlog)
+      if ! command -v dockerd >/dev/null; then echo '没装 Docker'
+      elif grep -q '"max-size"' "$DOCKER_DAEMON_FILE" 2>/dev/null; then echo "已设置（$(sed -n 's/.*"max-size": *"\([^"]*\)".*/\1/p' "$DOCKER_DAEMON_FILE" | head -n 1)）"
+      else echo '未设置（Docker 默认不限）'; fi ;;
     swap)
       value="$(awk -v n="$SWAP_FILE" 'NR > 1 && $1 == n {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
       if [[ -n "$value" ]]; then echo "已开启，${value} MiB"; else echo '未开启'; fi ;;
@@ -8535,6 +9147,12 @@ item_turn_on() {
       stage_run ipv4 ipv4_stage ;;
     login) LOGIN_CHOICE=1
       stage_run login login_stage ;;
+    notify) NOTIFY_CHOICE=1
+      stage_run notify notify_stage ;;
+    quota) QUOTA_CHOICE=1
+      stage_run quota quota_stage ;;
+    dockerlog) DOCKERLOG_CHOICE=1
+      stage_run dockerlog dockerlog_stage ;;
     ping)
       echo '禁止 ping 只挡最基础的扫描（真正的攻击者不靠 ping 找机器）。代价：服务商或你自己用 ping 做的监控会把机器当成宕机，排查网络时也看不到 ping 的结果。'
       confirm_yes '仍然禁止 ping 吗？' || return 0
