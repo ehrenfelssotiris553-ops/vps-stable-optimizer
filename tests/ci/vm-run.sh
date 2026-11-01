@@ -163,6 +163,13 @@ vm 'bash /root/install.sh --local-file /root/vps-stable-opt.sh --no-run'
 ka_kept="$(vm 'if grep -REiq "^[[:space:]]*ClientAliveInterval" /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null; then
   mkdir -p /run/sshd; sshd -T 2>/dev/null | awk '"'"'$1 == "clientaliveinterval" && $2 != 0 {print $2}'"'"'; fi' || true)"
 printf 'SSH keepalive set by the image: %s\n' "${ka_kept:-none}"
+# Debian 13 has three times ended with apt-listchanges.timer disabled after
+# the rollback, a unit the tool never names: its state after each step, shown
+# when the comparison at the end fails.
+lc_mark() {
+  printf '%s: %s\n' "$1" "$(vm 'systemctl is-enabled apt-listchanges.timer 2>&1' || true)" >> "$LOGS/listchanges-steps.txt"
+}
+lc_mark 'after the install'
 # Ubuntu's cloud kernels keep zram in linux-modules-extra, which the tool
 # deliberately does not install: there ZRAM has to be reported unsupported.
 zram_kernel=1
@@ -263,6 +270,7 @@ check_all() {
       fail "$name: /swapfile not in use with priority 10"
   fi
 }
+lc_mark 'after the setup'
 group 'Acceptance check'
 check_all check
 check_facts check
@@ -435,6 +443,7 @@ if ((!old)); then
   endgroup
 fi
 
+lc_mark 'after the reboot and the setups again'
 group 'SSH hardening: a connection dropped mid-way puts the old settings back'
 vm_drive ssh-drop.rules ssh-drop vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (dropped) exited with $rc"; }
 has ssh-drop '系统日志确认 ops 已用密钥登录成功'
@@ -494,6 +503,7 @@ VM_AS=$VM_OPS_HOST vm_drive rollback.rules rollback sudo vps rollback || fail "r
 has rollback '撤销完成'
 has rollback '已恢复 SSH 原来的登录设置'
 vm true || fail 'root cannot log in after the rollback'
+lc_mark 'after the rollback (packages removed)'
 [[ "$(ssh_methods root)" == *password* ]] || fail "password login not restored by the rollback: $(ssh_methods root)"
 # shellcheck disable=SC2016
 vm 'for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-bbr.conf /etc/systemd/zram-generator.conf /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/systemd/journald.conf.d/99-vps-stable.conf; do [ ! -e "$f" ] || { echo "left: $f"; exit 1; }; done' ||
@@ -503,6 +513,7 @@ vm 'swapon --noheadings | grep -q zram' && fail 'ZRAM still on after rollback'
 vm '[ ! -e /swapfile ] && ! grep -q "^/swapfile " /proc/swaps' || fail 'the disk swap stayed after the rollback'
 vm_drive uninstall.rules uninstall vps uninstall || fail "uninstall exited with $?"
 vm 'command -v vps' && fail 'vps command left after uninstall'
+lc_mark 'after the uninstall'
 endgroup
 
 group 'Nothing left behind: everything compared with before the install'
@@ -514,8 +525,9 @@ python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt"
   --allow-user ops --purged > "$LOGS/snapdiff.log" || rc=$?
 cat "$LOGS/snapdiff.log"
 if ((rc)); then
-  vm 'systemctl is-enabled apt-listchanges.timer 2>&1; grep -h -i listchanges /var/log/dpkg.log /var/log/apt/history.log 2>/dev/null | tail -n 20; journalctl -b --no-pager -o short-precise 2>/dev/null | grep -i -E "listchanges|preset" | tail -n 20' \
-    > "$LOGS/listchanges.log" 2>&1 || true
+  { cat "$LOGS/listchanges-steps.txt"
+    vm 'grep -h -i listchanges /var/log/dpkg.log /var/log/apt/history.log 2>/dev/null | tail -n 10; journalctl --no-pager -o short-precise 2>/dev/null | grep -i "apt-listchanges" | tail -n 15'
+  } > "$LOGS/listchanges.log" 2>&1 || true
   notice "apt-listchanges and presets after the rollback ($system)" "$LOGS/listchanges.log"
 fi
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
