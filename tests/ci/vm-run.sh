@@ -298,6 +298,14 @@ has login-shell '—— VPS 机器管家：登录记录 ——'
 has login-shell '上次登录：'
 endgroup
 
+group 'Security audit on a clean image: nothing suspect'
+vm 'vps audit' > "$LOGS/audit.log" 2>&1 || fail "vps audit exited with $?"
+cat "$LOGS/audit.log"
+has audit '结论：'
+# A fresh cloud image with only this tool on it: anything "suspect" is a false alarm.
+if grep -F '✖ 可疑' "$LOGS/audit.log"; then fail 'the audit calls something on a clean image suspect (listed above)'; fi
+endgroup
+
 group 'SSH with the listening socket only (as right after an OpenSSH update)'
 # Where systemd's socket starts sshd on demand, an OpenSSH update stops the
 # service until the next login; the tool must still see SSH then. Recorded

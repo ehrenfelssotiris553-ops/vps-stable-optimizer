@@ -82,10 +82,10 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
   { printf '1\n1\n\n'; for n in $(seq 2 14) 15; do printf '%s\n\n' "$n"; done; printf '1\n2\n\n1\n3\n\n1\n\n'; } > "$TEST_ROOT/menu-input"
   printf '0\n' >> "$TEST_ROOT/menu-input"
   menu < "$TEST_ROOT/menu-input" > "$TEST_ROOT/menu-out"
-  # 7 is the security review (batch 3); until then it only says so.
-  expected='plan setup check port item bans reboot firewall ssh records rollback uninstall update perf resources '
+  # 7 is the security audit.
+  expected='plan setup check port item bans audit reboot firewall ssh records rollback uninstall update perf resources '
   [[ "$(tr '\n' ' ' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' ' ' < "$TEST_ROOT/menu-actions")"
-  grep -Fq '安全排查还在开发中' "$TEST_ROOT/menu-out" || fail '7 does not say the security review is to come'
+  if grep -Fq '还在开发中' "$TEST_ROOT/menu-out"; then fail '7 still says the security audit is to come'; fi
   grep -Fq '无效选项，请输入 0 至 14 或 h' "$TEST_ROOT/menu-out" || fail 'number 15 not rejected'
   grep -Fq '14. 检查更新' "$TEST_ROOT/menu-out" || fail 'update is not the last item'
   grep -Fq '3. 开荒验收' "$TEST_ROOT/menu-out" || fail 'acceptance check does not follow setup'

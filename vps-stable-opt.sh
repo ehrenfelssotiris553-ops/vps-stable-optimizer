@@ -101,8 +101,11 @@ LOGIN_CHOICE=''
 LOGIN_PAM_FILE=/usr/share/pam-configs/vps-stable-login
 # Never written here: pam-auth-update changes it (tracked as login_pam).
 PAM_COMMON_SESSION=/etc/pam.d/common-session
+# Shows the note the hook left for the account, when its shell starts.
+LOGIN_PROFILE_FILE=/etc/profile.d/zz-vps-stable-login.sh
+LOGIN_NOTE_DIR=/run/vps-stable-login
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|audit|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|audit|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
@@ -111,6 +114,7 @@ VPS 机器管家 V2.7.8 — Debian 12/13、Ubuntu 22.04/24.04/26.04
   vps plan       给机器做体检（只检查）
   vps perf       性能体检（只读）：CPU 是否被抢、内存和硬盘压力、换页、网络重传、连接跟踪
   vps resources  资源占用一览（只读）：常驻服务各占多少内存和 CPU、能不能关、封禁规则多少
+  vps audit      安全排查（只读）：谁登录过、账户和公钥、装过什么、正在运行什么、开机自启和定时任务、系统文件
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
   vps check      开荒验收：逐项检查优化是否真的生效（适合重启后运行）
   vps port       端口管理；也可直接用：
@@ -2495,20 +2499,31 @@ ipv4_stage() {
 # a profile of pam-auth-update (Debian's own way to add a line to
 # common-session, so no file of a package is edited). The line is "optional":
 # a missing or failing hook never stops a login, and timeout ends it after 3 s.
+# sshd shows nothing a session module prints: the note goes into a file of the
+# account, and its shell shows it (LOGIN_PROFILE_FILE).
 login_pam_text() {
   printf '%s\n' 'Name: VPS Stable Optimizer: login record and note' 'Default: yes' 'Priority: 0' \
     'Session-Interactive-Only: yes' 'Session-Type: Additional' 'Session:' \
-    "	optional	pam_exec.so quiet stdout /usr/bin/timeout 3 /bin/bash $STATE_ROOT/login-hook"
+    "	optional	pam_exec.so quiet /usr/bin/timeout 3 /bin/bash $STATE_ROOT/login-hook"
+}
+
+# Run by every login shell: the note once, then emptied.
+login_profile_text() {
+  printf '%s\n' '# VPS Stable Optimizer v2.8: the login note left by the login record.' \
+    "if [ -t 1 ] && [ -s \"$LOGIN_NOTE_DIR/\$(id -un)\" ] && [ -O \"$LOGIN_NOTE_DIR/\$(id -un)\" ]; then" \
+    "  cat \"$LOGIN_NOTE_DIR/\$(id -un)\"; : > \"$LOGIN_NOTE_DIR/\$(id -un)\"" \
+    'fi'
 }
 
 # The hook: one line per login in logins (time, account, address or console
 # line, method, ssh or console, 1 for an address never seen before), a year
 # and at most 20000 lines. sshd's own lines of the last 10 minutes are read
-# too, so a login that opened no PAM session is not missed. An interactive
-# login is shown the previous one, the others of the last 10 minutes and, in
-# red, an address that logs in for the first time.
+# too, so a login that opened no PAM session is not missed. The note for the
+# account (the previous login, the others of the last 10 minutes and, in red,
+# an address that logs in for the first time) is left in NOTE_DIR/ACCOUNT,
+# owned by the account, for its shell to show.
 login_hook_text() {
-  sed "s#@STATE@#$STATE_ROOT#g" <<'HOOK'
+  sed -e "s#@STATE@#$STATE_ROOT#g" -e "s#@NOTES@#$LOGIN_NOTE_DIR#g" <<'HOOK'
 #!/bin/bash
 # VPS Stable Optimizer v2.8: login record and note (run by PAM as root).
 [ "${PAM_TYPE:-}" = open_session ] || exit 0
@@ -2561,14 +2576,21 @@ first="$(head -n 1 "$record" | cut -f1)"
 if [ "$(wc -l < "$record")" -gt 20000 ] || [ "${first:-$now}" -lt $((now - 31622400)) ] 2>/dev/null; then
   awk -F'\t' -v cut=$((now - 31622400)) '$1 >= cut' "$record" | tail -n 20000 > "$record.new" && mv -f "$record.new" "$record"
 fi
-# The note: interactive logins only (a terminal line).
-case "${PAM_TTY:-}" in /dev/*|tty*) ;; *) exit 0 ;; esac
+# The note, for the account's shell to show.
+notes='@NOTES@'
+# Every account must reach its own file (umask 077 above would shut them out).
+[ ! -L "$notes" ] || exit 0
+mkdir -p "$notes" 2>/dev/null; chmod 755 "$notes" 2>/dev/null
+[ -d "$notes" ] || exit 0
+note="$notes/$user"
+[ ! -L "$note" ] || rm -f "$note"
 say_method() { case "$1" in publickey) echo 密钥 ;; password) echo 密码 ;; keyboard-interactive) echo 密码 ;; console) echo 控制台 ;; *) echo 其他方式 ;; esac; }
 show() {
   when="$(date -d "@$1" '+%m-%d %H:%M' 2>/dev/null)"
   case "$3" in console:*) where="服务商控制台（${3#console:}）" ;; *) where="来自 $3" ;; esac
   if [ "$6" = 1 ]; then printf '\033[31m%s  %s %s（%s）  ← 第一次从这个 IP 登录\033[0m\n' "$when" "$2" "$where" "$(say_method "$4")"
   else printf '%s  %s %s（%s）\n' "$when" "$2" "$where" "$(say_method "$4")"; fi; }
+{
 echo '—— VPS 机器管家：登录记录 ——'
 if [ -n "$previous" ]; then
   IFS="$(printf '\t')" read -r t u ip m k n <<EOF
@@ -2589,6 +2611,8 @@ fi
 if [ "$new" = 1 ]; then
   printf '\033[31m这是第一次从 %s 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 7 安全排查。是你自己就不用管，下次不再标红。\033[0m\n' "$from"
 fi
+} > "$note"
+chown -- "$user" "$note" 2>/dev/null || rm -f "$note"
 exit 0
 HOOK
 }
@@ -2600,10 +2624,10 @@ login_pam_enabled() {
 
 login_stage() {
   say '登录记录和提醒'
-  local hook pam
+  local hook pam profile
   if [[ "${LOGIN_CHOICE:-}" != 1 ]]; then ok '按你的选择不开启登录记录。'; module_result login declined 'not requested'; return 0; fi
   if ! command -v pam-auth-update >/dev/null; then warn '找不到 pam-auth-update，不能开启登录记录。'; module_result login unsupported 'no pam-auth-update'; return 0; fi
-  hook="$(login_hook_text)" pam="$(login_pam_text)"
+  hook="$(login_hook_text)" pam="$(login_pam_text)" profile="$(login_profile_text)"
   # Written again when this tool has a newer text.
   if [[ -f "$STATE_ROOT/login-hook" && "$(cat -- "$STATE_ROOT/login-hook" 2>/dev/null || true)" != "$hook" ]] && restore_file_ours login_hook_file; then
     rm -f -- "$STATE_ROOT/login-hook"
@@ -2613,6 +2637,10 @@ login_stage() {
   fi
   put_file "$STATE_ROOT/login-hook" "$hook" || { module_result login preserved 'hook path conflict'; return 0; }
   chmod 600 -- "$STATE_ROOT/login-hook" || true
+  if [[ -f "$LOGIN_PROFILE_FILE" && "$(cat -- "$LOGIN_PROFILE_FILE" 2>/dev/null || true)" != "$profile" ]] && restore_file_ours login_profile_file; then
+    rm -f -- "$LOGIN_PROFILE_FILE"
+  fi
+  put_file "$LOGIN_PROFILE_FILE" "$profile" || { module_result login preserved 'profile script conflict'; return 0; }
   put_file "$LOGIN_PAM_FILE" "$pam" || { module_result login preserved 'PAM profile conflict'; return 0; }
   if ! login_pam_enabled; then
     # A common-session edited by hand is not touched (pam-auth-update refuses).
@@ -4829,7 +4857,7 @@ backup_config_group() {
 backup_configs() {
   local file unit
   say '保存配置快照与优化前状态'
-  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$LOGIN_PAM_FILE" "$PAM_COMMON_SESSION" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
+  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$LOGIN_PAM_FILE" "$LOGIN_PROFILE_FILE" "$PAM_COMMON_SESSION" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
       /etc/ssh/sshd_config /etc/default/ssh /etc/default/ufw \
       /etc/ufw/ufw.conf /etc/ufw/sysctl.conf /etc/ufw/before.rules /etc/ufw/before6.rules \
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
@@ -4973,7 +5001,7 @@ record_config_change() {
 # would suppress errexit inside that function; a separate /bin/bash avoids it.
 menu_action() {
   local self="$1" action="$2" code
-  case "$action" in plan|perf|resources|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
+  case "$action" in plan|perf|resources|audit|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
   # The new interpreter keeps its own errexit even inside the parent's if.
   if /bin/bash -- "$self" "$action"; then
     echo '本项已结束；请查看上方结果、跳过项和注意事项。'
@@ -5081,6 +5109,351 @@ resources_main() {
       printf '%s%s Fail2ban 的封禁规则有 %s 条：每次封禁、解封都要让 UFW 重新加载规则，攻击很多时会占不少 CPU。可以缩短封禁时间，或者让来源 IP 多的服务只对需要的人开放。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$rules" "${C_RESET-}"
     else printf '防火墙里的封禁规则：%s 条。\n' "$rules"; fi
   fi
+}
+
+# Security audit (vps audit, menu 7): read-only. Six parts, each line ✔, ⚠ or
+# ✖; a deep check of every package's files only when asked. What the user marks
+# as normal ("KIND VALUE" lines in STATE_ROOT/known: ip, key, exe, file; the
+# login note reads the ip lines too) is not reported again.
+AUDIT_MARKS=()
+AUDIT_IPS=()
+AUDIT_CONFIGS=()
+AUDIT_OWNED=''
+
+audit_known() {
+  [[ -f "$STATE_ROOT/known" && ! -L "$STATE_ROOT/known" ]] && grep -Fxq -- "$1 $2" "$STATE_ROOT/known"
+}
+
+# STATUS LABEL TEXT [KIND VALUE]: a line of the report; with KIND, one that can
+# be marked as normal.
+audit_flag() {
+  verify_line "$1" "$2" "$3"
+  if [[ -n "${4:-}" && "$1" != healthy ]]; then AUDIT_MARKS+=("$4"$'\t'"$5"$'\t'"$2：$3"); fi
+}
+
+audit_heading() {
+  printf '\n%s%s%s\n' "${C_BOLD-}" "$1" "${C_RESET-}"
+}
+
+# Every path a package owns, /bin and /usr/bin alike (merged /usr), sorted.
+audit_owned_paths() {
+  cat /var/lib/dpkg/info/*.list 2>/dev/null | sed -E 's#^/(bin|sbin|lib|lib32|lib64|libx32)/#/usr/\1/#' | LC_ALL=C sort -u
+}
+
+# PATH...: the ones no package owns (against AUDIT_OWNED).
+audit_unowned() {
+  (($#)) || return 0
+  printf '%s\n' "$@" | sed -E 's#^/(bin|sbin|lib|lib32|lib64|libx32)/#/usr/\1/#' | LC_ALL=C sort -u | LC_ALL=C comm -23 - "$AUDIT_OWNED"
+}
+
+audit_when() {
+  date -d "@$1" '+%m-%d %H:%M' 2>/dev/null || echo '?'
+}
+
+# 1. Who logged in during the last 30 days: from the login record (or, without
+# it, what the journal still has).
+audit_logins() {
+  local now lines source kind ip count last users methods new known=0 failed banned
+  audit_heading '一、谁登录过（最近 30 天）'
+  now="$(date +%s)"
+  if [[ -s "$STATE_ROOT/logins" ]]; then
+    lines="$(login_recent 20000 | awk -F'\t' -v cut=$((now - 2592000)) '$1 >= cut')" source='登录记录'
+  else
+    lines="$(journalctl -q --since=-30d _UID=0 -t sshd -t sshd-session -o short-unix --no-pager 2>/dev/null |
+      awk '$4 == "Accepted" && $6 == "for" && $8 == "from" {sub(/\..*/, "", $1); print $1 "\t" $7 "\t" $9 "\t" $5 "\tssh\t0"}' || true)"
+    source='系统日志（登录记录没开，只查得到日志还在的部分）'
+  fi
+  if [[ -z "$lines" ]]; then verify_line healthy '登录' "最近 30 天没有登录（来源：$source）"
+  else
+    while IFS=$'\t' read -r kind ip count last users methods new; do
+      if [[ "$kind" == console ]]; then
+        audit_flag notice '服务商控制台' "登录过 ${count} 次（${users}），最后一次 $(audit_when "$last")：不是你登录的，说明服务商面板的账户可能泄露了，先改面板密码"
+        continue
+      fi
+      ((${#AUDIT_IPS[@]} >= 20)) || AUDIT_IPS+=("$ip")
+      if [[ "$new" == 1 ]] && ! audit_known ip "$ip"; then
+        audit_flag notice "IP $ip" "最近 30 天第一次出现，登录 ${count} 次（${users}，${methods}），最后一次 $(audit_when "$last")" ip "$ip"
+      else known=$((known + 1)); fi
+    done < <(awk -F'\t' '
+      $5 == "ssh" {ip = $3; c[ip]++; if ($1 > l[ip]) l[ip] = $1
+        if (index(" " u[ip] " ", " " $2 " ") == 0) u[ip] = u[ip] " " $2
+        if (index(" " m[ip] " ", " " $4 " ") == 0) m[ip] = m[ip] " " $4
+        if ($6 == 1) n[ip] = 1}
+      $5 == "console" {cc++; if ($1 > cl) cl = $1; if (index(" " cu " ", " " $2 " ") == 0) cu = cu " " $2}
+      END {for (ip in c) print "ssh\t" ip "\t" c[ip] "\t" l[ip] "\t" substr(u[ip], 2) "\t" substr(m[ip], 2) "\t" (n[ip] + 0)
+        if (cc) print "console\t-\t" cc "\t" cl "\t" substr(cu, 2) "\t-\t0"}' <<< "$lines" |
+      sed 's/publickey/密钥/g; s/keyboard-interactive/密码/g; s/password/密码/g')
+    if ((known)); then verify_line healthy '登录' "${known} 个 IP 以前就登录过或标记过正常（来源：$source）"; fi
+  fi
+  failed="$(journalctl -q --since=-24h _UID=0 -t sshd -t sshd-session -o cat --no-pager 2>/dev/null | grep -cE '^(Failed password|Invalid user|Connection closed by authenticating user)' || true)"
+  banned="$(fail2ban-client get sshd banip 2>/dev/null | wc -w || true)"
+  verify_line healthy '失败的登录' "过去 24 小时 ${failed:-0} 次（扫描密码的程序一直都有）；Fail2ban 正在封禁 ${banned:-0} 个 IP"
+}
+
+# 2. Accounts and keys.
+audit_accounts_keys() {
+  local raw name uid shell home uid0_names='' can='' state file line fp rest days created changed sudoers
+  audit_heading '二、账户和公钥'
+  raw="$(getent passwd 2>/dev/null)" || { verify_line unknown '账户' '读不到账户列表'; return 0; }
+  while IFS=: read -r name _ uid _ _ home shell; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    name="$(audit_clean_text <<< "$name")"
+    if ((uid == 0)) && [[ "$name" != root ]]; then uid0_names+=" $name"; fi
+    case "$shell" in */nologin|*/false|'') continue ;; esac
+    ((uid == 0 || (uid >= 1000 && uid < 60000))) || continue
+    can+=" $name"
+    state="$(audit_passwd_state <<< "$(passwd -S "$name" 2>/dev/null)" 2>/dev/null || true)"
+    if [[ "$state" == NP ]]; then audit_flag suspect "账户 $name" '没有密码（空密码）：谁都能用它登录控制台，马上用 passwd 设置密码'; fi
+    for file in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+      [[ -f "$file" && ! -L "$file" ]] || continue
+      days=$((($(date +%s) - $(stat -c %Y -- "$file")) / 86400))
+      while read -r _ fp rest; do
+        [[ "$fp" == SHA256:* ]] || continue
+        rest="$(audit_clean_text <<< "$rest" | cut -c1-80)"
+        if audit_known key "$fp"; then continue; fi
+        audit_flag notice "账户 $name 的公钥" "$fp（$rest）$(if ((days < 7)); then echo "，这个文件 ${days} 天内改过"; fi)：确认是你自己的；不认识的就在 $file 里删掉那一行" key "$fp"
+      done < <(ssh-keygen -l -f "$file" 2>/dev/null || true)
+    done
+  done <<< "$raw"
+  if [[ -n "$uid0_names" ]]; then audit_flag suspect 'UID 0 账户' "除了 root 还有：${uid0_names# }。这样的账户和 root 权限一样，不是你建的就是被人留了后门"; fi
+  verify_line healthy '能登录的账户' "${can# }"
+  created="$(journalctl -q --since=-30d -t useradd -o cat --no-pager 2>/dev/null | sed -n 's/^new user: name=\([^,]*\),.*/\1/p' | audit_clean_text | sort -u | tr '\n' ' ' || true)"
+  if [[ -n "${created// /}" ]]; then audit_flag notice '新建的账户' "最近 30 天：${created% }。不是你建的要查一下"; fi
+  changed="$(journalctl -q --since=-30d -t passwd -t chpasswd -o cat --no-pager 2>/dev/null | sed -n 's/.*password changed for \([^ ]*\).*/\1/p' | audit_clean_text | sort -u | tr '\n' ' ' || true)"
+  if [[ -n "${changed// /}" ]]; then audit_flag notice '改过密码的账户' "最近 30 天：${changed% }。不是你改的要查一下"; fi
+  for sudoers in /etc/sudoers /etc/sudoers.d/*; do
+    [[ -f "$sudoers" && ! -L "$sudoers" ]] || continue
+    line="$(grep -E '^[^#]*NOPASSWD' "$sudoers" 2>/dev/null | head -n 1 | audit_clean_text | cut -c1-80 || true)"
+    if [[ -n "$line" ]] && ! audit_known file "$sudoers"; then
+      audit_flag notice 'sudo 免密码' "$sudoers：$line（云镜像常给默认账户这样设；不认识的账户要查）" file "$sudoers"
+    fi
+  done
+}
+
+# 3. Software: new packages, and programs that belong to no package.
+audit_software() {
+  local cutoff list ours='' others_pkgs='' pkg file
+  local -a audit_files=()
+  audit_heading '三、装过什么'
+  cutoff="$(date -d '30 days ago' +%F)"
+  list="$(cat /var/log/dpkg.log.1 /var/log/dpkg.log 2>/dev/null | awk -v c="$cutoff" '$3 == "install" && $1 >= c {sub(/:.*/, "", $4); print $4}' | sort -u || true)"
+  for pkg in $list; do
+    if [[ -f "$STATE_ROOT/restore-v2/packages/installed" ]] && grep -Fxq -- "$pkg" "$STATE_ROOT/restore-v2/packages/installed"; then ours+=" $pkg"
+    else others_pkgs+=" $pkg"; fi
+  done
+  if [[ -n "$others_pkgs" ]]; then audit_flag notice '新装的软件包' "最近 30 天（不算本工具装的）：$(cut -c2-400 <<< "$others_pkgs")"
+  else verify_line healthy '新装的软件包' "最近 30 天只有本工具装的${ours:+：${ours# }}"; fi
+  # Somebody's own programs (xray and the like) and programs in system directories
+  # that no package owns.
+  mapfile -t audit_files < <(find /usr/local/bin /usr/local/sbin /opt -maxdepth 3 -type f -perm /111 2>/dev/null | grep -vx /usr/local/bin/vps | head -n 50)
+  for file in "${audit_files[@]}"; do
+    audit_known file "$file" || audit_flag notice '自己装的程序' "$(audit_clean_text <<< "$file")：是你装的就标记为正常" file "$file"
+  done
+  mapfile -t audit_files < <(find /usr/bin /usr/sbin -maxdepth 1 -type f 2>/dev/null)
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    audit_known file "$file" || audit_flag suspect '系统目录里的程序' "$(audit_clean_text <<< "$file") 不属于任何软件包：系统命令被换掉或藏了程序时会这样" file "$file"
+  done < <(audit_unowned "${audit_files[@]}" | head -n 30)
+  mapfile -t audit_files < <(find /tmp /var/tmp /dev/shm -xdev -maxdepth 4 -type f -perm /111 2>/dev/null | head -n 30)
+  for file in "${audit_files[@]}"; do
+    audit_known file "$file" || audit_flag suspect '临时目录里的程序' "$(audit_clean_text <<< "$file")：恶意程序常放在这里" file "$file"
+  done
+}
+
+# 4. What runs: deleted or temporary programs, programs of no package, CPU hogs.
+audit_running() {
+  local own d exe comm pid pcpu secs ports base
+  local -A seen_exe=()
+  local -a plain=()
+  audit_heading '四、正在运行什么'
+  own="$(readlink /proc/1/ns/mnt 2>/dev/null || true)"
+  for d in /proc/[0-9]*; do
+    # Containers have programs of their own: only this system's processes.
+    [[ "$(readlink "$d/ns/mnt" 2>/dev/null || true)" == "$own" ]] || continue
+    exe="$(readlink "$d/exe" 2>/dev/null)" || continue
+    [[ -n "${seen_exe[$exe]:-}" ]] && continue
+    seen_exe[$exe]=1
+    comm="$(audit_clean_text < "$d/comm" 2>/dev/null || true)" pid="${d#/proc/}"
+    if [[ "$exe" == *' (deleted)' ]]; then
+      base="${exe% (deleted)}"
+      if [[ -e "$base" ]]; then verify_line notice "进程 $comm" "$(audit_clean_text <<< "$base") 已被换成新文件（多半是升级后这个服务还没重启；重启服务器就好）"
+      else audit_flag suspect "进程 $comm（$pid）" "程序文件 $(audit_clean_text <<< "$base") 已被删掉，进程还在运行：恶意程序常这样藏起来" exe "$base"; fi
+      continue
+    fi
+    case "$exe" in
+      /tmp/*|/var/tmp/*|/dev/shm/*) audit_known exe "$exe" || audit_flag suspect "进程 $comm（$pid）" "从临时目录运行：$(audit_clean_text <<< "$exe")" exe "$exe"; continue ;;
+    esac
+    plain+=("$exe")
+  done
+  while IFS= read -r exe; do
+    [[ -n "$exe" ]] || continue
+    audit_known exe "$exe" || audit_flag notice '不属于软件包的程序在运行' "$(audit_clean_text <<< "$exe")：是你装的就标记为正常" exe "$exe"
+  done < <(audit_unowned "${plain[@]}" | head -n 30)
+  while read -r pid pcpu secs comm; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || echo "$comm")"
+    audit_known exe "$exe" && continue
+    audit_flag notice "进程 $(audit_clean_text <<< "$comm")（$pid）" "运行 $((secs / 60)) 分钟，平均占 ${pcpu}% CPU：一直吃满 CPU 的陌生程序多半是挖矿的" exe "$exe"
+  done < <(ps -eo pid=,pcpu=,etimes=,comm= 2>/dev/null | awk '$2 >= 80 && $3 >= 600' | head -n 5)
+  ports="$(ss -H -tulpn 2>/dev/null | awk '$5 !~ /^(127\.|\[::1\]|::1)/ {n = split($5, a, ":"); p = a[n]; match($0, /\("[^"]*"/); prog = substr($0, RSTART + 2, RLENGTH - 3); k = p "/" $1 (prog != "" ? "(" prog ")" : ""); if (!(k in s)) {s[k] = 1; printf "%s ", k}}' || true)"
+  verify_line healthy '对外监听的端口' "$(if [[ -n "${ports// /}" ]]; then echo "${ports% }"; else echo 没有; fi)"
+}
+
+# 5. What starts by itself: units and cron jobs of no package, preload.
+audit_autostart() {
+  local file line
+  local -a audit_files=()
+  audit_heading '五、开机自启和定时任务'
+  mapfile -t audit_files < <(find /etc/systemd/system /usr/local/lib/systemd/system -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' -o -name '*.socket' -o -name '*.path' \) ! -name 'vps-stable-*' 2>/dev/null)
+  for file in "${audit_files[@]}"; do
+    audit_known file "$file" && continue
+    line="$(grep -m1 -E '^(ExecStart|OnCalendar|OnBootSec|ListenStream)=' "$file" 2>/dev/null | audit_clean_text | cut -c1-100 || true)"
+    audit_flag notice '自己加的服务' "$(audit_clean_text <<< "$file")（${line:-没有 ExecStart}）：是你装的就标记为正常" file "$file"
+  done
+  mapfile -t audit_files < <(find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -maxdepth 1 -type f ! -name .placeholder 2>/dev/null)
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    audit_known file "$file" || audit_flag notice '定时任务' "$(audit_clean_text <<< "$file") 不属于任何软件包：是你加的就标记为正常" file "$file"
+  done < <(audit_unowned "${audit_files[@]}")
+  for file in /var/spool/cron/crontabs/*; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    audit_known file "$file" && continue
+    line="$(grep -m1 -vE '^[[:space:]]*(#|$)' "$file" 2>/dev/null | audit_clean_text | cut -c1-100 || true)"
+    audit_flag notice "账户 ${file##*/} 的定时任务" "${line:-（空）}：是你加的就标记为正常" file "$file"
+  done
+  if [[ -s /etc/ld.so.preload ]]; then
+    audit_flag suspect '/etc/ld.so.preload' "让每个程序先加载：$(head -n 3 /etc/ld.so.preload | audit_clean_text | tr '\n' ' ')。正常系统没有这个文件，隐藏自己的恶意程序常用它"
+  fi
+  if [[ -x /etc/rc.local ]] && ! audit_known file /etc/rc.local; then audit_flag notice '/etc/rc.local' '开机会运行它：确认里面的命令是你写的' file /etc/rc.local; fi
+  mapfile -t audit_files < <(find /etc/profile.d -maxdepth 1 -type f ! -name zz-vps-stable-login.sh 2>/dev/null)
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    audit_known file "$file" || audit_flag notice '登录时运行的脚本' "$(audit_clean_text <<< "$file") 不属于任何软件包：每次登录都会运行，确认是你加的" file "$file"
+  done < <(audit_unowned "${audit_files[@]}")
+  verify_line healthy '检查过的位置' 'systemd 服务、cron、各账户的 crontab、ld.so.preload、rc.local、profile.d'
+}
+
+# 6. System files against the checksums of their packages: the programs a
+# break-in replaces first (quick), or every package (deep). Changed
+# configuration files are only listed (usually you or this tool changed them).
+audit_integrity() {
+  local -a pkgs=() changed_files=() missing_files=()
+  local pkg flags rest
+  if [[ "$1" == all ]]; then audit_heading '六（深度）、所有软件包的文件'
+  else
+    audit_heading '六、系统文件有没有被换过（关键软件包）'
+    for pkg in openssh-server openssh-client sudo passwd login util-linux coreutils procps bash systemd libpam-modules libpam-runtime cron iproute2 findutils; do
+      installed "$pkg" && pkgs+=("$pkg")
+    done
+  fi
+  while read -r flags rest; do
+    case "$flags" in
+      missing) missing_files+=("${rest#c }") ;;
+      ??5*)
+        if [[ "$rest" == 'c '* ]]; then AUDIT_CONFIGS+=("${rest#c }")
+        else changed_files+=("$rest"); fi ;;
+    esac
+  done < <(dpkg --verify "${pkgs[@]}" 2>/dev/null | audit_clean_text || true)
+  for rest in "${changed_files[@]}"; do
+    audit_known file "$rest" || audit_flag suspect '被改过的系统文件' "$rest 和软件包里的不一样：系统程序被替换时会这样（重装那个软件包能换回来）" file "$rest"
+  done
+  if ((${#missing_files[@]})); then verify_line notice '缺少的文件' "$(printf '%s ' "${missing_files[@]:0:5}")$(if ((${#missing_files[@]} > 5)); then echo "等 ${#missing_files[@]} 个"; fi)"; fi
+  if ((${#changed_files[@]} == 0)); then
+    if [[ "$1" == all ]]; then verify_line healthy '软件包的文件' '所有软件包的程序都和安装时一样'
+    else verify_line healthy '关键程序' "${#pkgs[@]} 个关键软件包的程序都和安装时一样"; fi
+  fi
+}
+
+audit_sections() {
+  audit_logins
+  audit_accounts_keys
+  audit_software
+  audit_running
+  audit_autostart
+  audit_integrity quick
+}
+
+# Numbers to mark as normal; u lists what is marked and takes some back.
+audit_mark_menu() {
+  local answer n entry kind value i known="$STATE_ROOT/known"
+  local -a lines=()
+  if ((${#AUDIT_MARKS[@]})); then
+    echo
+    echo '可以标记为正常的（标记后不再提醒，确认是你自己的再标）：'
+    for i in "${!AUDIT_MARKS[@]}"; do printf '  %s. %s\n' "$((i + 1))" "$(cut -f3- <<< "${AUDIT_MARKS[i]}")"; done
+  fi
+  [[ -s "$known" ]] && echo '  u. 查看已标记的，取消其中几项'
+  ((${#AUDIT_MARKS[@]})) || [[ -s "$known" ]] || return 0
+  read -r -p '要标记哪几项？输入编号（多个用空格隔开，a 是全部），直接回车跳过: ' answer || return 0
+  if [[ "$answer" == u ]]; then
+    mapfile -t lines < "$known"
+    for i in "${!lines[@]}"; do printf '  %s. %s\n' "$((i + 1))" "$(audit_clean_text <<< "${lines[i]}")"; done
+    read -r -p '要取消哪几项？输入编号，直接回车跳过: ' answer || return 0
+    for n in $answer; do [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 1 && n <= ${#lines[@]})) && lines[n - 1]=''; done
+    printf '%s\n' "${lines[@]}" | grep . > "$known.new" || true
+    chmod 600 -- "$known.new" && mv -f -- "$known.new" "$known" && ok '已取消。'
+    return 0
+  fi
+  [[ "$answer" != a ]] || answer="$(seq 1 "${#AUDIT_MARKS[@]}" | tr '\n' ' ')"
+  for n in $answer; do
+    if [[ ! "$n" =~ ^[0-9]+$ ]] || ((n < 1 || n > ${#AUDIT_MARKS[@]})); then continue; fi
+    entry="${AUDIT_MARKS[n - 1]}" kind="${entry%%$'\t'*}" value="${entry#*$'\t'}" value="${value%%$'\t'*}"
+    if ! audit_known "$kind" "$value"; then printf '%s %s\n' "$kind" "$value" >> "$known"; fi
+  done
+  chmod 600 -- "$known" 2>/dev/null || true
+  # At most 1000: the oldest go first.
+  if [[ -f "$known" ]] && (($(wc -l < "$known") > 1000)); then tail -n 1000 -- "$known" > "$known.new" && mv -f -- "$known.new" "$known"; fi
+  ok '已标记为正常，下次不再提醒。'
+}
+
+# Where the addresses are, only when asked (they go to ipinfo.io).
+audit_geo() {
+  local ip info
+  if ((${#AUDIT_IPS[@]} == 0)) || ! command -v curl >/dev/null; then return 0; fi
+  confirm_yes "要查这 ${#AUDIT_IPS[@]} 个登录过的 IP 的归属地吗？（会把这些 IP 发给 ipinfo.io 查询）" || return 0
+  for ip in "${AUDIT_IPS[@]}"; do
+    port_source_valid "$ip" || continue
+    info="$(curl -fsS --max-time 5 "https://ipinfo.io/$ip/json" 2>/dev/null |
+      sed -n 's/^ *"\(country\|region\|city\|org\)": *"\([^"]*\)".*/\2/p' | audit_clean_text | cut -c1-60 | tr '\n' ' ' || true)"
+    printf '  %s：%s\n' "$ip" "${info:-查不到}"
+  done
+}
+
+audit_main() {
+  local tmp part file='' config
+  if ((EUID != 0)); then warn '安全排查需要 root：请用 sudo vps audit。'; return 0; fi
+  VERIFY_PASS=0 VERIFY_FAIL=0 VERIFY_NA=0 VERIFY_UNKNOWN=0 VERIFY_NOTICE=0 VERIFY_ISSUES=() AUDIT_MARKS=() AUDIT_IPS=() AUDIT_CONFIGS=()
+  if ! tmp="$(mktemp)" || ! part="$(mktemp)" || ! AUDIT_OWNED="$(mktemp)"; then die '无法创建临时文件。'; fi
+  say '安全排查（只读）'
+  echo '正在快速检查（几秒钟）：谁登录过、账户和公钥、装过什么、正在运行什么、开机自启和定时任务、关键系统文件……'
+  audit_owned_paths > "$AUDIT_OWNED"
+  # No pipe: the counts and the lists must stay in this shell.
+  audit_sections > "$tmp"
+  cat -- "$tmp"
+  if [[ -t 0 ]] && confirm_yes '要做深度检查吗？（逐个核对所有软件包的文件有没有被换过，要读一遍硬盘，一般 1–5 分钟）'; then
+    echo '正在深度检查……'
+    AUDIT_CONFIGS=()
+    audit_integrity all > "$part"
+    cat -- "$part"; cat -- "$part" >> "$tmp"
+  fi
+  {
+    if ((${#AUDIT_CONFIGS[@]})); then
+      audit_heading '改动过的配置文件（多半是你或本工具改的，只列出来供核对）'
+      for config in "${AUDIT_CONFIGS[@]:0:40}"; do printf '  %s\n' "$config"; done
+    fi
+    echo
+    printf '%s结论：%s 项正常，%s 项要留意，%s 项可疑。%s\n' "${C_BOLD-}" "$VERIFY_PASS" "${VERIFY_NOTICE:-0}" "$VERIFY_FAIL" "${C_RESET-}"
+    if ((VERIFY_FAIL)); then echo '有可疑项时：先拍快照保留现场，改 root 和所有账户的密码，删掉不认识的公钥；被替换的系统文件说明入侵很深，最稳妥的是备份数据后重装系统。'; fi
+    echo '局限：查到可疑基本说明出过事；没查到不能证明没出事（高明的入侵会抹掉痕迹，或者替换掉用来检查的程序）。'
+  } > "$part"
+  cat -- "$part"; cat -- "$part" >> "$tmp"
+  if [[ -d "$LOG_DIR" && ! -L "$LOG_DIR" ]] && tool_data_owned "$LOG_DIR" 2>/dev/null; then
+    log_rotate 'audit-*.txt' 10
+    file="$LOG_DIR/audit-$(date -u +%Y%m%dT%H%M%SZ).txt"
+    sed 's/\x1b\[[0-9;]*m//g' -- "$tmp" > "$file" && chmod 600 -- "$file" && printf '报告已保存：%s\n' "$file"
+  fi
+  rm -f -- "$tmp" "$part" "$AUDIT_OWNED"
+  if [[ -t 0 ]]; then audit_mark_menu; audit_geo; fi
 }
 
 # Main menu entries: group, number, label (menu below maps numbers to actions).
@@ -5223,7 +5596,7 @@ menu() {
       4) action=port ;;
       5) action=item ;;
       6) action=bans ;;
-      7) echo '安全排查还在开发中，会在 2.8.0 里加上。'; action='' ;;
+      7) action=audit ;;
       8) action=reboot ;;
       9) action=firewall ;;
       10) action=ssh ;;
@@ -5692,6 +6065,8 @@ tool_uninstall() {
     ok '登录记录和提醒已关闭（它的脚本和记录随本工具一起删除）。'
   fi
   if [[ -f "$LOGIN_PAM_FILE" ]] && grep -Fq "$STATE_ROOT/login-hook" "$LOGIN_PAM_FILE"; then rm -f -- "$LOGIN_PAM_FILE"; fi
+  if [[ -f "$LOGIN_PROFILE_FILE" && "$(cat -- "$LOGIN_PROFILE_FILE")" == "$(login_profile_text)" ]]; then rm -f -- "$LOGIN_PROFILE_FILE"; fi
+  rm -rf --one-file-system -- "$LOGIN_NOTE_DIR"
   # Each recursive target is a literal member of the fixed allowlist and was
   # validated twice. --one-file-system adds protection if a mount races us.
   for directory in /var/log/vps-stable-opt /var/backups/vps-stable-opt /var/lib/vps-stable-opt; do
@@ -5734,7 +6109,7 @@ restore_ids() {
     ping) printf '%s\n' ping_file ;;
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
-    login) printf '%s\n' login_pam login_pam_file login_hook_file ;;
+    login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     journal) printf '%s\n' journal_file ;;
     trim) printf '%s\n' svc_trim ;;
@@ -5753,7 +6128,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file
 }
 
 restore_label() {
@@ -5764,7 +6139,7 @@ restore_label() {
     swap_unit) echo '硬盘 Swap 的启动配置' ;; swap_file) echo '硬盘 Swap 文件' ;;
     conntrack_file) echo '连接跟踪参数' ;; conntrack_module) echo '连接跟踪模块的开机加载' ;; ping_file) echo '禁止 ping 的参数' ;;
     keepalive_file) echo 'SSH 保活配置' ;; gai_file) echo '地址优先顺序（/etc/gai.conf）' ;; apt_time_file) echo '每天自动更新的时间' ;;
-    login_pam) echo '登录记录（common-session 里的那一行）' ;; login_pam_file) echo '登录记录的 PAM 设置' ;; login_hook_file) echo '登录记录脚本' ;;
+    login_pam) echo '登录记录（common-session 里的那一行）' ;; login_pam_file) echo '登录记录的 PAM 设置' ;; login_hook_file) echo '登录记录脚本' ;; login_profile_file) echo '登录时显示提示的脚本' ;;
     journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
@@ -5802,6 +6177,7 @@ restore_path() {
     ping_file) printf '%s\n' "$PING_FILE" ;;
     keepalive_file) printf '%s\n' "$KEEPALIVE_FILE" ;; gai_file) printf '%s\n' "$GAI_FILE" ;;
     login_pam_file) printf '%s\n' "$LOGIN_PAM_FILE" ;; login_hook_file) printf '%s\n' "$STATE_ROOT/login-hook" ;;
+    login_profile_file) printf '%s\n' "$LOGIN_PROFILE_FILE" ;;
     apt_time_file) printf '%s\n' "$APT_TIME_FILE" ;;
     *) return 1 ;;
   esac
@@ -6747,7 +7123,7 @@ restore_group_ids() {
     ping) printf '%s\n' ping_file ;;
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
-    login) printf '%s\n' login_pam login_pam_file login_hook_file ;;
+    login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
     tcp) printf '%s\n' tcp_file ;;
@@ -6993,6 +7369,8 @@ verify_line() {
     pass) VERIFY_PASS=$((VERIFY_PASS + 1)) mark="${SYM_OK-✔}" color="${C_OK-}" word='生效' ;;
     healthy) VERIFY_PASS=$((VERIFY_PASS + 1)) mark="${SYM_OK-✔}" color="${C_OK-}" word='正常' ;;
     fail) VERIFY_FAIL=$((VERIFY_FAIL + 1)) mark="${SYM_FAIL-✖}" color="${C_FAIL-}" word='未生效' ;;
+    # The security audit: a sign that someone got in.
+    suspect) VERIFY_FAIL=$((VERIFY_FAIL + 1)) mark="${SYM_FAIL-✖}" color="${C_FAIL-}" word='可疑' ;;
     na) VERIFY_NA=$((VERIFY_NA + 1)) mark="${SYM_SKIP-○}" word='未处理' ;;
     # Something to look at that is not this tool's (another service failing).
     notice) VERIFY_NOTICE=$((${VERIFY_NOTICE:-0} + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='注意' ;;
@@ -7003,7 +7381,7 @@ verify_line() {
     *) VERIFY_UNKNOWN=$((VERIFY_UNKNOWN + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='无法确认' ;;
   esac
   printf '%s%s %s%s  %s：%s\n' "$color" "$mark" "$word" "${C_RESET-}" "$2" "$3"
-  case "$1" in fail|reboot|unknown|update|notice) VERIFY_ISSUES+=("$color$mark $word${C_RESET-}  $2：$3") ;; esac
+  case "$1" in fail|suspect|reboot|unknown|update|notice) VERIFY_ISSUES+=("$color$mark $word${C_RESET-}  $2：$3") ;; esac
 }
 
 # Applies the recorded expectation: only applied/present results are checked
@@ -7051,7 +7429,8 @@ check_keepalive() {
 check_login() {
   local count
   if ! login_pam_enabled; then verify_set fail "$PAM_COMMON_SESSION 里没有本工具的那一行了：登录不会再记录"; return 0; fi
-  if [[ ! -f "$STATE_ROOT/login-hook" || "$(cat -- "$STATE_ROOT/login-hook" 2>/dev/null)" != "$(login_hook_text)" ]]; then
+  if [[ ! -f "$STATE_ROOT/login-hook" || "$(cat -- "$STATE_ROOT/login-hook" 2>/dev/null)" != "$(login_hook_text)" ||
+        "$(cat -- "$LOGIN_PROFILE_FILE" 2>/dev/null)" != "$(login_profile_text)" ]]; then
     verify_set update '登录记录脚本不是这个版本的：选 5 单项设置 → 登录记录和提醒 → 1 开启，就会更新'; return 0
   fi
   count="$(login_recent 20000 | grep -c . || true)"
@@ -8544,6 +8923,7 @@ main() {
     plan) plan; return 0 ;;
     perf) perf_main; return 0 ;;
     resources) resources_main; return 0 ;;
+    audit) audit_main; return 0 ;;
     port) port_main; return 0 ;;
     item) item_main; return 0 ;;
     params) params_main; return 0 ;;

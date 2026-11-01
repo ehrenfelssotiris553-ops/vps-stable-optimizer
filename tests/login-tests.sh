@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions login_pam_text login_hook_text login_pam_enabled login_stage login_recent menu_login_alert check_login verify_set \
+load_optimizer_functions login_pam_text login_hook_text login_profile_text login_pam_enabled login_stage login_recent menu_login_alert check_login verify_set \
   restore_value restore_apply_one restore_path
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -19,6 +19,7 @@ record() { printf '%s\n' "$*" >> "$TEST_ROOT/trace"; }
 reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 module_result() { record "result $1 $2 ${3:-}"; }
 STATE_ROOT="$TEST_ROOT/state" PAM_COMMON_SESSION="$TEST_ROOT/common-session" LOGIN_PAM_FILE="$TEST_ROOT/pam-configs/vps-stable-login"
+LOGIN_PROFILE_FILE="$TEST_ROOT/profile.d/zz-vps-stable-login.sh" LOGIN_NOTE_DIR="$TEST_ROOT/notes"
 mkdir -p "$STATE_ROOT" "$TEST_ROOT/bin"
 REC="$STATE_ROOT/logins"
 
@@ -30,10 +31,16 @@ cat "$TEST_ROOT/journal" 2>/dev/null
 EOF
 chmod +x "$TEST_ROOT/bin/journalctl"
 if ! command -v flock > /dev/null; then printf '#!/bin/sh\nexit 0\n' > "$TEST_ROOT/bin/flock"; chmod +x "$TEST_ROOT/bin/flock"; fi
+# Giving the note to the account needs root: stood in for here (vm-run logs in for real).
+printf '#!/bin/sh\nexit 0\n' > "$TEST_ROOT/bin/chown"; chmod +x "$TEST_ROOT/bin/chown"
 journal_line() { printf '%s.000001 host sshd[42]: Accepted %s for %s from %s port 50000 ssh2\n' "$(($(date +%s) - ${4:-2}))" "$1" "$2" "$3" >> "$TEST_ROOT/journal"; }
+# The note the hook leaves for the account goes to TEST_ROOT/note.
 hook() {
+  rm -rf "$LOGIN_NOTE_DIR"
   env -i PATH="$TEST_ROOT/bin:$PATH" PAM_TYPE="${TYPE:-open_session}" PAM_SERVICE="${SERVICE:-sshd}" PAM_USER="$1" PAM_RHOST="${2:-}" \
-    PAM_TTY="${TTY:-/dev/pts/0}" /bin/bash "$TEST_ROOT/hook" > "$TEST_ROOT/note" 2>&1
+    PAM_TTY="${TTY:-/dev/pts/0}" /bin/bash "$TEST_ROOT/hook" > "$TEST_ROOT/hook-out" 2>&1
+  [[ ! -s "$TEST_ROOT/hook-out" ]] || fail "the hook printed something (PAM shows nothing of it): $(cat "$TEST_ROOT/hook-out")"
+  cat "$LOGIN_NOTE_DIR/$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-')" > "$TEST_ROOT/note" 2>/dev/null || : > "$TEST_ROOT/note"
 }
 field() { tail -n 1 "$REC" | cut -f"$1"; }
 
@@ -63,18 +70,16 @@ hook root 203.0.113.5
 [[ "$(grep -c $'\tadmin\t198.51.100.7\t' "$REC")" == 1 && "$(wc -l < "$REC")" == $((lines + 1)) ]] || fail "a missed login recorded twice: $(cat "$REC")"
 printf 'PASS: a login only the journal has is recorded once and shown.\n'
 
-# Not a terminal (scp, a command): recorded, nothing printed. The console:
-# recorded with its line, never "new". Other services and closing: nothing.
+# The console: recorded with its line, never "new". Other services and
+# closing: nothing.
 : > "$TEST_ROOT/journal"; journal_line publickey root 203.0.113.5
-TTY=ssh hook root 203.0.113.5
-[[ ! -s "$TEST_ROOT/note" ]] || fail "a note without a terminal: $(cat "$TEST_ROOT/note")"
 SERVICE=login TTY=tty1 hook root
 [[ "$(field 3)" == console:tty1 && "$(field 4)" == console && "$(field 5)" == console && "$(field 6)" == 0 ]] || fail "console login: $(tail -n 1 "$REC")"
 grep -Fq '服务商控制台（tty1）' <(SERVICE=login TTY=tty1 hook root; cat "$TEST_ROOT/note") || fail 'console login not named in the note'
 lines="$(wc -l < "$REC")"
 SERVICE=su hook root; TYPE=close_session hook root 203.0.113.5
 [[ "$(wc -l < "$REC")" == "$lines" ]] || fail 'su or a closing session was recorded'
-printf 'PASS: logins without a terminal are recorded quietly, console logins with their line, su and closing not at all.\n'
+printf 'PASS: console logins are recorded with their line, su and closing not at all.\n'
 
 # What PAM passes is cleaned: no tab or newline can make a second record line.
 hook "$(printf 'ro\tot\nx')" "$(printf '203.0.113.9\t1\nevil')"
@@ -94,9 +99,24 @@ printf 'PASS: the record keeps a year and at most 20000 lines.\n'
 
 # The PAM profile: optional, the hook under a timeout.
 login_pam_text > "$TEST_ROOT/profile"
-grep -Fxq 'Session-Type: Additional' "$TEST_ROOT/profile" && grep -Eq $'^\toptional\tpam_exec.so quiet stdout /usr/bin/timeout 3 /bin/bash '"$STATE_ROOT"'/login-hook$' "$TEST_ROOT/profile" ||
+grep -Fxq 'Session-Type: Additional' "$TEST_ROOT/profile" && grep -Eq $'^\toptional\tpam_exec.so quiet /usr/bin/timeout 3 /bin/bash '"$STATE_ROOT"'/login-hook$' "$TEST_ROOT/profile" ||
   fail "PAM profile: $(cat -A "$TEST_ROOT/profile")"
 printf 'PASS: the PAM line is optional and the hook runs under a timeout.\n'
+
+# The login shell shows the note once (on a terminal only), then it is empty.
+login_profile_text > "$TEST_ROOT/show.sh"
+mkdir -p "$LOGIN_NOTE_DIR"; me="$(id -un)"
+printf 'the note\n' > "$LOGIN_NOTE_DIR/$me"
+[[ -z "$(sh "$TEST_ROOT/show.sh")" && -s "$LOGIN_NOTE_DIR/$me" ]] || fail 'the note was shown or emptied without a terminal'
+if command -v script > /dev/null && script -qc true /dev/null > /dev/null 2>&1; then
+  out="$(script -qc "sh $TEST_ROOT/show.sh" /dev/null)"
+  [[ "$out" == *'the note'* && ! -s "$LOGIN_NOTE_DIR/$me" ]] || fail "the note on a terminal: <$out>"
+  out="$(script -qc "sh $TEST_ROOT/show.sh" /dev/null)"
+  [[ "$out" != *'the note'* ]] || fail 'the note was shown twice'
+  printf 'PASS: the login shell shows the note once.\n'
+else
+  printf 'PASS (partly): no script(1) here for a terminal; the note stays without one.\n'
+fi
 
 # On through pam-auth-update; refused when common-session was edited by hand;
 # rollback takes it out the same way.
@@ -113,7 +133,8 @@ pam-auth-update() {
 }
 printf 'session required pam_unix.so\n' > "$PAM_COMMON_SESSION"
 reset; LOGIN_CHOICE=1; login_stage
-[[ "$(cat "$STATE_ROOT/login-hook")" == "$(login_hook_text)" && -f "$LOGIN_PAM_FILE" ]] && login_pam_enabled && grep -q '^result login applied' "$TEST_ROOT/trace" ||
+[[ "$(cat "$STATE_ROOT/login-hook")" == "$(login_hook_text)" && -f "$LOGIN_PAM_FILE" && "$(cat "$LOGIN_PROFILE_FILE")" == "$(login_profile_text)" ]] &&
+  login_pam_enabled && grep -q '^result login applied' "$TEST_ROOT/trace" ||
   fail "login on: $(cat "$TEST_ROOT/trace")"
 [[ "$(restore_value login_pam)" == enabled ]] || fail 'login_pam value'
 reset; login_stage
@@ -144,7 +165,7 @@ printf 'PASS: the menu shows first-time addresses of the last 3 days in red unti
 
 # vps check.
 printf '%s\troot\t203.0.113.5\tpublickey\tssh\t0\n' "$now" > "$REC"
-pam-auth-update --package --enable vps-stable-login; login_hook_text > "$STATE_ROOT/login-hook"
+pam-auth-update --package --enable vps-stable-login; login_hook_text > "$STATE_ROOT/login-hook"; login_profile_text > "$LOGIN_PROFILE_FILE"
 check_login ''
 [[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'记下了 1 次登录'* ]] || fail "check: $VERIFY_STATUS $VERIFY_TEXT"
 printf '# older\n' > "$STATE_ROOT/login-hook"; check_login ''

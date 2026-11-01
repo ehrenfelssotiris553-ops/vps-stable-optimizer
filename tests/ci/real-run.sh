@@ -347,7 +347,10 @@ item_do item-login-on login 1
 grep -Fq /var/lib/vps-stable-opt/login-hook /etc/pam.d/common-session || fail 'login record on: not in common-session'
 # shellcheck disable=SC2024
 sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PAM_TYPE=open_session PAM_SERVICE=sshd PAM_USER=runner PAM_RHOST=192.0.2.7 PAM_TTY=/dev/pts/9 \
-  /usr/bin/timeout 3 /bin/bash /var/lib/vps-stable-opt/login-hook > "$LOGS/login-note.log" 2>&1 || fail "the login hook exited with $?"
+  /usr/bin/timeout 3 /bin/bash /var/lib/vps-stable-opt/login-hook || fail "the login hook exited with $?"
+# The note is the account's own file, which its login shell shows.
+[[ -O /run/vps-stable-login/runner ]] || fail "the note does not belong to the account: $(ls -l /run/vps-stable-login 2>&1)"
+cat /run/vps-stable-login/runner > "$LOGS/login-note.log"
 cat "$LOGS/login-note.log"
 has login-note '这是第一次从 192.0.2.7 登录'
 sudo tail -n 1 /var/lib/vps-stable-opt/logins | grep -q $'\trunner\t192.0.2.7\tunknown\tssh\t1$' || fail "login record: $(sudo tail -n 1 /var/lib/vps-stable-opt/logins)"
@@ -443,6 +446,14 @@ sudo vps resources > "$LOGS/resources.log" 2>&1 || fail "vps resources exited wi
 cat "$LOGS/resources.log"
 has resources 'Fail2ban：内存'
 has resources '防火墙里的封禁规则'
+# The security audit, without a terminal (no deep check, nothing marked): all
+# six parts and the conclusion; a runner image is full of programs of its own,
+# so what it finds is not judged here (vm-run does that on clean images).
+# shellcheck disable=SC2024
+sudo vps audit > "$LOGS/audit.log" 2>&1 || fail "vps audit exited with $?"
+cat "$LOGS/audit.log"
+for part in 一、谁登录过 二、账户和公钥 三、装过什么 四、正在运行什么 五、开机自启和定时任务 六、系统文件有没有被换过 '结论：' '局限：'; do has audit "$part"; done
+sudo ls /var/lib/vps-stable-opt/logs | grep '^audit-' > /dev/null || fail 'no saved audit report'
 sudo find /etc -xdev -type f -newer "$run_marker" ! -perm -o=r -printf '%m %u:%g %p\n' 2>/dev/null | sort > "$LOGS/root-only.txt" || true
 if [[ -s "$LOGS/root-only.txt" ]]; then notice "files under /etc only root can read, written during the run ($mode, $(uname -m))" "$LOGS/root-only.txt"; fi
 endgroup
@@ -457,7 +468,7 @@ has rollback '撤销完成'
 for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/sysctl.d/99-vps-stable-bbr.conf \
     /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
     /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf \
-    /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login; do
+    /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login /etc/profile.d/zz-vps-stable-login.sh; do
   if sudo test -e "$f"; then fail "$f left after rollback"; fi
 done
 if grep -Fq login-hook /etc/pam.d/common-session; then fail 'the login record is still in common-session after the rollback'; fi
