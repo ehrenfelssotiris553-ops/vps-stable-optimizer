@@ -210,6 +210,19 @@ apt_wait_idle() {
   warn '等了 10 分钟，软件包锁仍被占用；接下来的软件操作可能失败。不要删除锁文件或强行结束它。'
 }
 
+# Every apt-get that changes the system. Neither apt nor dpkg sets a umask, so
+# package scripts inherit this tool's 077: what they create (20auto-upgrades
+# through ucf, for example) would be readable by root only, and apt run by any
+# other user could no longer read its configuration.
+apt_run() {
+  local mask rc=0
+  mask="$(umask)"
+  umask 022
+  apt-get "$@" || rc=$?
+  umask "$mask"
+  return "$rc"
+}
+
 # Packages absent before this call are recorded so rollback can offer removal.
 # apt waits for the package lock itself (DPkg::Lock::Timeout, 15 minutes): an
 # automatic update can take its lock right after apt_wait_idle looked, and on a
@@ -218,7 +231,7 @@ install_pkgs() {
   local pkg new=() rc=0
   for pkg in "$@"; do installed "$pkg" || new+=("$pkg"); done
   apt_wait_idle
-  apt-get -y -q -o DPkg::Lock::Timeout=900 install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" || rc=$?
+  apt_run -y -q -o DPkg::Lock::Timeout=900 install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" || rc=$?
   if declare -F restore_record_packages >/dev/null && ((${#new[@]})); then
     restore_record_packages "${new[@]}" || warn '无法记录本次新装的软件包；回退时不会提供卸载它们的选项。'
   fi
@@ -495,10 +508,10 @@ apt_index_stage() {
   [[ "$free_mb" =~ ^[0-9]+$ ]] || die '无法确定磁盘剩余空间。'
   ((free_mb >= 650)) || die "磁盘只剩 ${free_mb}MiB，至少需要 650MiB。"
   apt_wait_idle
-  if ! apt-get update -o APT::Update::Error-Mode=any; then
+  if ! apt_run update -o APT::Update::Error-Mode=any; then
     warn '软件索引更新失败，关闭增量下载后再试一次。'
     apt_wait_idle
-    apt-get update -o APT::Update::Error-Mode=any -o Acquire::PDiffs=false || die 'APT 软件索引更新失败：请检查软件源；如提示 "not valid yet"，说明系统时间不准，请先校准时间。'
+    apt_run update -o APT::Update::Error-Mode=any -o Acquire::PDiffs=false || die 'APT 软件索引更新失败：请检查软件源；如提示 "not valid yet"，说明系统时间不准，请先校准时间。'
   fi
   APT_INDEX_READY=1
   echo '-- 当前系统版本内的升级模拟（不修改软件源，不跨大版本） --'
@@ -762,7 +775,7 @@ kernel_cleanup() {
   if ((${#others[@]})); then echo "（另有不再需要的软件包：${others[*]}，不属于内核，这一步不动。）"; fi
   if [[ "$ask" == --ask ]] && ! confirm_yes '确认删除这些旧内核吗？（删除后无法撤销）'; then ok '保留旧内核。'; return 0; fi
   apt_wait_idle
-  if apt-get -y -q -o DPkg::Lock::Timeout=900 purge "${kernels[@]}"; then ok "已清理 ${#kernels[@]} 个旧内核包。"
+  if apt_run -y -q -o DPkg::Lock::Timeout=900 purge "${kernels[@]}"; then ok "已清理 ${#kernels[@]} 个旧内核包。"
   else warn '旧内核清理失败，请人工检查。'; fi
 }
 
@@ -787,7 +800,7 @@ apt_upgrade_stage() {
   local packages=() pkg tools=()
   if ((UPGRADE_APPROVED)); then
     apt_wait_idle
-    if ! apt-get -y -q -o DPkg::Lock::Timeout=900 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+    if ! apt_run -y -q -o DPkg::Lock::Timeout=900 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
       module_result upgrade failed 'apt-get upgrade failed'
       apt_failure_stop '系统升级'
     fi
@@ -865,7 +878,7 @@ upgrade_only_stage() {
   if upgrade_has_kernel "$simulation"; then KERNEL_UPDATE=1; echo '本次升级包含新内核：重启后才生效，旧内核会保留。'; fi
   if ! confirm_default_yes "升级这 $count 个软件包吗？（可能重启部分服务）"; then ok '没有升级。'; return 0; fi
   apt_wait_idle
-  if ! apt-get -y -q -o DPkg::Lock::Timeout=900 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+  if ! apt_run -y -q -o DPkg::Lock::Timeout=900 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
     module_result upgrade failed 'apt-get upgrade failed'
     apt_failure_stop '系统升级'
   fi
@@ -882,7 +895,7 @@ apt_index_ready() {
   if ((APT_INDEX_READY)); then return 0; fi
   apt_wait_idle
   echo '正在更新软件索引……'
-  if apt-get update -o APT::Update::Error-Mode=any >/dev/null; then APT_INDEX_READY=1; return 0; fi
+  if apt_run update -o APT::Update::Error-Mode=any >/dev/null; then APT_INDEX_READY=1; return 0; fi
   warn '软件索引更新失败：请检查网络和软件源；如提示 "not valid yet"，先校准系统时间。'
   return 1
 }
@@ -4967,13 +4980,13 @@ restore_packages_offer() {
   flags=()
   [[ "$chosen" == autoremove ]] && flags=(--autoremove)
   apt_wait_idle
-  if apt-get -y -q -o DPkg::Lock::Timeout=900 remove "${flags[@]}" "${ours[@]}"; then
+  if apt_run -y -q -o DPkg::Lock::Timeout=900 remove "${flags[@]}" "${ours[@]}"; then
     ok '已卸载本工具新装的软件包。'
     if [[ " ${ours[*]} " == *' systemd-zram-generator '* ]]; then ZRAM_PACKAGE_REMOVED=1; fi
     restore_packages_record
     # The packages are gone now: the purge only deletes what they left behind.
     if ((${#purge[@]})); then
-      if apt-get -y -q -o DPkg::Lock::Timeout=900 purge "${purge[@]}"; then ok "已删除它们留下的配置：${purge[*]}"
+      if apt_run -y -q -o DPkg::Lock::Timeout=900 purge "${purge[@]}"; then ok "已删除它们留下的配置：${purge[*]}"
       else warn "删除配置文件（purge）失败，程序已经卸载，配置留在原处：${purge[*]}"; fi
     fi
   else warn 'APT 卸载失败，请人工检查。'; RESTORE_PARTIAL=1; fi

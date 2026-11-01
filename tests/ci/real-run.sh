@@ -51,6 +51,18 @@ before_updates=0 before_reboot=0
 if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then before_updates=1; fi
 if apt_has 'Unattended-Upgrade::Automatic-Reboot "true";'; then before_reboot=1; fi
 before_periodic="$(apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true)"
+# apt's configuration stays readable for every user (checked as this CI user):
+# package scripts inherit the umask of whoever runs apt, and the tool's is 077.
+apt_unreadable() { find /etc/apt -xdev ! -readable -print 2>/dev/null | sort || true; }
+before_unreadable="$(apt_unreadable)"
+apt_readable() {
+  local left
+  left="$(comm -13 <(printf '%s\n' "$before_unreadable") <(apt_unreadable) | grep . || true)"
+  [[ -z "$left" ]] || fail "$1: apt configuration other users cannot read: $(tr '\n' ' ' <<< "$left")"
+}
+# What the run leaves under /etc that only root can read (reported, not judged).
+run_marker="$LOGS/run-start"
+touch "$run_marker"
 printf 'Periodic APT policy before: %s\n' "$(tr '\n' ' ' <<< "${before_periodic:-none}")"
 printf 'Before: %s | %s | %s\n' "$before_state" "$before_tz" "${before_ufw:-ufw not installed}"
 # Firewall rules at the start: the tool keeps a firewall that has rules.
@@ -183,6 +195,7 @@ group 'Acceptance check'
 check_all check
 # The previous release kept a policy with only Update-Package-Lists as it was.
 if [[ "$mode" != upgrade ]]; then passed check '自动安全更新'; fi
+apt_readable 'after the setup'
 check_facts check
 endgroup
 
@@ -237,6 +250,9 @@ fi
 apt_has 'APT::Periodic::Update-Package-Lists "1";' || fail 'automatic updates on: package lists are not updated daily'
 apt_has 'APT::Periodic::Unattended-Upgrade "1";' || fail 'automatic updates on: security updates are not installed daily'
 systemctl is-active -q apt-daily-upgrade.timer || fail 'automatic updates on: apt-daily-upgrade.timer is not running'
+# Off may have purged unattended-upgrades and on reinstalled it: its scripts
+# wrote 20auto-upgrades again.
+apt_readable 'automatic updates on'
 
 item_do item-timezone-off timezone 2
 [[ "$(tz)" == "$before_tz" ]] || fail "timezone back: $(tz)"
@@ -284,6 +300,9 @@ endgroup
 group 'Acceptance check after the single items'
 check_all check-again
 passed check-again '自动安全更新'
+apt_readable 'after the single items'
+sudo find /etc -xdev -type f -newer "$run_marker" ! -perm -o=r -printf '%m %u:%g %p\n' 2>/dev/null | sort > "$LOGS/root-only.txt" || true
+if [[ -s "$LOGS/root-only.txt" ]]; then notice "files under /etc only root can read, written during the run ($mode, $(uname -m))" "$LOGS/root-only.txt"; fi
 endgroup
 fi
 

@@ -101,3 +101,11 @@ while IFS= read -r key; do
   esac
 done < <(item_keys)
 printf 'PASS: every single item has a label, a status, a way to turn it on and a way back.\n'
+
+# Package scripts run with the umask of whoever starts apt: every apt-get that
+# changes the system goes through apt_run (umask 022). Simulations (-s) and
+# apt_run itself are the only other calls.
+direct="$(grep -nE '(^|[^-_[:alnum:]])apt-get ' "$TEST_SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get -s |apt-get "\$@" \|\| rc=|'"'"'apt-get upgrade failed'"'" || true)"
+[[ -z "$direct" ]] || fail "apt-get called without apt_run (package scripts would inherit umask 077): $direct"
+source_of apt_run | grep -Fxq '  umask 022' || fail 'apt_run does not set umask 022'
+printf 'PASS: every apt-get that changes the system runs with umask 022.\n'

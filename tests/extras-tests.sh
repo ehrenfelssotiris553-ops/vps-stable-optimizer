@@ -24,6 +24,21 @@ restore_record_hosts_line() { :; }
 put_file() { [[ ! -e "$1" ]] || return 1; mkdir -p -- "$(dirname -- "$1")"; printf '%s\n' "$2" > "$1"; }
 reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 
+# Package scripts inherit apt's umask: apt_run gives them 022 and puts this
+# tool's own umask back, also when apt-get fails (found in CI: after a purge,
+# the reinstalled 20auto-upgrades was root-only, unreadable for other users).
+(
+  load_optimizer_functions apt_run
+  apt-get() { umask > "$TEST_ROOT/apt-umask"; [[ "$1" != fail ]]; }
+  umask 077
+  apt_run install x || fail 'apt_run reported a successful apt-get as failed'
+  [[ "$(cat "$TEST_ROOT/apt-umask")" == 0022 ]] || fail "apt-get ran with umask $(cat "$TEST_ROOT/apt-umask")"
+  [[ "$(umask)" == 0077 ]] || fail "the tool's umask was not restored: $(umask)"
+  if apt_run fail; then fail 'a failed apt-get was not reported'; fi
+  [[ "$(umask)" == 0077 ]] || fail "the tool's umask was not restored after a failure: $(umask)"
+)
+printf 'PASS: apt-get runs with umask 022 and the tool umask comes back.\n'
+
 # Old kernels: the ones APT would autoremove, purged by name, never the running
 # one; other leftovers neither get removed nor block the cleanup (found on a real
 # Ubuntu 24.04 VPS: libfwupd2 left by an upgrade stopped every kernel cleanup).

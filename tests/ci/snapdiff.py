@@ -240,6 +240,10 @@ def main():
             explained.append(f'{what}: {path} (UFW layout, see the warning)')
         elif path in USER_FILES and users_changed and users_ok:
             explained.append(f'{what}: {path} (users above)')
+        elif path in USER_FILES and path.endswith('-') and fa.get(path[:-1]) == fb.get(path[:-1]):
+            # useradd/userdel keep the previous copy: a package that added its
+            # system user and removed it again with its purge (vnstat).
+            explained.append(f'{what}: {path} (backup copy; {path[:-1]} itself is exactly as before)')
         elif what in ('file added', 'file changed') and path in rc_files:
             continue  # listed with the package warning
         elif what == 'file added' and path.rsplit('/', 1)[0] in rc_dirs - SHARED_RC_DIRS:

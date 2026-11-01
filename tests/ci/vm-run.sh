@@ -369,13 +369,16 @@ has ssh-drop '系统日志确认 ops 已用密钥登录成功'
 has ssh-drop 'ops 当前已有 0 个公钥'
 has ssh-drop '已关闭 SSH 密码登录'
 # The guard timer (240 s) undoes it; ops logs in with the key all along.
-drop_at=$SECONDS
+drop_at=$SECONDS undone=0
 for ((i = 0; i < 120; i++)); do
-  if vm_ops "[ ! -e $KEYONLY ]" 2>/dev/null; then break; fi
+  if vm_ops "[ ! -e $KEYONLY ]" 2>/dev/null; then undone=1; break; fi
   sleep 5
 done
 printf 'Key-only login undone %s s after the drop.\n' "$((SECONDS - drop_at))"
-if ! vm_ops "[ ! -e $KEYONLY ]"; then
+# Judged by the loop, not by a second login: right after the file goes, the
+# undo reloads sshd, and a connection made in that moment is reset (seen on
+# Debian 12, the undo on time at 240 s).
+if ((undone == 0)); then
   # Present, or no SSH at all? Then when the undo timer was made and ran.
   seen="$(vm_ops "if [ -e $KEYONLY ]; then echo present; else echo absent; fi" 2>&1 || true)"
   vm_ops_sudo 'sh -c "date; systemctl list-units --all --no-legend \"vps-stable-ssh-revert-*\"; journalctl -b --no-pager -o short-precise | grep -E \"vps-stable-ssh-revert|Reload\" | tail -n 15; journalctl -n 8 --no-pager -o short -u ssh.service"' \

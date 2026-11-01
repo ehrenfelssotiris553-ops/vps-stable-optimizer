@@ -10,6 +10,8 @@ if [[ -v VPS_OPT_SCRIPT ]]; then TEST_SCRIPT="$VPS_OPT_SCRIPT"; fi
 unset SSH_CONNECTION SSH_CLIENT SSH_TTY SUDO_USER
 # Never creates /run/sshd from a test; ssh-tests loads the real one to test it.
 sshd_runtime_dir() { :; }
+# Straight to the (mocked) apt-get; extras-tests loads the real one to test it.
+apt_run() { apt-get "$@"; }
 load_optimizer_functions() {
   local name definition
   for name in "$@"; do
