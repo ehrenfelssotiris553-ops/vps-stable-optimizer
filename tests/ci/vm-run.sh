@@ -271,6 +271,27 @@ grep -Fxq 'ufw allow from 10.0.2.2 to any port 22 proto tcp' "$LOGS/ufw-rules.lo
 for i in 1 2 3 4 5 6 7 8 9 10; do vm true || fail "SSH login $i refused although the address is allowlisted"; done
 endgroup
 
+group 'Allowlist management: one more address, then removed again'
+index="$(item_index fail2ban)" || fail 'no single item fail2ban'
+allow_rules() {
+  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 3' "a 添加，d 删除，0 返回 ==> @seq $1 0" \
+    '要加的 IP 或网段 ==> 192.0.2.50' '要删除第几个？ ==> 2' > "$WORK/allow-$1.rules"
+}
+allow_rules a
+vm_drive "$WORK/allow-a.rules" allow-add vps item || fail "allowlist add exited with $?"
+vm "grep -Fx 'ignoreip = 127.0.0.1/8 ::1 10.0.2.2 192.0.2.50' /etc/fail2ban/jail.d/99-vps-stable-sshd.local" || fail 'jail file not updated'
+[[ "$(vm 'fail2ban-client get sshd ignoreip')" == *192.0.2.50* ]] || fail 'the running jail does not have the new address'
+vm 'ufw show added' > "$LOGS/ufw-allow.log"
+grep -Fxq 'ufw allow from 192.0.2.50 to any port 22 proto tcp' "$LOGS/ufw-allow.log" || fail 'the new address does not skip the SSH limit'
+allow_rules d
+vm_drive "$WORK/allow-d.rules" allow-delete vps item || fail "allowlist delete exited with $?"
+vm "grep -Fx 'ignoreip = 127.0.0.1/8 ::1 10.0.2.2' /etc/fail2ban/jail.d/99-vps-stable-sshd.local" || fail 'address not removed from the jail file'
+[[ "$(vm 'fail2ban-client get sshd ignoreip')" != *192.0.2.50* ]] || fail 'the running jail still has the removed address'
+vm 'ufw show added' > "$LOGS/ufw-allow.log"
+if grep -q '192.0.2.50' "$LOGS/ufw-allow.log"; then fail 'the exemption of the removed address stayed'; fi
+grep -Fxq 'ufw allow from 10.0.2.2 to any port 22 proto tcp' "$LOGS/ufw-allow.log" || fail 'the remaining address lost its exemption'
+endgroup
+
 group 'From outside: the firewall really blocks, opens and closes a port'
 vm 'nohup python3 -m http.server 8080 >/dev/null 2>&1 </dev/null &'
 web() { curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/ || true; }

@@ -64,6 +64,8 @@ TZ_CHOICE=''
 TZ_ASKED=0
 WEB_CHOICE=''
 F2B_IGNORE_CHOICE=''
+# The allowlist being written (f2b_allowlist_stage), space-separated.
+F2B_ALLOW=''
 SYSCTL_CHOICE=''
 TCP_BUFFER_CHOICE=''
 AUTO_REBOOT_TIME=''
@@ -2183,6 +2185,115 @@ f2b_jail_is_ours() {
   [[ "$body" == "$(f2b_jail_text "$2")" || "$body" == "$(f2b_jail_legacy_text "$2")" ]]
 }
 
+# The allowlist: the addresses on this tool's jail ignoreip line, one per line
+# (the loopback ones every jail has are left out).
+f2b_allowlist() {
+  [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] || return 0
+  awk '$1 == "ignoreip" && $2 == "=" {for (i = 3; i <= NF; i++) if ($i != "127.0.0.1/8" && $i != "::1") print $i}' "$F2B_FILE"
+}
+
+# ADDRESS: an IP, or a network no larger than /16 (IPv4) or /32 (IPv6); a
+# larger one would take too many strangers off Fail2ban.
+f2b_allow_valid() {
+  local bits
+  port_source_valid "$1" || { echo '格式不对：请输入一个 IP（例如 203.0.113.5）或网段（例如 203.0.113.0/24）。'; return 1; }
+  [[ "$1" == */* ]] || return 0
+  bits="${1##*/}"
+  if [[ "$1" == *:* ]] && ((10#$bits < 32)); then echo '网段太大：IPv6 至少要 /32。'; return 1; fi
+  if [[ "$1" != *:* ]] && ((10#$bits < 16)); then echo '网段太大：IPv4 至少要 /16。'; return 1; fi
+}
+
+# Writes F2B_ALLOW (space-separated) into this tool's jail and into the
+# running jail, and keeps the SSH rate-limit exemptions in step.
+f2b_allowlist_stage() {
+  say 'Fail2ban 白名单'
+  local current port body jail ip
+  local -a was=() now=()
+  if [[ ! -f "$F2B_FILE" || -L "$F2B_FILE" ]]; then warn '还没有本工具的 Fail2ban 规则：先在单项设置里开启 Fail2ban。'; return 0; fi
+  current="$(cat -- "$F2B_FILE")"
+  port="$(awk '$1 == "port" && $2 == "=" {print $3; exit}' <<< "$current")"
+  if ! f2b_jail_is_ours "$current" "$port"; then
+    warn "$F2B_FILE 不是本工具写的内容（或被改过），白名单没有改动。"; return 0
+  fi
+  mapfile -t was < <(f2b_allowlist)
+  read -r -a now <<< "${F2B_ALLOW:-}"
+  body="$(grep -v '^ignoreip = ' <<< "$current" || true)" jail="$body"
+  if ((${#now[@]})); then jail+=$'\n'"ignoreip = 127.0.0.1/8 ::1 ${now[*]}"; fi
+  if [[ "$jail" != "$current" ]] && ! f2b_replace_owned_file "$F2B_FILE" "$current" "$jail"; then
+    warn '规则文件被同时改动，白名单没有改动。'; return 0
+  fi
+  # The running jail too, without a reload (bans stay as they are).
+  if active fail2ban; then
+    for ip in "${was[@]}"; do
+      if [[ " ${now[*]} " != *" $ip "* ]]; then fail2ban-client set sshd delignoreip "$ip" >/dev/null 2>&1 || warn "正在运行的 Fail2ban 没能删掉 $ip，重启 Fail2ban 后生效。"; fi
+    done
+    for ip in "${now[@]}"; do
+      if [[ " ${was[*]} " != *" $ip "* ]]; then fail2ban-client set sshd addignoreip "$ip" >/dev/null 2>&1 || warn "正在运行的 Fail2ban 没能加上 $ip，重启 Fail2ban 后生效。"; fi
+    done
+  fi
+  if ufw_active; then
+    for ip in "${was[@]}"; do
+      if [[ " ${now[*]} " != *" $ip "* ]]; then ssh_limit_unexempt "$ip"; fi
+    done
+    for ip in "${now[@]}"; do ssh_limit_exempt_one "$ip"; done
+  fi
+  if ((${#now[@]})); then ok "白名单现在是：${now[*]}"; else ok '白名单已清空。'; fi
+}
+
+# The single item's allowlist menu: list, add (your current IP by default),
+# delete; each change is applied right away.
+f2b_allowlist_menu() {
+  local choice me entry i msg bits
+  local -a list=()
+  me="${SSH_CONNECTION:-}" me="${me%% *}"
+  while :; do
+    say 'Fail2ban 白名单'
+    echo '白名单里的地址输错密码也不会被封；单个 IP 在防火墙对 SSH 限速时连 SSH 也不限速，网段只防封。'
+    mapfile -t list < <(f2b_allowlist)
+    if ((${#list[@]} == 0)); then echo '  （现在是空的）'; fi
+    for ((i = 0; i < ${#list[@]}; i++)); do
+      entry="${list[i]}" msg=''
+      if [[ "$entry" == "$me" ]]; then msg='  你现在的 IP'; fi
+      if [[ "$entry" == */* ]]; then msg+='  网段：只防封'; fi
+      printf '%3s. %s%s\n' "$((i + 1))" "$entry" "$msg"
+    done
+    if [[ -n "$me" && " ${list[*]} " != *" $me "* ]] && port_source_valid "$me"; then echo "你现在的 IP 是 $me，还不在白名单里。"; fi
+    read -r -p 'a 添加，d 删除，0 返回: ' choice || return 0
+    case "$choice" in
+      a|A)
+        if ((${#list[@]} >= 20)); then warn '白名单最多 20 个地址，先删掉不用的。'; continue; fi
+        read -r -p "要加的 IP 或网段（直接回车加你现在的 IP ${me:-（读不到）}）: " entry || return 0
+        entry="${entry:-$me}"
+        [[ -n "$entry" ]] || continue
+        if ! msg="$(f2b_allow_valid "$entry")"; then echo "$msg"; continue; fi
+        if [[ " ${list[*]} " == *" $entry "* ]]; then ok "$entry 已经在白名单里。"; continue; fi
+        if [[ "$entry" == */* ]]; then
+          bits="${entry##*/}"
+          if { [[ "$entry" == *:* ]] && ((10#$bits < 48)); } || { [[ "$entry" != *:* ]] && ((10#$bits < 24)); }; then
+            confirm_yes "网段 $entry 很大：里面任何人输错密码都不会被封。仍然加入吗？" || continue
+          fi
+        fi
+        F2B_ALLOW="${list[*]} $entry" F2B_ALLOW="${F2B_ALLOW# }"
+        stage_run fail2ban f2b_allowlist_stage
+        if [[ "$entry" != */* ]] && fail2ban-client status sshd 2>/dev/null | grep -F 'Banned IP list' | grep -w -- "$entry" > /dev/null &&
+           confirm_default_yes "$entry 现在正被封禁，顺便解封吗？"; then
+          fail2ban-client set sshd unbanip "$entry" >/dev/null && ok "已解封 $entry。"
+        fi ;;
+      d|D)
+        ((${#list[@]})) || continue
+        read -r -p "要删除第几个？[1-${#list[@]}，直接回车取消]: " i || return 0
+        if [[ ! "$i" =~ ^[0-9]+$ ]] || ((i < 1 || i > ${#list[@]})); then continue; fi
+        entry="${list[i - 1]}"
+        if [[ "$entry" == "$me" ]]; then
+          confirm_yes "$entry 是你现在的 IP：删掉后输错密码会被封，连 SSH 也会限速。仍然删除吗？" || continue
+        fi
+        F2B_ALLOW="$(printf '%s\n' "${list[@]}" | grep -vxF -- "$entry" | tr '\n' ' ' || true)" F2B_ALLOW="${F2B_ALLOW% }"
+        stage_run fail2ban f2b_allowlist_stage ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 # '' = ask now, none = no allowlist entry, otherwise the address to allow.
 f2b_ignore_address() {
   local ip="${SSH_CONNECTION:-}"
@@ -2544,13 +2655,25 @@ ssh_allowlist_decide() {
   [[ -n "$F2B_IGNORE_CHOICE" ]] || F2B_IGNORE_CHOICE=none
 }
 
-# The allowlisted administrator address skips the SSH rate limit, so several
+# Allowlisted administrator addresses skip the SSH rate limit, so several
 # connections at once (file transfer tools, editors, reconnects) are not
-# refused. A single address only, placed before the limit rules (prepend) and
-# recorded for rollback like the other rules of this tool.
+# refused: the setup's choice and every single address on the Fail2ban
+# allowlist (a network only keeps its addresses from being banned).
 ssh_limit_exempt() {
-  local ip="${F2B_IGNORE_CHOICE:-}" rules p rule
-  [[ "$ip" != none && "$ip" != */* ]] && port_source_valid "$ip" || return 0
+  local ip
+  local -a ips=()
+  if [[ "${F2B_IGNORE_CHOICE:-none}" != none ]]; then ips+=("$F2B_IGNORE_CHOICE"); fi
+  while IFS= read -r ip; do
+    if [[ " ${ips[*]} " != *" $ip "* ]]; then ips+=("$ip"); fi
+  done < <(f2b_allowlist)
+  for ip in "${ips[@]}"; do ssh_limit_exempt_one "$ip"; done
+}
+
+# IP: placed before the limit rules (prepend), one rule per limited SSH port,
+# recorded for rollback like the other rules of this tool.
+ssh_limit_exempt_one() {
+  local ip="$1" rules p rule
+  [[ "$ip" != */* ]] && port_source_valid "$ip" || return 0
   rules="$(ufw show added 2>/dev/null || true)"
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
@@ -2569,6 +2692,22 @@ ssh_limit_exempt() {
 
 host_has_global_ipv6() {
   command -v ip >/dev/null && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
+}
+
+# IP: the exemption rules this tool added for IP go again (only those it
+# recorded: the same rule added by hand stays).
+ssh_limit_unexempt() {
+  local ip="$1" rule p record="$RESTORE_ROOT/fw_rules" temp
+  [[ -f "$record" && ! -L "$record" ]] || return 0
+  while IFS= read -r rule; do
+    [[ "$rule" =~ ^ufw\ allow\ from\ ([0-9A-Fa-f:.]+)\ to\ any\ port\ ([0-9]{1,5})\ proto\ tcp$ && "${BASH_REMATCH[1]}" == "$ip" ]] || continue
+    p="${BASH_REMATCH[2]}"
+    if ufw --force delete allow proto tcp from "$ip" to any port "$p" >/dev/null 2>&1; then ok "$ip 连 SSH 端口 $p 恢复限速。"
+    else warn "没能删掉 $ip 的免限速规则（端口 $p），请用 ufw status numbered 检查。"; continue; fi
+    temp="$(mktemp "$RESTORE_ROOT/.write.XXXXXX")" || continue
+    { grep -vxF -- "$rule" "$record" > "$temp" || true; }
+    if ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$record"; then rm -f -- "$temp"; fi
+  done < <(cat -- "$record")
 }
 
 # Rewrites the single IPV6= assignment of /etc/default/ufw.
@@ -6959,6 +7098,7 @@ item_action() {
     firewall) echo '1. 开启（需要新开 SSH 窗口确认）   2. 临时关闭   3. 撤销本工具的防火墙设置   0. 返回' ;;
     timezone) echo '1. 修改时区   2. 恢复成原来的时区   0. 返回' ;;
     hostname) echo '1. 修改显示名   2. 修改主机名   3. 撤销主机名修改（恢复原来的名字）   0. 返回' ;;
+    fail2ban) echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 管理白名单（不会被封的 IP）   0. 返回' ;;
     autoreboot) echo '1. 设置自动重启时间   2. 取消（撤销本工具的设置）   0. 返回' ;;
     ssh) echo '1. 加固（只允许密钥登录，可选禁止 root）   2. 撤销（恢复密码和 root 登录）   0. 返回' ;;
     *) if [[ -n "$(param_names "$key")" ]]; then echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 调整参数   4. 恢复推荐值   0. 返回'
@@ -6974,6 +7114,7 @@ item_action() {
     hostname:2) item_turn_on hostname ;;
     hostname:3) item_turn_off hostname ;;
     hostname:*) return 0 ;;
+    fail2ban:3) f2b_allowlist_menu ;;
     firewall:2) item_firewall_pause ;;
     firewall:3) item_turn_off firewall ;;
     upgrade:1|kernel:1) item_turn_on "$key" ;;
@@ -7213,6 +7354,8 @@ bans_main() {
   fi
   ignore="$(fail2ban-client get sshd ignoreip 2>/dev/null | sed -n 's/^[|`]- *//p' | tr '\n' ' ' || true)"
   if [[ -n "$ignore" ]]; then echo "白名单（不会被封）：$ignore"; fi
+  echo '管理白名单：选 5 单项设置 → Fail2ban 防爆破 → 3。'
+
   echo '最近的封禁和解封记录（最多 20 条，时间按服务器时区）：'
   line="$(f2b_ban_events)"
   if [[ -n "$line" ]]; then awk -F'\t' '{printf "  %s  %-14s %s\n", $1, $2, $3}' <<< "$line"
