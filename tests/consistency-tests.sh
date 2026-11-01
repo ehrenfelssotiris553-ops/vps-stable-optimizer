@@ -127,10 +127,12 @@ printf 'PASS: colours and state symbols come only from the interface block.\n'
 # Every parameter belongs to an existing single item, and on a small, a middle
 # and a large machine its recommendation is allowed and comes with a reason.
 (
-  load_optimizer_functions param_list param_recommended param_reason param_check
+  load_optimizer_functions param_list param_recommended param_reason param_check param_kind
   while IFS=$'\t' read -r name item label unit; do
     grep -Fxq -- "$item" <(item_keys) || fail "parameter $name belongs to no single item ($item)"
-    [[ -n "$label" && -n "$unit" ]] || fail "parameter $name has no label or unit"
+    [[ -n "$label" ]] || fail "parameter $name has no label"
+    # Numbers have a unit; a word (an algorithm's name) has none.
+    if [[ "$(param_kind "$name")" == int && -z "$unit" ]]; then fail "parameter $name has no unit"; fi
     for MEM_MIB in 512 2048 16384; do
       value="$(param_recommended "$name")" || fail "no recommendation for $name"
       param_check "$name" "$value" > /dev/null || fail "recommendation for $name with $MEM_MIB MiB is not allowed: $value"

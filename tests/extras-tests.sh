@@ -620,7 +620,7 @@ printf 'PASS: setup questions are asked once and stored.\n'
 # /etc/systemd/zram-generator.conf (Debian 13 keeps it in /usr/lib), which this
 # tool then refused to overwrite.
 (
-  load_optimizer_functions zram_stage zram_file_packaged
+  load_optimizer_functions zram_stage zram_file_packaged zram_size_expr zram_config_text param_kind
   ZRAM_FILE="$TEST_ROOT/zram/zram-generator.conf"
   ZRAM_VENDOR_FILE="$TEST_ROOT/zram/no-vendor-file"
   mkdir -p "$TEST_ROOT/zram"

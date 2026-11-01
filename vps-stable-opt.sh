@@ -19,6 +19,9 @@ LEGACY_LOG_DIR=/var/log/vps-stable-opt
 BBR_FILE=/etc/sysctl.d/99-vps-stable-bbr.conf
 MODULE_FILE=/etc/modules-load.d/99-vps-stable-bbr.conf
 ZRAM_FILE=/etc/systemd/zram-generator.conf
+# Disk swap (only where no other swap exists): the file and its systemd unit.
+SWAP_FILE=/swapfile
+SWAP_UNIT_FILE=/etc/systemd/system/swapfile.swap
 # The zram-generator package's own default (creates zram0 when nothing overrides it).
 ZRAM_VENDOR_FILE=/usr/lib/systemd/zram-generator.conf
 # Memory-management values that suit a swap that lives only in compressed RAM.
@@ -72,6 +75,7 @@ AUTO_REBOOT_TIME=''
 KERNEL_CLEAN_CHOICE=''
 VNSTAT_CHOICE=''
 ZRAM_CHOICE=''
+SWAP_CHOICE=''
 HOSTS_CHOICE=''
 HOSTNAME_CHOICE=''
 
@@ -1414,9 +1418,121 @@ zram_tune() {
   else warn 'ZRAM 配套内存参数没有生效，请查看日志。'; fi
 }
 
+# The zram-generator size expression for the zram_percent parameter (the two
+# usual values keep the form earlier versions wrote).
+zram_size_expr() {
+  case "$(param_value zram_percent)" in
+    50) echo 'ram / 2' ;; 25) echo 'ram / 4' ;; 100) echo ram ;;
+    *) echo "ram * $(param_value zram_percent) / 100" ;;
+  esac
+}
+
+# This tool's zram-generator configuration, from the parameters.
+zram_config_text() {
+  printf '%s\n' '[zram0]' "zram-size = $(zram_size_expr)" "compression-algorithm = $(param_value zram_algorithm)" 'swap-priority = 100'
+}
+
+# NAME: true when swapping NAME off now is safe: what it holds fits into the
+# available memory with a tenth of the RAM (at least 64 MiB) to spare.
+swapoff_safe() {
+  local used available total margin
+  used="$(awk -v n="$1" 'NR > 1 && $1 == n {print $4}' /proc/swaps)"
+  [[ -n "$used" ]] || return 0
+  available="$(awk '$1 == "MemAvailable:" {print $2}' /proc/meminfo)"
+  total="$(awk '$1 == "MemTotal:" {print $2}' /proc/meminfo)"
+  [[ "$used" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]] || return 1
+  margin=$((total / 10)); ((margin >= 65536)) || margin=65536
+  ((available > used + margin))
+}
+
+swap_file_active() {
+  awk -v n="$SWAP_FILE" 'NR > 1 && $1 == n {found = 1} END {exit !found}' /proc/swaps 2>/dev/null
+}
+
+# This tool's swap unit: used after ZRAM (priority 10 against 100), pulled in
+# by swap.target at boot; fstab is left alone.
+swap_unit_text() {
+  printf '%s\n' '# VPS Stable Optimizer v2.8: disk swap, used after ZRAM' '[Unit]' 'Description=Disk swap (VPS Stable Optimizer)' \
+    '[Swap]' "What=$SWAP_FILE" 'Priority=10' '[Install]' 'WantedBy=swap.target'
+}
+
+# MIB: writes the swap file (allocated, without holes), formats and starts it.
+swap_create() {
+  local mib="$1"
+  if ! fallocate -l "${mib}M" -- "$SWAP_FILE" 2>/dev/null; then
+    rm -f -- "$SWAP_FILE"
+    dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$mib" status=none || { rm -f -- "$SWAP_FILE"; return 1; }
+  fi
+  if ! chmod 600 -- "$SWAP_FILE" || ! mkswap -- "$SWAP_FILE" >/dev/null; then rm -f -- "$SWAP_FILE"; return 1; fi
+}
+
+# Disk swap: where there is no other swap (on its own when RAM is under 2 GiB
+# and ZRAM cannot be used, or when asked for), on ext4 or xfs only, never
+# leaving less than 3 GB free on the system disk.
+swap_stage() {
+  step 4 '硬盘 Swap（没有别的 Swap 时的应急）'
+  local mib free current
+  if [[ "${SWAP_CHOICE:-}" != 1 ]]; then
+    if ((MEM_MIB >= 2048)); then ok '内存不少于 2GiB，不需要硬盘 Swap。'; module_result swap skipped 'RAM >= 2GiB'; return 0; fi
+    if swapon --noheadings 2>/dev/null | grep . > /dev/null || swap_exists; then
+      ok '已有 Swap 或 ZRAM，不需要硬盘 Swap。'; module_result swap skipped 'other swap present'; return 0
+    fi
+  fi
+  case "$VIRT" in openvz|lxc|lxc-libvirt|systemd-nspawn|docker|podman|wsl)
+    warn "容器类虚拟化（$VIRT）不允许自己开 Swap，跳过。"; module_result swap unsupported "$VIRT"; return 0 ;;
+  esac
+  case "$ROOT_FS" in ext4|xfs) ;; *)
+    warn "系统盘是 $ROOT_FS 文件系统：本工具只在 ext4、xfs 上建硬盘 Swap，跳过。"; module_result swap unsupported "$ROOT_FS"; return 0 ;;
+  esac
+  mib="$(param_value swap_mib)"
+  if [[ -e "$SWAP_UNIT_FILE" || -e "$SWAP_FILE" ]]; then
+    if ! restore_file_ours swap_unit || [[ ! -f "$SWAP_FILE" ]]; then
+      warn "$SWAP_FILE 或 $SWAP_UNIT_FILE 已经存在，不是本工具上次建的，保持不变。"; module_result swap preserved 'swap file exists'; return 0
+    fi
+    current="$(($(stat -c %s -- "$SWAP_FILE") / 1048576))"
+    if ((current == mib)) && swap_file_active; then
+      ok "硬盘 Swap 已经是 ${mib} MiB。"; module_result swap applied "$mib MiB"; return 0
+    fi
+    # A new size: the file is made again, its contents first back into RAM.
+    if swap_file_active && ! swapoff_safe "$SWAP_FILE"; then
+      warn "可用内存不够，现在不能停用硬盘 Swap 来改大小（保持 ${current} MiB）；内存空一些时再试。"; module_result swap applied "$current MiB"; return 0
+    fi
+    systemctl stop swapfile.swap 2>/dev/null || swapoff -- "$SWAP_FILE" 2>/dev/null || true
+    rm -f -- "$SWAP_FILE"
+  elif swapon --noheadings 2>/dev/null | grep . > /dev/null; then
+    ok '已有其他 Swap：这个硬盘 Swap 排在它们后面用。'
+  fi
+  free="$(df -Pm / | awk 'NR == 2 {print $4}')"
+  [[ "$free" =~ ^[0-9]+$ ]] || { warn '读不到系统盘的剩余空间，跳过。'; module_result swap failed 'free space unknown'; return 0; }
+  if ((free - mib < 3072)); then
+    if ((free - 3072 < 128)); then
+      warn "系统盘只剩 ${free} MiB：建了 Swap 就不够 3 GB 了，跳过。"; module_result swap unsupported 'not enough disk space'; return 0
+    fi
+    mib=$(((free - 3072) / 64 * 64))
+    ok "系统盘只剩 ${free} MiB，为了留够 3 GB，Swap 缩小到 ${mib} MiB。"
+  fi
+  if ! swap_create "$mib"; then warn '建硬盘 Swap 文件失败，已删除。'; module_result swap failed 'swap file not created'; return 0; fi
+  if [[ ! -f "$SWAP_UNIT_FILE" ]] && ! put_file "$SWAP_UNIT_FILE" "$(swap_unit_text)"; then
+    rm -f -- "$SWAP_FILE"; module_result swap preserved 'swap unit conflict'; return 0
+  fi
+  if systemctl daemon-reload && systemctl enable --now swapfile.swap >/dev/null 2>&1 && swap_file_active; then
+    ok "硬盘 Swap 已开启：${mib} MiB（$SWAP_FILE，排在 ZRAM 后面用）。"
+    # Next to a disk swap the ZRAM values (swappiness 100, page-cluster 0) would
+    # slow the disk down: this tool's own go back.
+    if restore_file_ours zram_sysctl_file; then
+      restore_resource zram_sysctl_file
+      restore_sysctl_runtime zram_sysctl_runtime
+      ok '有了硬盘 Swap，ZRAM 的配套内存参数恢复成默认值。'
+    fi
+    module_result swap applied "$mib MiB"
+  else
+    warn '硬盘 Swap 没有启动，请运行 systemctl status swapfile.swap 查看原因。'; module_result swap failed 'swapfile.swap did not start'
+  fi
+}
+
 zram_stage() {
   step 4 '内存与 ZRAM（在系统升级前配置）'
-  local size='ram / 2' vendor=0
+  local size vendor=0
   if swap_exists; then
     # The package default is replaced by this tool's own file when asked for
     # explicitly, or when it runs no swap at all (Ubuntu installs it unstarted).
@@ -1433,6 +1549,16 @@ zram_stage() {
       else warn 'ZRAM 仍然没有启动，请运行 systemctl status systemd-zram-setup@zram0 查看原因。'; module_result zram failed 'dev-zram0.swap did not start'; fi
       swapon --show || true
       return 0
+    elif restore_file_ours zram_file && zram_swap_active && [[ "$(cat -- "$ZRAM_FILE" 2>/dev/null || true)" != "$(zram_config_text)" ]]; then
+      # New parameters for this tool's ZRAM: a swap in use cannot be resized
+      # safely, so the new configuration applies from the next boot.
+      rm -f -- "$ZRAM_FILE"
+      if put_file "$ZRAM_FILE" "$(zram_config_text)"; then
+        systemctl daemon-reload || true
+        ok "ZRAM 设置已改成 $(zram_size_expr)、$(param_value zram_algorithm) 压缩，重启后生效（正在使用的 ZRAM 不能直接改）。"
+        zram_tune; module_result zram applied "zram0 = $(zram_size_expr) (from next boot)"
+      else module_result zram preserved 'zram config conflict'; fi
+      return 0
     else
       ok '已有 Swap/ZRAM，保持不变。'; swapon --show || true
       # A ZRAM this tool set up earlier also gets the tuning added later.
@@ -1442,14 +1568,11 @@ zram_stage() {
       return 0
     fi
   fi
-  if ((MEM_MIB >= 2048)); then
-    if [[ "${ZRAM_CHOICE:-}" != 1 ]]; then
-      ok '内存不少于 2GiB：按你的选择不新增 ZRAM。'
-      module_result zram skipped 'RAM >= 2GiB'; return 0
-    fi
-    # Larger machines get a smaller emergency buffer.
-    size='ram / 4'
+  if ((MEM_MIB >= 2048)) && [[ "${ZRAM_CHOICE:-}" != 1 ]]; then
+    ok '内存不少于 2GiB：按你的选择不新增 ZRAM。'
+    module_result zram skipped 'RAM >= 2GiB'; return 0
   fi
+  size="$(zram_size_expr)"
   if ! zram_module_available; then
     warn '这个内核没有 zram 模块，跳过 ZRAM（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里，占几百 MB，且每次升级内核都要跟着装，本工具不自动安装）。'
     module_result zram unsupported 'kernel has no zram module'; return 0
@@ -1464,7 +1587,7 @@ zram_stage() {
   if zram_file_packaged; then rm -f -- "$ZRAM_FILE"; fi
   # zstd packs about a third more into the same RAM than the kernel default;
   # zram-generator only warns and keeps the default if the kernel lacks it.
-  if put_file "$ZRAM_FILE" "[zram0]"$'\n'"zram-size = $size"$'\n''compression-algorithm = zstd'$'\n''swap-priority = 100'; then
+  if put_file "$ZRAM_FILE" "$(zram_config_text)"; then
     if ((vendor)) && zram_swap_active; then
       systemctl daemon-reload
       # Resizing a zram swap in use is not safe: the new size applies from the next boot.
@@ -1764,7 +1887,18 @@ sysctl_hardening_stage() {
 # Lines: name, single item it belongs to, label, unit.
 param_list() {
   printf '%s\t%s\t%s\t%s\n' \
-    tcp_buffer_mib tcp 'TCP 缓冲区上限' MiB
+    tcp_buffer_mib tcp 'TCP 缓冲区上限' MiB \
+    zram_percent zram 'ZRAM 大小（占内存）' % \
+    zram_algorithm zram 'ZRAM 压缩算法' '' \
+    swap_mib swap '硬盘 Swap 大小' MiB
+}
+
+# NAME: "int" (a whole number) or "word" (one of a few names).
+param_kind() {
+  case "$1" in
+    zram_algorithm) echo word ;;
+    *) echo int ;;
+  esac
 }
 
 # NAME: the value recommended for this machine.
@@ -1774,6 +1908,14 @@ param_recommended() {
       if ((${MEM_MIB:-0} < 1024)); then echo 16
       elif ((MEM_MIB < 4096)); then echo 32
       else echo 64; fi ;;
+    # Small machines lean on it; larger ones keep it as an emergency buffer.
+    zram_percent) if ((${MEM_MIB:-0} < 2048)); then echo 50; else echo 25; fi ;;
+    zram_algorithm) echo zstd ;;
+    # About the RAM, at most 2 GiB, in whole 64 MiB.
+    swap_mib)
+      if ((${MEM_MIB:-0} >= 2048)); then echo 2048
+      elif ((${MEM_MIB:-0} >= 256)); then echo $((MEM_MIB / 64 * 64))
+      else echo 256; fi ;;
     *) return 1 ;;
   esac
 }
@@ -1786,6 +1928,12 @@ param_reason() {
       mib="$(param_recommended tcp_buffer_mib)"
       printf '内存 %s MiB：%s MiB 能让一个连接在 200 ms 延迟的线路上跑到约 %s Mbps，连接多时也不会占太多内存（内存小于 1 GiB 用 16，1–4 GiB 用 32，更大用 64）。\n' \
         "${MEM_MIB:-?}" "$mib" "$((mib * 1048576 * 8 / 200000))" ;;
+    zram_percent)
+      printf '内存 %s MiB：%s%%。内存小于 2 GiB 的机器常要用到它，配内存的一半；更大的机器只作应急，配四分之一。ZRAM 按需占内存，不用时几乎不占。\n' \
+        "${MEM_MIB:-?}" "$(param_recommended zram_percent)" ;;
+    zram_algorithm) echo 'zstd 压缩率最高，同样的内存能多装约三分之一；lz4 更快、更省 CPU，CPU 很弱又经常用到 ZRAM 时可以改用它。' ;;
+    swap_mib)
+      printf '内存 %s MiB：硬盘 Swap 只在没有 ZRAM 时作应急，约等于内存、最多 2 GiB；建好后系统盘至少还要剩 3 GB，不够时会自动缩小。\n' "${MEM_MIB:-?}" ;;
   esac
 }
 
@@ -1795,6 +1943,15 @@ param_check() {
     tcp_buffer_mib)
       if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 4 && 10#$2 <= 256)); then return 0; fi
       echo '请输入 4 到 256 之间的整数（单位 MiB）。' ;;
+    zram_percent)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 10 && 10#$2 <= 150)); then return 0; fi
+      echo '请输入 10 到 150 之间的整数（占内存的百分比）。' ;;
+    zram_algorithm)
+      case "$2" in zstd|lz4|lzo-rle) return 0 ;; esac
+      echo '请输入 zstd、lz4 或 lzo-rle。' ;;
+    swap_mib)
+      if [[ "$2" =~ ^[0-9]{1,5}$ ]] && ((10#$2 >= 128 && 10#$2 <= 8192)); then return 0; fi
+      echo '请输入 128 到 8192 之间的整数（单位 MiB）。' ;;
     *) echo "没有这个参数：$1" ;;
   esac
   return 1
@@ -1811,6 +1968,11 @@ param_caution() {
       elif ((10#$2 < 8)); then
         echo '比 Linux 默认的接收上限（6 MiB）大不了多少：本工具不会调低系统已有的值，这一项基本不起作用。'
       fi ;;
+    zram_percent)
+      if ((10#$2 > 100)); then echo '超过内存大小：只有数据很好压缩时才装得满，内存很紧时还会多占 CPU；一般不超过 100。'
+      elif ((10#$2 < 20)); then echo '这么小的 ZRAM 应急作用有限。'; fi ;;
+    swap_mib)
+      if ((10#$2 > ${MEM_MIB:-0} * 2)); then echo '比内存大一倍以上：硬盘 Swap 很慢，太大只会让机器在内存不够时卡很久，而不是及时报错。'; fi ;;
   esac
 }
 
@@ -1880,18 +2042,18 @@ param_adjust() {
   for name in "${names[@]}"; do
     IFS=$'\t' read -r label unit <<< "$(param_info "$name")"
     value="$(param_value "$name")"
-    printf '%s：现在 %s %s（%s），本机推荐 %s %s。\n' "$label" "$value" "$unit" "$(param_mode "$name")" "$(param_recommended "$name")" "$unit"
+    printf '%s：现在 %s%s（%s），本机推荐 %s%s。\n' "$label" "$value" "${unit:+ $unit}" "$(param_mode "$name")" "$(param_recommended "$name")" "${unit:+ $unit}"
     param_reason "$name"
     while :; do
       read -r -p '新的值（直接回车不改，输入 auto 用推荐值）: ' answer || return 0
       if [[ -z "$answer" ]]; then break; fi
       if [[ "$answer" == auto ]]; then param_store "$name" '' || die '无法保存参数。'; changed=1; break; fi
       if ! note="$(param_check "$name" "$answer")"; then echo "$note"; continue; fi
-      answer="$((10#$answer))"
+      if [[ "$(param_kind "$name")" == int ]]; then answer="$((10#$answer))"; fi
       note="$(param_caution "$name" "$answer")"
       if [[ -n "$note" ]]; then
         warn "$note"
-        confirm_yes "仍然用 $answer $unit 吗？" || continue
+        confirm_yes "仍然用 $answer${unit:+ $unit} 吗？" || continue
       fi
       param_store "$name" "$answer" || die '无法保存参数。'
       changed=1; break
@@ -1926,7 +2088,7 @@ params_overview() {
   while IFS=$'\t' read -r name item label unit; do
     value="$(param_value "$name")" recommended="$(param_recommended "$name")"
     printf ' %s%s%s（单项设置：%s）\n' "${C_BOLD-}" "$label" "${C_RESET-}" "$(item_label "$item")"
-    printf '   现在用 %s %s（%s）· 本机推荐 %s %s\n' "$value" "$unit" "$(param_mode "$name")" "$recommended" "$unit"
+    printf '   现在用 %s%s（%s）· 本机推荐 %s%s\n' "$value" "${unit:+ $unit}" "$(param_mode "$name")" "$recommended" "${unit:+ $unit}"
     printf '   %s\n' "$(param_reason "$name")"
     note="$(param_caution "$name" "$value")"
     if [[ -n "$note" ]]; then printf '   %s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$note" "${C_RESET-}"; fi
@@ -1974,13 +2136,14 @@ params_import() {
   echo '将改成：'
   for ((line = 0; line < ${#names[@]}; line++)); do
     IFS=$'\t' read -r label unit <<< "$(param_info "${names[line]}")"
-    if [[ "${values[line]}" == auto ]]; then printf '  %s：自动（本机推荐 %s %s）\n' "$label" "$(param_recommended "${names[line]}")" "$unit"
-    else printf '  %s：%s %s\n' "$label" "${values[line]}" "$unit"; fi
+    if [[ "${values[line]}" == auto ]]; then printf '  %s：自动（本机推荐 %s%s）\n' "$label" "$(param_recommended "${names[line]}")" "${unit:+ $unit}"
+    else printf '  %s：%s%s\n' "$label" "${values[line]}" "${unit:+ $unit}"; fi
   done
   confirm_yes '确认导入吗？' || { ok '已取消。'; return 0; }
   for ((line = 0; line < ${#names[@]}; line++)); do
     value="${values[line]}"
-    if [[ "$value" == auto ]]; then value=''; else value="$((10#$value))"; fi
+    if [[ "$value" == auto ]]; then value=''
+    elif [[ "$(param_kind "${names[line]}")" == int ]]; then value="$((10#$value))"; fi
     param_store "${names[line]}" "$value" || die '无法保存参数。'
     while IFS=$'\t' read -r name label _ _; do
       if [[ "$name" == "${names[line]}" && " ${items[*]} " != *" $label "* ]]; then items+=("$label"); fi
@@ -4049,7 +4212,7 @@ backup_configs() {
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
       /etc/sysctl.conf /etc/systemd/journald.conf /etc/default/zramswap \
       /etc/apt/apt.conf /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/sources.list /etc/fail2ban/jail.conf /etc/fail2ban/jail.local \
-      /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE"; do
+      /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE" "$SWAP_UNIT_FILE"; do
     backup_config_path "$file"
   done
   backup_config_group /etc/ssh/sshd_config.d '*.conf'
@@ -4506,6 +4669,13 @@ decision_report() {
   else
     decision_line '准备调整' '内存缓冲（ZRAM）' '内存低于 2GiB，未发现 Swap/ZRAM；当前软件索引未确认组件可用，更新索引后再检查，不可用就跳过。'
   fi
+  # Without ZRAM a small machine gets a disk swap instead.
+  if [[ "${MEM_MIB:-}" =~ ^[0-9]+$ ]] && ((MEM_MIB < 2048)) && ! swap_exists && ! zram_module_available; then
+    case "$ROOT_FS" in
+      ext4|xfs) decision_line '准备调整' '硬盘 Swap' "用不了 ZRAM：建约 $(param_value swap_mib) MiB 的硬盘 Swap（$SWAP_FILE），系统盘至少留 3 GB。" ;;
+      *) decision_line '保留现状' '硬盘 Swap' "用不了 ZRAM，系统盘是 $ROOT_FS：本工具只在 ext4、xfs 上建硬盘 Swap。" ;;
+    esac
+  fi
 
   synchronized="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
   if [[ "$synchronized" == yes ]]; then
@@ -4826,6 +4996,7 @@ restore_ids() {
     apt_upgrade) printf '%s\n' apt_auto_file svc_timesync svc_trim svc_apt_daily svc_apt_upgrade svc_ufw svc_fail2ban ntp ufw_policy_in ufw_policy_out ufw_runtime ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
+    swap) printf '%s\n' swap_unit swap_file zram_sysctl_file ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     journal) printf '%s\n' journal_file ;;
     trim) printf '%s\n' svc_trim ;;
@@ -4844,7 +5015,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
 }
 
 restore_label() {
@@ -4852,6 +5023,7 @@ restore_label() {
     bbr_file) echo 'BBR 配置文件' ;; bbr_module) echo 'BBR 模块加载配置' ;;
     cc) echo 'TCP 拥塞算法' ;; qdisc) echo '默认队列算法' ;;
     zram_file) echo 'ZRAM 配置' ;; zram_swap) echo 'ZRAM 交换空间' ;; zram_sysctl_file) echo 'ZRAM 配套内存参数' ;;
+    swap_unit) echo '硬盘 Swap 的启动配置' ;; swap_file) echo '硬盘 Swap 文件' ;;
     journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
@@ -4883,6 +5055,7 @@ restore_path() {
     apt_reboot_file) printf '%s\n' "$APT_REBOOT_FILE" ;;
     hosts_file) echo /etc/hosts ;;
     cloud_hostname_file) printf '%s\n' "$CLOUD_HOSTNAME_FILE" ;;
+    swap_unit) printf '%s\n' "$SWAP_UNIT_FILE" ;;
     *) return 1 ;;
   esac
 }
@@ -4973,6 +5146,13 @@ restore_value() {
       if grep -Fxq 'Status: active' <<< "$value"; then echo active
       elif grep -Fxq 'Status: inactive' <<< "$value"; then echo inactive
       else return 1; fi ;;
+    # The swap file by size and whether it is in use (its contents change
+    # all the time, so they are never hashed).
+    swap_file)
+      if [[ ! -e "$SWAP_FILE" && ! -L "$SWAP_FILE" ]]; then echo absent; return 0; fi
+      [[ -f "$SWAP_FILE" && ! -L "$SWAP_FILE" ]] || return 1
+      if swap_file_active; then printf 'file:%s:on\n' "$(stat -c %s -- "$SWAP_FILE")"
+      else printf 'file:%s:off\n' "$(stat -c %s -- "$SWAP_FILE")"; fi ;;
     zram_swap)
       # Usage changes continuously, so only identity/size/priority are compared.
       awk 'NR>1 && $1=="/dev/zram0" { if ($2!="partition" || $3!~/^[0-9]+$/ || $5!~/^-?[0-9]+$/) exit 2; print $1 ":" $3 ":" $5; found=1 } END {if (!found) print "absent"}' /proc/swaps ;;
@@ -5339,6 +5519,14 @@ restore_apply_one() {
         *) return 1 ;;
       esac
       [[ "$(restore_value ufw_runtime)" != active ]] ;;
+    # Only a swap file this tool made (none before) goes.
+    swap_file)
+      [[ "$value" == absent ]] || return 1
+      if swap_file_active; then
+        swapoff_safe "$SWAP_FILE" || { warn '可用内存不够，现在停用硬盘 Swap 不安全；先保留，稍后再试。'; return 1; }
+        swapoff -- "$SWAP_FILE" || return 1
+      fi
+      rm -f -- "$SWAP_FILE" ;;
     zram_swap)
       restore_zram_safe || return 1
       if active dev-zram0.swap; then systemctl stop dev-zram0.swap || return 1; fi
@@ -5574,6 +5762,20 @@ restore_zram_group() {
 # it is back within moments, not only after a reboot. Once the package is gone
 # such a ZRAM is switched off for good; while the package stays, its ZRAM is
 # started now, so what is shown is what the next boot will have.
+# The swap goes off and its file away first (the unit is still there to be
+# disabled), then the unit itself.
+restore_swap_group() {
+  if [[ -f "$SWAP_UNIT_FILE" ]] && restore_needed swap_unit; then
+    if swap_file_active && ! swapoff_safe "$SWAP_FILE"; then
+      warn '可用内存不够，现在停用硬盘 Swap 不安全；先保留，稍后再试。'; RESTORE_PARTIAL=1; return 0
+    fi
+    systemctl disable --now swapfile.swap >/dev/null 2>&1 || true
+  fi
+  restore_resource swap_file
+  restore_resource swap_unit
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 # The rename goes: cloud-init's setting, the old name, and the /etc/hosts line
 # added for the new one (the setup's own hosts line stays with the hosts group).
 restore_hostname_group() {
@@ -5762,13 +5964,13 @@ restore_packages_record() {
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
 restore_groups() {
-  printf '%s\n' fail2ban firewall ssh zram bbr sysctl tcp journal updates autoreboot ntp trim timezone hostname hosts
+  printf '%s\n' fail2ban firewall ssh zram swap bbr sysctl tcp journal updates autoreboot ntp trim timezone hostname hosts
 }
 
 restore_group_label() {
   case "$1" in
     firewall) echo '防火墙（本工具加的规则、默认策略、开关）' ;; fail2ban) echo 'Fail2ban 防爆破' ;;
-    ssh) echo 'SSH 登录加固（恢复密码和 root 登录）' ;; zram) echo 'ZRAM 内存缓冲' ;;
+    ssh) echo 'SSH 登录加固（恢复密码和 root 登录）' ;; zram) echo 'ZRAM 内存缓冲' ;; swap) echo '硬盘 Swap' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; tcp) echo 'TCP 缓冲区上限' ;;
     journal) echo '日志空间限制' ;;
     updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
@@ -5784,6 +5986,7 @@ restore_group_ids() {
     fail2ban) printf '%s\n' f2b_jail f2b_action svc_fail2ban ;;
     ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
+    swap) printf '%s\n' swap_unit swap_file ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
     tcp) printf '%s\n' tcp_file ;;
@@ -5827,6 +6030,7 @@ restore_group_apply() {
     ssh) restore_ssh_group ;;
     zram) restore_zram_group ;;
     hostname) restore_hostname_group ;;
+    swap) restore_swap_group ;;
     sysctl)
       restore_resource sysctl_file
       if [[ "$(restore_read sysctl_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime; fi ;;
@@ -6031,15 +6235,15 @@ verify_line() {
 VERIFY_STATUS=''
 VERIFY_TEXT=''
 verify_module() {
-  local module="$1" label="$2" check="$3" info result detail
+  local module="$1" label="$2" check="$3" info result boot detail
   if ! info="$(module_expect "$module")"; then
     verify_line na "$label" '没有开荒记录（还没运行过一键开荒或对应功能）'; return 0
   fi
-  IFS=$'\t' read -r result _ detail <<< "$info"
+  IFS=$'\t' read -r result boot detail <<< "$info"
   case "$result" in
     applied|present)
       VERIFY_STATUS=unknown VERIFY_TEXT='检查未返回结果'
-      "$check" "$detail"
+      "$check" "$detail" "$boot"
       verify_line "$VERIFY_STATUS" "$label" "$VERIFY_TEXT" ;;
     failed) verify_line fail "$label" "开荒时没有成功（$detail），请查看运行日志后重试" ;;
     *) verify_line na "$label" "$(module_result_label "$result")（$detail）" ;;
@@ -6057,6 +6261,15 @@ verify_ssh_connection_cc() {
   [[ "$lport" =~ ^[0-9]+$ && "$rport" =~ ^[0-9]+$ ]] || return 1
   command -v ss >/dev/null || return 1
   ss -tinH state established "( sport = :$lport and dport = :$rport )" 2>/dev/null | grep -qw bbr
+}
+
+# SIZE: this tool's disk swap in use, at that size, started at boot.
+check_swap() {
+  local size
+  size="$(awk -v n="$SWAP_FILE" 'NR > 1 && $1 == n {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
+  if [[ -z "$size" ]]; then verify_set fail "$SWAP_FILE 没有在用"
+  elif ! systemctl is-enabled -q swapfile.swap 2>/dev/null; then verify_set fail "$SWAP_FILE 在用，但开机不会启用（swapfile.swap 没有启用）"
+  else verify_set pass "$SWAP_FILE，约 ${size} MiB，排在 ZRAM 后面"; fi
 }
 
 # NAME: the hostname this tool set, still in force (after a reboot too) and resolving.
@@ -6082,7 +6295,7 @@ check_bbr() {
 }
 
 check_zram() {
-  local size line bad='' algorithm
+  local size line bad='' algorithm want
   size="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
   [[ -n "$size" ]] || { verify_set fail '没有找到正在使用的 /dev/zram0'; return 0; }
   if [[ -f "$ZRAM_SYSCTL_FILE" ]]; then
@@ -6092,7 +6305,11 @@ check_zram() {
   fi
   # The selected algorithm is the bracketed one: "lzo [lz4] zstd".
   algorithm="$(sed -n 's/.*\[\([a-z0-9-]*\)\].*/\1/p' /sys/block/zram0/comp_algorithm 2>/dev/null || true)"
+  want="$(awk -F' *= *' '$1 == "compression-algorithm" {print $2}' "$ZRAM_FILE" 2>/dev/null || true)"
   if [[ -n "$bad" ]]; then verify_set fail "/dev/zram0 已启用，但配套内存参数和配置不一致：${bad# }"
+  elif [[ "$1" == *'(from next boot)'* && "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" == "${2:-}" ]] ||
+       [[ -n "$want" && -n "$algorithm" && "$want" != "$algorithm" ]]; then
+    verify_set reboot "改过的 ZRAM 设置（${1% (from next boot)}${want:+，$want}）重启后生效；现在是约 ${size} MiB${algorithm:+，$algorithm}"
   else verify_set pass "/dev/zram0 已启用，约 ${size} MiB${algorithm:+，压缩算法 $algorithm}"; fi
 }
 
@@ -6400,6 +6617,7 @@ verify_checks() {
   verify_module sysctl '内核网络安全参数' check_sysctl
   verify_module tcp 'TCP 缓冲区上限' check_tcp
   verify_module zram 'ZRAM 内存缓冲' check_zram
+  verify_module swap '硬盘 Swap' check_swap
   verify_module ntp '时间同步' check_ntp
   verify_module journal '日志限制' check_journal
   verify_module trim '磁盘 TRIM' check_trim
@@ -6913,7 +7131,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname
+  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap
 }
 
 item_label() {
@@ -6921,7 +7139,7 @@ item_label() {
     upgrade) echo '系统升级（立即升级一次）' ;; updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; zram) echo 'ZRAM 内存缓冲' ;;
     journal) echo '日志空间限制' ;; trim) echo '定期 TRIM' ;; ntp) echo '时间同步' ;; timezone) echo '时区' ;;
-    hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; tools) echo '常用工具' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
+    hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; swap) echo '硬盘 Swap' ;; tools) echo '常用工具' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
     tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
     *) printf '%s\n' "$1" ;;
@@ -6960,6 +7178,9 @@ item_status() {
     ntp) if ntp_synced; then echo '已同步'; else echo '未同步'; fi ;;
     timezone) timedatectl show -p Timezone --value 2>/dev/null || echo '未知' ;;
     hosts) if hostname_resolves; then echo '正常'; else echo '无法解析'; fi ;;
+    swap)
+      value="$(awk -v n="$SWAP_FILE" 'NR > 1 && $1 == n {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
+      if [[ -n "$value" ]]; then echo "已开启，${value} MiB"; else echo '未开启'; fi ;;
     hostname)
       value="$(hostname 2>/dev/null || echo 未知)"
       if dump="$(display_name_get)"; then echo "$value，显示名 $dump"; else echo "$value，没设显示名"; fi ;;
@@ -7049,6 +7270,11 @@ item_turn_on() {
       stage_run hosts hosts_stage ;;
     hostname) hostname_ask || return 0
       stage_run hostname hostname_stage ;;
+    swap)
+      if swapon --noheadings 2>/dev/null | grep -v "^$SWAP_FILE " | grep . > /dev/null &&
+         ! confirm_yes '已经有别的 Swap 或 ZRAM：通常不需要再加硬盘 Swap。仍然加一个吗？'; then return 0; fi
+      SWAP_CHOICE=1
+      stage_run swap swap_stage ;;
     tools) apt_index_ready || return 0
       stage_run tools tools_item_stage ;;
     vnstat) apt_index_ready || return 0
@@ -7459,6 +7685,7 @@ main() {
     stage_run apt_index apt_index_stage
     stage_run questions setup_questions
     stage_run zram zram_stage
+    stage_run swap swap_stage
     stage_run apt_upgrade apt_upgrade_stage
     stage_run bbr bbr_stage
     stage_run sysctl sysctl_hardening_stage

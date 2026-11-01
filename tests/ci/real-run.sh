@@ -274,6 +274,17 @@ item_do item-timezone-off timezone 2
 item_do item-timezone-on timezone 1
 [[ "$(tz)" == Asia/Shanghai ]] || fail "timezone set: $(tz)"
 
+# Disk swap by hand (these runners may have a swap already: it is asked).
+if [[ -e /swapfile ]]; then
+  printf '::notice::%s\n' 'disk swap item not tested here: /swapfile exists before the tool'
+else
+  item_do item-swap-on swap 1
+  awk '$1 == "/swapfile" && $5 == 10 {f = 1} END {exit !f}' /proc/swaps || fail "disk swap on: not in use with priority 10: $(cat /proc/swaps)"
+  systemctl is-enabled -q swapfile.swap || fail 'disk swap on: not enabled at boot'
+  item_do item-swap-off swap 2
+  if grep -q '^/swapfile ' /proc/swaps || [[ -e /swapfile || -e /etc/systemd/system/swapfile.swap ]]; then fail 'disk swap off: still there'; fi
+fi
+
 item_do item-vnstat-off vnstat 2
 if installed vnstat; then fail 'vnStat off: still installed'; fi
 item_do item-vnstat-on vnstat 1

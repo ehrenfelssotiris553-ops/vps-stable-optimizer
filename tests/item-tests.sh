@@ -106,6 +106,7 @@ restore_fail2ban_group() { record 'group fail2ban'; }
 restore_ssh_group() { record 'group ssh'; }
 restore_zram_group() { record 'group zram'; }
 restore_hostname_group() { record 'group hostname'; }
+restore_swap_group() { record 'group swap'; }
 restore_resource() { record "resource $1"; }
 restore_sysctl_runtime() { record 'sysctl runtime'; }
 restore_packages_offer() { record "packages $*"; }
@@ -181,10 +182,10 @@ item_action ports < /dev/null > /dev/null
 reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-[[ "$(item_keys | wc -l | tr -d ' ')" == 20 ]] || fail 'item count'
+[[ "$(item_keys | wc -l | tr -d ' ')" == 21 ]] || fail 'item count'
 # New items are appended: the numbers the user knows stay the same.
 [[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
-[[ "$(item_keys | sed -n '20p')" == hostname ]] || fail 'the hostname item is not appended last'
+[[ "$(item_keys | sed -n '20p;21p' | tr '\n' ' ')" == 'hostname swap ' ]] || fail 'new items are not appended in order'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

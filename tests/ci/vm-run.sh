@@ -227,7 +227,12 @@ check_all() {
     passed "$name" "$item"
   done
   if ((zram_kernel)); then passed "$name" 'ZRAM 内存缓冲'
-  else has "$name" '○ 未处理  ZRAM 内存缓冲：系统不支持'; fi
+  else
+    # No ZRAM on a small machine: a disk swap instead, used after ZRAM, at boot.
+    has "$name" '○ 未处理  ZRAM 内存缓冲：系统不支持'
+    passed "$name" '硬盘 Swap'
+    vm "awk '\$1 == \"/swapfile\" && \$5 == 10 {f = 1} END {exit !f}' /proc/swaps" || fail "$name: /swapfile not in use with priority 10"
+  fi
 }
 group 'Acceptance check'
 check_all check
@@ -466,6 +471,7 @@ vm 'for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-sta
   fail 'files left after rollback'
 vm 'swapon --noheadings | grep -q zram' && fail 'ZRAM still on after rollback'
 [[ "$(vm hostname)" == "$old_name" ]] || fail "the rollback did not bring the name $old_name back: $(vm hostname)"
+vm '[ ! -e /swapfile ] && ! grep -q "^/swapfile " /proc/swaps' || fail 'the disk swap stayed after the rollback'
 vm_drive uninstall.rules uninstall vps uninstall || fail "uninstall exited with $?"
 vm 'command -v vps' && fail 'vps command left after uninstall'
 endgroup
