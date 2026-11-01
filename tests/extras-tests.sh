@@ -97,6 +97,7 @@ APT_FILE="$TEST_ROOT/apt/52-vps-stable-auto-upgrades"
 AUTO_UPDATES=1
 installed() { [[ "$1" == unattended-upgrades ]]; }
 systemctl() { record "systemctl $*"; }
+apt_timers_postpone() { record postpone; }
 reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "0";\nAPT::Periodic::Unattended-Upgrade "0";'
 updates_stage
 [[ ! -e "$APT_FILE" ]] || fail 'an administrator policy that turned updates off was overridden'
@@ -104,10 +105,22 @@ grep -q '^result updates preserved' "$TEST_ROOT/trace" || fail 'kept update poli
 reset; APT_DUMP=''
 updates_stage
 grep -Fxq 'APT::Periodic::Unattended-Upgrade "1";' "$APT_FILE" || fail 'update policy not written when none existed'
+[[ "$(grep -E '^(postpone|systemctl enable)' "$TEST_ROOT/trace" | head -n 1)" == postpone ]] ||
+  fail 'APT timers started before their catch-up run was put off'
 reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'
 updates_stage
 grep -q '^result updates present' "$TEST_ROOT/trace" || fail 'already enabled updates not recognised'
-unset -f installed systemctl apt-config
+unset -f installed systemctl apt-config apt_timers_postpone
+# Only a stopped timer has its last run moved to now.
+(
+  load_optimizer_functions apt_timers_postpone
+  d="$TEST_ROOT/timers"; mkdir -p "$d"
+  touch -d '2020-01-01' "$d/stamp-apt-daily.timer" "$d/stamp-apt-daily-upgrade.timer"
+  active() { [[ "$1" == apt-daily.timer ]]; }
+  apt_timers_postpone "$d"
+  [[ "$(date -r "$d/stamp-apt-daily.timer" +%Y)" == 2020 ]] || fail 'a running timer was touched'
+  [[ "$(date -r "$d/stamp-apt-daily-upgrade.timer" +%Y)" != 2020 ]] || fail 'a stopped timer would catch up during the setup'
+)
 printf 'PASS: automatic updates keep a policy APT already reports, in any syntax.\n'
 
 # sysctl hardening: keys set elsewhere are kept, originals recorded after writing.

@@ -1328,6 +1328,20 @@ trim_stage() {
   else ok '磁盘不支持 TRIM，跳过。'; module_result trim unsupported 'device rejects TRIM'; fi
 }
 
+# A stopped APT timer catches up at once when started again (Persistent=true):
+# the automatic update then holds the package lock while the setup goes on
+# installing packages, for well over its 15 minutes on a long-unpatched
+# machine. Marking the last run as now leaves the first one for the timer's
+# usual time; a timer that already runs is left as it is.
+apt_timers_postpone() {
+  local dir="${1:-/var/lib/systemd/timers}" t
+  for t in apt-daily apt-daily-upgrade; do
+    if ! active "$t.timer" && [[ -f "$dir/stamp-$t.timer" && ! -L "$dir/stamp-$t.timer" ]]; then
+      touch -- "$dir/stamp-$t.timer" 2>/dev/null || true
+    fi
+  done
+}
+
 updates_stage() {
   say '第10步：自动安全更新'
   if (( !AUTO_UPDATES )); then ok '自动更新策略保持不变。'; module_result updates declined 'not requested'; return 0; fi
@@ -1341,6 +1355,7 @@ updates_stage() {
     warn "已有自定义的定期更新策略（$(tr '\n' ' ' <<< "$periodic")），不覆盖。"; result=preserved
   elif ! put_file "$APT_FILE" $'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'; then result=preserved
   fi
+  apt_timers_postpone
   if systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then module_result updates "$result" 'periodic updates'
   else warn '无法启用 APT 定时器。'; module_result updates failed 'timers not enabled'; fi
 }

@@ -24,7 +24,8 @@ esac
 version="$(sed -n 's/^SCRIPT_VERSION=//p' "$ROOT/vps-stable-opt.sh")"
 # No step here waits long for its next question: a stuck one fails with its
 # transcript well before the job's time limit.
-export ANSWER_TIMEOUT="${ANSWER_TIMEOUT:-900}"
+# (Longer than apt's own 15 minutes of waiting for the package lock.)
+export ANSWER_TIMEOUT="${ANSWER_TIMEOUT:-1500}"
 
 state() {
   sysctl -n net.ipv4.tcp_congestion_control net.core.rmem_max net.ipv4.tcp_rmem kernel.kptr_restrict \
