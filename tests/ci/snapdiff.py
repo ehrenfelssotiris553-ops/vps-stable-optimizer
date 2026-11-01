@@ -30,6 +30,25 @@ CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_co
 TOOL_KEYS = re.compile(r'^(net\.ipv[46]\.conf\.|net\.ipv4\.(tcp_congestion_control|tcp_syncookies|icmp_)'
                        r'|net\.core\.(default_qdisc|rmem_max|wmem_max)|vm\.(swappiness|page-cluster)'
                        r'|kernel\.(kptr_restrict|dmesg_restrict))')
+# Defaults the kernel works out from the free memory at boot: after a reboot
+# they move a little (a wrong restore moves them a lot).
+MEMORY_KEYS = re.compile(r'^(net\.ipv4\.(tcp_mem|udp_mem|tcp_rmem|tcp_wmem|inet_peer_threshold)'
+                         r'|vm\.(user_reserve_kbytes|admin_reserve_kbytes|min_free_kbytes)'
+                         r'|kernel\.threads-max|fs\.epoll\.max_user_watches|fs\.file-max)$')
+# Kept up to date by the maintainer scripts of packages, not as their files.
+PKG_SCRIPT_FILES = {'/etc/shells': None, '/etc/ca-certificates.conf': 'ca-certificates',
+                    '/etc/ca-certificates.conf.dpkg-old': 'ca-certificates'}
+
+
+def close(x, y, share=0.02):
+    """Every number of x within SHARE of y's (the same count of numbers)."""
+    try:
+        xs, ys = [int(v) for v in x.split()], [int(v) for v in y.split()]
+    except ValueError:
+        return False
+    return len(xs) == len(ys) and all(abs(i - j) <= share * max(abs(i), abs(j), 1) for i, j in zip(xs, ys))
+
+
 # A loaded logging module fills in its slot ("NONE" before).
 NF_LOG = re.compile(r'^net\.netfilter\.nf_log\.[0-9]+$')
 # The layout UFW writes into user.rules/user6.rules the first time it starts:
@@ -113,6 +132,7 @@ def main():
     # changes do not, so those are still compared.
     sa, sb = pairs(a, 'sysctl', ' = '), pairs(b, 'sysctl', ' = ')
     new_kernel = sa.get('kernel.osrelease') != sb.get('kernel.osrelease')
+    rebooted = sa.get('kernel.random.boot_id') != sb.get('kernel.random.boot_id')
     if new_kernel:
         explained.append(f"kernel {sa.get('kernel.osrelease')} -> {sb.get('kernel.osrelease')} after the reboot")
     for key in sorted(set(sa) | set(sb)):
@@ -120,6 +140,13 @@ def main():
             continue
         if new_kernel and not TOOL_KEYS.match(key):
             continue
+        if rebooted and key in sa and key in sb:
+            if MEMORY_KEYS.match(key) and close(sa[key], sb[key]):
+                explained.append(f'{key}: {sa[key]} -> {sb[key]} (worked out from memory at boot)')
+                continue
+            if key in CC_KEYS:
+                explained.append(f'{key}: {sa[key]} -> {sb[key]} (other modules loaded in this boot)')
+                continue
         if key not in sa:
             explained.append(f'new kernel parameter (module loaded): {key} = {sb[key]}')
         elif key not in sb:
@@ -185,6 +212,9 @@ def main():
         if fa.get(path) == fb.get(path) or SNAPD.match(path):
             continue
         what = 'file added' if path not in fa else 'file removed' if path not in fb else 'file changed'
+        if path in PKG_SCRIPT_FILES and up_pkgs and (PKG_SCRIPT_FILES[path] is None or PKG_SCRIPT_FILES[path] in up_pkgs):
+            explained.append(f'{what}: {path} (kept by package scripts during upgrades)')
+            continue
         if up_pkgs and 'vps-stable' not in path and (path in TRIGGERED or path.rsplit('/', 1)[0] in up_dirs):
             explained.append(f'{what}: {path} (package upgrades)')
             continue
