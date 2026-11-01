@@ -75,11 +75,23 @@ printf 'PASS: the recommended set is one question and still respects an empty up
   timezone_ask() { fail 'recommended mode asked for the timezone'; }
   hostname_resolves() { return 1; }
   swap_exists() { return 1; }
+  IPV6_BROKEN=0
+  ipv6_broken() { ((IPV6_BROKEN)); }
   RECOMMENDED=1 UPGRADE_APPROVED=1 AUTO_UPDATES=1 MEM_MIB=4096 INSTALL_TOOLS=0 SSH_CONNECTION='203.0.113.9 1 192.0.2.1 22'
   TOOLS_PACKAGES=(curl)
   setup_questions < /dev/null > "$TEST_ROOT/q-out"
   [[ "$INSTALL_TOOLS" == 1 && "$SYSCTL_CHOICE" == 1 && "$KERNEL_CLEAN_CHOICE" == 1 && "$HOSTS_CHOICE" == 1 ]] || fail 'recommended items not set'
-  [[ "$VNSTAT_CHOICE" == 0 && "$ZRAM_CHOICE" == 0 && "$TCP_BUFFER_CHOICE" == 0 && -z "$AUTO_REBOOT_TIME" && -z "$TZ_CHOICE" ]] || fail 'non-recommended items were switched on'
+  [[ "$VNSTAT_CHOICE" == 0 && "$ZRAM_CHOICE" == 0 && -z "$AUTO_REBOOT_TIME" && -z "$TZ_CHOICE" ]] || fail 'non-recommended items were switched on'
+  # TCP tuning only raises ceilings: in the set from 1 GiB of RAM, not below.
+  [[ "$TCP_BUFFER_CHOICE" == 1 ]] || fail 'TCP tuning not in the recommended set with 4 GiB'
+  MEM_MIB=512 TCP_BUFFER_CHOICE=''
+  setup_questions < /dev/null > "$TEST_ROOT/q-out"
+  [[ "$TCP_BUFFER_CHOICE" == 0 ]] || fail 'TCP tuning in the recommended set below 1 GiB'
+  # SSH keepalive is in the set; IPv4 first only where IPv6 is broken.
+  [[ "$KEEPALIVE_CHOICE" == 1 && "$IPV4_CHOICE" == 0 ]] || fail "keepalive/IPv4 in the recommended set: $KEEPALIVE_CHOICE $IPV4_CHOICE"
+  IPV6_BROKEN=1
+  setup_questions < /dev/null > "$TEST_ROOT/q-out"
+  [[ "$IPV4_CHOICE" == 1 ]] || fail 'IPv4 first not recommended with a broken IPv6'
   [[ "$SSH_CHOICE" == 0 && "$WEB_CHOICE" == 0 ]] || fail 'SSH/web questions were not asked separately'
   [[ "$F2B_IGNORE_CHOICE" == 203.0.113.9 ]] || fail "recommended mode did not offer the Fail2ban allowlist: $F2B_IGNORE_CHOICE"
 )
@@ -107,6 +119,7 @@ restore_ssh_group() { record 'group ssh'; }
 restore_zram_group() { record 'group zram'; }
 restore_hostname_group() { record 'group hostname'; }
 restore_swap_group() { record 'group swap'; }
+ssh_reload() { record 'ssh reload'; }
 restore_resource() { record "resource $1"; }
 restore_sysctl_runtime() { record 'sysctl runtime'; }
 restore_packages_offer() { record "packages $*"; }
@@ -182,10 +195,10 @@ item_action ports < /dev/null > /dev/null
 reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-[[ "$(item_keys | wc -l | tr -d ' ')" == 21 ]] || fail 'item count'
+[[ "$(item_keys | wc -l | tr -d ' ')" == 25 ]] || fail 'item count'
 # New items are appended: the numbers the user knows stay the same.
 [[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
-[[ "$(item_keys | sed -n '20p;21p' | tr '\n' ' ')" == 'hostname swap ' ]] || fail 'new items are not appended in order'
+[[ "$(item_keys | sed -n '20,25p' | tr '\n' ' ')" == 'hostname swap conntrack ping keepalive ipv4 ' ]] || fail 'new items are not appended in order'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

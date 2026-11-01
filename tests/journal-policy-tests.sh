@@ -6,7 +6,8 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions journal_policy_paths journal_stage decision_file_state decision_journal_state
+load_optimizer_functions journal_policy_paths journal_stage decision_file_state decision_journal_state journal_config_text \
+  param_value param_read param_recommended param_check param_mode
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -19,7 +20,9 @@ for directory in /etc/systemd /run/systemd /usr/local/lib/systemd /usr/lib/syste
   grep -Fq "$directory/journald.conf" <<< "$all_paths" || fail "missing policy directory: $directory"
 done
 ROOT_GIB=10 JOURNAL_LIMIT_GB=20
-JOURNAL_FILE="$TEST_ROOT/managed.conf"
+JOURNAL_FILE="$TEST_ROOT/managed.conf" PARAMS_FILE="$TEST_ROOT/params"
+OURS=1
+restore_file_ours() { [[ "$1" == journal_file ]] && ((OURS)); }
 TRACE="$TEST_ROOT/trace"
 POLICY=''
 journal_policy_paths() { printf '%s\n' "$POLICY" "$JOURNAL_FILE"; }
@@ -49,4 +52,19 @@ POLICY="$TEST_ROOT/missing"
 journal_stage
 [[ "$(cat "$TRACE")" == $'put\nrestart' ]] || fail 'missing policies did not lead to the normal managed setting'
 [[ "$(decision_journal_state --system)" == match ]] || fail 'managed policy misclassified'
+[[ "$(cat "$JOURNAL_FILE")" == $'[Journal]\nSystemMaxUse=100M\nRuntimeMaxUse=50M\nMaxRetentionSec=90day' ]] || fail "managed policy: $(cat "$JOURNAL_FILE")"
 printf 'PASS: runtime and vendor journal policies are preserved by planning and execution.\n'
+
+# The 14 days of earlier versions, or new parameters: this tool's own file is
+# written again; a file that is not this tool's own stays.
+printf '[Journal]\nSystemMaxUse=100M\nRuntimeMaxUse=50M\nMaxRetentionSec=14day\n' > "$JOURNAL_FILE"
+: > "$TRACE"; journal_stage
+grep -Fxq 'MaxRetentionSec=90day' "$JOURNAL_FILE" || fail "an earlier version's file was not brought to 90 days"
+printf 'journal_max_mb=20\njournal_days=30\n' > "$PARAMS_FILE"
+: > "$TRACE"; journal_stage
+[[ "$(cat "$JOURNAL_FILE")" == $'[Journal]\nSystemMaxUse=20M\nRuntimeMaxUse=16M\nMaxRetentionSec=30day' ]] || fail "parameters: $(cat "$JOURNAL_FILE")"
+OURS=0; printf '[Journal]\nSystemMaxUse=500M\n' > "$JOURNAL_FILE"
+put_file() { [[ ! -e "$1" ]] || return 1; printf '%s\n' "$2" > "$1"; }
+journal_stage
+[[ "$(cat "$JOURNAL_FILE")" == $'[Journal]\nSystemMaxUse=500M' ]] || fail 'a file that is not this tool was rewritten'
+printf 'PASS: the journal limit and retention follow the parameters; earlier 14-day files become 90 days.\n'

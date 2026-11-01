@@ -1,2 +1,3 @@
 # Python bytecode from checking the CI scripts locally.
 __pycache__/
+tests/.run-all.out

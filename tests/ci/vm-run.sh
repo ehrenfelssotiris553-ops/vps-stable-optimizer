@@ -223,7 +223,8 @@ check_all() {
   vm_drive check.rules "$name" "$@" vps check || rc=$?
   cat "$LOGS/$name.log"
   [[ "$rc" == 0 || "$rc" == 3 ]] || fail "$name exited with $rc"
-  for item in 'BBR 网络优化' '内核网络安全参数' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破'; do
+  # SSH keepalive is in the recommended set, and sshd runs on every VM.
+  for item in 'BBR 网络优化' '内核网络安全参数' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破' 'SSH 保活'; do
     passed "$name" "$item"
   done
   if ((zram_kernel)); then passed "$name" 'ZRAM 内存缓冲'
@@ -231,7 +232,9 @@ check_all() {
     # No ZRAM on a small machine: a disk swap instead, used after ZRAM, at boot.
     has "$name" '○ 未处理  ZRAM 内存缓冲：系统不支持'
     passed "$name" '硬盘 Swap'
-    vm "awk '\$1 == \"/swapfile\" && \$5 == 10 {f = 1} END {exit !f}' /proc/swaps" || fail "$name: /swapfile not in use with priority 10"
+    # As whoever may log in now (after the SSH hardening root may not).
+    ssh "${VM_OPTS[@]}" "${VM_AS:-$VM_HOST}" "awk '\$1 == \"/swapfile\" && \$5 == 10 {f = 1} END {exit !f}' /proc/swaps" ||
+      fail "$name: /swapfile not in use with priority 10"
   fi
 }
 group 'Acceptance check'
@@ -484,6 +487,11 @@ rc=0
 python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt" --upgrades "$LOGS/upgrade-info.txt" \
   --allow-user ops --purged > "$LOGS/snapdiff.log" || rc=$?
 cat "$LOGS/snapdiff.log"
+if ((rc)); then
+  vm 'systemctl is-enabled apt-listchanges.timer 2>&1; grep -h -i listchanges /var/log/dpkg.log /var/log/apt/history.log 2>/dev/null | tail -n 20; journalctl -b --no-pager -o short-precise 2>/dev/null | grep -i -E "listchanges|preset" | tail -n 20' \
+    > "$LOGS/listchanges.log" 2>&1 || true
+  notice "apt-listchanges and presets after the rollback ($system)" "$LOGS/listchanges.log"
+fi
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup
 printf 'PASS: %s VM (%s MiB): setup, check, allowlisted logins, reboot, tmux reconnect, SSH hardening (dropped and kept), rollback, uninstall.\n' "$system" "$memory"

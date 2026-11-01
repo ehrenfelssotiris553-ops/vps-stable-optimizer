@@ -112,6 +112,7 @@ AUTO_UPDATES=1
 installed() { [[ "$1" == unattended-upgrades ]]; }
 systemctl() { record "systemctl $*"; }
 apt_timers_postpone() { record postpone; }
+apt_time_apply() { record 'apt time'; }
 reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "0";\nAPT::Periodic::Unattended-Upgrade "0";'
 updates_stage
 [[ ! -e "$APT_FILE" ]] || fail 'an administrator policy that turned updates off was overridden'
@@ -152,7 +153,7 @@ updates_stage
 [[ ! -e "$APT_FILE" ]] || fail 'a weekly policy was overridden'
 grep -q '^WARN 已有自定义的定期更新策略（APT::Periodic::Update-Package-Lists "7";）' "$TEST_ROOT/log" || fail "weekly policy not reported as custom: $(cat "$TEST_ROOT/log")"
 if grep -q '没有开启' "$TEST_ROOT/log"; then fail 'a weekly policy was called off'; fi
-unset -f installed systemctl apt-config apt_timers_postpone
+unset -f installed systemctl apt-config apt_timers_postpone apt_time_apply
 # Only a stopped timer has its last run moved to now.
 (
   load_optimizer_functions apt_timers_postpone
@@ -358,6 +359,19 @@ printf 'PASS: TCP buffer ceilings follow RAM, are only raised and keep foreign k
   [[ ! -e "$TCP_BUFFER_FILE" ]] || fail "the tool's file stayed although nothing is raised: $(cat "$TCP_BUFFER_FILE")"
   grep -Fxq 'sysctl -w net.core.rmem_max=8388608' "$TEST_ROOT/trace" || fail 'values not set back when the file went'
   grep -q '^result tcp preserved system values already large enough' "$TEST_ROOT/trace" || fail "result: $(cat "$TEST_ROOT/trace")"
+  # The two switches: set when the system is the other way, never against a
+  # value set elsewhere or a stricter one (mtu_probing 2 = always).
+  rm -f "$TCP_BUFFER_FILE"; : > "$RESTORE_ROOT/tcp_sysctl_runtime"
+  SYSVAL[net.ipv4.tcp_slow_start_after_idle]=1 SYSVAL[net.ipv4.tcp_mtu_probing]=0
+  reset; OURS=0
+  tcp_buffer_stage
+  grep -Fxq 'net.ipv4.tcp_slow_start_after_idle = 0' "$TCP_BUFFER_FILE" && grep -Fxq 'net.ipv4.tcp_mtu_probing = 1' "$TCP_BUFFER_FILE" ||
+    fail "the two switches not written: $(cat "$TCP_BUFFER_FILE")"
+  grep -Fxq 'orig net.ipv4.tcp_mtu_probing=0' "$TEST_ROOT/trace" || fail 'original of mtu_probing not recorded'
+  rm -f "$TCP_BUFFER_FILE"; SYSVAL[net.ipv4.tcp_mtu_probing]=2; CONFIGURED=net.ipv4.tcp_slow_start_after_idle
+  reset; tcp_buffer_stage
+  if grep -q 'mtu_probing\|slow_start_after_idle' "$TCP_BUFFER_FILE"; then fail "a stricter or foreign switch was overridden: $(cat "$TCP_BUFFER_FILE")"; fi
+  CONFIGURED=none; unset 'SYSVAL[net.ipv4.tcp_slow_start_after_idle]' 'SYSVAL[net.ipv4.tcp_mtu_probing]'
   # Back to automatic: the file stores nothing for it.
   param_store tcp_buffer_mib ''
   [[ "$(param_mode tcp_buffer_mib)" == '自动' && "$(param_value tcp_buffer_mib)" == 32 ]] || fail 'reset did not go back to the recommendation'
@@ -594,9 +608,17 @@ printf 'PASS: a failed APT step stops with the next step to take.\n'
       *) return 1 ;;
     esac
   }
-  confirm_default_yes() { case "$1" in *内核网络安全*) return 0 ;; *) return 1 ;; esac; }
+  # From 1 GiB of RAM the TCP question defaults to yes (the user says no here).
+  confirm_default_yes() {
+    case "$1" in
+      *内核网络安全*) return 0 ;;
+      *TCP\ 缓冲区*) printf '%s\n' "$1" > "$TEST_ROOT/tcp-question"; return 1 ;;
+      *) return 1 ;;
+    esac
+  }
   swap_exists() { return 1; }
   hostname_resolves() { return 0; }
+  ipv6_broken() { return 1; }
   timezone_ask() { TZ_CHOICE=Asia/Shanghai; }
   logname() { echo root; }
   SUDO_USER='' UPGRADE_APPROVED=1 AUTO_UPDATES=1 MEM_MIB=4096 INSTALL_TOOLS=0 ADMIN_NAME=''
@@ -611,6 +633,7 @@ printf 'PASS: a failed APT step stops with the next step to take.\n'
   [[ "$WEB_CHOICE" == 0 && "$F2B_IGNORE_CHOICE" == none && "$TZ_CHOICE" == Asia/Shanghai && "$TZ_ASKED" == 1 ]] || fail 'web/allowlist/timezone choices'
   [[ "$TCP_BUFFER_CHOICE" == 0 ]] || fail 'TCP buffers chosen without a yes'
   grep -Fq '64 MiB' "$TEST_ROOT/tcp-question" || fail 'TCP buffer question does not name the ceiling for this RAM'
+  grep -Fq '空闲后不重新慢启动' "$TEST_ROOT/tcp-question" || fail 'TCP question does not name the two switches'
   grep -Fq '需要你在场' "$TEST_ROOT/q-out" || fail 'user not told the end needs them'
 )
 printf 'PASS: setup questions are asked once and stored.\n'

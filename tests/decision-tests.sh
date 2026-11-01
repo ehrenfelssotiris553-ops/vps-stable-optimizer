@@ -16,7 +16,9 @@ load_function() {
   ' "$TEST_SCRIPT")"
   eval "$definition"
 }
-for name in journal_policy_paths sysctl_config_files trim_support decision_line decision_file_state decision_journal_state decision_report; do load_function "$name"; done
+for name in journal_policy_paths sysctl_config_files trim_support decision_line decision_file_state decision_journal_state decision_report \
+    param_value param_read param_recommended param_check journal_config_text; do load_function "$name"; done
+SWAP_FILE=/swapfile PARAMS_FILE=/nonexistent/params
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -28,7 +30,8 @@ JOURNAL_LIMIT_GB=20
 BBR_FILE="$TEST_ROOT/bbr.conf"
 MODULE_FILE="$TEST_ROOT/module.conf"
 F2B_FILE="$TEST_ROOT/99-vps-stable-sshd.local"
-printf '%s\n' '[Journal]' 'SystemMaxUse=100M' 'RuntimeMaxUse=50M' 'MaxRetentionSec=14day' > "$TEST_ROOT/exact.conf"
+printf '%s\n' '[Journal]' 'SystemMaxUse=100M' 'RuntimeMaxUse=50M' 'MaxRetentionSec=90day' > "$TEST_ROOT/exact.conf"
+printf '%s\n' '[Journal]' 'SystemMaxUse=100M' 'RuntimeMaxUse=50M' 'MaxRetentionSec=14day' > "$TEST_ROOT/legacy.conf"
 [[ "$(decision_file_state "$TEST_ROOT/missing" text)" == missing ]] || fail 'missing file not classified'
 printf '%s\n' text > "$TEST_ROOT/file"
 [[ "$(decision_file_state "$TEST_ROOT/file" text)" == match ]] || fail 'exact file not classified'
@@ -42,6 +45,9 @@ printf '%s\n' 'SystemMaxUse=30M' > "$TEST_ROOT/custom.conf"
 [[ "$(decision_journal_state "$TEST_ROOT/custom.conf")" == custom ]] || fail 'custom journal policy not preserved'
 cp -- "$TEST_ROOT/exact.conf" "$JOURNAL_FILE"
 [[ "$(decision_journal_state "$JOURNAL_FILE")" == match ]] || fail 'managed journal not recognized'
+# The 14-day file an earlier version wrote is this tool's too.
+cp -- "$TEST_ROOT/legacy.conf" "$JOURNAL_FILE"
+[[ "$(decision_journal_state "$JOURNAL_FILE")" == match ]] || fail "an earlier version's journal file not recognized"
 printf '%s\n' other > "$JOURNAL_FILE"
 [[ "$(decision_journal_state "$JOURNAL_FILE")" == conflict ]] || fail 'changed managed journal not preserved'
 rm -f -- "$JOURNAL_FILE"
@@ -106,6 +112,12 @@ assert_contains '内存低于 2GiB，未发现 Swap/ZRAM'
 ZRAM_MODULE=0
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '这个内核没有 zram 模块'
+# ...and a disk swap instead (about the RAM), only on ext4 or xfs.
+assert_contains '用不了 ZRAM：建约 1024 MiB 的硬盘 Swap（/swapfile），系统盘至少留 3 GB。'
+ROOT_FS=btrfs
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '系统盘是 btrfs：本工具只在 ext4、xfs 上建硬盘 Swap。'
+ROOT_FS=ext4
 # Found on a real VPS: a machine already set up still showed Fail2ban as
 # "准备调整". This tool's jail in place and running is kept as it is.
 assert_contains '配置 SSH 防爆破'
@@ -124,6 +136,7 @@ assert_absent '计划配置约内存一半大小的 ZRAM'
 ZRAM_MODULE=1
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '当前未确认 BBR 可用'
+assert_absent '硬盘 Swap'
 assert_absent '内核不支持'
 assert_contains '系统盘不大于 20GiB'
 assert_contains '必须通过新 SSH 窗口验证'

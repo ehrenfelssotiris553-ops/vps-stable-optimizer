@@ -19,6 +19,21 @@ LEGACY_LOG_DIR=/var/log/vps-stable-opt
 BBR_FILE=/etc/sysctl.d/99-vps-stable-bbr.conf
 MODULE_FILE=/etc/modules-load.d/99-vps-stable-bbr.conf
 ZRAM_FILE=/etc/systemd/zram-generator.conf
+# SSH keepalive: before cloud-init's 50- file (sshd keeps the first value).
+# sshd takes the first value it reads: 00- comes before the drop-ins of the
+# SSH hardening (01-, which set ClientAliveInterval 300 before 2.8.0) and of
+# cloud images (50-).
+KEEPALIVE_FILE=/etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf
+# Preferring IPv4 in getaddrinfo (IPv6 stays on).
+GAI_FILE=/etc/gai.conf
+# The time of the daily security upgrade, when changed from the distribution's.
+APT_TIME_FILE=/etc/systemd/system/apt-daily-upgrade.timer.d/50-vps-stable-time.conf
+# Connection tracking capacity, and the module loaded before systemd-sysctl
+# (otherwise UFW loads it later at boot and the values never apply).
+CONNTRACK_FILE=/etc/sysctl.d/99-vps-stable-conntrack.conf
+CONNTRACK_MODULE_FILE=/etc/modules-load.d/99-vps-stable-conntrack.conf
+# Not answering ping (optional).
+PING_FILE=/etc/sysctl.d/99-vps-stable-noping.conf
 # Disk swap (only where no other swap exists): the file and its systemd unit.
 SWAP_FILE=/swapfile
 SWAP_UNIT_FILE=/etc/systemd/system/swapfile.swap
@@ -78,14 +93,18 @@ ZRAM_CHOICE=''
 SWAP_CHOICE=''
 HOSTS_CHOICE=''
 HOSTNAME_CHOICE=''
+KEEPALIVE_CHOICE=''
+IPV4_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
 VPS 机器管家 V2.7.8 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps plan       给机器做体检（只检查）
+  vps perf       性能体检（只读）：CPU 是否被抢、内存和硬盘压力、换页、网络重传、连接跟踪
+  vps resources  资源占用一览（只读）：常驻服务各占多少内存和 CPU、能不能关、封禁规则多少
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
   vps check      开荒验收：逐项检查优化是否真的生效（适合重启后运行）
   vps port       端口管理；也可直接用：
@@ -821,13 +840,18 @@ timezone_ask() {
 # runs unattended; only the SSH/firewall confirmations at the end need the user.
 setup_questions() {
   step 3 '开荒选项（一次问完，之后自动执行）'
-  local login ip
+  local login ip question
   if [[ "${RECOMMENDED:-0}" == 1 ]]; then
     # Recommended set: low-risk items only. Everything else stays off and can
     # be turned on later from the single-item menu.
     INSTALL_TOOLS=1 SYSCTL_CHOICE=1 TCP_BUFFER_CHOICE=0 VNSTAT_CHOICE=0 ZRAM_CHOICE=0 AUTO_REBOOT_TIME=''
-    KERNEL_CLEAN_CHOICE="$UPGRADE_APPROVED" HOSTS_CHOICE=1 TZ_CHOICE='' TZ_ASKED=1
-    echo '已按推荐设置记下：安装常用工具、启用内核网络安全参数、升级后清理旧内核、需要时修复主机名；时区保持不变。'
+    # Only raised ceilings and two safe switches: in the set from 1 GiB of RAM.
+    if ((MEM_MIB >= 1024)); then TCP_BUFFER_CHOICE=1; fi
+    KERNEL_CLEAN_CHOICE="$UPGRADE_APPROVED" HOSTS_CHOICE=1 TZ_CHOICE='' TZ_ASKED=1 KEEPALIVE_CHOICE=1 IPV4_CHOICE=0
+    # Preferring IPv4 only where IPv6 is broken here.
+    if ipv6_broken; then IPV4_CHOICE=1; fi
+    printf '已按推荐设置记下：安装常用工具、启用内核网络安全参数%s、SSH 保活%s、升级后清理旧内核、需要时修复主机名；时区保持不变。\n' \
+      "$(if ((TCP_BUFFER_CHOICE)); then echo '、TCP 调优'; fi)" "$(if ((IPV4_CHOICE)); then echo '、优先使用 IPv4（这里的 IPv6 连不通）'; fi)"
   else
     if confirm_yes "安装常用工具（${TOOLS_PACKAGES[*]}）吗？"; then INSTALL_TOOLS=1; fi
     if confirm_yes '安装 vnStat 流量统计吗？（按流量计费的 VPS 推荐，之后用 vnstat 命令查看用量）'; then VNSTAT_CHOICE=1; else VNSTAT_CHOICE=0; fi
@@ -844,10 +868,16 @@ setup_questions() {
       if confirm_yes '没有 Swap：要配一个约 1/4 内存大小的 ZRAM 作为应急缓冲吗？（防止内存突然用尽时进程被杀）'; then ZRAM_CHOICE=1; else ZRAM_CHOICE=0; fi
     fi
     if confirm_default_yes '启用内核网络安全参数吗？（不接受 ICMP 重定向和源路由、开启 SYN Cookies 等；不影响代理和 Docker）'; then SYSCTL_CHOICE=1; else SYSCTL_CHOICE=0; fi
-    if confirm_yes "把 TCP 缓冲区上限加大到 $(param_value tcp_buffer_mib) MiB 吗？（跨洲代理、远距离传大文件时单个连接更快；只提高上限，空闲连接不会多占内存）"; then TCP_BUFFER_CHOICE=1; else TCP_BUFFER_CHOICE=0; fi
+    question="把 TCP 缓冲区上限加大到 $(param_value tcp_buffer_mib) MiB 吗？（并且空闲后不重新慢启动、自动探测被丢的大包：跨洲代理、远距离传大文件时单个连接更快；只提高上限，空闲连接不会多占内存）"
+    if ((MEM_MIB >= 1024)); then
+      if confirm_default_yes "$question"; then TCP_BUFFER_CHOICE=1; else TCP_BUFFER_CHOICE=0; fi
+    elif confirm_yes "$question"; then TCP_BUFFER_CHOICE=1; else TCP_BUFFER_CHOICE=0; fi
     if ! hostname_resolves; then
       if confirm_default_yes "主机名 $(hostname) 无法解析（sudo 会提示 unable to resolve host）。在 /etc/hosts 里补上吗？"; then HOSTS_CHOICE=1; else HOSTS_CHOICE=0; fi
     fi
+    if confirm_default_yes "开启 SSH 保活吗？（SSH 连接放着不动时每 $(param_value ssh_keepalive_seconds) 秒检测一次，不会因为路由器丢掉空闲连接而卡死）"; then KEEPALIVE_CHOICE=1; else KEEPALIVE_CHOICE=0; fi
+    IPV4_CHOICE=0
+    if ipv6_broken && confirm_default_yes '这台机器的 IPv6 连不通外网（IPv4 正常）：改成优先使用 IPv4 吗？（不关闭 IPv6，只是先试 IPv4，免得程序卡在 IPv6 上）'; then IPV4_CHOICE=1; fi
     timezone_ask
     TZ_ASKED=1
   fi
@@ -1533,6 +1563,15 @@ swap_stage() {
 zram_stage() {
   step 4 '内存与 ZRAM（在系统升级前配置）'
   local size vendor=0
+  # Without the module nothing below applies, whatever swap there is.
+  if ! zram_module_available; then
+    if restore_file_ours zram_file; then
+      warn '本工具的 ZRAM 配置还在，但这个内核没有 zram 模块，ZRAM 无法启动；可以在撤销里撤销 ZRAM。'
+    else
+      warn '这个内核没有 zram 模块，跳过 ZRAM（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里，占几百 MB，且每次升级内核都要跟着装，本工具不自动安装）。'
+    fi
+    module_result zram unsupported 'kernel has no zram module'; return 0
+  fi
   if swap_exists; then
     # The package default is replaced by this tool's own file when asked for
     # explicitly, or when it runs no swap at all (Ubuntu installs it unstarted).
@@ -1628,6 +1667,15 @@ ntp_stage() {
   module_result ntp skipped 'timesyncd install pending'
 }
 
+# This tool's journald drop-in, from the parameters (runtime journal: half the
+# persistent cap, at least 16 MiB).
+journal_config_text() {
+  local max days runtime
+  max="$(param_value journal_max_mb)" days="$(param_value journal_days)"
+  runtime=$((max / 2)); ((runtime >= 16)) || runtime=16
+  printf '%s\n' '[Journal]' "SystemMaxUse=${max}M" "RuntimeMaxUse=${runtime}M" "MaxRetentionSec=${days}day"
+}
+
 journal_stage() {
   step 8 '日志空间（仅小硬盘）'
   # The single-item menu may ask for the limit on a larger disk too.
@@ -1643,8 +1691,15 @@ journal_stage() {
       ok "$f 里已有日志限制，保持不变。"; module_result journal preserved "$f"; return 0
     fi
   done < <(journal_policy_paths)
-  if put_file "$JOURNAL_FILE" $'[Journal]\nSystemMaxUse=100M\nRuntimeMaxUse=50M\nMaxRetentionSec=14day'; then
-    if systemctl restart systemd-journald; then module_result journal applied 'SystemMaxUse=100M'
+  # New parameters (or the 14 days of earlier versions): this tool's own file
+  # is written again.
+  if [[ -f "$JOURNAL_FILE" && "$(cat -- "$JOURNAL_FILE" 2>/dev/null || true)" != "$(journal_config_text)" ]] && restore_file_ours journal_file; then
+    rm -f -- "$JOURNAL_FILE"
+  fi
+  if put_file "$JOURNAL_FILE" "$(journal_config_text)"; then
+    if systemctl restart systemd-journald; then
+      ok "日志上限 $(param_value journal_max_mb) MiB、保留 $(param_value journal_days) 天（$(param_mode journal_days)）。"
+      module_result journal applied "SystemMaxUse=$(param_value journal_max_mb)M"
     else warn '日志服务重启失败。'; module_result journal failed 'journald restart failed'; fi
   else
     module_result journal preserved 'journal config conflict'
@@ -1722,7 +1777,9 @@ updates_stage() {
     ok "原有策略里缺少的设置已补上：$(tr '\n' ' ' <<< "${text%$'\n'}")"
   fi
   apt_timers_postpone
-  if systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then module_result updates "$result" "$detail"
+  if systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then
+    apt_time_apply
+    module_result updates "$result" "$detail"
   else warn '无法启用 APT 定时器。'; module_result updates failed 'timers not enabled'; fi
 }
 
@@ -1890,13 +1947,20 @@ param_list() {
     tcp_buffer_mib tcp 'TCP 缓冲区上限' MiB \
     zram_percent zram 'ZRAM 大小（占内存）' % \
     zram_algorithm zram 'ZRAM 压缩算法' '' \
-    swap_mib swap '硬盘 Swap 大小' MiB
+    swap_mib swap '硬盘 Swap 大小' MiB \
+    journal_max_mb journal '日志空间上限' MiB \
+    journal_days journal '日志保留天数' 天 \
+    conntrack_max conntrack '连接跟踪上限' 条 \
+    conntrack_hours conntrack '已建立连接的保留时间' 小时 \
+    ssh_keepalive_seconds keepalive 'SSH 保活间隔' 秒 \
+    apt_upgrade_time updates '每天自动安全更新的时间' '' \
+    tools_list tools '常用工具清单' ''
 }
 
 # NAME: "int" (a whole number) or "word" (one of a few names).
 param_kind() {
   case "$1" in
-    zram_algorithm) echo word ;;
+    zram_algorithm|apt_upgrade_time|tools_list) echo word ;;
     *) echo int ;;
   esac
 }
@@ -1916,6 +1980,19 @@ param_recommended() {
       if ((${MEM_MIB:-0} >= 2048)); then echo 2048
       elif ((${MEM_MIB:-0} >= 256)); then echo $((MEM_MIB / 64 * 64))
       else echo 256; fi ;;
+    journal_max_mb) echo 100 ;;
+    journal_days) echo 90 ;;
+    # 64 entries per MiB of RAM (about 2% of it when full), 16384 to 1048576.
+    conntrack_max)
+      local n=$((${MEM_MIB:-0} * 64))
+      ((n >= 16384)) || n=16384; ((n <= 1048576)) || n=1048576
+      echo "$n" ;;
+    # The kernel's own 5 days.
+    conntrack_hours) echo 120 ;;
+    ssh_keepalive_seconds) echo 60 ;;
+    # The distribution's own time (apt-daily-upgrade.timer: 06:00, up to an hour later).
+    apt_upgrade_time) echo 06:00 ;;
+    tools_list) echo 'curl wget ca-certificates vim htop unzip lsof tmux' ;;
     *) return 1 ;;
   esac
 }
@@ -1934,6 +2011,15 @@ param_reason() {
     zram_algorithm) echo 'zstd 压缩率最高，同样的内存能多装约三分之一；lz4 更快、更省 CPU，CPU 很弱又经常用到 ZRAM 时可以改用它。' ;;
     swap_mib)
       printf '内存 %s MiB：硬盘 Swap 只在没有 ZRAM 时作应急，约等于内存、最多 2 GiB；建好后系统盘至少还要剩 3 GB，不够时会自动缩小。\n' "${MEM_MIB:-?}" ;;
+    journal_max_mb) echo '100 MiB 够一台普通服务器存几个月的系统日志，小硬盘也不会被日志占满（临时日志用它的一半）。' ;;
+    journal_days) echo '90 天：出了问题（包括可能的入侵）能往回查一个季度；有大小上限兜底，天数长也不会占满硬盘。' ;;
+    conntrack_max)
+      printf '内存 %s MiB：每条连接记录约 320 字节，%s 条满载时约 %s MiB；不用时不占。只调大不调小：内核原来的值更大时保持不变。\n' \
+        "${MEM_MIB:-?}" "$(param_recommended conntrack_max)" "$(($(param_recommended conntrack_max) * 320 / 1048576))" ;;
+    conntrack_hours) echo '内核默认 5 天。只有连接跟踪表经常接近满时才需要缩短；最短 2 小时：TCP 保活每 2 小时一次，再短会误删还活着的空闲连接。' ;;
+    ssh_keepalive_seconds) echo '60 秒：比常见的路由器和防火墙丢掉空闲连接的时间（几分钟）短，连接放着不动也不会卡死；断网后约 3 分钟服务器会清掉死连接。' ;;
+    apt_upgrade_time) echo '系统默认每天 06:00（服务器时间）左右，随机推迟最多一小时；改到业务最闲的时候，可以避开高峰。' ;;
+    tools_list) echo '装几个排查问题时常用的小工具：下载（curl、wget）、编辑（vim）、看进程（htop）、解压（unzip）、看端口（lsof）、防断线（tmux）。' ;;
   esac
 }
 
@@ -1952,6 +2038,32 @@ param_check() {
     swap_mib)
       if [[ "$2" =~ ^[0-9]{1,5}$ ]] && ((10#$2 >= 128 && 10#$2 <= 8192)); then return 0; fi
       echo '请输入 128 到 8192 之间的整数（单位 MiB）。' ;;
+    journal_max_mb)
+      if [[ "$2" =~ ^[0-9]{1,4}$ ]] && ((10#$2 >= 16 && 10#$2 <= 4096)); then return 0; fi
+      echo '请输入 16 到 4096 之间的整数（单位 MiB）。' ;;
+    journal_days)
+      if [[ "$2" =~ ^[0-9]{1,4}$ ]] && ((10#$2 >= 1 && 10#$2 <= 3650)); then return 0; fi
+      echo '请输入 1 到 3650 之间的整数（天）。' ;;
+    conntrack_max)
+      if [[ "$2" =~ ^[0-9]{1,7}$ ]] && ((10#$2 >= 16384 && 10#$2 <= 4194304)); then return 0; fi
+      echo '请输入 16384 到 4194304 之间的整数（条）。' ;;
+    conntrack_hours)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 2 && 10#$2 <= 720)); then return 0; fi
+      echo '请输入 2 到 720 之间的整数（小时）。' ;;
+    ssh_keepalive_seconds)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 15 && 10#$2 <= 600)); then return 0; fi
+      echo '请输入 15 到 600 之间的整数（秒）。' ;;
+    apt_upgrade_time)
+      if [[ "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then return 0; fi
+      echo '请输入 24 小时制的时间，例如 03:30。' ;;
+    tools_list)
+      local pkg n=0
+      for pkg in $2; do
+        n=$((n + 1))
+        [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]{1,62}$ ]] || { echo "软件包名不对：$pkg"; return 1; }
+      done
+      if ((n >= 1 && n <= 30)); then return 0; fi
+      echo '请输入 1 到 30 个软件包名，用空格隔开。' ;;
     *) echo "没有这个参数：$1" ;;
   esac
   return 1
@@ -1973,6 +2085,18 @@ param_caution() {
       elif ((10#$2 < 20)); then echo '这么小的 ZRAM 应急作用有限。'; fi ;;
     swap_mib)
       if ((10#$2 > ${MEM_MIB:-0} * 2)); then echo '比内存大一倍以上：硬盘 Swap 很慢，太大只会让机器在内存不够时卡很久，而不是及时报错。'; fi ;;
+    journal_max_mb)
+      if ((10#$2 * 50 > ${ROOT_GIB:-0} * 1024)); then echo "超过系统盘（${ROOT_GIB:-?} GiB）的 2%：日志会占掉不少空间。"; fi ;;
+    journal_days)
+      if ((10#$2 < 7)); then echo '不到一周：出了问题回头查的时候，当时的日志可能已经删了。'; fi ;;
+    conntrack_max)
+      if ((10#$2 * 320 > ${MEM_MIB:-0} * 1048576 / 16)); then echo "满载时约 $((10#$2 * 320 / 1048576)) MiB，超过内存的十六分之一：连接很多时会挤占内存。"; fi ;;
+    conntrack_hours)
+      if ((10#$2 < 6)); then echo '和 TCP 保活的 2 小时差不多：长时间不动的连接（例如挂着的 SSH）可能被当成已断开。'; fi ;;
+    ssh_keepalive_seconds)
+      if ((10#$2 > 300)); then echo '超过 5 分钟：有些路由器会先把空闲连接丢掉，连接还是可能卡死。'; fi ;;
+    tools_list)
+      if [[ " $2 " != *' tmux '* ]]; then echo '去掉了 tmux：一键开荒防断线要用它，开荒时仍会单独问你装不装。'; fi ;;
   esac
 }
 
@@ -2046,6 +2170,7 @@ param_adjust() {
     param_reason "$name"
     while :; do
       read -r -p '新的值（直接回车不改，输入 auto 用推荐值）: ' answer || return 0
+      answer="$(tr -s ' \t' ' ' <<< "$answer")" answer="${answer# }" answer="${answer% }"
       if [[ -z "$answer" ]]; then break; fi
       if [[ "$answer" == auto ]]; then param_store "$name" '' || die '无法保存参数。'; changed=1; break; fi
       if ! note="$(param_check "$name" "$answer")"; then echo "$note"; continue; fi
@@ -2176,6 +2301,180 @@ params_main() {
 # Only the maxima grow, never shrink: buffers are still allocated on demand and
 # the kernel's total TCP memory limit (tcp_mem) is left alone, so idle
 # connections cost nothing more. A key set in any other file keeps its value.
+# MODULE ID FILE RUNTIME [KEY=VALUE...]: this tool's sysctl FILE with these
+# values. A key set in another file stays; the running value before the first
+# write is recorded in RUNTIME for the rollback. This tool's own file is
+# written again when the values change, and what it no longer sets goes back
+# to its value from before (all of it when nothing is left). Fails, with the
+# result recorded, when FILE is not this tool's or cannot be applied.
+sysctl_owned_apply() {
+  local module="$1" id="$2" file="$3" runtime="$4" pair key value current text='' old='' ours=0 content
+  local -a originals=() kept=()
+  shift 4
+  if [[ -e "$file" || -L "$file" ]]; then
+    if ! restore_file_ours "$id"; then
+      warn "$file 已经存在，不是本工具上次写入的内容，保持不变。"; module_result "$module" preserved 'file differs'; return 1
+    fi
+    ours=1 old="$(cat -- "$file")"
+  fi
+  for pair in "$@"; do
+    key="${pair%%=*}" value="${pair#*=}"
+    if ((ours == 0)) || ! current="$(restore_sysctl_original "$key" "$runtime")"; then
+      current="$(sysctl -n "$key" 2>/dev/null || true)"
+    fi
+    [[ "$current" =~ ^-?[0-9]+$ ]] || continue
+    if sysctl_key_configured "$key" "$file"; then kept+=("$key"); continue; fi
+    text+="$key = $value"$'\n'
+    originals+=("$key=$current")
+  done
+  if ((${#kept[@]})); then ok "已有其他配置的参数保持不变：${kept[*]}"; fi
+  content="# VPS Stable Optimizer v2.8: $module"$'\n'"${text%$'\n'}"
+  if ((ours)) && [[ "$old" == "$content" ]]; then
+    sysctl -e -p "$file" >/dev/null && return 0
+    warn '参数没有生效，请查看日志。'; module_result "$module" failed 'sysctl -p failed'; return 1
+  fi
+  if ((ours)); then
+    rm -f -- "$file"
+    while IFS= read -r key; do
+      [[ -n "$key" && "$text" != *"$key = "* ]] || continue
+      if current="$(restore_sysctl_original "$key" "$runtime")"; then
+        sysctl -w "$key=$current" >/dev/null 2>&1 || warn "无法把 $key 恢复成原来的 $current；重启后会恢复。"
+      fi
+    done < <(awk '/ = / {print $1}' <<< "$old")
+  fi
+  [[ -n "$text" ]] || return 0
+  if ! put_file "$file" "$content"; then module_result "$module" preserved 'sysctl file conflict'; return 1; fi
+  for pair in "${originals[@]}"; do
+    restore_record_sysctl "${pair%%=*}" "${pair#*=}" "$runtime" || warn "无法记录 ${pair%%=*} 的原值；回退后要重启才会恢复默认。"
+  done
+  if ! sysctl -e -p "$file" >/dev/null; then warn '参数没有生效，请查看日志。'; module_result "$module" failed 'sysctl -p failed'; return 1; fi
+}
+
+# SSH keepalive: the server checks an idle session every N seconds and drops
+# it after 3 answers missing. Only this tool's file; sshd checks it first.
+keepalive_stage() {
+  say 'SSH 保活'
+  local seconds content current
+  if [[ "${KEEPALIVE_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改 SSH 保活。'; module_result keepalive declined 'not requested'; return 0; fi
+  seconds="$(param_value ssh_keepalive_seconds)"
+  content="# VPS Stable Optimizer v2.8: SSH keepalive"$'\n'"ClientAliveInterval $seconds"$'\n'"ClientAliveCountMax 3"
+  if [[ -e "$KEEPALIVE_FILE" || -L "$KEEPALIVE_FILE" ]]; then
+    if [[ "$(cat -- "$KEEPALIVE_FILE" 2>/dev/null || true)" != "$content" ]]; then
+      restore_file_ours keepalive_file || { warn "$KEEPALIVE_FILE 不是本工具写的，保持不变。"; module_result keepalive preserved 'file differs'; return 0; }
+      rm -f -- "$KEEPALIVE_FILE"
+    fi
+  fi
+  sshd_runtime_dir
+  current="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"
+  # Set elsewhere: not by this tool's own SSH hardening of earlier versions.
+  if [[ ! -e "$KEEPALIVE_FILE" && -n "$current" && "$current" != 0 ]] &&
+     grep -REiq --exclude="${SSH_DROPIN##*/}" '^[[:space:]]*ClientAliveInterval' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null; then
+    ok "SSH 已经有保活设置（每 $current 秒），保持不变。"; module_result keepalive preserved "ClientAliveInterval $current"; return 0
+  fi
+  put_file "$KEEPALIVE_FILE" "$content" || { module_result keepalive preserved 'drop-in path conflict'; return 0; }
+  # Never a configuration sshd refuses: tested first, taken back if it fails.
+  if ! sshd -t; then
+    rm -f -- "$KEEPALIVE_FILE"; warn 'SSH 配置检查没通过，保活设置已撤回，SSH 保持原样。'; module_result keepalive failed 'sshd -t failed'; return 0
+  fi
+  ssh_reload || warn 'SSH 服务没能重新加载：新连接要等 SSH 重启后才有保活。'
+  current="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"
+  if [[ "$current" == "$seconds" ]]; then ok "SSH 保活：每 $seconds 秒检测一次空闲连接（新连接生效）。"; module_result keepalive applied "$seconds s"
+  else warn "SSH 实际生效的保活间隔是 ${current:-0} 秒（别的配置先设置了它）。"; module_result keepalive preserved "ClientAliveInterval ${current:-0}"; fi
+}
+
+# A host that has public IPv6 but cannot reach the distribution's mirror over
+# it, while IPv4 works: programs that try IPv6 first then hang for a while.
+ipv6_broken() {
+  local host addr6 addr4
+  host_has_global_ipv6 || return 1
+  if [[ "$OS" == ubuntu ]]; then host=archive.ubuntu.com; else host=deb.debian.org; fi
+  addr6="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR == 1 {print $1}')"
+  addr4="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 {print $1}')"
+  [[ -n "$addr6" && -n "$addr4" ]] || return 1
+  if timeout 5 bash -c "exec 3<>/dev/tcp/$addr6/80" 2>/dev/null; then return 1; fi
+  timeout 5 bash -c "exec 3<>/dev/tcp/$addr4/80" 2>/dev/null
+}
+
+# Prefers IPv4 in getaddrinfo (/etc/gai.conf; glibc programs only, IPv6 stays
+# on). A precedence policy set by someone else is kept.
+ipv4_stage() {
+  say '优先使用 IPv4'
+  local line='precedence ::ffff:0:0/96  100'
+  if [[ "${IPV4_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改地址优先顺序。'; module_result ipv4 declined 'not requested'; return 0; fi
+  if [[ -f "$GAI_FILE" ]] && grep -Eq '^[[:space:]]*precedence[[:space:]]' "$GAI_FILE"; then
+    if grep -Fxq "$line" "$GAI_FILE"; then ok '已经优先使用 IPv4。'; module_result ipv4 present 'precedence set'
+    else ok "$GAI_FILE 里已有别的地址优先设置，保持不变。"; module_result ipv4 preserved 'own precedence policy'; fi
+    return 0
+  fi
+  if [[ -L "$GAI_FILE" ]]; then warn "$GAI_FILE 是链接，保持不变。"; module_result ipv4 preserved 'gai.conf is a link'; return 0; fi
+  backup_config_path "$GAI_FILE" || die "无法备份 $GAI_FILE"
+  if [[ ! -e "$GAI_FILE" ]]; then
+    put_file "$GAI_FILE" "# VPS Stable Optimizer v2.8: prefer IPv4 (IPv6 stays on)"$'\n'"$line" || { module_result ipv4 preserved 'gai.conf conflict'; return 0; }
+  elif ! append_line_safely "$GAI_FILE" '# VPS Stable Optimizer v2.8: prefer IPv4 (IPv6 stays on)' || ! append_line_safely "$GAI_FILE" "$line"; then
+    warn "没能写入 $GAI_FILE。"; module_result ipv4 failed 'gai.conf not written'; return 0
+  fi
+  record_config_change "$GAI_FILE" line-appended || die '无法记录这次配置变更。'
+  ok '已改成优先使用 IPv4（IPv6 照常可用）。xray、sing-box 这类用 Go 写的程序不读这个设置，要在它们自己的配置里指定。'
+  module_result ipv4 applied 'precedence set'
+}
+
+# The daily security upgrade at the time asked for (a timer drop-in), or the
+# distribution's own time (no drop-in).
+apt_time_apply() {
+  local time content
+  time="$(param_value apt_upgrade_time)"
+  content="# VPS Stable Optimizer v2.8: time of the daily security upgrade"$'\n'"[Timer]"$'\n'"OnCalendar="$'\n'"OnCalendar=*-*-* $time:00"$'\n'"RandomizedDelaySec=15m"
+  if [[ -e "$APT_TIME_FILE" && "$(cat -- "$APT_TIME_FILE" 2>/dev/null || true)" != "$content" ]]; then
+    restore_file_ours apt_time_file || { warn "$APT_TIME_FILE 不是本工具写的，更新时间保持不变。"; return 0; }
+    rm -f -- "$APT_TIME_FILE"
+  fi
+  if [[ "$time" == "$(param_recommended apt_upgrade_time)" ]] && ! param_read apt_upgrade_time > /dev/null; then
+    ok '每天自动安全更新的时间：系统默认（06:00 左右）。'
+  elif put_file "$APT_TIME_FILE" "$content"; then
+    ok "每天自动安全更新改在 $time 左右（随机推迟最多 15 分钟）。"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if active apt-daily-upgrade.timer; then systemctl restart apt-daily-upgrade.timer >/dev/null 2>&1 || true; fi
+}
+
+# Connection tracking: every connection through the firewall has an entry; a
+# full table drops new connections. The limit is only ever raised (from the
+# value before this tool), the established timeout set when it differs, and
+# the table itself is never flushed.
+conntrack_stage() {
+  say '连接跟踪容量'
+  local max hours original
+  local -a pairs=()
+  if ! sysctl -n net.netfilter.nf_conntrack_max >/dev/null 2>&1; then
+    ok '现在没有用到连接跟踪（通常防火墙开着才会用到），不需要调整。'; module_result conntrack skipped 'nf_conntrack not loaded'; return 0
+  fi
+  max="$(param_value conntrack_max)" hours="$(param_value conntrack_hours)"
+  original="$(restore_sysctl_original net.netfilter.nf_conntrack_max conntrack_sysctl_runtime || sysctl -n net.netfilter.nf_conntrack_max)"
+  if ((max > original)); then pairs+=("net.netfilter.nf_conntrack_max=$max"); fi
+  original="$(restore_sysctl_original net.netfilter.nf_conntrack_tcp_timeout_established conntrack_sysctl_runtime ||
+    sysctl -n net.netfilter.nf_conntrack_tcp_timeout_established)"
+  if ((hours * 3600 != original)); then pairs+=("net.netfilter.nf_conntrack_tcp_timeout_established=$((hours * 3600))"); fi
+  sysctl_owned_apply conntrack conntrack_file "$CONNTRACK_FILE" conntrack_sysctl_runtime "${pairs[@]}" || return 0
+  if [[ ! -f "$CONNTRACK_FILE" ]]; then
+    if [[ -f "$CONNTRACK_MODULE_FILE" ]] && restore_file_ours conntrack_module; then rm -f -- "$CONNTRACK_MODULE_FILE"; fi
+    ok "上限 $max 条、保留 $hours 小时，都不比系统原来的大：不需要本工具的设置。"; module_result conntrack preserved 'system values already enough'; return 0
+  fi
+  # Loaded before systemd-sysctl at boot, or the values would never apply.
+  put_file "$CONNTRACK_MODULE_FILE" nf_conntrack || warn "没能写入 $CONNTRACK_MODULE_FILE：重启后这些值可能不生效。"
+  ok "连接跟踪：上限 $(sysctl -n net.netfilter.nf_conntrack_max) 条、已建立连接保留 $(($(sysctl -n net.netfilter.nf_conntrack_tcp_timeout_established) / 3600)) 小时。"
+  module_result conntrack applied "max $max, $hours h"
+}
+
+# Not answering ping, IPv4 and (where the kernel has it) IPv6.
+ping_stage() {
+  say '禁止 ping'
+  local -a pairs=(net.ipv4.icmp_echo_ignore_all=1)
+  if sysctl -n net.ipv6.icmp.echo_ignore_all >/dev/null 2>&1; then pairs+=(net.ipv6.icmp.echo_ignore_all=1); fi
+  sysctl_owned_apply ping ping_file "$PING_FILE" ping_sysctl_runtime "${pairs[@]}" || return 0
+  if [[ -f "$PING_FILE" ]]; then ok '已经不回应 ping 了。'; module_result ping applied 'echo ignored'
+  else ok '本来就不回应 ping，保持不变。'; module_result ping present 'echo ignored already'; fi
+}
+
 # The value KEY had before this tool first changed it, as recorded in FILE.
 restore_sysctl_original() {
   local file="$RESTORE_ROOT/${2:-sysctl_runtime}"
@@ -2184,8 +2483,8 @@ restore_sysctl_original() {
 }
 
 tcp_buffer_stage() {
-  step 7 'TCP 缓冲区上限（可选）'
-  local mib max key current text='' min def top content old='' ours=0
+  step 7 'TCP 缓冲区上限和调优（可选）'
+  local mib max key current text='' min def top content old='' ours=0 pair value
   local -a kept=() originals=()
   if [[ "${TCP_BUFFER_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改 TCP 缓冲区。'; module_result tcp declined 'not requested'; return 0; fi
   mib="$(param_value tcp_buffer_mib)"
@@ -2213,6 +2512,23 @@ tcp_buffer_stage() {
       ((top < max)) || continue
       text+="$key = $min $def $max"$'\n'; current="$min $def $top"
     fi
+    originals+=("$key=$current")
+  done
+  # A connection idle for a while keeps its speed (no slow start again), and
+  # MTU probing starts when large packets are lost without any ICMP reply.
+  # Both only ever go one way: an administrator's stricter value stays.
+  for pair in net.ipv4.tcp_slow_start_after_idle=0 net.ipv4.tcp_mtu_probing=1; do
+    key="${pair%%=*}" value="${pair#*=}"
+    if ((ours == 0)) || ! current="$(restore_sysctl_original "$key" tcp_sysctl_runtime)"; then
+      current="$(sysctl -n "$key" 2>/dev/null || true)"
+    fi
+    [[ "$current" =~ ^[0-9]+$ ]] || continue
+    if sysctl_key_configured "$key" "$TCP_BUFFER_FILE"; then kept+=("$key"); continue; fi
+    case "$key" in
+      *slow_start_after_idle) ((current != 0)) || continue ;;
+      *mtu_probing) ((current < 1)) || continue ;;
+    esac
+    text+="$key = $value"$'\n'
     originals+=("$key=$current")
   done
   if ((${#kept[@]})); then ok "已有其他配置的参数保持不变：${kept[*]}"; fi
@@ -2252,7 +2568,7 @@ tcp_buffer_stage() {
     restore_record_sysctl "${key%%=*}" "${key#*=}" tcp_sysctl_runtime || warn "无法记录 ${key%%=*} 的原值；回退后要重启才会恢复默认。"
   done
   if sysctl -e -p "$TCP_BUFFER_FILE" >/dev/null; then
-    ok "TCP 缓冲区上限：$mib MiB（$(param_mode tcp_buffer_mib)，内存 ${MEM_MIB} MiB）。"; module_result tcp applied "$mib MiB"
+    ok "TCP 调优已生效：缓冲区上限 $mib MiB（$(param_mode tcp_buffer_mib)，内存 ${MEM_MIB} MiB）$(if [[ "$text" == *slow_start_after_idle* ]]; then echo '，空闲后不重新慢启动'; fi)$(if [[ "$text" == *mtu_probing* ]]; then echo '，自动探测被丢的大包'; fi)。"; module_result tcp applied "$mib MiB"
   else warn 'TCP 缓冲区参数没有生效，请查看日志。'; module_result tcp failed 'sysctl -p failed'; fi
 }
 
@@ -3103,8 +3419,8 @@ ssh_dropin_text() {
     'PasswordAuthentication no' 'KbdInteractiveAuthentication no'
   if [[ "${1:-0}" == 1 ]]; then printf '%s\n' 'PermitRootLogin no'; fi
   # MaxAuthTries 4 leaves room for a few ssh-agent keys before the right one.
-  printf '%s\n' 'MaxAuthTries 4' 'LoginGraceTime 30' 'X11Forwarding no' \
-    'ClientAliveInterval 300' 'ClientAliveCountMax 2'
+  # Idle connections are the SSH keepalive item's (its own drop-in).
+  printf '%s\n' 'MaxAuthTries 4' 'LoginGraceTime 30' 'X11Forwarding no'
 }
 
 ssh_pubkey_valid() {
@@ -4212,7 +4528,8 @@ backup_configs() {
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
       /etc/sysctl.conf /etc/systemd/journald.conf /etc/default/zramswap \
       /etc/apt/apt.conf /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/sources.list /etc/fail2ban/jail.conf /etc/fail2ban/jail.local \
-      /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE" "$SWAP_UNIT_FILE"; do
+      /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE" "$SWAP_UNIT_FILE" "$CONNTRACK_FILE" "$CONNTRACK_MODULE_FILE" "$PING_FILE" \
+      "$KEEPALIVE_FILE" "$GAI_FILE" "$APT_TIME_FILE"; do
     backup_config_path "$file"
   done
   backup_config_group /etc/ssh/sshd_config.d '*.conf'
@@ -4349,7 +4666,7 @@ record_config_change() {
 # would suppress errexit inside that function; a separate /bin/bash avoids it.
 menu_action() {
   local self="$1" action="$2" code
-  case "$action" in plan|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
+  case "$action" in plan|perf|resources|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
   # The new interpreter keeps its own errexit even inside the parent's if.
   if /bin/bash -- "$self" "$action"; then
     echo '本项已结束；请查看上方结果、跳过项和注意事项。'
@@ -4362,6 +4679,100 @@ menu_action() {
     else
       printf '本项已停止（退出码 %s）；请先查看错误和记录，再决定是否重试。\n' "$code" >&2
     fi
+  fi
+}
+
+# Read-only performance check: a 3-second sample of the CPU (stolen by the
+# host, waiting for the disk), the pressure the kernel reports, memory and
+# paging, TCP retransmissions, connection tracking and the system disk.
+perf_main() {
+  local -a a=() b=()
+  local total steal iowait pin pout pin2 pout2 cores load line some retrans out pct avail
+  say '性能体检（只读，约 3 秒）'
+  VERIFY_PASS=0 VERIFY_FAIL=0 VERIFY_NA=0 VERIFY_UNKNOWN=0 VERIFY_NOTICE=0 VERIFY_ISSUES=()
+  read -r -a a < <(awk '$1 == "cpu"' /proc/stat)
+  pin="$(awk '$1 == "pswpin" {print $2}' /proc/vmstat)" pout="$(awk '$1 == "pswpout" {print $2}' /proc/vmstat)"
+  sleep 3
+  read -r -a b < <(awk '$1 == "cpu"' /proc/stat)
+  pin2="$(awk '$1 == "pswpin" {print $2}' /proc/vmstat)" pout2="$(awk '$1 == "pswpout" {print $2}' /proc/vmstat)"
+  total=0
+  for ((line = 1; line <= 8 && line < ${#b[@]}; line++)); do total=$((total + b[line] - a[line])); done
+  ((total > 0)) || total=1
+  steal=$(((b[8] - a[8]) * 100 / total)) iowait=$(((b[5] - a[5]) * 100 / total))
+  if ((steal >= 5)); then verify_line notice 'CPU 被抢' "${steal}%：同一台宿主机上的别的机器在抢 CPU（超卖），程序会时快时慢；长期这样可以找服务商"
+  else verify_line healthy 'CPU 被抢' "${steal}%"; fi
+  if ((iowait >= 20)); then verify_line notice '等硬盘' "${iowait}%：CPU 有很多时间在等硬盘读写，硬盘慢或者正在大量读写"
+  else verify_line healthy '等硬盘' "${iowait}%"; fi
+  cores="$(nproc 2>/dev/null || echo 1)" load="$(awk '{print $1}' /proc/loadavg)"
+  if awk -v l="$load" -v c="$cores" 'BEGIN {exit !(l > c * 1.5)}'; then verify_line notice '负载' "最近 1 分钟 $load（$cores 核）：要处理的任务比 CPU 多不少"
+  else verify_line healthy '负载' "最近 1 分钟 $load（$cores 核）"; fi
+  for line in cpu memory io; do
+    some="$(awk '$1 == "some" {sub(/avg60=/, "", $3); print $3}' "/proc/pressure/$line" 2>/dev/null || true)"
+    [[ -n "$some" ]] || continue
+    if awk -v s="$some" 'BEGIN {exit !(s >= 10)}'; then verify_line notice "压力（$line）" "过去 1 分钟有 ${some}% 的时间有任务在等 $line：这一项是瓶颈"
+    else verify_line healthy "压力（$line）" "${some}%"; fi
+  done
+  avail="$(awk '$1 == "MemAvailable:" {a = $2} $1 == "MemTotal:" {t = $2} END {printf "%d", a * 100 / t}' /proc/meminfo)"
+  if ((avail < 10)); then verify_line notice '可用内存' "只剩 ${avail}%：再多一点就可能有进程被杀"
+  else verify_line healthy '可用内存' "${avail}%"; fi
+  if [[ "$pin" =~ ^[0-9]+$ && "$pin2" =~ ^[0-9]+$ ]]; then
+    line=$(((pin2 - pin + pout2 - pout) / 3))
+    if ((line >= 100)); then verify_line notice '换页' "每秒约 $line 页：内存不够，正在频繁用 Swap，会明显变慢"
+    else verify_line healthy '换页' "每秒约 $line 页"; fi
+  fi
+  read -r retrans out < <(awk '$1 == "Tcp:" && $2 ~ /^[0-9]+$/ {print $13, $12}' /proc/net/snmp 2>/dev/null) || true
+  if [[ "$retrans" =~ ^[0-9]+$ && "$out" =~ ^[1-9][0-9]*$ ]]; then
+    pct=$((retrans * 1000 / out))
+    if ((pct >= 20)); then verify_line notice 'TCP 重传' "开机以来 $((pct / 10)).$((pct % 10))% 的包要重发：线路丢包比较多"
+    else verify_line healthy 'TCP 重传' "开机以来 $((pct / 10)).$((pct % 10))%"; fi
+  fi
+  verify_conntrack_usage
+  read -r pct line < <(df -P / 2>/dev/null | awk 'NR == 2 {sub(/%/, "", $5); print $5, $4}') || true
+  if [[ "$pct" =~ ^[0-9]+$ ]] && ((pct >= 90)); then verify_line notice '系统盘' "用了 ${pct}%：快满了，满了会出各种奇怪的错误"
+  elif [[ "$pct" =~ ^[0-9]+$ ]]; then verify_line healthy '系统盘' "用了 ${pct}%"; fi
+  pct="$(df -Pi / 2>/dev/null | awk 'NR == 2 {sub(/%/, "", $5); print $5}' || true)"
+  if [[ "$pct" =~ ^[0-9]+$ ]] && ((pct >= 90)); then verify_line notice '系统盘文件数（inode）' "用了 ${pct}%：小文件太多，满了就写不了新文件"; fi
+  echo
+  if ((${#VERIFY_ISSUES[@]})); then printf '有 %s 项要留意（见上面的 %s）。这是这 3 秒和开机以来的情况，偶尔一次不代表有问题。\n' "${#VERIFY_ISSUES[@]}" "${SYM_WARN-⚠}"
+  else printf '%s%s 都正常。%s这是这 3 秒和开机以来的情况。\n' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}"; fi
+}
+
+# KEY UNIT LABEL CAN: one resident service: its memory and CPU time (from its
+# cgroup), and whether it can be turned off and what that costs.
+resources_line() {
+  local unit="$2" mem cpu state
+  state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+  [[ "$state" == active ]] || return 0
+  mem="$(systemctl show -p MemoryCurrent --value "$unit" 2>/dev/null || true)"
+  cpu="$(systemctl show -p CPUUsageNSec --value "$unit" 2>/dev/null || true)"
+  if [[ "$mem" =~ ^[0-9]+$ ]]; then mem="$((mem / 1048576)) MiB"; else mem='未知'; fi
+  if [[ "$cpu" =~ ^[0-9]+$ ]]; then cpu="$((cpu / 1000000000)) 秒"; else cpu='未知'; fi
+  printf '  %s%s%s：内存 %s，开机以来 CPU %s。%s\n' "${C_BOLD-}" "$3" "${C_RESET-}" "$mem" "$cpu" "$4"
+}
+
+# Read-only: what keeps running, what it costs, what turning it off loses.
+resources_main() {
+  local rules size
+  say '资源占用一览（只读）'
+  echo '常驻的服务（只列在运行的）：'
+  resources_line ssh ssh.service 'SSH' '不能关：远程登录靠它。'
+  resources_line ssh sshd.service 'SSH' '不能关：远程登录靠它。'
+  resources_line fail2ban fail2ban.service 'Fail2ban' '可以关（单项设置 16）：关了就没有防爆破，扫描请求照样打过来，日志会多一些。'
+  resources_line vnstat vnstat.service 'vnStat' '可以关（单项设置 13）：关了就没有流量统计。'
+  resources_line updates unattended-upgrades.service '自动安全更新' '常驻部分只是关机时收尾用的；真正升级时（每天一次）才多占内存。可以关（单项设置 2）。'
+  resources_line ntp systemd-timesyncd.service '时间同步' '很小，建议保留：时间不准会让证书校验和日志出错。'
+  resources_line ntp chrony.service '时间同步（chrony）' '建议保留：时间不准会让证书校验和日志出错。'
+  resources_line journal systemd-journald.service '系统日志' '不能关：系统和程序的日志都靠它；大小有上限。'
+  resources_line docker docker.service 'Docker' '你自己装的服务。'
+  echo '内核里的功能（BBR、内核参数、TCP 调优、防火墙）几乎不占内存，也不常驻进程。'
+  if [[ -r /sys/block/zram0/mm_stat ]] && size="$(awk '{printf "%d %d", $1 / 1048576, $3 / 1048576}' /sys/block/zram0/mm_stat)" && [[ -n "$size" ]]; then
+    printf 'ZRAM：存了 %s MiB 的数据，实际占内存 %s MiB（压缩后）。\n' "${size% *}" "${size#* }"
+  fi
+  if command -v ufw >/dev/null; then
+    rules="$(ufw show added 2>/dev/null | grep -cE '^ufw (prepend |insert [0-9]+ )?deny ' || true)"
+    if ((rules > 300)); then
+      printf '%s%s Fail2ban 的封禁规则有 %s 条：每次封禁、解封都要让 UFW 重新加载规则，攻击很多时会占不少 CPU。可以缩短封禁时间，或者让来源 IP 多的服务只对需要的人开放。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$rules" "${C_RESET-}"
+    else printf '防火墙里的封禁规则：%s 条。\n' "$rules"; fi
   fi
 }
 
@@ -4496,7 +4907,9 @@ menu() {
     if ! read -r -p $'\n请输入选项 [0-14 或 h]: ' choice; then printf '\n'; return 0; fi
     case "$choice" in
       0) return 0 ;;
-      1) action=plan ;;
+      1)
+        read -r -p '1) 开荒前体检（只检查）   2) 性能体检   3) 资源占用一览   回车返回: ' choice || choice=''
+        case "$choice" in 1) action=plan ;; 2) action=perf ;; 3) action=resources ;; *) continue ;; esac ;;
       2) action=setup ;;
       3) action=check ;;
       4) action=port ;;
@@ -4604,7 +5017,12 @@ decision_journal_state() {
       printf '%s\n' custom; return 0
     fi
   done
-  own_state="$(decision_file_state "$JOURNAL_FILE" $'[Journal]\nSystemMaxUse=100M\nRuntimeMaxUse=50M\nMaxRetentionSec=14day')"
+  own_state="$(decision_file_state "$JOURNAL_FILE" "$(journal_config_text)")"
+  # The 14-day file of versions before 2.8.0 is this tool's too (the setup
+  # brings it to the current parameters).
+  if [[ "$own_state" == conflict && "$(decision_file_state "$JOURNAL_FILE" $'[Journal]\nSystemMaxUse=100M\nRuntimeMaxUse=50M\nMaxRetentionSec=14day')" == match ]]; then
+    own_state=match
+  fi
   printf '%s\n' "$own_state"
 }
 
@@ -4707,7 +5125,7 @@ decision_report() {
       match) decision_line '保留现状' '日志空间' '本工具的日志容量和保留时间限制已经存在。' ;;
       conflict) decision_line '保留现状' '日志空间' '目标日志配置已有不同内容，不会覆盖。' ;;
       unknown) decision_line '需要先处理' '日志空间' '已有日志配置无法读取，计划未确认，需人工检查。' ;;
-      *) decision_line '准备调整' '日志空间' '系统盘不大于 20GiB，计划限制日志：持久日志 100MiB、临时日志 50MiB、保留 14 天。' ;;
+      *) decision_line '准备调整' '日志空间' "系统盘不大于 20GiB，计划限制日志：持久日志 $(param_value journal_max_mb)MiB、保留 $(param_value journal_days) 天。" ;;
     esac
   fi
 
@@ -4997,10 +5415,14 @@ restore_ids() {
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     swap) printf '%s\n' swap_unit swap_file zram_sysctl_file ;;
+    conntrack) printf '%s\n' conntrack_file conntrack_module ;;
+    ping) printf '%s\n' ping_file ;;
+    keepalive) printf '%s\n' keepalive_file ;;
+    ipv4) printf '%s\n' gai_file ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     journal) printf '%s\n' journal_file ;;
     trim) printf '%s\n' svc_trim ;;
-    updates) printf '%s\n' apt_file svc_apt_daily svc_apt_upgrade ;;
+    updates) printf '%s\n' apt_file apt_time_file svc_apt_daily svc_apt_upgrade ;;
     autoreboot) printf '%s\n' apt_reboot_file ;;
     timezone) printf '%s\n' tz ;;
     sysctl) printf '%s\n' sysctl_file ;;
@@ -5015,7 +5437,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action svc_fail2ban
 }
 
 restore_label() {
@@ -5024,6 +5446,8 @@ restore_label() {
     cc) echo 'TCP 拥塞算法' ;; qdisc) echo '默认队列算法' ;;
     zram_file) echo 'ZRAM 配置' ;; zram_swap) echo 'ZRAM 交换空间' ;; zram_sysctl_file) echo 'ZRAM 配套内存参数' ;;
     swap_unit) echo '硬盘 Swap 的启动配置' ;; swap_file) echo '硬盘 Swap 文件' ;;
+    conntrack_file) echo '连接跟踪参数' ;; conntrack_module) echo '连接跟踪模块的开机加载' ;; ping_file) echo '禁止 ping 的参数' ;;
+    keepalive_file) echo 'SSH 保活配置' ;; gai_file) echo '地址优先顺序（/etc/gai.conf）' ;; apt_time_file) echo '每天自动更新的时间' ;;
     journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
@@ -5056,6 +5480,10 @@ restore_path() {
     hosts_file) echo /etc/hosts ;;
     cloud_hostname_file) printf '%s\n' "$CLOUD_HOSTNAME_FILE" ;;
     swap_unit) printf '%s\n' "$SWAP_UNIT_FILE" ;;
+    conntrack_file) printf '%s\n' "$CONNTRACK_FILE" ;; conntrack_module) printf '%s\n' "$CONNTRACK_MODULE_FILE" ;;
+    ping_file) printf '%s\n' "$PING_FILE" ;;
+    keepalive_file) printf '%s\n' "$KEEPALIVE_FILE" ;; gai_file) printf '%s\n' "$GAI_FILE" ;;
+    apt_time_file) printf '%s\n' "$APT_TIME_FILE" ;;
     *) return 1 ;;
   esac
 }
@@ -5964,13 +6392,15 @@ restore_packages_record() {
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
 restore_groups() {
-  printf '%s\n' fail2ban firewall ssh zram swap bbr sysctl tcp journal updates autoreboot ntp trim timezone hostname hosts
+  printf '%s\n' fail2ban firewall ssh keepalive zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
 }
 
 restore_group_label() {
   case "$1" in
     firewall) echo '防火墙（本工具加的规则、默认策略、开关）' ;; fail2ban) echo 'Fail2ban 防爆破' ;;
     ssh) echo 'SSH 登录加固（恢复密码和 root 登录）' ;; zram) echo 'ZRAM 内存缓冲' ;; swap) echo '硬盘 Swap' ;;
+    conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;;
+    keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; tcp) echo 'TCP 缓冲区上限' ;;
     journal) echo '日志空间限制' ;;
     updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
@@ -5987,11 +6417,15 @@ restore_group_ids() {
     ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     swap) printf '%s\n' swap_unit swap_file ;;
+    conntrack) printf '%s\n' conntrack_file conntrack_module ;;
+    ping) printf '%s\n' ping_file ;;
+    keepalive) printf '%s\n' keepalive_file ;;
+    ipv4) printf '%s\n' gai_file ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
     tcp) printf '%s\n' tcp_file ;;
     journal) printf '%s\n' journal_file ;;
-    updates) printf '%s\n' apt_auto_file apt_file svc_apt_daily svc_apt_upgrade ;;
+    updates) printf '%s\n' apt_auto_file apt_file apt_time_file svc_apt_daily svc_apt_upgrade ;;
     autoreboot) printf '%s\n' apt_reboot_file ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     trim) printf '%s\n' svc_trim ;;
@@ -6014,6 +6448,8 @@ restore_group_pending() {
     firewall) [[ -s "$RESTORE_ROOT/fw_rules" ]] && return 0 ;;
     sysctl) [[ -s "$RESTORE_ROOT/sysctl_runtime" ]] && return 0 ;;
     tcp) [[ -s "$RESTORE_ROOT/tcp_sysctl_runtime" ]] && return 0 ;;
+    conntrack) [[ -s "$RESTORE_ROOT/conntrack_sysctl_runtime" ]] && return 0 ;;
+    ping) [[ -s "$RESTORE_ROOT/ping_sysctl_runtime" ]] && return 0 ;;
     zram) [[ -s "$RESTORE_ROOT/zram_sysctl_runtime" ]] && return 0 ;;
     hostname) [[ -s "$RESTORE_ROOT/hostname_hosts_line" ]] && return 0 ;;
   esac
@@ -6037,6 +6473,19 @@ restore_group_apply() {
     tcp)
       restore_resource tcp_file
       if [[ "$(restore_read tcp_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime tcp_sysctl_runtime; fi ;;
+    conntrack)
+      restore_resource conntrack_file
+      restore_resource conntrack_module
+      if [[ "$(restore_read conntrack_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime conntrack_sysctl_runtime; fi ;;
+    keepalive)
+      restore_resource keepalive_file
+      ssh_reload || warn 'SSH 服务没能重新加载：新连接要等 SSH 重启后才恢复原来的保活设置。' ;;
+    updates)
+      while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids updates)
+      systemctl daemon-reload >/dev/null 2>&1 || true ;;
+    ping)
+      restore_resource ping_file
+      if [[ "$(restore_read ping_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime ping_sysctl_runtime; fi ;;
     journal)
       # "applied" while already at the original: an earlier journald restart failed.
       pending=0
@@ -6263,6 +6712,51 @@ verify_ssh_connection_cc() {
   ss -tinH state established "( sport = :$lport and dport = :$rport )" 2>/dev/null | grep -qw bbr
 }
 
+check_keepalive() {
+  local current
+  sshd_runtime_dir
+  current="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"
+  if [[ "$current" == "${1% s}" ]]; then verify_set pass "每 $current 秒检测一次空闲连接"
+  elif [[ -z "$current" ]]; then verify_set unknown '读不到 sshd 实际生效的配置'
+  else verify_set fail "生效的保活间隔是 ${current} 秒，不是 ${1% s} 秒"; fi
+}
+
+check_ipv4() {
+  local first
+  if ! grep -Fxq 'precedence ::ffff:0:0/96  100' "$GAI_FILE" 2>/dev/null; then verify_set fail "$GAI_FILE 里没有优先 IPv4 的设置了"; return 0; fi
+  if [[ "$OS" == ubuntu ]]; then first=archive.ubuntu.com; else first=deb.debian.org; fi
+  first="$(getent ahosts "$first" 2>/dev/null | awk 'NR == 1 {print $1}')"
+  if [[ "$first" == *:* ]]; then verify_set fail "设置在，但解析结果仍是 IPv6 在前（$first）"
+  else verify_set pass "解析时 IPv4 排在前面${first:+（例如 $first）}"; fi
+}
+
+check_conntrack() {
+  local line bad=''
+  [[ -f "$CONNTRACK_FILE" ]] || { verify_set fail "配置文件不在了：$CONNTRACK_FILE"; return 0; }
+  while IFS= read -r line; do
+    case "$line" in 'bad '*|'missing '*) bad+=" ${line#* }" ;; esac
+  done < <(sysctl_file_mismatch "$CONNTRACK_FILE")
+  if [[ -n "$bad" ]]; then verify_set fail "这些参数的当前值和配置不一致（开机时连接跟踪模块可能加载晚了）：${bad# }"
+  else verify_set pass "上限 $(sysctl -n net.netfilter.nf_conntrack_max) 条、已建立连接保留 $(($(sysctl -n net.netfilter.nf_conntrack_tcp_timeout_established) / 3600)) 小时"; fi
+}
+
+check_ping() {
+  if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" == 1 ]]; then verify_set pass '不回应 ping'
+  else verify_set fail '又在回应 ping 了（net.ipv4.icmp_echo_ignore_all 不是 1）'; fi
+}
+
+# How full the connection tracking table is (a full one drops new connections).
+verify_conntrack_usage() {
+  local count max pct
+  count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || true)"
+  max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+  [[ "$count" =~ ^[0-9]+$ && "$max" =~ ^[1-9][0-9]*$ ]] || return 0
+  pct=$((count * 100 / max))
+  if ((pct >= 70)); then
+    verify_line notice '连接跟踪' "用了 ${pct}%（${count}/${max}）：满了以后新连接会被丢弃。可以在单项设置 → 连接跟踪容量 里加大上限，或缩短已建立连接的保留时间"
+  else verify_line healthy '连接跟踪' "用了 ${pct}%（${count}/${max}）"; fi
+}
+
 # SIZE: this tool's disk swap in use, at that size, started at boot.
 check_swap() {
   local size
@@ -6322,11 +6816,15 @@ check_ntp() {
 }
 
 check_journal() {
-  local value usage
+  local value days usage want want_days
   value="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk -F= '$1 == "SystemMaxUse" {v = $2} END {print v}' || true)"
+  days="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk -F= '$1 == "MaxRetentionSec" {v = $2} END {print v}' || true)"
   usage="$(journalctl --disk-usage 2>/dev/null | grep -Eo '[0-9]+(\.[0-9]+)?[KMGT]?B?' | head -n 1 || true)"
-  if [[ "$value" == 100M ]]; then verify_set pass "日志上限 100M 已生效，当前占用 ${usage:-未知}"
-  else verify_set fail "当前生效的日志上限是 ${value:-默认值}，不是 100M"; fi
+  want="$(param_value journal_max_mb)M" want_days="$(param_value journal_days)day"
+  if [[ "$value" != "$1" && "$value" != "${1#SystemMaxUse=}" ]]; then verify_set fail "当前生效的日志上限是 ${value:-默认值}，不是 ${1#SystemMaxUse=}"
+  elif [[ "${1#SystemMaxUse=}" != "$want" || "$days" != "$want_days" ]]; then
+    verify_set update "生效的是上限 ${value}、保留 ${days:-不限}，现在应是 ${want}、${want_days}：选 5 单项设置 → 日志空间限制 → 开启，就会更新"
+  else verify_set pass "日志上限 ${value}、保留 ${days} 已生效，当前占用 ${usage:-未知}"; fi
 }
 
 check_trim() {
@@ -6618,6 +7116,10 @@ verify_checks() {
   verify_module tcp 'TCP 缓冲区上限' check_tcp
   verify_module zram 'ZRAM 内存缓冲' check_zram
   verify_module swap '硬盘 Swap' check_swap
+  verify_module conntrack '连接跟踪容量' check_conntrack
+  verify_module ping '禁止 ping' check_ping
+  verify_module keepalive 'SSH 保活' check_keepalive
+  verify_module ipv4 '优先使用 IPv4' check_ipv4
   verify_module ntp '时间同步' check_ntp
   verify_module journal '日志限制' check_journal
   verify_module trim '磁盘 TRIM' check_trim
@@ -6632,6 +7134,7 @@ verify_checks() {
   verify_module firewall '防火墙' check_firewall
   verify_module fail2ban 'Fail2ban 防爆破' check_fail2ban
   if docker_present; then verify_line unknown 'Docker' '已安装：用 -p 发布的容器端口会绕过防火墙，请确认这些端口确实需要对外'; fi
+  verify_conntrack_usage
   verify_health
 }
 
@@ -7131,7 +7634,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap
+  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4
 }
 
 item_label() {
@@ -7139,7 +7642,8 @@ item_label() {
     upgrade) echo '系统升级（立即升级一次）' ;; updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; zram) echo 'ZRAM 内存缓冲' ;;
     journal) echo '日志空间限制' ;; trim) echo '定期 TRIM' ;; ntp) echo '时间同步' ;; timezone) echo '时区' ;;
-    hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; swap) echo '硬盘 Swap' ;; tools) echo '常用工具' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
+    hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; swap) echo '硬盘 Swap' ;; tools) echo '常用工具' ;;
+    conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;; keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
     tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
     *) printf '%s\n' "$1" ;;
@@ -7173,11 +7677,25 @@ item_status() {
       elif swapon --noheadings 2>/dev/null | grep -q .; then echo '已有其他 Swap'
       elif ! zram_module_available; then echo '内核不支持（没有 zram 模块）'
       else echo '未开启'; fi ;;
-    journal) if [[ -f "$JOURNAL_FILE" ]]; then echo '已限制（100M）'; else echo '默认设置'; fi ;;
+    journal)
+      if [[ -f "$JOURNAL_FILE" ]]; then
+        echo "已限制（$(awk -F= '$1 == "SystemMaxUse" {print $2}' "$JOURNAL_FILE" 2>/dev/null)，$(awk -F= '$1 == "MaxRetentionSec" {print $2}' "$JOURNAL_FILE" 2>/dev/null)）"
+      else echo '默认设置'; fi ;;
     trim) if ! trim_support; then echo '系统盘不支持'; elif systemctl is-enabled -q fstrim.timer 2>/dev/null; then echo '已开启'; else echo '未开启'; fi ;;
     ntp) if ntp_synced; then echo '已同步'; else echo '未同步'; fi ;;
     timezone) timedatectl show -p Timezone --value 2>/dev/null || echo '未知' ;;
     hosts) if hostname_resolves; then echo '正常'; else echo '无法解析'; fi ;;
+    conntrack)
+      value="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+      if [[ -z "$value" ]]; then echo '没用到（防火墙没开）'
+      elif [[ -f "$CONNTRACK_FILE" ]]; then echo "已调整（上限 $value 条，用了 $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo ?) 条）"
+      else echo "默认（上限 $value 条，用了 $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo ?) 条）"; fi ;;
+    ping) if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" == 1 ]]; then echo '不回应 ping'; else echo '回应 ping（默认）'; fi ;;
+    keepalive)
+      sshd_runtime_dir
+      value="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"
+      if [[ -n "$value" && "$value" != 0 ]]; then echo "每 $value 秒"; else echo '未开启'; fi ;;
+    ipv4) if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' "$GAI_FILE" 2>/dev/null; then echo '已优先 IPv4'; else echo '默认（IPv6 优先）'; fi ;;
     swap)
       value="$(awk -v n="$SWAP_FILE" 'NR > 1 && $1 == n {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
       if [[ -n "$value" ]]; then echo "已开启，${value} MiB"; else echo '未开启'; fi ;;
@@ -7270,6 +7788,19 @@ item_turn_on() {
       stage_run hosts hosts_stage ;;
     hostname) hostname_ask || return 0
       stage_run hostname hostname_stage ;;
+    conntrack) stage_run conntrack conntrack_stage ;;
+    keepalive) KEEPALIVE_CHOICE=1
+      stage_run keepalive keepalive_stage ;;
+    ipv4)
+      if ! ipv6_broken; then echo '这台机器的 IPv6 正常（或没有 IPv6）：一般不需要改，改了只是先试 IPv4。'; fi
+      echo 'xray、sing-box 这类用 Go 写的程序不读这个设置，要在它们自己的配置里指定。'
+      confirm_yes '改成优先使用 IPv4 吗？' || return 0
+      IPV4_CHOICE=1
+      stage_run ipv4 ipv4_stage ;;
+    ping)
+      echo '禁止 ping 只挡最基础的扫描（真正的攻击者不靠 ping 找机器）。代价：服务商或你自己用 ping 做的监控会把机器当成宕机，排查网络时也看不到 ping 的结果。'
+      confirm_yes '仍然禁止 ping 吗？' || return 0
+      stage_run ping ping_stage ;;
     swap)
       if swapon --noheadings 2>/dev/null | grep -v "^$SWAP_FILE " | grep . > /dev/null &&
          ! confirm_yes '已经有别的 Swap 或 ZRAM：通常不需要再加硬盘 Swap。仍然加一个吗？'; then return 0; fi
@@ -7640,6 +8171,8 @@ offer_reboot() {
 }
 
 main() {
+  # The tools list is a parameter (root only can read it; others get the default).
+  read -r -a TOOLS_PACKAGES <<< "$(param_value tools_list 2>/dev/null || echo "${TOOLS_PACKAGES[*]}")"
   case "$MODE" in
     menu) menu; return 0 ;;
     uninstall) tool_uninstall; return 0 ;;
@@ -7647,6 +8180,8 @@ main() {
     records) records_report; return 0 ;;
     check) verify_main; exit "$VERIFY_EXIT" ;;
     plan) plan; return 0 ;;
+    perf) perf_main; return 0 ;;
+    resources) resources_main; return 0 ;;
     port) port_main; return 0 ;;
     item) item_main; return 0 ;;
     params) params_main; return 0 ;;
@@ -7696,6 +8231,8 @@ main() {
     stage_run autoreboot auto_reboot_configure
     stage_run timezone timezone_stage
     stage_run hosts hosts_stage
+    stage_run keepalive keepalive_stage
+    stage_run ipv4 ipv4_stage
     attention_banner
     stage_run ssh ssh_harden_stage
     stage_run firewall firewall_stage

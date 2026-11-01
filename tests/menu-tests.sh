@@ -6,7 +6,7 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width
+load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width display_name_get
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -76,11 +76,12 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
   systemctl() { return 1; }
   menu_action() { printf '%s\n' "$2" >> "$TEST_ROOT/menu-actions"; }
   : > "$TEST_ROOT/menu-actions"
-  for n in $(seq 1 14) 15; do printf '%s\n\n' "$n"; done > "$TEST_ROOT/menu-input"
+  # 1 opens the read-only checks: 1 the plan, 2 performance, 3 resources.
+  { printf '1\n1\n\n'; for n in $(seq 2 14) 15; do printf '%s\n\n' "$n"; done; printf '1\n2\n\n1\n3\n\n1\n\n'; } > "$TEST_ROOT/menu-input"
   printf '0\n' >> "$TEST_ROOT/menu-input"
   menu < "$TEST_ROOT/menu-input" > "$TEST_ROOT/menu-out"
   # 7 is the security review (batch 3); until then it only says so.
-  expected='plan setup check port item bans reboot firewall ssh records rollback uninstall update '
+  expected='plan setup check port item bans reboot firewall ssh records rollback uninstall update perf resources '
   [[ "$(tr '\n' ' ' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' ' ' < "$TEST_ROOT/menu-actions")"
   grep -Fq '安全排查还在开发中' "$TEST_ROOT/menu-out" || fail '7 does not say the security review is to come'
   grep -Fq '无效选项，请输入 0 至 14 或 h' "$TEST_ROOT/menu-out" || fail 'number 15 not rejected'

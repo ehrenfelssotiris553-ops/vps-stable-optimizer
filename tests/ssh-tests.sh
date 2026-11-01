@@ -20,8 +20,12 @@ for bad in '' 'ssh-ed25519' "command=\"id\" $KEY" '-----BEGIN OPENSSH PRIVATE KE
 done
 [[ "$(ssh_dropin_text 0)" != *PermitRootLogin* ]] || fail 'root login disabled without being asked'
 [[ "$(ssh_dropin_text 1)" == *$'\nPermitRootLogin no\n'* ]] || fail 'root login not disabled when asked'
-for setting in 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'MaxAuthTries 4' 'LoginGraceTime 30' 'X11Forwarding no' 'ClientAliveInterval 300' 'ClientAliveCountMax 2'; do
+for setting in 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'MaxAuthTries 4' 'LoginGraceTime 30' 'X11Forwarding no'; do
   grep -Fxq "$setting" <<< "$(ssh_dropin_text 1)" || fail "drop-in lacks: $setting"
+done
+# Idle connections belong to the SSH keepalive item: the hardening sets none.
+for setting in ClientAliveInterval ClientAliveCountMax; do
+  if grep -q "^$setting" <<< "$(ssh_dropin_text 1)"; then fail "the hardening drop-in sets $setting"; fi
 done
 effective=$'passwordauthentication yes\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2'
 [[ "$(ssh_effective_value "$effective" authorizedkeysfile)" == '.ssh/authorized_keys .ssh/authorized_keys2' ]] || fail 'multi-word sshd value'

@@ -29,7 +29,7 @@ export ANSWER_TIMEOUT="${ANSWER_TIMEOUT:-1500}"
 
 state() {
   sysctl -n net.ipv4.tcp_congestion_control net.core.rmem_max net.ipv4.tcp_rmem kernel.kptr_restrict \
-    net.ipv4.conf.all.accept_redirects 2>/dev/null | tr -s '\t\n' '  '
+    net.ipv4.conf.all.accept_redirects net.ipv4.icmp_echo_ignore_all 2>/dev/null | tr -s '\t\n' '  '
 }
 tz() { timedatectl show -p Timezone --value; }
 on_target() { sudo bash -c "$1"; }
@@ -285,6 +285,49 @@ else
   if grep -q '^/swapfile ' /proc/swaps || [[ -e /swapfile || -e /etc/systemd/system/swapfile.swap ]]; then fail 'disk swap off: still there'; fi
 fi
 
+# Connection tracking (loaded by the firewall): only raised, to 64 entries a
+# MiB of RAM between 16384 and 1048576; off puts the kernel's value back.
+ct_max() { sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null; }
+if ct_before="$(ct_max)"; then
+  ct_want=$(($(awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo) * 64))
+  ((ct_want >= 16384)) || ct_want=16384; ((ct_want <= 1048576)) || ct_want=1048576
+  ((ct_want > ct_before)) || ct_want="$ct_before"
+  item_do item-conntrack-on conntrack 1
+  [[ "$(ct_max)" == "$ct_want" ]] || fail "connection tracking on: nf_conntrack_max is $(ct_max), not $ct_want"
+  if ((ct_want > ct_before)); then
+    sudo grep -Fxq nf_conntrack /etc/modules-load.d/99-vps-stable-conntrack.conf || fail 'connection tracking on: the module is not loaded at boot'
+  fi
+  item_do item-conntrack-off conntrack 2
+  [[ "$(ct_max)" == "$ct_before" ]] || fail "connection tracking off: nf_conntrack_max is $(ct_max), was $ct_before"
+  for f in /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/modules-load.d/99-vps-stable-conntrack.conf; do
+    if sudo test -e "$f"; then fail "connection tracking off: $f left"; fi
+  done
+  # Left on: the full rollback must put it back as well.
+  item_do item-conntrack-on-again conntrack 1
+else
+  printf '::notice::%s\n' 'connection tracking not tested here: nf_conntrack is not loaded'
+fi
+
+# Not answering ping, left on for the rollback.
+before_ping="$(sysctl -n net.ipv4.icmp_echo_ignore_all)"
+item_do item-ping-on ping 1
+[[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == 1 ]] || fail 'ping off: echo still answered'
+item_do item-ping-off ping 2
+[[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == "$before_ping" ]] || fail 'ping back: not as it was'
+if sudo test -e /etc/sysctl.d/99-vps-stable-noping.conf; then fail 'ping back: file left'; fi
+item_do item-ping-on-again ping 1
+
+# SSH keepalive, where the runner has an SSH server: what sshd itself uses.
+if sudo test -x /usr/sbin/sshd; then
+  item_do item-keepalive-off keepalive 2
+  if sudo test -e /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf; then fail 'SSH keepalive off: file left'; fi
+  item_do item-keepalive-on keepalive 1
+  sudo /usr/sbin/sshd -T 2>/dev/null | grep -Fx 'clientaliveinterval 60' > /dev/null ||
+    fail "SSH keepalive on: sshd uses $(sudo /usr/sbin/sshd -T 2>/dev/null | grep '^clientaliveinterval' || echo nothing)"
+else
+  printf '::notice::%s\n' 'SSH keepalive not tested here: no SSH server on this runner'
+fi
+
 item_do item-vnstat-off vnstat 2
 if installed vnstat; then fail 'vnStat off: still installed'; fi
 item_do item-vnstat-on vnstat 1
@@ -360,6 +403,18 @@ apt_readable 'after the single items'
 coloured="$(sudo grep -rlF $'\x1b[' /var/lib/vps-stable-opt/logs 2>/dev/null || true)"
 [[ -z "$coloured" ]] || fail "colour codes in the tool's logs or reports: $(tr '\n' ' ' <<< "$coloured")"
 sudo ls /var/lib/vps-stable-opt/logs | grep '^verify-' > /dev/null || fail 'no saved acceptance report to look at'
+# The read-only reports: they finish and say what they found.
+# shellcheck disable=SC2024
+sudo vps perf > "$LOGS/perf.log" 2>&1 || fail "vps perf exited with $?"
+cat "$LOGS/perf.log"
+has perf 'CPU 被抢'
+has perf '系统盘'
+grep -Eq '都正常|项要留意' "$LOGS/perf.log" || fail 'vps perf: no summary'
+# shellcheck disable=SC2024
+sudo vps resources > "$LOGS/resources.log" 2>&1 || fail "vps resources exited with $?"
+cat "$LOGS/resources.log"
+has resources 'Fail2ban：内存'
+has resources '防火墙里的封禁规则'
 sudo find /etc -xdev -type f -newer "$run_marker" ! -perm -o=r -printf '%m %u:%g %p\n' 2>/dev/null | sort > "$LOGS/root-only.txt" || true
 if [[ -s "$LOGS/root-only.txt" ]]; then notice "files under /etc only root can read, written during the run ($mode, $(uname -m))" "$LOGS/root-only.txt"; fi
 endgroup
@@ -372,9 +427,14 @@ has rollback '撤销完成'
 [[ "$(tz)" == "$before_tz" ]] || fail "timezone not restored: $(tz)"
 [[ "$(ufw_line)" == "$before_ufw" ]] || fail 'firewall not back to how it was'
 for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/sysctl.d/99-vps-stable-bbr.conf \
-    /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/apt/apt.conf.d/53-vps-stable-auto-reboot; do
+    /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
+    /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf \
+    /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf; do
   if sudo test -e "$f"; then fail "$f left after rollback"; fi
 done
+if [[ -n "${ct_before:-}" && -n "$(ct_max)" ]]; then
+  [[ "$(ct_max)" == "$ct_before" ]] || fail "connection tracking not restored: $(ct_max) (was $ct_before)"
+fi
 endgroup
 
 group 'Uninstall'

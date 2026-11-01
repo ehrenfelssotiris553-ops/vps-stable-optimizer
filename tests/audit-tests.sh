@@ -23,6 +23,8 @@ passed() { PASS=$((PASS+1)); printf 'PASS: %s\n' "$*"; }
 assert_has() { [[ "$1" == *"$2"* ]] || fail "Missing: $2"; }
 assert_not() { [[ "$1" != *"$2"* ]] || fail "Unexpected: $2"; }
 say() { printf 'SECTION %s\n' "$*"; }
+# sshd is a mock here: its runtime directory is not needed.
+sshd_runtime_dir() { :; }
 ok() { printf 'OK %s\n' "$*"; }
 warn() { printf 'WARN %s\n' "$*"; }
 

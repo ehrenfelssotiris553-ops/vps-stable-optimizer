@@ -6,7 +6,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_health_units verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
+load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_health_units param_value param_read param_recommended param_check param_mode verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
   trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -271,10 +271,16 @@ UFW_BOOT=enabled
 printf 'PASS: Fail2ban needs a running UFW; the firewall must also load at boot.\n'
 
 # The usage sentence ends with ".", which must not be taken for the size.
-systemd-analyze() { printf '[Journal]\nSystemMaxUse=100M\n'; }
+PARAMS_FILE="$TEST_ROOT/params"
+systemd-analyze() { printf '[Journal]\nSystemMaxUse=100M\nMaxRetentionSec=%s\n' "${DAYS:-90day}"; }
 journalctl() { echo 'Archived and active journals take up 24.0M in the file system.'; }
-check_journal ''
+check_journal 'SystemMaxUse=100M'
 [[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'当前占用 24.0M' ]] || fail "journal usage misread: $VERIFY_TEXT"
+# The 14 days of an earlier version: in force, but now 90 days are wanted.
+DAYS=14day check_journal 'SystemMaxUse=100M'
+[[ "$VERIFY_STATUS" == update ]] || fail "an earlier 14-day limit not offered an update: $VERIFY_STATUS $VERIFY_TEXT"
+check_journal 'SystemMaxUse=50M'
+[[ "$VERIFY_STATUS" == fail ]] || fail 'a limit other than the one applied passed'
 printf 'PASS: journal check reads the limit and the current usage.\n'
 
 # The exit code also covers the optional Fail2ban live test (run interactively).
