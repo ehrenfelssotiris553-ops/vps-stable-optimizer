@@ -71,7 +71,7 @@ sudo bash "$CI/snapshot.sh" > "$LOGS/snapshot-after.txt"
 sudo bash "$CI/upgrade-info.sh" "$snapshot_since" > "$LOGS/upgrade-info.txt"
 rc=0
 python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt" --upgrades "$LOGS/upgrade-info.txt" \
-  > "$LOGS/snapdiff.log" || rc=$?
+  --purged > "$LOGS/snapdiff.log" || rc=$?
 cat "$LOGS/snapdiff.log"
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup

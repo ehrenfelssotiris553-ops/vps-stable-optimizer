@@ -8,7 +8,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group ufw_sysctl_keys restore_record_dir restore_created_dirs restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
-  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid
+  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid pkg_file_unchanged pkg_changed_configs
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 WARNINGS=0
@@ -836,6 +836,82 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
   if restore_tool_package curl; then die 'a package present before the tool counted as its own'; fi
 )
 
+# The removal is followed by a purge, so the configuration goes too. Not for a
+# package whose configuration was left before the tool ("rc"), not without a
+# record of that (an older version), and changed configuration (dpkg's
+# conffiles, ucf's files, UFW's stored rules) only when the user says so.
+(
+  RESTORE_ROOT="$TMP/purge/restore-v2" P="$TMP/purge"
+  mkdir -p "$RESTORE_ROOT/packages" "$P/etc" "$P/ucf"; chmod 700 "$P" "$RESTORE_ROOT" "$RESTORE_ROOT/packages"
+  printf 'ufw\nfail2ban\nvnstat\n' > "$RESTORE_ROOT/packages/installed"
+  printf 'bash\n' > "$RESTORE_ROOT/packages/before"
+  printf 'vnstat\n' > "$RESTORE_ROOT/packages/before-rc"
+  chmod 600 "$RESTORE_ROOT/packages/"*
+  installed() { [[ " ufw fail2ban vnstat bash " == *" $1 "* ]]; }
+  module_expect() { return 1; }
+  sum() { md5sum < "$1" | cut -d' ' -f1; }
+  printf 'shipped\n' > "$P/etc/jail.conf"; JAIL_SUM="$(sum "$P/etc/jail.conf")"
+  # As dpkg prints them: one indented "path md5" line per conffile.
+  dpkg-query() {
+    [[ "$1 $2" == '-W -f=${Conffiles}\n' ]] || die "unexpected dpkg-query $*"
+    if [[ "${*: -1}" == fail2ban ]]; then printf ' %s %s\n /etc/fail2ban/gone.conf %s obsolete\n' "$P/etc/jail.conf" "$JAIL_SUM" "$JAIL_SUM"; fi
+  }
+  UCF_DIR="$P/ucf"
+  printf 'shipped\n' > "$P/etc/before.rules"
+  printf 'ufw  %s\n' "$P/etc/before.rules" > "$UCF_DIR/registry"
+  printf '%s  %s\n' "$(sum "$P/etc/before.rules")" "$P/etc/before.rules" > "$UCF_DIR/hashfile"
+  UFW_RULES='(None)'
+  ufw() { [[ "$*" == 'show added' ]] || die "unexpected ufw $*"; printf 'Added user rules (see the running firewall):\n%s\n' "$UFW_RULES"; }
+  TRACE="$P/trace"
+  apt-get() {
+    case "$*" in
+      '-s remove --autoremove ufw fail2ban vnstat') printf 'Remv ufw [0.36]\nRemv fail2ban [1.0]\nRemv vnstat [2.12]\nRemv python3-pyinotify [0.9]\n' ;;
+      '-y -q -o DPkg::Lock::Timeout=900 '*) printf '%s\n' "${*:5}" >> "$TRACE" ;;
+      *) die "unexpected apt-get $*" ;;
+    esac
+  }
+  DELETE_CHANGED=1 ANSWER_REMOVE=1
+  confirm_yes() {
+    printf 'ask %s\n' "$1" >> "$TRACE"
+    case "$1" in *改过的这些配置*) ((DELETE_CHANGED)) ;; *) ((ANSWER_REMOVE)) ;; esac
+  }
+  run() { : > "$TRACE"; restore_packages_offer > "$P/out"; }
+  # Nothing changed: removed, then purged, except the one with older leftovers.
+  run
+  expect "$(cat "$TRACE")" $'ask 确认卸载上述软件包吗？\nremove --autoremove ufw fail2ban vnstat\npurge ufw fail2ban python3-pyinotify'
+  grep -Fq '只卸载程序、配置留在原处：vnstat' "$P/out" || die 'the package with older leftovers is not named'
+  grep -Fq 'Fail2ban 的封禁记录也会一起删除' "$P/out" || die 'losing the Fail2ban ban history is not said'
+  # A changed conffile is listed and asked about; "n" keeps that package's configuration.
+  printf 'mine\n' > "$P/etc/jail.conf"
+  DELETE_CHANGED=0; run
+  grep -Fq "  $P/etc/jail.conf（fail2ban）" "$P/out" || die "changed conffile not listed: $(cat "$P/out")"
+  if grep -q 'gone.conf' "$P/out"; then die 'a missing conffile was listed as changed'; fi
+  expect "$(tail -n 2 "$TRACE")" $'remove --autoremove ufw fail2ban vnstat\npurge ufw python3-pyinotify'
+  DELETE_CHANGED=1; run
+  grep -Fxq 'ask 改过的这些配置也一起删除吗？选 n：这些软件包只卸载程序，配置留在原处' "$TRACE" || die 'changed configuration not asked about'
+  expect "$(tail -n 1 "$TRACE")" 'purge ufw fail2ban python3-pyinotify'
+  printf 'shipped\n' > "$P/etc/jail.conf"
+  # A changed file kept with ucf (which a purge deletes as well).
+  printf 'shipped\n-A ufw-before-input -j ACCEPT\n' > "$P/etc/before.rules"
+  DELETE_CHANGED=0; run
+  grep -Fq "  $P/etc/before.rules（ufw）" "$P/out" || die "changed ucf file not listed: $(cat "$P/out")"
+  expect "$(tail -n 1 "$TRACE")" 'purge fail2ban python3-pyinotify'
+  printf 'shipped\n' > "$P/etc/before.rules"
+  # Rules still stored in UFW: its purge deletes user.rules without asking.
+  UFW_RULES='ufw allow 8080/tcp'; run
+  grep -Fq '/etc/ufw/user.rules（保存着 1 条规则）（ufw）' "$P/out" || die "stored UFW rules not listed: $(cat "$P/out")"
+  expect "$(tail -n 1 "$TRACE")" 'purge fail2ban python3-pyinotify'
+  UFW_RULES='(None)'
+  # Declined: nothing removed, nothing purged.
+  ANSWER_REMOVE=0; run
+  expect "$(cat "$TRACE")" 'ask 确认卸载上述软件包吗？'
+  ANSWER_REMOVE=1
+  # Recorded by an older version (no list of leftovers): removal only.
+  rm -f -- "$RESTORE_ROOT/packages/before-rc"; run
+  expect "$(cat "$TRACE")" $'ask 确认卸载上述软件包吗？\nremove --autoremove ufw fail2ban vnstat'
+  grep -Fq '旧版本没有记录' "$P/out" || die 'removal without purge not explained'
+)
+
 # The first package inventory is kept; records accept only real package names.
 # restore_prepare insists on root, so this part runs only in a root test session.
 if ((EUID == 0)); then (
@@ -844,6 +920,7 @@ if ((EUID == 0)); then (
   dpkg-query() { printf 'installed\tbash\nconfig-files\told-removed\ninstalled\tcurl\n'; }
   restore_prepare
   expect "$(cat "$RESTORE_ROOT/packages/before")" $'bash\ncurl'
+  expect "$(cat "$RESTORE_ROOT/packages/before-rc")" old-removed
   dpkg-query() { printf 'installed\tsomething-new\n'; }
   restore_prepare
   expect "$(cat "$RESTORE_ROOT/packages/before")" $'bash\ncurl'
@@ -851,7 +928,7 @@ if ((EUID == 0)); then (
   restore_record_packages fail2ban 'evil;rm' not-installed fail2ban
   expect "$(cat "$RESTORE_ROOT/packages/installed")" fail2ban
 ) else printf 'SKIP: restore_prepare package inventory (requires root).\n'; fi
-printf 'PASS: package removal offer is limited, simulated first and never removes pre-existing software.\n'
+printf 'PASS: package removal offer is limited, simulated first, never removes pre-existing software, and purges only what the tool brought.\n'
 
 # A masked unit is a valid unchanged baseline, common on chrony VPS images.
 # Read the actual service-value function; no mock bypasses the LoadState parser.

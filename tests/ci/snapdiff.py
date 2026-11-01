@@ -9,8 +9,10 @@ explain. Explained are:
 - volatile kernel counters.
 Configuration that removed packages keep ("rc" state, as with apt remove) is
 listed as a warning: it is not the tool's own file, but it is left behind.
+With --purged (the tool recorded the packages' state before its first run, so
+it purges what it installed) any such configuration is a difference instead.
 
-Usage: snapdiff.py BEFORE AFTER [--upgrades FILE] [--allow-user NAME]...
+Usage: snapdiff.py BEFORE AFTER [--upgrades FILE] [--allow-user NAME]... [--purged]
 """
 import argparse
 import re
@@ -121,6 +123,7 @@ def main():
     ap.add_argument('after')
     ap.add_argument('--upgrades')
     ap.add_argument('--allow-user', action='append', default=[])
+    ap.add_argument('--purged', action='store_true')
     args = ap.parse_args()
     a, b = load(args.before), load(args.after)
     up = load(args.upgrades) if args.upgrades else {}
@@ -177,7 +180,9 @@ def main():
         (explained if name in up_pkgs or KERNEL_PKG.match(name) else unexplained).append(f'package removed: {name}')
     rc_new = sorted(set(b.get('pkgconf', [])) - set(a.get('pkgconf', [])))
     rc_files = set(b.get('rcfile', []))
-    if rc_new:
+    if rc_new and args.purged:
+        unexplained += [f'configuration left by a removed package (the tool purges): {name}' for name in rc_new]
+    elif rc_new:
         warnings.append('removed packages keep their configuration (apt remove, not purge): ' + ' '.join(rc_new))
 
     # Users.

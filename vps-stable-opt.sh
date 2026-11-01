@@ -1342,21 +1342,37 @@ apt_timers_postpone() {
   done
 }
 
+# APT's parsed configuration covers every syntax (including blocks) and file.
+# A key it does not report is filled in with this tool's file (some images set
+# only Update-Package-Lists, which leaves security updates off); a key set to
+# anything but "1" was chosen by someone, and the policy is kept as it is.
 updates_stage() {
   say '第10步：自动安全更新'
   if (( !AUTO_UPDATES )); then ok '自动更新策略保持不变。'; module_result updates declined 'not requested'; return 0; fi
   installed unattended-upgrades || { warn '没有安装 unattended-upgrades。'; module_result updates unsupported 'package missing'; return 0; }
-  local periodic result=applied
+  local periodic key value text='' custom='' off=0 files result=applied detail='periodic updates'
   periodic="$(apt-config dump 2>/dev/null | grep -E '^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) ' || true)"
-  if grep -Fq 'APT::Periodic::Update-Package-Lists "1";' <<< "$periodic" &&
-     grep -Fq 'APT::Periodic::Unattended-Upgrade "1";' <<< "$periodic"; then ok '自动安全更新原本就已开启。'; result=present
+  for key in Update-Package-Lists Unattended-Upgrade; do
+    value="$(awk -v k="APT::Periodic::$key" '$1 == k {v = $2} END {gsub(/^"|";?$/, "", v); print v}' <<< "$periodic")"
+    if [[ -z "$value" ]]; then text+="APT::Periodic::$key \"1\";"$'\n'
+    elif [[ "$value" != 1 ]]; then
+      custom+="APT::Periodic::$key \"$value\"; "
+      if [[ "$value" =~ ^0+$ ]]; then off=1; fi
+    fi
+  done
+  if [[ -n "$custom" ]] && ((off)); then
+    files="$(grep -lsE 'Periodic' /etc/apt/apt.conf /etc/apt/apt.conf.d/* 2>/dev/null | tr '\n' ' ' || true)"
+    warn "已有的更新策略关闭了自动更新（${custom% }），按原样保留：自动安全更新现在没有开启。要开启，先把这一项改成 \"1\"（可能在：${files:-/etc/apt/apt.conf.d}），再选开启。"
+    result=preserved detail='原有策略关闭了自动安全更新，没有开启'
+  elif [[ -n "$custom" ]]; then
+    warn "已有自定义的定期更新策略（${custom% }），不覆盖。"; result=preserved
+  elif [[ -z "$text" ]]; then ok '自动安全更新原本就已开启。'; result=present
+  elif ! put_file "$APT_FILE" "${text%$'\n'}"; then result=preserved
   elif [[ -n "$periodic" ]]; then
-    # APT's parsed configuration covers every syntax (including blocks) and file.
-    warn "已有自定义的定期更新策略（$(tr '\n' ' ' <<< "$periodic")），不覆盖。"; result=preserved
-  elif ! put_file "$APT_FILE" $'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'; then result=preserved
+    ok "原有策略里缺少的设置已补上：$(tr '\n' ' ' <<< "${text%$'\n'}")"
   fi
   apt_timers_postpone
-  if systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then module_result updates "$result" 'periodic updates'
+  if systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then module_result updates "$result" "$detail"
   else warn '无法启用 APT 定时器。'; module_result updates failed 'timers not enabled'; fi
 }
 
@@ -4263,6 +4279,8 @@ restore_snapshot() {
 
 # The first package inventory is the reference for "installed by this tool":
 # a package present before the first recorded run is never offered for removal.
+# Packages whose configuration was left behind then ("rc") are listed too: a
+# later removal keeps that configuration (it predates the tool).
 restore_prepare() {
   local tmp
   [[ "${EUID:-$(id -u)}" == 0 ]] || die '回退记录需要 root 权限。'
@@ -4271,8 +4289,10 @@ restore_prepare() {
   if [[ ! -e "$RESTORE_ROOT/packages" && ! -L "$RESTORE_ROOT/packages" ]]; then
     tmp="$(mktemp -d "$RESTORE_ROOT/.capture.XXXXXX")"
     chmod 700 -- "$tmp"
-    if dpkg-query -W -f='${db:Status-Status}\t${Package}\n' 2>/dev/null | awk -F'\t' '$1 == "installed" {print $2}' | sort -u > "$tmp/before" &&
-       [[ -s "$tmp/before" ]] && chmod 600 -- "$tmp/before"; then
+    if dpkg-query -W -f='${db:Status-Status}\t${Package}\n' 2>/dev/null > "$tmp/status" &&
+       awk -F'\t' '$1 == "installed" {print $2}' "$tmp/status" | sort -u > "$tmp/before" &&
+       awk -F'\t' '$1 == "config-files" {print $2}' "$tmp/status" | sort -u > "$tmp/before-rc" &&
+       rm -f -- "$tmp/status" && [[ -s "$tmp/before" ]] && chmod 600 -- "$tmp/before" "$tmp/before-rc"; then
       mv -T -- "$tmp" "$RESTORE_ROOT/packages"
     else
       rm -rf -- "$tmp"
@@ -4846,12 +4866,49 @@ restore_tool_package() {
   return "$found"
 }
 
-# Simulates first. Removal (never purge) proceeds only when APT would remove
-# nothing that existed before this tool's first run. With arguments, only
-# those packages (of the ones this tool installed) are considered.
+# True when FILE is missing (nothing to keep) or matches the MD5 its package recorded.
+pkg_file_unchanged() {
+  local actual
+  [[ -e "$1" || -L "$1" ]] || return 0
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  read -r actual _ < <(md5sum < "$1" 2>/dev/null || true) || actual=''
+  [[ "$actual" == "$2" ]]
+}
+
+# What a purge of these packages would delete that differs from what they
+# installed, as "path<TAB>package": dpkg's conffiles, files kept with ucf
+# (unattended-upgrades, UFW, chrony) and the rules stored in UFW, whose
+# user.rules its purge deletes without checking.
+pkg_changed_configs() {
+  local pkg path sum rules registry="${UCF_DIR:-/var/lib/ucf}/registry" hashfile="${UCF_DIR:-/var/lib/ucf}/hashfile"
+  for pkg in "$@"; do
+    while read -r path sum _; do
+      [[ "$path" == /* && "$sum" =~ ^[0-9a-f]{32}$ ]] || continue
+      if ! pkg_file_unchanged "$path" "$sum"; then printf '%s\t%s\n' "$path" "$pkg"; fi
+    done < <(dpkg-query -W -f='${Conffiles}\n' -- "$pkg" 2>/dev/null || true)
+    if [[ -f "$registry" && -f "$hashfile" ]]; then
+      while read -r path; do
+        sum="$(awk -v p="$path" '$2 == p {s = $1} END {print s}' "$hashfile")"
+        [[ "$sum" =~ ^[0-9a-f]{32}$ ]] || continue
+        if ! pkg_file_unchanged "$path" "$sum"; then printf '%s\t%s\n' "$path" "$pkg"; fi
+      done < <(awk -v p="$pkg" '$1 == p && $2 ~ /^\// {print $2}' "$registry")
+    fi
+    if [[ "$pkg" == ufw ]] && command -v ufw >/dev/null; then
+      rules="$(ufw show added 2>/dev/null | grep -c '^ufw ' || true)"
+      if ((rules > 0)); then printf '%s\t%s\n' "/etc/ufw/user.rules（保存着 $rules 条规则）" "$pkg"; fi
+    fi
+  done
+}
+
+# Simulates first. Removal proceeds only when APT would remove nothing that
+# existed before this tool's first run. With arguments, only those packages
+# (of the ones this tool installed) are considered. What was removed is then
+# purged, so its configuration goes too, except configuration that predates
+# the tool ("rc" before its first run, or not known: recorded by an older
+# version) and changed configuration the user chooses to keep.
 restore_packages_offer() {
-  local dir="$RESTORE_ROOT/packages" sim pkg mode chosen='' bad
-  local -a ours=() removed=() flags=() all=()
+  local dir="$RESTORE_ROOT/packages" sim pkg mode chosen='' bad changed path owner
+  local -a ours=() removed=() flags=() all=() purge=() kept=() old_rc=()
   mapfile -t all < <(restore_tool_packages)
   if (($#)); then
     for pkg in "${all[@]}"; do
@@ -4884,8 +4941,29 @@ restore_packages_offer() {
     return 0
   fi
   printf '将卸载：%s\n' "${removed[*]}"
-  echo '只用 apt remove（不是 purge），配置文件会留在 /etc；系统升级和内核不受影响。'
+  if restore_data_safe "$dir/before-rc"; then
+    for pkg in "${removed[@]}"; do
+      if grep -Fxq -- "$pkg" "$dir/before-rc"; then old_rc+=("$pkg"); else purge+=("$pkg"); fi
+    done
+    if ((${#purge[@]})); then echo '会连同配置文件一起删除（purge），回到装之前的样子；系统升级和内核不受影响。'; fi
+    if ((${#old_rc[@]})); then echo "这些软件包在本工具第一次运行前就留有配置，只卸载程序、配置留在原处：${old_rc[*]}"; fi
+  else
+    echo '只卸载程序（remove），配置留在原处：本工具的旧版本没有记录装之前哪些软件留有配置，为稳妥不删。系统升级和内核不受影响。'
+  fi
+  if [[ " ${purge[*]} " == *' fail2ban '* ]]; then echo 'Fail2ban 的封禁记录也会一起删除。'; fi
+  changed="$(pkg_changed_configs "${purge[@]}")"
+  if [[ -n "$changed" ]]; then
+    echo '下面这些配置和软件包装上时不一样（可能是你改过的）：'
+    while IFS=$'\t' read -r path owner; do printf '  %s（%s）\n' "$path" "$owner"; done <<< "$changed"
+  fi
   if ! confirm_yes '确认卸载上述软件包吗？'; then ok '保留这些软件包。'; return 0; fi
+  if [[ -n "$changed" ]] && ! confirm_yes '改过的这些配置也一起删除吗？选 n：这些软件包只卸载程序，配置留在原处'; then
+    while IFS=$'\t' read -r _ owner; do kept+=("$owner"); done <<< "$changed"
+    for pkg in "${!purge[@]}"; do
+      if [[ " ${kept[*]} " == *" ${purge[pkg]} "* ]]; then unset 'purge[pkg]'; fi
+    done
+    purge=("${purge[@]}")
+  fi
   flags=()
   [[ "$chosen" == autoremove ]] && flags=(--autoremove)
   apt_wait_idle
@@ -4893,6 +4971,11 @@ restore_packages_offer() {
     ok '已卸载本工具新装的软件包。'
     if [[ " ${ours[*]} " == *' systemd-zram-generator '* ]]; then ZRAM_PACKAGE_REMOVED=1; fi
     restore_packages_record
+    # The packages are gone now: the purge only deletes what they left behind.
+    if ((${#purge[@]})); then
+      if apt-get -y -q -o DPkg::Lock::Timeout=900 purge "${purge[@]}"; then ok "已删除它们留下的配置：${purge[*]}"
+      else warn "删除配置文件（purge）失败，程序已经卸载，配置留在原处：${purge[*]}"; fi
+    fi
   else warn 'APT 卸载失败，请人工检查。'; RESTORE_PARTIAL=1; fi
 }
 

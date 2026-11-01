@@ -50,6 +50,8 @@ before_trim="$(systemctl is-enabled fstrim.timer 2>/dev/null || true)"
 before_updates=0 before_reboot=0
 if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then before_updates=1; fi
 if apt_has 'Unattended-Upgrade::Automatic-Reboot "true";'; then before_reboot=1; fi
+before_periodic="$(apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true)"
+printf 'Periodic APT policy before: %s\n' "$(tr '\n' ' ' <<< "${before_periodic:-none}")"
 printf 'Before: %s | %s | %s\n' "$before_state" "$before_tz" "${before_ufw:-ufw not installed}"
 # Firewall rules at the start: the tool keeps a firewall that has rules.
 # shellcheck disable=SC2024
@@ -179,6 +181,8 @@ if [[ "$mode" == upgrade ]] && grep -q 'Could not get lock' "$LOGS/setup-old.log
 fi
 group 'Acceptance check'
 check_all check
+# The previous release kept a policy with only Update-Package-Lists as it was.
+if [[ "$mode" != upgrade ]]; then passed check '自动安全更新'; fi
 check_facts check
 endgroup
 
@@ -222,15 +226,17 @@ apt_has 'Unattended-Upgrade::Automatic-Reboot-Time "04:30";' || fail 'automatic 
 item_do item-updates-off updates 2
 now=0; if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then now=1; fi
 [[ "$now" == "$before_updates" ]] || fail 'automatic updates off: not back'
+[[ "$(apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true)" == "$before_periodic" ]] ||
+  fail 'automatic updates off: the periodic policy is not as it was'
 item_do item-updates-on updates 1
-if ! apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then
-  # Known and waiting for a decision: a policy that only sets
-  # Update-Package-Lists (as on these runners) is kept as "custom", so
-  # security updates stay off although they were asked for. Any other reason
-  # still fails.
-  grep -Fq '已有自定义的定期更新策略' "$LOGS/item-updates-on.log" || fail 'automatic updates on: not on'
-  printf '::warning::%s\n' 'automatic updates asked for but left off: partial periodic policy kept (decision pending)'
+# GitHub's images set only Update-Package-Lists "1": the tool fills in the
+# missing key. A value other than "1" would be kept (see extras-tests.sh).
+if grep -E '^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) ' <<< "$before_periodic" | grep -vqF ' "1";'; then
+  fail "this image sets its own periodic policy ($(tr '\n' ' ' <<< "$before_periodic")): the test expects none other than \"1\""
 fi
+apt_has 'APT::Periodic::Update-Package-Lists "1";' || fail 'automatic updates on: package lists are not updated daily'
+apt_has 'APT::Periodic::Unattended-Upgrade "1";' || fail 'automatic updates on: security updates are not installed daily'
+systemctl is-active -q apt-daily-upgrade.timer || fail 'automatic updates on: apt-daily-upgrade.timer is not running'
 
 item_do item-timezone-off timezone 2
 [[ "$(tz)" == "$before_tz" ]] || fail "timezone back: $(tz)"
@@ -277,6 +283,7 @@ endgroup
 
 group 'Acceptance check after the single items'
 check_all check-again
+passed check-again '自动安全更新'
 endgroup
 fi
 
@@ -306,8 +313,12 @@ sudo bash "$CI/snapshot.sh" > "$LOGS/snapshot-after.txt"
 # shellcheck disable=SC2024
 sudo bash "$CI/upgrade-info.sh" "$snapshot_since" > "$LOGS/upgrade-info.txt"
 rc=0
+# The previous release recorded no package states, so this version only
+# removes (never purges) what that one installed.
+purged=(--purged)
+if [[ "$mode" == upgrade ]]; then purged=(); fi
 python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt" --upgrades "$LOGS/upgrade-info.txt" \
-  > "$LOGS/snapdiff.log" || rc=$?
+  "${purged[@]}" > "$LOGS/snapdiff.log" || rc=$?
 cat "$LOGS/snapdiff.log"
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup

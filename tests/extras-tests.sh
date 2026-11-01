@@ -110,6 +110,34 @@ grep -Fxq 'APT::Periodic::Unattended-Upgrade "1";' "$APT_FILE" || fail 'update p
 reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";'
 updates_stage
 grep -q '^result updates present' "$TEST_ROOT/trace" || fail 'already enabled updates not recognised'
+# Only the missing key is filled in (GitHub's runners set Update-Package-Lists
+# alone, which left security updates off although they were asked for).
+rm -f -- "$APT_FILE"; reset; APT_DUMP='APT::Periodic::Update-Package-Lists "1";'
+updates_stage
+[[ "$(cat "$APT_FILE" 2>/dev/null)" == 'APT::Periodic::Unattended-Upgrade "1";' ]] ||
+  fail "a policy with only Update-Package-Lists was not completed: $(cat "$APT_FILE" 2>/dev/null)"
+grep -q '^result updates applied' "$TEST_ROOT/trace" || fail 'a completed policy not recorded as applied'
+rm -f -- "$APT_FILE"; reset; APT_DUMP='APT::Periodic::Unattended-Upgrade "1";'
+updates_stage
+[[ "$(cat "$APT_FILE" 2>/dev/null)" == 'APT::Periodic::Update-Package-Lists "1";' ]] ||
+  fail "a policy with only Unattended-Upgrade was not completed: $(cat "$APT_FILE" 2>/dev/null)"
+# A "0" someone wrote is kept, and said plainly: updates stay off.
+rm -f -- "$APT_FILE"; reset; APT_DUMP='APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "0";'
+updates_stage
+[[ ! -e "$APT_FILE" ]] || fail 'an explicit Unattended-Upgrade "0" was overridden'
+grep -q '^result updates preserved 原有策略关闭了自动安全更新' "$TEST_ROOT/trace" || fail "updates left off not recorded as such: $(cat "$TEST_ROOT/trace")"
+grep -q '^WARN .*自动安全更新现在没有开启' "$TEST_ROOT/log" || fail 'updates left off not said plainly'
+reset; APT_DUMP='APT::Periodic::Update-Package-Lists "0";'
+updates_stage
+[[ ! -e "$APT_FILE" ]] || fail 'an explicit Update-Package-Lists "0" was completed'
+grep -q '^WARN .*没有开启' "$TEST_ROOT/log" || fail 'package lists off not said to leave updates off'
+# Another interval (weekly) is a custom policy: kept, not called off.
+reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "7";\nAPT::Periodic::Unattended-Upgrade "1";'
+updates_stage
+[[ ! -e "$APT_FILE" ]] || fail 'a weekly policy was overridden'
+grep -q '^WARN 已有自定义的定期更新策略（APT::Periodic::Update-Package-Lists "7";）' "$TEST_ROOT/log" || fail "weekly policy not reported as custom: $(cat "$TEST_ROOT/log")"
+if grep -q '没有开启' "$TEST_ROOT/log"; then fail 'a weekly policy was called off'; fi
 unset -f installed systemctl apt-config apt_timers_postpone
 # Only a stopped timer has its last run moved to now.
 (
@@ -121,7 +149,7 @@ unset -f installed systemctl apt-config apt_timers_postpone
   [[ "$(date -r "$d/stamp-apt-daily.timer" +%Y)" == 2020 ]] || fail 'a running timer was touched'
   [[ "$(date -r "$d/stamp-apt-daily-upgrade.timer" +%Y)" != 2020 ]] || fail 'a stopped timer would catch up during the setup'
 )
-printf 'PASS: automatic updates keep a policy APT already reports, in any syntax.\n'
+printf 'PASS: automatic updates complete a missing key and keep a policy someone set, in any syntax.\n'
 
 # sysctl hardening: keys set elsewhere are kept, originals recorded after writing.
 SYSCTL_HARDENING_FILE="$TEST_ROOT/sysctl/98-vps-stable-hardening.conf"
