@@ -9,7 +9,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions param_list param_kind param_recommended param_reason param_check param_caution param_read param_value param_mode \
-  param_store param_names param_info param_item_on param_adjust param_reset param_apply params_overview params_export params_import \
+  param_store param_names param_info param_item_on param_adjust param_reset param_apply param_live params_overview params_export params_import \
   item_action item_symbols check_tcp verify_set verify_line
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -111,6 +111,22 @@ CONFIRM=n
 printf 'tcp_buffer_mib=64\n\n' | params_import > /dev/null
 [[ "$(param_mode tcp_buffer_mib)" == 自动 ]] || fail 'a declined import was kept'
 printf 'PASS: the overview shows value, recommendation and reason; export and import round-trip and skip bad lines.\n'
+
+# Importing the values a machine already has applies nothing again (found on
+# CI: every item that was on was turned on again). TG and the traffic alert
+# read theirs when the check runs: never turned on again for it, which would
+# ask their questions again.
+CONFIRM=y; param_store tcp_buffer_mib 48; : > "$TEST_ROOT/applied"
+printf 'tcp_buffer_mib=48\nzram_percent=auto\n\n' | params_import > /dev/null
+[[ ! -s "$TEST_ROOT/applied" ]] || fail "unchanged values applied again: $(cat "$TEST_ROOT/applied")"
+module_expect() { [[ "$1" == quota || "$1" == notify ]] && printf 'applied\tboot\tx\n'; }
+out="$(printf 'quota_alerts=50 100\nnotify_summary_time=21:00\n\n' | params_import)"
+[[ ! -s "$TEST_ROOT/applied" && "$out" == *'下次检查时就会用新的参数'* && "$(param_value quota_alerts)" == '50 100' ]] ||
+  fail "TG or the traffic alert turned on again: $(cat "$TEST_ROOT/applied") $out"
+[[ "$(param_apply quota)" == *'下次检查时'* && ! -s "$TEST_ROOT/applied" ]] || fail 'adjusting the traffic alert turned it on again'
+param_store quota_alerts ''; param_store notify_summary_time ''; param_store tcp_buffer_mib ''
+module_expect() { [[ "$1" == tcp && -n "$MODULE" ]] && printf '%s\t%s\t%s\n' "$MODULE" boot '32 MiB'; }
+printf 'PASS: an import applies only what changed, and never turns TG or the traffic alert on again.\n'
 
 # vps check: an applied cap that is no longer the one wanted is "可更新".
 TCP_BUFFER_FILE="$TEST_ROOT/tcp.conf"; : > "$TCP_BUFFER_FILE"

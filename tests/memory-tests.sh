@@ -10,7 +10,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions param_list param_kind param_recommended param_reason param_check param_caution param_read param_value \
-  param_mode param_store param_names param_info param_adjust params_import swap_unit_text swap_create zram_size_expr zram_config_text verify_set param_apply
+  param_mode param_store param_names param_info param_adjust params_import swap_unit_text swap_create zram_size_expr zram_config_text verify_set param_apply param_live
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }

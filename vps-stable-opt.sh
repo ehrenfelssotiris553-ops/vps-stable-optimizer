@@ -2338,8 +2338,17 @@ param_reset() {
 }
 
 # KEY: applies the item again with its current parameters when it is on.
+# KEY: an item whose parameters the check reads each time it runs (TG, the
+# traffic alert): nothing to apply, and turning it on again would ask its
+# questions again.
+param_live() {
+  [[ "$1" == notify || "$1" == quota ]]
+}
+
 param_apply() {
-  if param_item_on "$1"; then
+  if param_live "$1"; then
+    ok '新的参数下次检查时（几分钟内）就会用上。'
+  elif param_item_on "$1"; then
     echo '这一项已经开启：按新的参数重新应用。'
     item_turn_on "$1"
   else
@@ -2410,6 +2419,8 @@ params_import() {
     value="${values[line]}"
     if [[ "$value" == auto ]]; then value=''
     elif [[ "$(param_kind "${names[line]}")" == int ]]; then value="$((10#$value))"; fi
+    # Only an item whose values change is offered to be applied again.
+    [[ "$value" != "$(param_read "${names[line]}" 2>/dev/null || true)" ]] || continue
     param_store "${names[line]}" "$value" || die '无法保存参数。'
     while IFS=$'\t' read -r name label _ _; do
       if [[ "$name" == "${names[line]}" && " ${items[*]} " != *" $label "* ]]; then items+=("$label"); fi
@@ -2417,6 +2428,10 @@ params_import() {
   done
   ok '参数已导入。'
   for line in "${items[@]}"; do
+    if param_live "$line"; then
+      if param_item_on "$line"; then ok "「$(item_label "$line")」下次检查时就会用新的参数。"; fi
+      continue
+    fi
     if param_item_on "$line" && confirm_default_yes "「$(item_label "$line")」已经开启，现在就按新的参数重新应用吗？"; then item_turn_on "$line"; fi
   done
 }
