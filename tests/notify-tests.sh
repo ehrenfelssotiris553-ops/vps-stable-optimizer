@@ -205,6 +205,8 @@ menu_ip() { echo 203.0.113.1; }
 confirm_yes() { return 1; }
 TG_UPDATES='{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":987654,"type":"private"},"text":"hi"}}]}' TG_SEND=0
 tg_call() { record "tg $3 $(cat)"; case "$3" in getUpdates) echo "$TG_UPDATES" ;; sendMessage) return "$TG_SEND" ;; esac; }
+# The test containers have no curl: TG needs it to be there (tg_call answers).
+curl() { :; }
 check_reconcile() { record reconcile; }
 reset; NOTIFY_CHOICE=1
 printf 'not-a-token\n' | notify_stage
