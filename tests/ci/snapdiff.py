@@ -212,6 +212,8 @@ def main():
     # Units (compared further down; the links below need them too).
     ua_units, ub_units = pairs(a, 'unit', ' '), pairs(b, 'unit', ' ')
     up_units = set(up.get('upgradeunit', []))
+    # Units their own service switched off (upgrade-info.sh read it in the journal).
+    self_disabled = set(up.get('selfdisabled', []))
 
     # Files, links and directories under /etc.
     fa, fb = files(a), files(b)
@@ -258,6 +260,9 @@ def main():
         unit = path.rsplit('/', 1)[-1]
         if SNAPD.match(path):
             continue
+        if path in la and path not in lb and unit in self_disabled:
+            explained.append(f'enablement link its own service took away (journal): {path}')
+            continue
         if system_upgrade and path.startswith('/etc/alternatives/'):
             explained.append(f'alternative set by a package of the system upgrade: {path}')
             continue
@@ -301,6 +306,9 @@ def main():
         if 'transient' in (ua_units.get(name), ub_units.get(name)) or SNAPD.match(name):
             continue  # login sessions and snapd's own mounts come and go
         if ua_units.get(name) != ub_units.get(name):
+            if name in self_disabled and (ua_units.get(name), ub_units.get(name)) == ('enabled', 'disabled'):
+                explained.append(f'unit {name}: enabled -> disabled (by its own service, see the journal)')
+                continue
             if name in up_units:
                 explained.append(f'unit {name}: {ua_units.get(name, "(none)")} -> {ub_units.get(name, "(none)")} (its package was upgraded)')
                 continue
