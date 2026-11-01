@@ -1344,8 +1344,11 @@ bbr_report() {
   echo 'default_qdisc=fq 不会替换网卡已有的队列；本工具不修改 tc 配置。'
 }
 
+# --other: this tool's own disk swap does not count.
 swap_exists() {
-  swapon --noheadings 2>/dev/null | grep -q . && return 0
+  local own=''
+  if [[ "${1:-}" == --other ]]; then own="$SWAP_FILE"; fi
+  swapon --noheadings 2>/dev/null | awk -v own="$own" '$1 != own {found = 1} END {exit !found}' && return 0
   [[ -e "$ZRAM_FILE" || -d /etc/systemd/zram-generator.conf.d || -f /etc/default/zramswap ]] && return 0
   systemctl is-enabled zramswap.service >/dev/null 2>&1 && return 0
   awk '$1 !~ /^#/ && $3=="swap" {found=1} END{exit !found}' /etc/fstab 2>/dev/null && return 0
@@ -1504,7 +1507,8 @@ swap_stage() {
   local mib free current
   if [[ "${SWAP_CHOICE:-}" != 1 ]]; then
     if ((MEM_MIB >= 2048)); then ok '内存不少于 2GiB，不需要硬盘 Swap。'; module_result swap skipped 'RAM >= 2GiB'; return 0; fi
-    if swapon --noheadings 2>/dev/null | grep . > /dev/null || swap_exists; then
+    # A setup run again finds this tool's own swap: that one is checked below.
+    if swap_exists --other; then
       ok '已有 Swap 或 ZRAM，不需要硬盘 Swap。'; module_result swap skipped 'other swap present'; return 0
     fi
   fi

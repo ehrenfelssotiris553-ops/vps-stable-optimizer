@@ -157,6 +157,12 @@ vm 'bash -s' < "$CI/snapshot.sh" > "$LOGS/snapshot-before.txt"
 scp -q -i key -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
   "$ROOT/install.sh" "$ROOT/vps-stable-opt.sh" root@127.0.0.1:/root/
 vm 'bash /root/install.sh --local-file /root/vps-stable-opt.sh --no-run'
+# An SSH keepalive the image sets itself (Debian's cloud images: 120 seconds)
+# is kept by the tool; without one the tool's 60 seconds apply.
+# shellcheck disable=SC2016
+ka_kept="$(vm 'if grep -REiq "^[[:space:]]*ClientAliveInterval" /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null; then
+  mkdir -p /run/sshd; sshd -T 2>/dev/null | awk '"'"'$1 == "clientaliveinterval" && $2 != 0 {print $2}'"'"'; fi' || true)"
+printf 'SSH keepalive set by the image: %s\n' "${ka_kept:-none}"
 # Ubuntu's cloud kernels keep zram in linux-modules-extra, which the tool
 # deliberately does not install: there ZRAM has to be reported unsupported.
 zram_kernel=1
@@ -223,10 +229,17 @@ check_all() {
   vm_drive check.rules "$name" "$@" vps check || rc=$?
   cat "$LOGS/$name.log"
   [[ "$rc" == 0 || "$rc" == 3 ]] || fail "$name exited with $rc"
-  # SSH keepalive is in the recommended set, and sshd runs on every VM.
-  for item in 'BBR 网络优化' '内核网络安全参数' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破' 'SSH 保活'; do
+  for item in 'BBR 网络优化' '内核网络安全参数' '日志限制' '自动安全更新' '常用工具' '防火墙' 'Fail2ban 防爆破'; do
     passed "$name" "$item"
   done
+  # SSH keepalive is in the recommended set: the image's own interval kept,
+  # or the tool's 60 seconds; checked against sshd itself where root may log in.
+  if [[ -n "$ka_kept" ]]; then has "$name" "SSH 保活：保留了已有配置（ClientAliveInterval $ka_kept）"
+  else passed "$name" 'SSH 保活'; fi
+  if (($# == 0)); then
+    vm "mkdir -p /run/sshd; sshd -T 2>/dev/null | grep -qx 'clientaliveinterval ${ka_kept:-60}'" ||
+      fail "$name: sshd does not use a keepalive of ${ka_kept:-60} seconds"
+  fi
   if ((zram_kernel)); then passed "$name" 'ZRAM 内存缓冲'
   else
     # No ZRAM on a small machine: a disk swap instead, used after ZRAM, at boot.

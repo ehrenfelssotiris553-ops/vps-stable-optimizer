@@ -60,6 +60,14 @@ before_cc="$(sysctl -n net.ipv4.tcp_congestion_control)" before_rmem="$(sysctl -
 before_tcp_rmem="$(tcp_rmem_max)"
 before_kptr="$(sysctl -n kernel.kptr_restrict)" before_tools="$(tool_packages)"
 before_trim="$(systemctl is-enabled fstrim.timer 2>/dev/null || true)"
+# An SSH keepalive the runner's image sets itself (GitHub's: 120 seconds) is
+# kept by the tool; without one the tool's 60 seconds apply.
+ka_kept=''
+if sudo test -x /usr/sbin/sshd && sudo grep -REiq '^[[:space:]]*ClientAliveInterval' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null; then
+  sudo mkdir -p /run/sshd
+  ka_kept="$(sudo /usr/sbin/sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" && $2 != 0 {print $2}' || true)"
+fi
+printf 'SSH keepalive set by the image: %s\n' "${ka_kept:-none}"
 before_updates=0 before_reboot=0
 if apt_has 'APT::Periodic::Unattended-Upgrade "1";'; then before_updates=1; fi
 if apt_has 'Unattended-Upgrade::Automatic-Reboot "true";'; then before_reboot=1; fi
@@ -317,13 +325,18 @@ item_do item-ping-off ping 2
 if sudo test -e /etc/sysctl.d/99-vps-stable-noping.conf; then fail 'ping back: file left'; fi
 item_do item-ping-on-again ping 1
 
-# SSH keepalive, where the runner has an SSH server: what sshd itself uses.
+# SSH keepalive, where the runner has an SSH server: what sshd itself uses,
+# and the image's own interval kept without a file of this tool.
 if sudo test -x /usr/sbin/sshd; then
   item_do item-keepalive-off keepalive 2
   if sudo test -e /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf; then fail 'SSH keepalive off: file left'; fi
   item_do item-keepalive-on keepalive 1
-  sudo /usr/sbin/sshd -T 2>/dev/null | grep -Fx 'clientaliveinterval 60' > /dev/null ||
-    fail "SSH keepalive on: sshd uses $(sudo /usr/sbin/sshd -T 2>/dev/null | grep '^clientaliveinterval' || echo nothing)"
+  sudo /usr/sbin/sshd -T 2>/dev/null | grep -Fx "clientaliveinterval ${ka_kept:-60}" > /dev/null ||
+    fail "SSH keepalive on: sshd uses $(sudo /usr/sbin/sshd -T 2>/dev/null | grep '^clientaliveinterval' || echo nothing), not ${ka_kept:-60}"
+  if [[ -n "$ka_kept" ]]; then
+    if sudo test -e /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf; then fail "SSH keepalive on: a file of this tool next to the image's $ka_kept seconds"; fi
+    has item-keepalive-on "SSH 已经有保活设置（每 $ka_kept 秒），保持不变。"
+  fi
 else
   printf '::notice::%s\n' 'SSH keepalive not tested here: no SSH server on this runner'
 fi

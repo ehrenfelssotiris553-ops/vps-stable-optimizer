@@ -91,6 +91,23 @@ ENABLED=0; check_swap '1024 MiB'
 ENABLED=1
 printf 'PASS: the disk swap is about the RAM, formatted, used after ZRAM, started at boot and checked.\n'
 
+# The setup run again (found on Ubuntu VMs): this tool's own swap in use is
+# not "another swap", so it stays applied; a ZRAM next to it still counts.
+(
+  eval "$(awk -v n=swap_exists '$0 == n "() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT" | sed -e "s#/etc/fstab#$TEST_ROOT/fstab#g")"
+  : > "$TEST_ROOT/fstab"
+  eval "outer_$(declare -f systemctl)"
+  systemctl() { if [[ "$*" == 'is-enabled zramswap.service' ]]; then return 1; fi; outer_systemctl "$@"; }
+  OURS=1
+  reset; swap_stage
+  grep -q '^result swap applied 1024 MiB' "$TEST_ROOT/trace" || fail "a second setup did not keep its own swap: $(cat "$TEST_ROOT/trace")"
+  printf '/dev/zram0\tpartition\t500000\t0\t100\n' >> "$P/swaps"
+  reset; swap_stage
+  grep -q '^result swap skipped other swap present' "$TEST_ROOT/trace" || fail 'a ZRAM next to the own swap was not counted'
+)
+grep -v '^/dev/zram0' "$P/swaps" > "$P/swaps.new" || true; mv "$P/swaps.new" "$P/swaps"
+printf 'PASS: a setup run again keeps its own disk swap and still counts any other swap.\n'
+
 # 3 GB stay free: the size shrinks, or there is no swap at all.
 reset; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"; FREE=3600; swap_stage
 [[ "$(($(stat -c %s -- "$SWAP_FILE") / 1048576))" == 512 ]] || fail "not shrunk to keep 3 GB: $(stat -c %s -- "$SWAP_FILE")"

@@ -9,6 +9,8 @@ source "$HERE/test-common.sh"
 load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width display_name_get
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
+# No display name stored (the header shows the hostname).
+PARAMS_FILE="$TEST_ROOT/params"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 say() { :; }
 warn() { printf 'WARN: %s\n' "$*"; }

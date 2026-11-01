@@ -136,7 +136,8 @@ assert_absent '计划配置约内存一半大小的 ZRAM'
 ZRAM_MODULE=1
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '当前未确认 BBR 可用'
-assert_absent '硬盘 Swap'
+# No disk swap item (the ZRAM line itself says none is made).
+assert_absent '] 硬盘 Swap：'
 assert_absent '内核不支持'
 assert_contains '系统盘不大于 20GiB'
 assert_contains '必须通过新 SSH 窗口验证'
