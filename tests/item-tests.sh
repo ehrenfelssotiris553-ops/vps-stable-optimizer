@@ -107,8 +107,9 @@ printf 'PASS: the recommended set is one question and still respects an empty up
 )
 printf 'PASS: recommended mode sets only the low-risk items and still asks about SSH, web ports and the Fail2ban allowlist.\n'
 
-# Rollback groups: Fail2ban before the firewall, pending detection, per-item pick.
-[[ "$(restore_groups | head -n 2 | tr '\n' ' ')" == 'fail2ban firewall ' ]] || fail 'Fail2ban must be undone before the firewall'
+# Rollback groups: Fail2ban and the SSH port (which lets the old port in again)
+# before the firewall, pending detection, per-item pick.
+[[ "$(restore_groups | head -n 3 | tr '\n' ' ')" == 'fail2ban sshport firewall ' ]] || fail 'Fail2ban and the SSH port must be undone before the firewall'
 RESTORE_ROOT="$TEST_ROOT/restore-v2"; mkdir -p "$RESTORE_ROOT"
 declare -A STATE=()
 restore_read() { [[ "$2" == state && -n "${STATE[$1]:-}" ]] || return 1; echo "${STATE[$1]}"; }
@@ -129,6 +130,7 @@ restore_ssh_group() { record 'group ssh'; }
 restore_zram_group() { record 'group zram'; }
 restore_hostname_group() { record 'group hostname'; }
 restore_swap_group() { record 'group swap'; }
+restore_sshport_group() { record 'group sshport'; }
 check_reconcile() { record 'check reconcile'; }
 check_remove() { record 'check remove'; }
 # No Docker running here (the Docker log group only warns when it runs).
@@ -141,7 +143,7 @@ restore_zram_settle() { record 'zram settle'; }
 restore_value() { echo inactive; }
 restore_tool_packages() { :; }
 reset; restore_all_groups
-[[ "$(head -n 2 "$TEST_ROOT/trace" | tr '\n' ' ')" == 'group fail2ban group firewall ' ]] || fail 'full rollback order'
+[[ "$(head -n 3 "$TEST_ROOT/trace" | tr '\n' ' ')" == 'group fail2ban group sshport group firewall ' ]] || fail 'full rollback order'
 grep -Fxq 'resource bbr_file' "$TEST_ROOT/trace" || fail 'plain group resources not restored'
 # A rename is undone with its own handler (cloud-init, the name, its hosts line).
 grep -Fxq 'group hostname' "$TEST_ROOT/trace" || fail 'the rename was not undone by the full rollback'
@@ -212,10 +214,10 @@ item_action ports < /dev/null > /dev/null
 reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-[[ "$(item_keys | wc -l | tr -d ' ')" == 29 ]] || fail 'item count'
+[[ "$(item_keys | wc -l | tr -d ' ')" == 30 ]] || fail 'item count'
 # New items are appended: the numbers the user knows stay the same.
 [[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
-[[ "$(item_keys | sed -n '20,29p' | tr '\n' ' ')" == 'hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog ' ]] || fail 'new items are not appended in order'
+[[ "$(item_keys | sed -n '20,30p' | tr '\n' ' ')" == 'hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog sshport ' ]] || fail 'new items are not appended in order'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

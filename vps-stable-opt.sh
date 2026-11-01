@@ -53,6 +53,8 @@ F2B_ACTION_FILE=/etc/fail2ban/action.d/vps-stable-ufw-sshd.conf
 F2B_DB_FILE=/etc/fail2ban/fail2ban.d/99-vps-stable.local
 # sshd keeps the FIRST value it reads; 01- sorts before cloud-init's 50- file.
 SSH_DROPIN=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
+# The SSH port this tool set (sshd uses every Port line it reads).
+SSH_PORT_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-port.conf
 # Only written when a provider image ships "PubkeyAuthentication no".
 SSH_PUBKEY_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-pubkey.conf
 # Tells cloud-init to keep a hostname set with vps (it sets the provider's at boot).
@@ -108,7 +110,7 @@ LOGIN_NOTE_DIR=/run/vps-stable-login
 CHECK_SERVICE_FILE=/etc/systemd/system/vps-stable-check.service
 CHECK_TIMER_FILE=/etc/systemd/system/vps-stable-check.timer
 DOCKER_DAEMON_FILE=/etc/docker/daemon.json
-NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE=''
+NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE='' SSHPORT_CHOICE=''
 
 case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|audit|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|audit|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
@@ -3256,8 +3258,9 @@ fail2ban_stage() {
       warn "Fail2ban 规则文件是链接或特殊文件，保持不变：$F2B_FILE"; return 0
     fi
     current="$(cat "$F2B_FILE")"
-    if [[ "$current" != "$guard" ]] && ! f2b_jail_is_ours "$current" "$joined"; then
-      warn "已有自定义规则，或 SSH 端口变了：$F2B_FILE。保持不变，请人工迁移后再试。"
+    # This tool's jail for the ports it names: it follows a changed SSH port.
+    if [[ "$current" != "$guard" ]] && ! f2b_jail_is_ours "$current" "$(sed -n 's/^port = //p' <<< "$current" | head -n 1)"; then
+      warn "已有自定义规则：$F2B_FILE。保持不变，请人工迁移后再试。"
       module_result fail2ban preserved 'jail file differs'; return 0
     fi
   fi
@@ -4147,6 +4150,169 @@ ssh_harden_stage() {
   module_result ssh failed 'second login not confirmed; reverted'
 }
 
+# Changing the SSH port: the firewall lets the new port in first, then sshd
+# listens on both, under a timer that puts the old setting back. Only after a
+# new login on the new port is the old one closed (sshd, this tool's firewall
+# rules, Fail2ban). A port set anywhere else is not touched.
+ssh_port_text() {
+  printf '%s\n' '# VPS Stable Optimizer v2.8: SSH port'
+  printf 'Port %s\n' "$@"
+}
+
+# Where a port is set apart from this tool's file (sshd_config, another
+# drop-in, an override of ssh.socket); nothing when nowhere.
+ssh_port_elsewhere() {
+  local found
+  found="$(grep -REin --exclude="${SSH_PORT_DROPIN##*/}" '^[[:space:]]*Port[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null | head -n 1 || true)"
+  [[ -n "$found" ]] || found="$(grep -Rls '^[[:space:]]*ListenStream' /etc/systemd/system/ssh.socket.d 2>/dev/null | head -n 1 || true)"
+  printf '%s' "$found"
+}
+
+# The ports in force: where systemd listens for sshd (ssh.socket, Ubuntu 24.04
+# and later) it makes the socket from sshd's configuration at daemon-reload.
+ssh_port_reload() {
+  if systemctl is-active -q ssh.socket 2>/dev/null; then systemctl daemon-reload && systemctl restart ssh.socket
+  else ssh_reload; fi
+}
+
+# PORT: a connection to sshd on it now (a new window logged in there).
+ssh_port_established() {
+  [[ -n "$(ss -Htn state established "( sport = :$1 )" 2>/dev/null)" ]]
+}
+
+# The setting before this change, back (the timer does the same if this run dies).
+ssh_port_restore_previous() {
+  if [[ -s "$STATE_ROOT/sshport-previous" ]]; then cp -f -- "$STATE_ROOT/sshport-previous" "$SSH_PORT_DROPIN"
+  else rm -f -- "$SSH_PORT_DROPIN"; fi
+  chmod 644 -- "$SSH_PORT_DROPIN" 2>/dev/null || true
+}
+
+# Fail2ban watches the ports sshd listens on now (its own jail only).
+ssh_port_follow() {
+  [[ -f "$F2B_FILE" ]] && grep -Fq vps-stable-ufw-sshd "$F2B_FILE" && active fail2ban || return 0
+  FIREWALL_READY=1 F2B_IGNORE_CHOICE=none fail2ban_stage > /dev/null || true
+  if ssh_detect; then ok "Fail2ban 改为盯 SSH 端口 $(IFS=,; echo "${SSH_PORTS[*]}")。"; fi
+}
+
+# PORT: this tool's firewall rules for PORT go (rules someone else added stay).
+ssh_port_fw_close() {
+  local port="$1" rule record="$RESTORE_ROOT/fw_rules" temp left=1
+  local -a words=()
+  [[ -f "$record" && ! -L "$record" ]] || return 1
+  while IFS= read -r rule; do
+    [[ "$rule" =~ ^ufw\ (allow|limit)\ $port/tcp$ || "$rule" =~ ^ufw\ allow\ from\ [0-9A-Fa-f:.]+\ to\ any\ port\ $port\ proto\ tcp$ ]] || continue
+    read -r -a words <<< "${rule#ufw }"
+    if [[ "${words[1]}" == from ]]; then words=(allow proto tcp from "${words[2]}" to any port "$port"); fi
+    if ufw --force delete "${words[@]}" >/dev/null 2>&1; then
+      left=0
+      temp="$(mktemp "$RESTORE_ROOT/.write.XXXXXX")" || continue
+      { grep -vxF -- "$rule" "$record" > "$temp" || true; }
+      if ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$record"; then rm -f -- "$temp"; fi
+    else warn "没能删掉防火墙规则：${rule#ufw }"; fi
+  done < <(cat -- "$record")
+  return "$left"
+}
+
+ssh_port_stage() {
+  say '修改 SSH 端口'
+  local old new verb=allow previous='' unit deadline where fw=0
+  if [[ "${SSHPORT_CHOICE:-}" != 1 ]]; then module_result sshport declined 'not requested'; return 0; fi
+  if ! ssh_detect || ((${#SSH_PORTS[@]} != 1)); then
+    warn '没能确认 SSH 正在监听的唯一端口（没在运行，或者同时监听了几个），不改。'; module_result sshport skipped 'SSH port not clear'; return 0
+  fi
+  old="${SSH_PORTS[0]}"
+  where="$(ssh_port_elsewhere)"
+  if [[ -n "$where" ]]; then
+    warn "SSH 端口在别处设置了（$(audit_clean_text <<< "$where" | cut -c1-120)）：本工具不改那里。要改的话先把那一行注释掉。"
+    module_result sshport preserved 'port set elsewhere'; return 0
+  fi
+  if guard_leftovers; then module_result sshport skipped 'earlier protection timer pending'; return 0; fi
+  echo "现在的 SSH 端口：$old。换端口挡不住真正的攻击者，但能少掉绝大多数自动扫描（日志清净，Fail2ban 也轻松）。"
+  read -r -p '新的端口（1024–65535，直接回车取消）: ' new || new=''
+  if [[ -z "$new" ]]; then ok '已取消。'; module_result sshport declined 'cancelled'; return 0; fi
+  if [[ ! "$new" =~ ^[0-9]{4,5}$ ]] || ((10#$new < 1024 || 10#$new > 65535 || 10#$new == old)); then
+    warn '端口要在 1024 到 65535 之间，而且和现在的不一样。'; module_result sshport declined 'bad port'; return 0
+  fi
+  new=$((10#$new))
+  if [[ -n "$(ss -H -ltn "( sport = :$new )" 2>/dev/null)" ]]; then warn "端口 $new 已经有程序在用。"; module_result sshport declined 'port in use'; return 0; fi
+  echo "很多服务商还有自己的安全组（云防火墙）：先在那里放行 TCP $new，不然改完从外面连不上。"
+  if ! confirm_yes "服务商那边已经放行 TCP $new 了吗？"; then ok '已取消：放行以后再来。'; module_result sshport declined 'provider firewall'; return 0; fi
+  if [[ -e "$SSH_PORT_DROPIN" ]] && ! restore_file_ours sshport_dropin; then
+    warn "$SSH_PORT_DROPIN 不是本工具写的，保持不变。"; module_result sshport preserved 'drop-in differs'; return 0
+  fi
+  [[ ! -f "$SSH_PORT_DROPIN" ]] || previous="$(cat -- "$SSH_PORT_DROPIN")"
+  printf '%s' "${previous:+$previous$'\n'}" > "$STATE_ROOT/sshport-previous"
+  # 1. The firewall lets the new port in first, the way it lets the old one in.
+  if ufw_active; then
+    fw=1
+    if ufw show added 2>/dev/null | grep -Fx "ufw limit $old/tcp" > /dev/null; then verb=limit; fi
+    if ! ufw_rule "$verb" "$new"; then warn "防火墙没能放行 $new，什么都没改。"; module_result sshport failed 'firewall'; return 0; fi
+    if [[ "$verb" == limit ]]; then ssh_limit_exempt; fi
+  fi
+  # The port to go back to (kept from the first change on).
+  if [[ ! -s "$RESTORE_ROOT/sshport" ]]; then printf 'port=%s\nverb=%s\n' "$old" "$verb" > "$RESTORE_ROOT/sshport"; chmod 600 -- "$RESTORE_ROOT/sshport"; fi
+  # 2. sshd on both ports, under a timer that puts the old setting back.
+  rm -f -- "$SSH_PORT_DROPIN"
+  if ! put_file "$SSH_PORT_DROPIN" "$(ssh_port_text "$old" "$new")" || ! { sshd_runtime_dir; sshd -t; }; then
+    ssh_port_restore_previous; if ((fw)); then ssh_port_fw_close "$new" || true; fi
+    warn 'sshd 不接受新的端口设置，已撤回。'; module_result sshport failed 'sshd -t failed'; return 0
+  fi
+  unit="vps-stable-ssh-revert-$(date +%s)-$$"
+  if ! guard_arm "$unit" /bin/sh -c "if [ -s '$STATE_ROOT/sshport-previous' ]; then cp -f '$STATE_ROOT/sshport-previous' '$SSH_PORT_DROPIN'; else rm -f '$SSH_PORT_DROPIN'; fi; if systemctl is-active -q ssh.socket; then systemctl daemon-reload; systemctl restart ssh.socket; else systemctl try-reload-or-restart ssh.service; fi"; then
+    ssh_port_restore_previous; if ((fw)); then ssh_port_fw_close "$new" || true; fi
+    warn '无法启用自动撤销计时器；什么都没改。'; module_result sshport failed 'guard not armed'; return 0
+  fi
+  deadline=$((SECONDS + 180))
+  ssh_port_reload || true
+  if ! port_listening "$new" || ! port_listening "$old"; then
+    ssh_port_restore_previous; ssh_port_reload || true
+    if ((fw)); then ssh_port_fw_close "$new" || true; fi
+    systemctl stop "$unit.timer" 2>/dev/null || true
+    warn "SSH 没能同时在 $old 和 $new 上监听，已恢复原样。"; module_result sshport failed 'not listening'; return 0
+  fi
+  ssh_port_follow
+  echo "SSH 现在同时在 $old 和 $new 上。请保留这个窗口，再新开一个终端，用新端口登录：
+  ssh -p $new 账户名@服务器IP
+新端口上一有登录，这里几秒内就会自动确认；没有自动确认时回到这个窗口输入 CONNECTED。180 秒内没有确认就恢复原样。"
+  if guard_confirm "$unit" "$deadline" ssh_port_established "$new"; then
+    # 3. Only the new port: sshd, then this tool's rules for the old one.
+    rm -f -- "$SSH_PORT_DROPIN"
+    if put_file "$SSH_PORT_DROPIN" "$(ssh_port_text "$new")" && sshd -t && ssh_port_reload && port_listening "$new"; then
+      if ((fw)) && ! ssh_port_fw_close "$old"; then
+        warn "防火墙里放行旧端口 $old 的规则不是本工具加的，保持不变：不需要的话用 vps port 或 ufw 删掉。"
+      fi
+      ssh_port_follow
+      ok "SSH 端口已改成 $new。以后登录用 ssh -p $new；记得到服务商的安全组里把旧端口 $old 关掉。"
+      module_result sshport applied "port $new"
+      return 0
+    fi
+    warn "只留新端口时出了问题：SSH 保持同时监听 $old 和 $new，请检查后再试。"
+    rm -f -- "$SSH_PORT_DROPIN"; put_file "$SSH_PORT_DROPIN" "$(ssh_port_text "$old" "$new")" || true; ssh_port_reload || true
+    module_result sshport failed 'old port not closed'; return 0
+  fi
+  warn '这次没有确认：正在恢复原来的 SSH 端口。'
+  ssh_port_restore_previous
+  if ssh_port_reload; then systemctl stop "$unit.timer" 2>/dev/null || true
+  else warn 'SSH 重新加载失败：自动撤销计时器保留，到期时会再试一次。'; fi
+  if ((fw)); then ssh_port_fw_close "$new" || true; fi
+  ssh_port_follow
+  module_result sshport failed 'new port not confirmed; reverted'
+}
+
+# Rollback only widens access: the port SSH goes back to is let in first.
+restore_sshport_group() {
+  local port verb
+  restore_needed sshport_dropin || return 0
+  port="$(sed -n 's/^port=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)" verb="$(sed -n 's/^verb=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)"
+  if [[ "$port" =~ ^[0-9]{1,5}$ ]] && ufw_active && ! ufw_rule "${verb:-allow}" "$port"; then
+    warn "防火墙没能放行原来的 SSH 端口 $port：SSH 端口保持不变。"; RESTORE_PARTIAL=1; return 0
+  fi
+  restore_resource sshport_dropin
+  if ! ssh_port_reload; then warn 'SSH 重新加载失败：重启 SSH 后才回到原来的端口。'; RESTORE_PARTIAL=1; fi
+  ssh_port_follow
+  if [[ "$port" =~ ^[0-9]+$ ]]; then ok "SSH 回到端口 $port（新端口的防火墙规则在撤销防火墙时一起删掉）。"; fi
+}
+
 # Read-only preflight. A blocking finding is enforced only after APPLY.
 preflight_block() {
   PREFLIGHT_BLOCKERS=$((PREFLIGHT_BLOCKERS + 1))
@@ -4919,7 +5085,7 @@ backup_config_group() {
 backup_configs() {
   local file unit
   say '保存配置快照与优化前状态'
-  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$LOGIN_PAM_FILE" "$LOGIN_PROFILE_FILE" "$PAM_COMMON_SESSION" "$CHECK_SERVICE_FILE" "$CHECK_TIMER_FILE" "$DOCKER_DAEMON_FILE" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
+  for file in "$BBR_FILE" "$MODULE_FILE" "$ZRAM_FILE" "$ZRAM_SYSCTL_FILE" "$JOURNAL_FILE" "$F2B_FILE" "$APT_FILE" "$F2B_ACTION_FILE" "$F2B_DB_FILE" "$LOGIN_PAM_FILE" "$LOGIN_PROFILE_FILE" "$PAM_COMMON_SESSION" "$CHECK_SERVICE_FILE" "$CHECK_TIMER_FILE" "$DOCKER_DAEMON_FILE" "$SSH_PORT_DROPIN" "$SSH_DROPIN" "$SSH_PUBKEY_DROPIN" \
       /etc/ssh/sshd_config /etc/default/ssh /etc/default/ufw \
       /etc/ufw/ufw.conf /etc/ufw/sysctl.conf /etc/ufw/before.rules /etc/ufw/before6.rules \
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
@@ -5264,9 +5430,19 @@ printf '%s\n' "$boot" > "$dir/boot"
 # Logins, every run: from the login record (it knows first-time addresses
 # and console logins), or from sshd's own lines.
 if [ "$tg" = 1 ]; then
-  if [ -s "$state/logins" ]; then
-    last="$(cat "$dir/login-ts" 2>/dev/null || echo "$now")"
-    awk -F'\t' -v t="$last" 'NF == 6 && $1 > t' "$state/logins" | tail -n 20 > "$dir/logins.new"
+  if [ -s "$state/logins" ] || [ -f "$dir/login-last" ]; then
+    # Read on from the last line handled, so a login in the same second as the
+    # last run is not lost (by time only when that line was pruned); the first
+    # time from the end of the record.
+    if [ ! -f "$dir/login-last" ]; then
+      tail -n 1 "$state/logins" > "$dir/login-last" 2>/dev/null; : > "$dir/logins.new"
+    else
+      awk -F'\t' -v L="$(cat "$dir/login-last")" -v out="$dir/login-last" '
+        BEGIN {split(L, f, "\t"); t0 = f[1] + 0}
+        NF == 6 {n++; line[n] = $0; ts[n] = $1; if ($0 == L) at = n}
+        END {if (n) print line[n] > out
+          for (i = 1; i <= n; i++) if ((at && i > at) || (!at && ts[i] > t0)) print line[i]}' "$state/logins" 2>/dev/null | tail -n 20 > "$dir/logins.new"
+    fi
     while IFS="$tab" read -r t u from m _ n; do
       u="$(printf '%s' "$u" | clean 32)" from="$(printf '%s' "$from" | clean 64)"
       case "$from" in
@@ -5276,8 +5452,6 @@ if [ "$tg" = 1 ]; then
            else queue "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）"; fi ;;
       esac
     done < "$dir/logins.new"
-    t="$(awk -F'\t' 'END {print $1}' "$dir/logins.new")"
-    if [ -n "$t" ]; then printf '%s\n' "$t" > "$dir/login-ts"; elif [ ! -f "$dir/login-ts" ]; then printf '%s\n' "$now" > "$dir/login-ts"; fi
   else
     journal_new logins -t sshd -t sshd-session | awk -F'\t' '{split($3, f, " "); if (f[1] == "Accepted" && f[3] == "for" && f[5] == "from") print f[4] "\t" f[6] "\t" f[2]}' |
       while IFS="$tab" read -r u from m; do
@@ -6649,6 +6823,7 @@ restore_ids() {
     notify) printf '%s\n' notify_conf check_timer check_service_file check_timer_file check_script_file ;;
     quota) printf '%s\n' quota_conf check_timer check_service_file check_timer_file check_script_file ;;
     dockerlog) printf '%s\n' dockerlog_file ;;
+    sshport) printf '%s\n' sshport_dropin ;;
     ntp) printf '%s\n' ntp svc_timesync ;;
     journal) printf '%s\n' journal_file ;;
     trim) printf '%s\n' svc_trim ;;
@@ -6667,7 +6842,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file notify_conf quota_conf check_timer check_service_file check_timer_file check_script_file dockerlog_file
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file notify_conf quota_conf check_timer check_service_file check_timer_file check_script_file dockerlog_file sshport_dropin
 }
 
 restore_label() {
@@ -6681,7 +6856,7 @@ restore_label() {
     login_pam) echo '登录记录（common-session 里的那一行）' ;; login_pam_file) echo '登录记录的 PAM 设置' ;; login_hook_file) echo '登录记录脚本' ;; login_profile_file) echo '登录时显示提示的脚本' ;;
     notify_conf) echo 'TG 通知的设置' ;; quota_conf) echo '月流量提醒的设置' ;; check_timer) echo '检查定时任务（开关）' ;;
     check_service_file) echo '检查定时任务的服务' ;; check_timer_file) echo '检查定时任务的时间' ;; check_script_file) echo '检查脚本' ;;
-    dockerlog_file) echo 'Docker 的 daemon.json' ;;
+    dockerlog_file) echo 'Docker 的 daemon.json' ;; sshport_dropin) echo 'SSH 端口' ;;
     journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
     apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
     svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
@@ -6723,6 +6898,7 @@ restore_path() {
     notify_conf) printf '%s\n' "$STATE_ROOT/notify.conf" ;; quota_conf) printf '%s\n' "$STATE_ROOT/quota.conf" ;;
     check_service_file) printf '%s\n' "$CHECK_SERVICE_FILE" ;; check_timer_file) printf '%s\n' "$CHECK_TIMER_FILE" ;;
     check_script_file) printf '%s\n' "$STATE_ROOT/notify-check" ;; dockerlog_file) printf '%s\n' "$DOCKER_DAEMON_FILE" ;;
+    sshport_dropin) printf '%s\n' "$SSH_PORT_DROPIN" ;;
     apt_time_file) printf '%s\n' "$APT_TIME_FILE" ;;
     *) return 1 ;;
   esac
@@ -7643,7 +7819,7 @@ restore_packages_record() {
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
 restore_groups() {
-  printf '%s\n' fail2ban firewall ssh keepalive login notify quota check dockerlog zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
+  printf '%s\n' fail2ban sshport firewall ssh keepalive login notify quota check dockerlog zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
 }
 
 restore_group_label() {
@@ -7654,6 +7830,7 @@ restore_group_label() {
     keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; login) echo '登录记录和提醒（记录本身保留）' ;;
     notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; check) echo '检查定时任务（TG 通知和流量提醒共用）' ;;
     dockerlog) echo 'Docker 容器日志上限（重启 Docker 后恢复）' ;;
+    sshport) echo 'SSH 端口（回到原来的端口）' ;;
     bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; tcp) echo 'TCP 缓冲区上限' ;;
     journal) echo '日志空间限制' ;;
     updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
@@ -7679,6 +7856,7 @@ restore_group_ids() {
     quota) printf '%s\n' quota_conf ;;
     check) printf '%s\n' check_timer check_service_file check_timer_file check_script_file ;;
     dockerlog) printf '%s\n' dockerlog_file ;;
+    sshport) printf '%s\n' sshport_dropin ;;
     bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
     sysctl) printf '%s\n' sysctl_file ;;
     tcp) printf '%s\n' tcp_file ;;
@@ -7721,6 +7899,7 @@ restore_group_apply() {
   case "$group" in
     firewall) restore_firewall_group ;;
     fail2ban) restore_fail2ban_group ;;
+    sshport) restore_sshport_group ;;
     ssh) restore_ssh_group ;;
     zram) restore_zram_group ;;
     hostname) restore_hostname_group ;;
@@ -7988,6 +8167,18 @@ check_keepalive() {
   if [[ "$current" == "${1% s}" ]]; then verify_set pass "每 $current 秒检测一次空闲连接"
   elif [[ -z "$current" ]]; then verify_set unknown '读不到 sshd 实际生效的配置'
   else verify_set fail "生效的保活间隔是 ${current} 秒，不是 ${1% s} 秒"; fi
+}
+
+check_sshport() {
+  local ports p rules
+  ports="$(sed -n 's/^Port //p' "$SSH_PORT_DROPIN" 2>/dev/null | tr '\n' ' ')"
+  [[ -n "${ports// /}" ]] || { verify_set fail "$SSH_PORT_DROPIN 不见了：SSH 回到了默认端口"; return 0; }
+  for p in $ports; do port_listening "$p" || { verify_set fail "SSH 没有在端口 $p 上监听"; return 0; }; done
+  if ufw_active; then
+    rules="$(ufw show added 2>/dev/null || true)"
+    for p in $ports; do grep -Eq "^ufw (allow|limit) $p/tcp$" <<< "$rules" || { verify_set fail "防火墙没有放行 SSH 端口 $p"; return 0; }; done
+  fi
+  verify_set pass "SSH 在端口 ${ports% } 上$(if ufw_active; then echo '，防火墙已放行'; fi)"
 }
 
 # The timer runs and the script is this version's.
@@ -8457,6 +8648,7 @@ verify_checks() {
   verify_module notify 'TG 通知' check_notify
   verify_module quota '月流量提醒' check_quota
   verify_module dockerlog 'Docker 容器日志上限' check_dockerlog
+  verify_module sshport 'SSH 端口' check_sshport
   verify_module ntp '时间同步' check_ntp
   verify_module journal '日志限制' check_journal
   verify_module trim '磁盘 TRIM' check_trim
@@ -8971,7 +9163,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog
+  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog sshport
 }
 
 item_label() {
@@ -8982,7 +9174,7 @@ item_label() {
     hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; swap) echo '硬盘 Swap' ;; tools) echo '常用工具' ;;
     conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;; keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
     login) echo '登录记录和提醒' ;;
-    notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; dockerlog) echo 'Docker 容器日志上限' ;;
+    notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; dockerlog) echo 'Docker 容器日志上限' ;; sshport) echo 'SSH 端口' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
     tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
     *) printf '%s\n' "$1" ;;
@@ -9040,6 +9232,9 @@ item_status() {
     quota)
       if read -r value total < <(quota_status); then echo "本周期已用 $((value / 1024)) GB / $((total / 1024)) GB"
       elif [[ -s "$STATE_ROOT/quota.conf" ]]; then echo '已开启，还没统计'; else echo '未开启'; fi ;;
+    sshport)
+      if [[ -f "$SSH_PORT_DROPIN" ]]; then echo "$(sed -n 's/^Port //p' "$SSH_PORT_DROPIN" | tr '\n' ' ')（原来是 $(sed -n 's/^port=//p' "$STATE_ROOT/restore-v2/sshport" 2>/dev/null || echo '?')）"
+      else echo "$(ssh_candidates | sort -n -u | tr '\n' ' ')（默认）"; fi ;;
     dockerlog)
       if ! command -v dockerd >/dev/null; then echo '没装 Docker'
       elif grep -q '"max-size"' "$DOCKER_DAEMON_FILE" 2>/dev/null; then echo "已设置（$(sed -n 's/.*"max-size": *"\([^"]*\)".*/\1/p' "$DOCKER_DAEMON_FILE" | head -n 1)）"
@@ -9153,6 +9348,8 @@ item_turn_on() {
       stage_run quota quota_stage ;;
     dockerlog) DOCKERLOG_CHOICE=1
       stage_run dockerlog dockerlog_stage ;;
+    sshport) SSHPORT_CHOICE=1
+      stage_run sshport ssh_port_stage ;;
     ping)
       echo '禁止 ping 只挡最基础的扫描（真正的攻击者不靠 ping 找机器）。代价：服务商或你自己用 ping 做的监控会把机器当成宕机，排查网络时也看不到 ping 的结果。'
       confirm_yes '仍然禁止 ping 吗？' || return 0
@@ -9239,6 +9436,7 @@ item_action() {
     fail2ban) echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 管理白名单（不会被封的 IP）   4. 调整参数   5. 恢复推荐值   0. 返回' ;;
     autoreboot) echo '1. 设置自动重启时间   2. 取消（撤销本工具的设置）   0. 返回' ;;
     ssh) echo '1. 加固（只允许密钥登录，可选禁止 root）   2. 撤销（恢复密码和 root 登录）   0. 返回' ;;
+    sshport) echo '1. 修改端口（新旧端口先同时开着，新端口能登录才关旧的）   2. 恢复原来的端口   0. 返回' ;;
     *) if [[ -n "$(param_names "$key")" ]]; then echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 调整参数   4. 恢复推荐值   0. 返回'
        else echo '1. 开启   2. 关闭（撤销本工具的修改）   0. 返回'; fi ;;
   esac

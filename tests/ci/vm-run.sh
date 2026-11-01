@@ -79,7 +79,7 @@ if [[ -w /dev/kvm ]]; then accel=kvm cpu=host; fi
 printf 'Accelerator: %s, memory: %s MiB\n' "$accel" "$memory"
 qemu-system-x86_64 -machine accel="$accel" -cpu "$cpu" -m "$memory" -smp 2 \
   -drive file=disk.qcow2,if=virtio -drive file=seed.img,if=virtio,format=raw \
-  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8080-:8080 \
+  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8080-:8080,hostfwd=tcp:127.0.0.1:2224-:2244 \
   -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:01 \
   -netdev user,id=n1,net=10.0.3.0/24,hostfwd=tcp:127.0.0.1:2223-:22 -device virtio-net-pci,netdev=n1,mac=52:54:00:12:34:02 \
   -display none -serial file:"$LOGS/console-$system.log" -daemonize -pidfile qemu.pid
@@ -92,6 +92,10 @@ VM_HOST=root@127.0.0.1
 # The same login as one string, for the "!" answers that run through sh.
 VM_SSH="ssh ${VM_OPTS[*]} $VM_HOST"
 export VM_SSH
+# The same VM on SSH port 2244 (the port change test), from 127.0.0.1:2224.
+VM_NEW_OPTS=(-i "$WORK/key" -p 2224 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
+VM_SSH_NEW="ssh ${VM_NEW_OPTS[*]} $VM_HOST"
+export VM_SSH_NEW
 # Commands are given as strings and expand on the VM, not here.
 # shellcheck disable=SC2029
 vm() { ssh "${VM_OPTS[@]}" "$VM_HOST" "$@"; }
@@ -463,6 +467,29 @@ if ((!old)); then
 fi
 
 lc_mark 'after the reboot and the setups again'
+
+group 'SSH port: 22 to 2244 from outside (the old port closed only after a login on the new one), then back'
+# Single item 30; the login that confirms stays a few seconds on the new port
+# ($VM_SSH_NEW is expanded by the shell answer.exp starts).
+# shellcheck disable=SC2016
+printf '%s\n' '请选择要修改的项目 ==> @seq 30 0' '请选择: ==> 1' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+  '等待确认（剩余 ==> !$VM_SSH_NEW sleep 10' > "$LOGS/sshport-on.rules"
+vm_drive "$LOGS/sshport-on.rules" sshport-on vps item || fail "the port change exited with $?"
+has sshport-on 'SSH 端口已改成 2244'
+ssh "${VM_NEW_OPTS[@]}" "$VM_HOST" true || fail 'no login on the new port 2244'
+if ssh "${VM_OPTS[@]}" -o ConnectTimeout=5 "$VM_HOST" true 2>/dev/null; then fail 'the old port 22 still lets logins in'; fi
+ssh "${VM_NEW_OPTS[@]}" "$VM_HOST" 'cat /etc/ssh/sshd_config.d/00-vps-stable-port.conf; ufw show added; fail2ban-client get sshd actions >/dev/null && grep "^port" /etc/fail2ban/jail.d/99-vps-stable-sshd.local' > "$LOGS/sshport-state.txt" 2>&1 || true
+cat "$LOGS/sshport-state.txt"
+if ! grep -Fxq 'Port 2244' "$LOGS/sshport-state.txt" || ! grep -Fxq 'ufw limit 2244/tcp' "$LOGS/sshport-state.txt" || ! grep -Fxq 'port = 2244' "$LOGS/sshport-state.txt"; then
+  fail 'sshd, the firewall or Fail2ban did not follow the new port'
+fi
+if grep -Eq '^ufw (allow|limit) 22/tcp$' "$LOGS/sshport-state.txt"; then fail "the firewall still lets the old port in"; fi
+# Back, logged in on the new port: the old port is let in again first.
+printf '%s\n' '请选择要修改的项目 ==> @seq 30 0' '请选择: ==> 2' '撤销本工具对 ==> y' > "$LOGS/sshport-off.rules"
+drive "$LOGS/sshport-off.rules" sshport-off ssh "${VM_NEW_OPTS[@]}" -tt "$VM_HOST" 'TERM=xterm vps item' || fail "putting the port back exited with $?"
+vm true || fail 'no login on port 22 after putting the port back'
+if ssh "${VM_NEW_OPTS[@]}" -o ConnectTimeout=5 "$VM_HOST" true 2>/dev/null; then fail 'port 2244 still lets logins in after putting the port back'; fi
+endgroup
 group 'SSH hardening: a connection dropped mid-way puts the old settings back'
 vm_drive ssh-drop.rules ssh-drop vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (dropped) exited with $rc"; }
 has ssh-drop '系统日志确认 ops 已用密钥登录成功'

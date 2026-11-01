@@ -208,6 +208,16 @@ fail2ban_stage
 [[ "$(cat "$CASE_DIR/events")" == 'test' ]] || fail 'service restarted after a failed test'
 passed 'a failed test after the upgrade restores the earlier jail'
 
+# The SSH port changed (vps item, SSH 端口): this tool's jail for the old port
+# is still its own and watches the new one.
+new_case port_changed
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
+f2b_jail_text 2222 > "$F2B_FILE"
+EXPECT_JAIL="$(f2b_jail_text '22,2222')"
+fail2ban_stage
+[[ "$(cat "$F2B_FILE")" == "$EXPECT_JAIL" ]] && grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail "the jail did not follow the SSH port: $(cat "$F2B_FILE")"
+passed 'a jail of this tool follows a changed SSH port'
+
 # Parameters changed: this tool's jail with any values is still its own and
 # is written again with the new ones; back to the recommendation, again.
 new_case params

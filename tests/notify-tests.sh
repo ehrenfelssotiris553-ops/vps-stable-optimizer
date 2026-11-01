@@ -59,7 +59,8 @@ printf 'token=123456:SECRET-TOKEN-abcdefghijklmnopqrstu\nchat=4242\napi=http://t
 printf 'display_name=东京-1\n' > "$PARAMS_FILE"
 
 # The first run starts from now: nothing old is sent, no summary.
-printf '%s\troot\t203.0.113.5\tpublickey\tssh\t0\n' "$(($(date +%s) - 100))" > "$STATE_ROOT/logins"
+t0=$(($(date +%s) - 100))
+printf '%s\troot\t203.0.113.5\tpublickey\tssh\t0\n' "$t0" > "$STATE_ROOT/logins"
 printf '2026-01-01 10:00:00 install old:amd64 <none> 1\n' > "$F/dpkg.log"
 printf '1700000000.1 host useradd[1]: new user: name=old, UID=1001\n' > "$T/journal"
 run
@@ -68,9 +69,10 @@ run
 printf 'PASS: the first run starts from now and sends nothing old.\n'
 
 # A login: within a minute, with the machine's name and address; a first-time
-# address with what to do. The token goes to curl through stdin only.
+# address with what to do. The token goes to curl through stdin only. It is
+# in the same second as the last one handled (found on CI, where runs are fast).
 now="$(date +%s)"
-printf '%s\troot\t198.51.100.7\tpassword\tssh\t1\n' "$now" >> "$STATE_ROOT/logins"
+printf '%s\troot\t198.51.100.7\tpassword\tssh\t1\n' "$t0" >> "$STATE_ROOT/logins"
 : > "$T/journal"
 run
 sent | grep -Fq '【东京-1 · 203.0.113.1】' && sent | grep -Fq '登录：root 来自 198.51.100.7（密码，' && sent | grep -Fq '第一次从这个 IP 登录' || fail "login message: $(sent)"
