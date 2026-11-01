@@ -35,10 +35,12 @@ tz() { timedatectl show -p Timezone --value; }
 on_target() { sudo bash -c "$1"; }
 ufw_line() { sudo ufw status 2>/dev/null | head -n 1 || true; }
 ufw_added() { sudo ufw show added; }
-# APT's policy as root sees it: apt-daily and unattended-upgrade run as root.
-# On Ubuntu 26.04 this CI user saw less of it than root did, without any new
-# unreadable file; that the run leaves none is checked apart, by apt_readable.
-apt_has() { sudo apt-config dump 2>/dev/null | grep -Fqx -- "$1"; }
+# APT's policy as root sees it: apt-daily and unattended-upgrade run as root
+# (that other users can read it too is apt_readable's check). grep reads the
+# whole dump: with -q it stops at the first match, and under pipefail the
+# writer's SIGPIPE turns a match into a failure (every time on Ubuntu 26.04,
+# whose apt 3 writes the dump in more pieces).
+apt_has() { sudo apt-config dump 2>/dev/null | grep -Fx -- "$1" > /dev/null; }
 # NAME: the periodic policy as root and as this user, and the files behind it.
 apt_views() {
   { echo '-- as root:'; sudo apt-config dump 2>/dev/null | grep '^APT::Periodic::' || true
@@ -257,7 +259,7 @@ item_do item-updates-on updates 1
 apt_views 'after automatic updates on'
 # GitHub's images set only Update-Package-Lists "1": the tool fills in the
 # missing key. A value other than "1" would be kept (see extras-tests.sh).
-if grep -E '^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) ' <<< "$before_periodic" | grep -vqF ' "1";'; then
+if grep -E '^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) ' <<< "$before_periodic" | grep -vF ' "1";' > /dev/null; then
   fail "this image sets its own periodic policy ($(tr '\n' ' ' <<< "$before_periodic")): the test expects none other than \"1\""
 fi
 apt_has 'APT::Periodic::Update-Package-Lists "1";' || fail 'automatic updates on: package lists are not updated daily'

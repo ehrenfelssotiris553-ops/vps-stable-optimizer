@@ -211,9 +211,9 @@ apt_wait_idle() {
 }
 
 # Every apt-get that changes the system. Neither apt nor dpkg sets a umask, so
-# package scripts inherit this tool's 077: what they create (20auto-upgrades
-# through ucf, for example) would be readable by root only, and apt run by any
-# other user could no longer read its configuration.
+# package scripts would inherit this tool's 077: a file one writes without
+# setting its mode (cat or touch; ucf copies keep theirs) would be readable by
+# root only. They get the 022 of an ordinary root shell instead.
 apt_run() {
   local mask rc=0
   mask="$(umask)"

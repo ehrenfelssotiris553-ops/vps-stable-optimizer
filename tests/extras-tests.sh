@@ -25,8 +25,7 @@ put_file() { [[ ! -e "$1" ]] || return 1; mkdir -p -- "$(dirname -- "$1")"; prin
 reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 
 # Package scripts inherit apt's umask: apt_run gives them 022 and puts this
-# tool's own umask back, also when apt-get fails (found in CI: after a purge,
-# the reinstalled 20auto-upgrades was root-only, unreadable for other users).
+# tool's own umask back, also when apt-get fails.
 (
   load_optimizer_functions apt_run
   apt-get() { umask > "$TEST_ROOT/apt-umask"; [[ "$1" != fail ]]; }

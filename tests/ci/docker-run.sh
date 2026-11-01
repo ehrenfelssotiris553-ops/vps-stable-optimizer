@@ -47,7 +47,9 @@ cat "$LOGS/check.log"
 for item in 'BBR 网络优化' '内核网络安全参数' 'TCP 缓冲区上限' '常用工具' '时区'; do passed check "$item"; done
 has check '防火墙：保留了已有配置（other firewall rules present）'
 has check 'Docker：已安装：用 -p 发布的容器端口会绕过防火墙'
-if sudo ufw status 2>/dev/null | grep -Fxq 'Status: active'; then fail 'UFW was turned on next to Docker'; fi
+# grep reads all of it: -q would stop early, and under pipefail the writer's
+# SIGPIPE would hide a match.
+if sudo ufw status 2>/dev/null | grep -Fx 'Status: active' > /dev/null; then fail 'UFW was turned on next to Docker'; fi
 endgroup
 
 group 'The container keeps working'
