@@ -211,11 +211,14 @@ apt_wait_idle() {
 }
 
 # Packages absent before this call are recorded so rollback can offer removal.
+# apt waits for the package lock itself (DPkg::Lock::Timeout, 15 minutes): an
+# automatic update can take its lock right after apt_wait_idle looked, and on a
+# small or long-unpatched machine it often runs for more than a few minutes.
 install_pkgs() {
   local pkg new=() rc=0
   for pkg in "$@"; do installed "$pkg" || new+=("$pkg"); done
   apt_wait_idle
-  apt-get -y -q -o DPkg::Lock::Timeout=120 install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" || rc=$?
+  apt-get -y -q -o DPkg::Lock::Timeout=900 install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" || rc=$?
   if declare -F restore_record_packages >/dev/null && ((${#new[@]})); then
     restore_record_packages "${new[@]}" || warn '无法记录本次新装的软件包；回退时不会提供卸载它们的选项。'
   fi
@@ -759,7 +762,7 @@ kernel_cleanup() {
   if ((${#others[@]})); then echo "（另有不再需要的软件包：${others[*]}，不属于内核，这一步不动。）"; fi
   if [[ "$ask" == --ask ]] && ! confirm_yes '确认删除这些旧内核吗？（删除后无法撤销）'; then ok '保留旧内核。'; return 0; fi
   apt_wait_idle
-  if apt-get -y -q -o DPkg::Lock::Timeout=120 purge "${kernels[@]}"; then ok "已清理 ${#kernels[@]} 个旧内核包。"
+  if apt-get -y -q -o DPkg::Lock::Timeout=900 purge "${kernels[@]}"; then ok "已清理 ${#kernels[@]} 个旧内核包。"
   else warn '旧内核清理失败，请人工检查。'; fi
 }
 
@@ -784,7 +787,7 @@ apt_upgrade_stage() {
   local packages=() pkg tools=()
   if ((UPGRADE_APPROVED)); then
     apt_wait_idle
-    if ! apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+    if ! apt-get -y -q -o DPkg::Lock::Timeout=900 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
       module_result upgrade failed 'apt-get upgrade failed'
       apt_failure_stop '系统升级'
     fi
@@ -862,7 +865,7 @@ upgrade_only_stage() {
   if upgrade_has_kernel "$simulation"; then KERNEL_UPDATE=1; echo '本次升级包含新内核：重启后才生效，旧内核会保留。'; fi
   if ! confirm_default_yes "升级这 $count 个软件包吗？（可能重启部分服务）"; then ok '没有升级。'; return 0; fi
   apt_wait_idle
-  if ! apt-get -y -q -o DPkg::Lock::Timeout=120 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+  if ! apt-get -y -q -o DPkg::Lock::Timeout=900 upgrade --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
     module_result upgrade failed 'apt-get upgrade failed'
     apt_failure_stop '系统升级'
   fi
@@ -4851,7 +4854,7 @@ restore_packages_offer() {
   flags=()
   [[ "$chosen" == autoremove ]] && flags=(--autoremove)
   apt_wait_idle
-  if apt-get -y -q -o DPkg::Lock::Timeout=120 remove "${flags[@]}" "${ours[@]}"; then
+  if apt-get -y -q -o DPkg::Lock::Timeout=900 remove "${flags[@]}" "${ours[@]}"; then
     ok '已卸载本工具新装的软件包。'
     if [[ " ${ours[*]} " == *' systemd-zram-generator '* ]]; then ZRAM_PACKAGE_REMOVED=1; fi
     restore_packages_record

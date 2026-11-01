@@ -795,18 +795,18 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
     case "$*" in
       '-s remove --autoremove ufw fail2ban python3-systemd') printf 'Remv ufw [0.36]\nRemv fail2ban [1.0]\nRemv python3-systemd [235]\nRemv %s [1.8]\n' "$SIM_EXTRA" ;;
       '-s remove ufw fail2ban python3-systemd') printf 'Remv ufw [0.36]\nRemv fail2ban [1.0]\nRemv python3-systemd [235]\n' ;;
-      '-y -q -o DPkg::Lock::Timeout=120 remove '*) printf '%s\n' "$*" >> "$TRACE" ;;
+      '-y -q -o DPkg::Lock::Timeout=900 remove '*) printf '%s\n' "$*" >> "$TRACE" ;;
       *) die "unexpected apt-get $*" ;;
     esac
   }
   restore_packages_offer
-  expect "$(cat "$TRACE")" '-y -q -o DPkg::Lock::Timeout=120 remove --autoremove ufw fail2ban python3-systemd'
+  expect "$(cat "$TRACE")" '-y -q -o DPkg::Lock::Timeout=900 remove --autoremove ufw fail2ban python3-systemd'
   # A tool package is gone now: vps check reports the tools as undone, not broken.
   expect "$(cat "$TMP/pkg/results")" 'result tools reverted'
   # Autoremove would take a package that existed before: fall back to plain remove.
   SIM_EXTRA=iptables-old; : > "$TRACE"
   restore_packages_offer
-  expect "$(cat "$TRACE")" '-y -q -o DPkg::Lock::Timeout=120 remove ufw fail2ban python3-systemd'
+  expect "$(cat "$TRACE")" '-y -q -o DPkg::Lock::Timeout=900 remove ufw fail2ban python3-systemd'
   # Even plain removal would take something else: nothing is removed.
   apt-get() {
     case "$*" in
@@ -824,7 +824,7 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
   apt-get() {
     case "$*" in
       '-s remove --autoremove systemd-zram-generator') printf 'Remv systemd-zram-generator [1.2]\n' ;;
-      '-y -q -o DPkg::Lock::Timeout=120 remove --autoremove systemd-zram-generator') printf '%s\n' "$*" >> "$TRACE" ;;
+      '-y -q -o DPkg::Lock::Timeout=900 remove --autoremove systemd-zram-generator') printf '%s\n' "$*" >> "$TRACE" ;;
       *) die "unexpected apt-get $*" ;;
     esac
   }

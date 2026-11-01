@@ -34,7 +34,7 @@ apt-get() {
   case "$*" in
     '-s autoremove --purge') printf '%s\n' "$SIM" ;;
     '-s purge '*) printf '%s\n' "${PURGE_SIM:-$(for p in "${@:3}"; do printf 'Purg %s [1]\n' "$p"; done)}" ;;
-    '-y -q -o DPkg::Lock::Timeout=120 purge '*) record "purge ${*:6}" ;;
+    '-y -q -o DPkg::Lock::Timeout=900 purge '*) record "purge ${*:6}" ;;
     *) fail "unexpected apt-get $*" ;;
   esac
 }
