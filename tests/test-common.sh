@@ -15,6 +15,9 @@ apt_run() { apt-get "$@"; }
 # A step title through each test's own say(), as outside a setup; ui-tests
 # loads the real one.
 step() { say "$2"; }
+# Answers come through pipes here, which the real one leaves alone anyway;
+# consistency-tests checks it.
+input_flush() { :; }
 load_optimizer_functions() {
   local name definition
   for name in "$@"; do

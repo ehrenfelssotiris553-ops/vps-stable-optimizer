@@ -189,6 +189,9 @@ if ((old)); then
   vm 'tmux has-session -t =vps-setup' || fail 'the setup in tmux ended with the connection'
   printf 'After the drop: %s\n' "$(vm 'pgrep -a dpkg | head -n 2' || true)"
   ANSWER_TIMEOUT=2700 vm_drive tmux-return.rules setup-return vps || fail "return to tmux exited with $?"
+  # The redrawn screen can show old questions as if they were waiting: the
+  # answers sent to them reach the tool, which drops them at its next question.
+  notice "answers after reconnecting ($system)" "$LOGS/setup-return.raw.answers"
   has setup-return '一键开荒已结束（退出码 0）'
   # tmux redraws the screen in pieces, which can split a line of text: the
   # facts come from the tool's own run log and a plan outside tmux.

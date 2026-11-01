@@ -231,9 +231,19 @@ ROOT_DEV="$(findmnt -no SOURCE / 2>/dev/null || echo unknown)"
 ROOT_FS="$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)"
 ROOT_GIB="$(df -Pk / | awk 'NR==2 {printf "%d", $2/1024/1024}')"
 
+# Keys pressed on the terminal before a question is shown (Enter during a long
+# upgrade, say) must not answer it: they are dropped first. Input from a pipe
+# or a file is left alone.
+input_flush() {
+  local REPLY
+  [[ -t 0 ]] || return 0
+  while read -r -t 0.05 -n 1024; do :; done 2>/dev/null
+}
+
 confirm() {
   local question="$1" expected="$2" answer=''
   [[ -t 0 ]] || return 1
+  input_flush
   read -r -p "$question 请输入 [$expected]: " answer || true
   [[ "$answer" == "$expected" ]] && return 0
   # Say why instead of silently treating a near miss as "no".
@@ -247,6 +257,7 @@ confirm() {
 confirm_yes() {
   local question="$1" answer=''
   [[ -t 0 ]] || return 1
+  input_flush
   read -r -p "$question [y/N]: " answer || true
   [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]]
 }
@@ -254,6 +265,7 @@ confirm_yes() {
 confirm_default_yes() {
   local question="$1" answer=''
   [[ -t 0 ]] || return 1
+  input_flush
   read -r -p "$question [Y/n]: " answer || true
   [[ -z "$answer" || "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]]
 }
@@ -3031,6 +3043,8 @@ ssh_login_seen() {
 guard_confirm() {
   local unit="$1" deadline="$2" remaining answer started rc prompt=1
   shift 2
+  # An "n" typed ahead would undo the change at once.
+  input_flush
   while :; do
     remaining=$((deadline - SECONDS))
     # prompt=0 means the prompt is on screen without a newline yet.

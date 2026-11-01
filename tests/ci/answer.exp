@@ -51,8 +51,9 @@ while {[gets $f line] >= 0} {
 close $f
 
 proc respond {index} {
-  global rules seqpos
+  global rules seqpos answers
   set answer [lindex $rules $index 1]
+  puts $answers "[clock format [clock seconds] -format %H:%M:%S] [lindex $rules $index 0] ==> $answer"
   if {[string range $answer 0 4] eq "@seq "} {
     set items [regexp -all -inline {\S+} [string range $answer 5 end]]
     set answer [lindex $items [expr {min($seqpos($index), [llength $items] - 1)}]]
@@ -75,6 +76,9 @@ proc respond {index} {
 }
 
 log_file -noappend $log_path
+# Every answer sent, with the time and the rule, next to the transcript.
+set answers [open "$log_path.answers" w]
+fconfigure $answers -encoding utf-8 -buffering line
 spawn -noecho {*}$command
 catch {fconfigure $spawn_id -encoding utf-8}
 

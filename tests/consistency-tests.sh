@@ -122,6 +122,16 @@ symbols="$(awk '/<<.HELP.$/ {skip = 1} !skip {print NR ":" $0} $0 == "HELP" {ski
   grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vF "SYM_OK='" | grep -vF '✔ ⚠' |
   sed -E 's/\$\{SYM_[A-Z]+-[^}]*\}//g' | grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' || true)"
 [[ -z "$symbols" ]] || fail "a state symbol written out instead of a SYM_ variable: $symbols"
+# Every question drops what was typed before it was shown (found on a VM: the
+# screen redrawn after reconnecting to tmux sent answers to old questions, and
+# the next question, the firewall's, took one of them).
+for fn in confirm confirm_yes confirm_default_yes guard_confirm; do
+  awk -v n="$fn" '$0 == n "() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT" | grep -Fx '  input_flush' > /dev/null ||
+    fail "$fn does not drop the input typed before its question"
+done
+# Input from a pipe is never dropped (tests and scripted answers).
+eval "$(awk '$0 == "input_flush() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT")"
+[[ "$(printf 'y\n' | { input_flush; read -r line; echo "$line"; })" == y ]] || fail 'input from a pipe was dropped'
 printf 'PASS: colours and state symbols come only from the interface block.\n'
 
 # Every parameter belongs to an existing single item, and on a small, a middle
