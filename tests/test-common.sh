@@ -12,6 +12,9 @@ unset SSH_CONNECTION SSH_CLIENT SSH_TTY SUDO_USER
 sshd_runtime_dir() { :; }
 # Straight to the (mocked) apt-get; extras-tests loads the real one to test it.
 apt_run() { apt-get "$@"; }
+# A step title through each test's own say(), as outside a setup; ui-tests
+# loads the real one.
+step() { say "$2"; }
 load_optimizer_functions() {
   local name definition
   for name in "$@"; do

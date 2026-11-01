@@ -227,7 +227,7 @@ check_all() {
     passed "$name" "$item"
   done
   if ((zram_kernel)); then passed "$name" 'ZRAM 内存缓冲'
-  else has "$name" '[➖ 未处理] ZRAM 内存缓冲：系统不支持'; fi
+  else has "$name" '○ 未处理  ZRAM 内存缓冲：系统不支持'; fi
 }
 group 'Acceptance check'
 check_all check

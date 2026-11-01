@@ -92,10 +92,10 @@ item_index() {
 }
 lacks() { if grep -Fq -- "$2" "$LOGS/$1.log"; then fail "$1: \"$2\" should not be there"; fi; }
 
-# An acceptance line "[✅ 生效]   LABEL：…" (or "✅ 正常" for health lines).
+# An acceptance line "✔ 生效  LABEL：…" (or "✔ 正常" for health lines).
 passed() {
-  grep -Eq "\[✅ (生效|正常)\][[:space:]]+$2：" "$LOGS/$1.log" || {
-    grep -E "^\[.*\][[:space:]]+$2：" "$LOGS/$1.log" | head -n 3 >&2 || true
+  grep -Eq "^✔ (生效|正常)[[:space:]]+$2：" "$LOGS/$1.log" || {
+    grep -E "^[^[:space:]]+ [^[:space:]]+[[:space:]]+$2：" "$LOGS/$1.log" | head -n 3 >&2 || true
     fail "$1: \"$2\" did not pass"
   }
 }

@@ -131,7 +131,7 @@ else
   if [[ "$mode" == alt ]]; then rules=setup-alt.rules; fi
   group "One-click setup ($rules)"
   drive "$rules" setup sudo vps setup || fail "setup exited with $?"
-  sed -n '/第15步：Fail2ban/,/^=== /p' "$LOGS/setup.log" > "$LOGS/setup-fail2ban.log"
+  sed -n '/^【15\/15】Fail2ban/,/^【/p' "$LOGS/setup.log" > "$LOGS/setup-fail2ban.log"
   notice "Fail2ban step of the setup ($mode, $(uname -m))" "$LOGS/setup-fail2ban.log"
   has setup '本次流程已完成'
   ssh_facts setup
@@ -176,7 +176,7 @@ if [[ "$mode" == alt ]]; then
   cat "$LOGS/check.log"
   [[ "$rc" == 0 || "$rc" == 3 ]] || fail "check exited with $rc"
   for item in '内核网络安全参数' 'TCP 缓冲区上限' '常用工具' '时区' '自动安全更新'; do
-    grep -Eq "^\[➖ 未处理\][[:space:]]+$item：" "$LOGS/check.log" || fail "declined $item is not reported as left alone"
+    grep -Eq "^○ 未处理[[:space:]]+$item：" "$LOGS/check.log" || fail "declined $item is not reported as left alone"
   done
   passed check '防火墙'
   passed check 'Fail2ban 防爆破'
@@ -316,6 +316,10 @@ group 'Acceptance check after the single items'
 check_all check-again
 passed check-again '自动安全更新'
 apt_readable 'after the single items'
+# Colours are for the screen: the tool's logs and saved reports are plain text.
+coloured="$(sudo grep -rlF $'\x1b[' /var/lib/vps-stable-opt/logs 2>/dev/null || true)"
+[[ -z "$coloured" ]] || fail "colour codes in the tool's logs or reports: $(tr '\n' ' ' <<< "$coloured")"
+sudo ls /var/lib/vps-stable-opt/logs | grep '^verify-' > /dev/null || fail 'no saved acceptance report to look at'
 sudo find /etc -xdev -type f -newer "$run_marker" ! -perm -o=r -printf '%m %u:%g %p\n' 2>/dev/null | sort > "$LOGS/root-only.txt" || true
 if [[ -s "$LOGS/root-only.txt" ]]; then notice "files under /etc only root can read, written during the run ($mode, $(uname -m))" "$LOGS/root-only.txt"; fi
 endgroup

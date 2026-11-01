@@ -6,7 +6,7 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions menu_action records_report state_path_safe menu
+load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -69,25 +69,53 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
 (
   eval "$(declare -f menu | sed 's/\[\[ -t 0 \]\] || die/true || die/')"
   # shellcheck disable=SC2034
-  SCRIPT_VERSION=9.9.9
+  SCRIPT_VERSION=9.9.9 OS=debian OS_VERSION=13 ROOT_GIB=20 STATE_ROOT="$TEST_ROOT/state" LOG_DIR="$TEST_ROOT/logs" COLUMNS=100
   menu_reboot_hint() { :; }
   menu_pending_reboot_hint() { echo 'PENDING-REBOOT-HINT'; }
   setup_tmux_running() { return 0; }
+  systemctl() { return 1; }
   menu_action() { printf '%s\n' "$2" >> "$TEST_ROOT/menu-actions"; }
   : > "$TEST_ROOT/menu-actions"
-  for n in $(seq 1 13) 14; do printf '%s\n\n' "$n"; done > "$TEST_ROOT/menu-input"
+  for n in $(seq 1 14) 15; do printf '%s\n\n' "$n"; done > "$TEST_ROOT/menu-input"
   printf '0\n' >> "$TEST_ROOT/menu-input"
   menu < "$TEST_ROOT/menu-input" > "$TEST_ROOT/menu-out"
+  # 7 is the security review (batch 3); until then it only says so.
   expected='plan setup check port item bans reboot firewall ssh records rollback uninstall update '
   [[ "$(tr '\n' ' ' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' ' ' < "$TEST_ROOT/menu-actions")"
-  grep -Fq '无效选项，请输入 0 至 13 或 h' "$TEST_ROOT/menu-out" || fail 'number 14 not rejected'
-  grep -Fq '13. 检查更新' "$TEST_ROOT/menu-out" || fail 'update is not the last item'
+  grep -Fq '安全排查还在开发中' "$TEST_ROOT/menu-out" || fail '7 does not say the security review is to come'
+  grep -Fq '无效选项，请输入 0 至 14 或 h' "$TEST_ROOT/menu-out" || fail 'number 15 not rejected'
+  grep -Fq '14. 检查更新' "$TEST_ROOT/menu-out" || fail 'update is not the last item'
   grep -Fq '3. 开荒验收' "$TEST_ROOT/menu-out" || fail 'acceptance check does not follow setup'
+  grep -Fq '第一次用：先选 1 体检' "$TEST_ROOT/menu-out" || fail 'no first-time hint before any setup'
   # Banners: an update waiting for a reboot, and a setup still running in tmux.
   grep -Fq 'PENDING-REBOOT-HINT' "$TEST_ROOT/menu-out" || fail 'pending reboot not shown in the menu'
   grep -Fq '一键开荒正在 tmux 里运行' "$TEST_ROOT/menu-out" || fail 'setup running in tmux not shown in the menu'
 )
 printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
+
+# Two columns on a wide terminal, aligned by display width (CJK counts two);
+# one column on a narrow one; every entry in both.
+(
+  wide="$(menu_render 100)" narrow="$(menu_render 44)"
+  for f in "$wide" "$narrow"; do
+    grep -Eq '^  h\. 使用说明 +0\. 退出$' <<< "$f" || fail "no help and exit line: $f"
+  done
+  for n in $(seq 1 14); do
+    grep -Eq "(^| )$n\. " <<< "$wide" || fail "entry $n missing from the wide menu"
+    grep -Eq "^ *$n\. " <<< "$narrow" || fail "entry $n missing from the narrow menu"
+  done
+  grep -Eq '^  1\. 体检.* 4\. 端口管理$' <<< "$wide" || fail "groups not side by side: $wide"
+  grep -Fxq '  4. 端口管理' <<< "$narrow" || fail "narrow menu not one column: $narrow"
+  # The right column lines up: in every row with two entries, the right
+  # entry's dot (the 4th column of its cell) is at the same display column.
+  two='[0-9]\. .* [0-9]{1,2}\. ' upto='^(.* [0-9]{1,2})\. '
+  starts="$(while IFS= read -r line; do
+    [[ "$line" =~ $two && "$line" =~ $upto ]] || continue
+    ui_width "${BASH_REMATCH[1]}"; done <<< "$wide" | sort -u)"
+  [[ -n "$starts" && "$(wc -l <<< "$starts")" == 1 ]] || fail "right column not aligned: dots at $(tr '\n' ' ' <<< "$starts")"
+  if grep -q ' $' <<< "$wide"; then fail 'trailing spaces in the wide menu'; fi
+)
+printf '%s\n' 'PASS: the menu is two aligned columns when wide and one when narrow.'
 
 # The menu says when an update waits for a reboot, and for how long; a newer
 # kernel that was already there at boot (a provider kernel) is left to vps check.
@@ -100,7 +128,7 @@ printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
   printf '100.00 50.00\n' > "$TEST_ROOT/up-short"
   printf '0.00 0.00\n' > "$TEST_ROOT/up-zero"
   out="$(menu_pending_reboot_hint "$B" "$TEST_ROOT/no-flag" "$TEST_ROOT/up-short")"
-  [[ "$out" == *'新内核 6.1.0-11-amd64 已经装好，重启后才会用上：方便时选 7 重启。'* ]] || fail "new kernel not announced: $out"
+  [[ "$out" == *'新内核 6.1.0-11-amd64 已经装好，重启后才会用上：方便时选 8 重启。'* ]] || fail "new kernel not announced: $out"
   [[ -z "$(menu_pending_reboot_hint "$B" "$TEST_ROOT/no-flag" "$TEST_ROOT/up-zero")" ]] || fail 'a kernel present at boot was announced'
   touch -d '3 days ago' "$TEST_ROOT/flag"
   out="$(menu_pending_reboot_hint "$B" "$TEST_ROOT/flag" "$TEST_ROOT/up-zero")"

@@ -105,7 +105,20 @@ printf 'PASS: every single item has a label, a status, a way to turn it on and a
 # Package scripts run with the umask of whoever starts apt: every apt-get that
 # changes the system goes through apt_run (umask 022). Simulations (-s) and
 # apt_run itself are the only other calls.
-direct="$(grep -nE '(^|[^-_[:alnum:]])apt-get ' "$TEST_SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get -s |apt-get "\$@" \|\| rc=|'"'"'apt-get upgrade failed'"'" || true)"
+# apt_run's own lines are left out by position, not by what they say.
+direct="$(awk '$0 == "apt_run() {" {skip = 1} !skip {print NR ": " $0} skip && $0 == "}" {skip = 0}' "$TEST_SCRIPT" |
+  grep -E '(^|[^-_[:alnum:]])apt-get ' | grep -vE '^[0-9]+: [[:space:]]*#|apt-get -s |'"'"'apt-get upgrade failed'"'" || true)"
 [[ -z "$direct" ]] || fail "apt-get called without apt_run (package scripts would inherit umask 077): $direct"
 source_of apt_run | grep -Fxq '  umask 022' || fail 'apt_run does not set umask 022'
 printf 'PASS: every apt-get that changes the system runs with umask 022.\n'
+
+# Colours and state symbols come only from the interface block at the top, so
+# NO_COLOR, a log or a saved report, and VPS_ASCII=1 reach every line.
+raw="$(grep -nF '\033[' "$TEST_SCRIPT" | grep -vF "C_OK=\$'" | grep -vF '\r\033[K' || true)"
+[[ -z "$raw" ]] || fail "a colour written out instead of a C_ variable: $raw"
+# The help text (which names the symbols) is left out by position.
+symbols="$(awk '/<<.HELP.$/ {skip = 1} !skip {print NR ":" $0} $0 == "HELP" {skip = 0}' "$TEST_SCRIPT" |
+  grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vF "SYM_OK='" |
+  sed -E 's/\$\{SYM_[A-Z]+-[^}]*\}//g' | grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' || true)"
+[[ -z "$symbols" ]] || fail "a state symbol written out instead of a SYM_ variable: $symbols"
+printf 'PASS: colours and state symbols come only from the interface block.\n'

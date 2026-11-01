@@ -10,7 +10,7 @@ bash -n "$HERE/../install.sh"
 for test in "$HERE"/*.sh; do bash -n "$test"; done
 printf 'PASS: Bash syntax checks.\n'
 failed=()
-for test in ufw-tests.sh firewall-tests.sh bbr-tests.sh f2b-tests.sh entry-tests.sh backup-tests.sh audit-tests.sh preflight-tests.sh config-write-tests.sh menu-tests.sh decision-tests.sh tool-tests.sh restore-tests.sh stage-hooks-tests.sh journal-policy-tests.sh port-tests.sh ssh-tests.sh verify-tests.sh extras-tests.sh item-tests.sh robustness-tests.sh install-tests.sh update-tests.sh bans-tests.sh consistency-tests.sh; do
+for test in ufw-tests.sh firewall-tests.sh bbr-tests.sh f2b-tests.sh entry-tests.sh backup-tests.sh audit-tests.sh preflight-tests.sh config-write-tests.sh menu-tests.sh decision-tests.sh tool-tests.sh restore-tests.sh stage-hooks-tests.sh journal-policy-tests.sh port-tests.sh ssh-tests.sh verify-tests.sh extras-tests.sh item-tests.sh robustness-tests.sh install-tests.sh update-tests.sh bans-tests.sh ui-tests.sh consistency-tests.sh; do
   printf '\nRunning %s\n' "$test"
   # Every file runs, so one pass shows all failures; the run still fails.
   bash "$HERE/$test" "$TEST_SCRIPT" || failed+=("$test")

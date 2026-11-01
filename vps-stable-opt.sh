@@ -37,6 +37,8 @@ SSH_DROPIN=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
 # Only written when a provider image ships "PubkeyAuthentication no".
 SSH_PUBKEY_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-pubkey.conf
 WARNINGS=0
+# This run's log (set by start_logging); apt writes its full output there.
+RUN_LOG=''
 AUTO_UPDATES=0
 INSTALL_TOOLS=0
 NEED_TIMESYNCD=0
@@ -96,6 +98,7 @@ VPS 机器管家 V2.7.8 — Debian 12/13、Ubuntu 22.04/24.04/26.04
   NOCONSOLE  没有控制台密码时仍要关闭 SSH 密码登录（不推荐）。
   UNINSTALL  卸载本工具（会删除全部备份）。
 一键开荒会先问要不要在 tmux 里运行（回车就是要）：SSH 断线也不中断，重新登录输入 vps 选 2 就能回去。
+符号：✔ 正常  ⚠ 注意  ✖ 失败  ○ 没做。显示成乱码时用 VPS_ASCII=1 vps 打开；不要颜色用 NO_COLOR=1 vps。
 默认保留 SSH 端口、root 登录、DNS、IPv6、MTU；不自动重启整机。
 回退只会放宽访问（关防火墙、恢复密码登录），不会把你锁在外面。
 系统升级和新内核无法回退；需要整机还原请使用服务商快照。
@@ -104,16 +107,62 @@ HELP
   exit 0
 fi
 
-say() { printf '\n\033[1;36m=== %s ===\033[0m\n' "$*"; }
-ok() { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
-warn() { WARNINGS=$((WARNINGS+1)); printf '\033[1;33m[注意]\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31m[停止]\033[0m %s\n' "$*" >&2; exit 1; }
+# Text interface. One symbol per state: ✔ done, ⚠ needs a look, ✖ failed,
+# ○ not done. Colour only on a terminal, never in logs or saved reports
+# (NO_COLOR or TERM=dumb turn it off); plain ASCII with VPS_ASCII=1 where a
+# terminal draws these symbols badly. CJK terminals (Xshell and others) draw
+# ambiguous-width symbols two columns wide, so nothing is aligned after one.
+UI_COLOR=0
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then UI_COLOR=1; fi
+if [[ "${VPS_ASCII:-0}" == 1 ]]; then
+  SYM_OK='[OK]' SYM_WARN='[!]' SYM_FAIL='[X]' SYM_SKIP='[-]' SYM_NEXT='>' UI_OPEN='== ' UI_CLOSE=' =='
+else
+  SYM_OK='✔' SYM_WARN='⚠' SYM_FAIL='✖' SYM_SKIP='○' SYM_NEXT='›' UI_OPEN='【' UI_CLOSE='】'
+fi
+C_OK='' C_WARN='' C_FAIL='' C_TITLE='' C_DIM='' C_BOLD='' C_RESET=''
+if ((UI_COLOR)); then
+  C_OK=$'\033[32m' C_WARN=$'\033[33m' C_FAIL=$'\033[31m' C_TITLE=$'\033[1;36m' C_DIM=$'\033[2m' C_BOLD=$'\033[1m' C_RESET=$'\033[0m'
+fi
+# The number of setup steps while a setup runs (0: titles without numbers).
+UI_STEPS=0
+# The terminal itself, kept before the output also goes to the log: the apt
+# progress line is drawn there only.
+UI_TTY_FD=''
+if [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then exec {UI_TTY_FD}>&1; fi
+
+say() { printf '\n%s%s%s%s%s\n' "${C_TITLE-}" "${UI_OPEN-【}" "$*" "${UI_CLOSE-】}" "${C_RESET-}"; }
+ok() { printf '%s%s%s %s\n' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}" "$*"; }
+warn() { WARNINGS=$((WARNINGS+1)); printf '%s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$*" "${C_RESET-}"; }
+die() { printf '%s%s %s%s\n' "${C_FAIL-}" "${SYM_FAIL-✖}" "$*" "${C_RESET-}" >&2; exit 1; }
+
+# N TITLE: a setup step, with how far the setup has come ("[5/15]" and one
+# mark per step); outside a setup (a single item) only the title.
+step() {
+  local n="$1" title="$2" bar='' i
+  if ((${UI_STEPS:-0} <= 0)); then say "$title"; return 0; fi
+  for ((i = 1; i <= UI_STEPS; i++)); do
+    if ((i <= n)); then bar+='#'; else bar+='.'; fi
+  done
+  printf '\n%s%s%s/%s%s%s%s  %s[%s]%s\n' "${C_TITLE-}" "${UI_OPEN-【}" "$n" "$UI_STEPS" "${UI_CLOSE-】}" "$title" "${C_RESET-}" "${C_DIM-}" "$bar" "${C_RESET-}"
+}
+
+# Display columns of TEXT, counted on its bytes: ASCII and two-byte UTF-8 one
+# column, three- and four-byte (CJK, full-width punctuation, the symbols above)
+# two. Prints the number; with a variable name first, stores it there instead.
+ui_width() {
+  local LC_ALL=C text="${!#}" chars wide
+  chars="${text//[$'\x80'-$'\xbf']/}"
+  wide="${text//[^$'\xe0'-$'\xf7']/}"
+  if (($# > 1)); then printf -v "$1" '%s' "$((${#chars} + ${#wide}))"
+  else printf '%s\n' "$((${#chars} + ${#wide}))"; fi
+}
+
 on_error() {
   local code="$1" line="$2"
   trap - ERR
   if declare -F restore_capture_failure >/dev/null; then restore_capture_failure || true; fi
   if declare -F record_failure >/dev/null; then record_failure "$line" "$code" || true; fi
-  printf '[出错] line=%s exit=%s；请查看运行记录，不要盲目重跑。\n' "$line" "$code" >&2
+  printf '%s%s 出错：第 %s 行，退出码 %s；请查看运行记录，不要盲目重跑。%s\n' "${C_FAIL-}" "${SYM_FAIL-✖}" "$line" "$code" "${C_RESET-}" >&2
   exit "$code"
 }
 
@@ -214,13 +263,49 @@ apt_wait_idle() {
 # package scripts would inherit this tool's 077: a file one writes without
 # setting its mode (cat or touch; ucf copies keep theirs) would be readable by
 # root only. They get the 022 of an ordinary root shell instead.
+# During a logged run apt's whole output goes to the log only: the screen gets
+# what runs, one progress line, and apt's last lines when it fails.
 apt_run() {
-  local mask rc=0
+  local mask rc=0 start arg skip=0
+  local -a words=()
   mask="$(umask)"
   umask 022
-  apt-get "$@" || rc=$?
+  if [[ -n "${RUN_LOG:-}" && -f "$RUN_LOG" && ! -L "$RUN_LOG" ]]; then
+    for arg in "$@"; do
+      if ((skip)); then skip=0; continue; fi
+      case "$arg" in -o) skip=1 ;; -*) ;; *) words+=("$arg") ;; esac
+    done
+    printf '  %s apt-get %s（完整输出写进日志）\n' "${SYM_NEXT-›}" "${words[*]}"
+    start="$(stat -c %s -- "$RUN_LOG" 2>/dev/null || echo 0)"
+    { apt-get -o APT::Status-Fd=3 "$@" 3>&1 >> "$RUN_LOG" 2>&1 < /dev/null; } | apt_progress || rc=$?
+    if ((rc)); then
+      printf '%s%s apt-get 没有成功（退出码 %s），它最后的输出：%s\n' "${C_FAIL-}" "${SYM_FAIL-✖}" "$rc" "${C_RESET-}"
+      { tail -c +"$((start + 1))" -- "$RUN_LOG" | tail -n 15 | sed 's/^/    /'; } || true
+      printf '  完整输出：%s\n' "$RUN_LOG"
+    fi
+  else
+    apt-get "$@" || rc=$?
+  fi
   umask "$mask"
   return "$rc"
+}
+
+# APT::Status-Fd lines in, one changing line on the terminal out: downloading
+# or setting up, how far, and which package. Without a terminal, only drained.
+apt_progress() {
+  local kind item pct line=''
+  while IFS=: read -r kind item pct _; do
+    [[ -n "${UI_TTY_FD:-}" ]] || continue
+    pct="${pct%%.*}"
+    [[ "$pct" =~ ^[0-9]+$ ]] || continue
+    case "$kind" in
+      dlstatus) line="下载软件包 $pct%" ;;
+      pmstatus) line="安装和配置 $pct% $item" ;;
+      *) continue ;;
+    esac
+    printf '\r\033[K    %s' "$line" >&"$UI_TTY_FD"
+  done
+  if [[ -n "$line" ]]; then printf '\r\033[K' >&"$UI_TTY_FD"; fi
 }
 
 # Packages absent before this call are recorded so rollback can offer removal.
@@ -287,7 +372,10 @@ start_logging() {
   local prefix=run keep=9
   if [[ "$MODE" == port ]]; then prefix=port; keep=20; fi
   log_rotate "$prefix-*.log" "$keep"
-  exec > >(tee -a "$LOG_DIR/$prefix-$(date -u +%Y%m%dT%H%M%SZ)-$$.log") 2>&1
+  RUN_LOG="$LOG_DIR/$prefix-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+  : >> "$RUN_LOG"
+  # The screen gets the colours, the log the plain text.
+  exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$RUN_LOG")) 2>&1
   say "VPS 机器管家 v$SCRIPT_VERSION | $PRETTY_NAME"
 }
 
@@ -501,7 +589,7 @@ upgrade_has_kernel() {
 UPGRADE_APPROVED=0
 UPGRADE_COUNT=0
 apt_index_stage() {
-  say '第2步：软件索引与升级计划'
+  step 2 '软件索引与升级计划'
   local free_mb simulation count
   local -a names=()
   free_mb="$(df -Pm / | awk 'NR==2 {print $4}')"
@@ -602,7 +690,7 @@ timezone_ask() {
 # Every choice for the rest of setup is asked here, so the long automatic part
 # runs unattended; only the SSH/firewall confirmations at the end need the user.
 setup_questions() {
-  say '第3步：开荒选项（一次问完，之后自动执行）'
+  step 3 '开荒选项（一次问完，之后自动执行）'
   local login ip
   if [[ "${RECOMMENDED:-0}" == 1 ]]; then
     # Recommended set: low-risk items only. Everything else stays off and can
@@ -796,7 +884,7 @@ apt_failure_stop() {
 }
 
 apt_upgrade_stage() {
-  say '第5步：系统升级与组件安装'
+  step 5 '系统升级与组件安装'
   local packages=() pkg tools=()
   if ((UPGRADE_APPROVED)); then
     apt_wait_idle
@@ -1035,7 +1123,7 @@ bbr_set_elsewhere() {
 }
 
 bbr_stage() {
-  say '第6步：BBR 与默认 fq 队列配置'
+  step 6 'BBR 与默认 fq 队列配置'
   local was_present=0
   local -a files=()
   mapfile -t files < <(sysctl_config_files)
@@ -1201,7 +1289,7 @@ zram_tune() {
 }
 
 zram_stage() {
-  say '第4步：内存与 ZRAM（在系统升级前配置）'
+  step 4 '内存与 ZRAM（在系统升级前配置）'
   local size='ram / 2' vendor=0
   if swap_exists; then
     # The package default is replaced by this tool's own file when asked for
@@ -1270,7 +1358,7 @@ ntp_synced() {
   [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == yes ]]
 }
 ntp_stage() {
-  say '第1步：时间同步（不修改时区，先于软件更新）'
+  step 1 '时间同步（不修改时区，先于软件更新）'
   local pkg i
   if ntp_synced; then ok '时间已经同步。'; module_result ntp present 'synchronized'; return 0; fi
   if timedatectl set-ntp true >/dev/null 2>&1; then
@@ -1292,7 +1380,7 @@ ntp_stage() {
 }
 
 journal_stage() {
-  say '第8步：日志空间（仅小硬盘）'
+  step 8 '日志空间（仅小硬盘）'
   # The single-item menu may ask for the limit on a larger disk too.
   if ((ROOT_GIB>JOURNAL_LIMIT_GB)) && [[ "${JOURNAL_FORCE:-0}" != 1 ]]; then
     ok "系统盘 ${ROOT_GIB}GiB，大于 ${JOURNAL_LIMIT_GB}GiB，保持日志默认设置。"
@@ -1325,7 +1413,7 @@ trim_support() {
 }
 
 trim_stage() {
-  say '第9步：TRIM 支持检测'
+  step 9 'TRIM 支持检测'
   case "$ROOT_FS" in ext4|xfs|btrfs) ;; *) ok "系统盘文件系统是 $ROOT_FS，跳过 TRIM。"; module_result trim skipped "filesystem $ROOT_FS"; return 0 ;; esac
   [[ "$ROOT_DEV" == /dev/* ]] || { ok '系统盘不是可直接识别的块设备，跳过 TRIM。'; module_result trim skipped 'not a block device'; return 0; }
   # Checked before the timer: images often ship fstrim.timer enabled on disks without discard.
@@ -1360,7 +1448,7 @@ apt_timers_postpone() {
 # only Update-Package-Lists, which leaves security updates off); a key set to
 # anything but "1" was chosen by someone, and the policy is kept as it is.
 updates_stage() {
-  say '第10步：自动安全更新'
+  step 10 '自动安全更新'
   if (( !AUTO_UPDATES )); then ok '自动更新策略保持不变。'; module_result updates declined 'not requested'; return 0; fi
   installed unattended-upgrades || { warn '没有安装 unattended-upgrades。'; module_result updates unsupported 'package missing'; return 0; }
   local periodic key value text='' custom='' off=0 files result=applied detail='periodic updates'
@@ -1412,7 +1500,7 @@ auto_reboot_configure() {
 }
 
 timezone_stage() {
-  say '第11步：时区'
+  step 11 '时区'
   local current
   current="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
   if [[ "${TZ_ASKED:-0}" != 1 ]]; then timezone_ask; fi
@@ -1485,7 +1573,7 @@ sysctl_ipv6_iface_redirects() {
 }
 
 sysctl_hardening_stage() {
-  say '第7步：内核网络安全参数（可选）'
+  step 7 '内核网络安全参数（可选）'
   local pair key value current text='' content
   local -a kept=() originals=() ifaces=()
   if [[ "${SYSCTL_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改内核网络参数。'; module_result sysctl declined 'not requested'; return 0; fi
@@ -1552,7 +1640,7 @@ tcp_buffer_max() {
 # the kernel's total TCP memory limit (tcp_mem) is left alone, so idle
 # connections cost nothing more. A key set in any other file keeps its value.
 tcp_buffer_stage() {
-  say '第7步（续）：TCP 缓冲区上限（可选）'
+  step 7 'TCP 缓冲区上限（可选）'
   local max key current text='' min def top
   local -a kept=() originals=()
   if [[ "${TCP_BUFFER_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改 TCP 缓冲区。'; module_result tcp declined 'not requested'; return 0; fi
@@ -1608,7 +1696,7 @@ append_line_safely() {
 
 # Adds "127.0.1.1 <hostname>" (the Debian convention) when the name does not resolve.
 hosts_stage() {
-  say '第12步：主机名解析'
+  step 12 '主机名解析'
   local name
   name="$(hostname 2>/dev/null || true)"
   if hostname_resolves; then ok "主机名 $name 可以正常解析。"; module_result hosts present "$name"; return 0; fi
@@ -1750,7 +1838,7 @@ f2b_jail_ready() {
 }
 
 fail2ban_stage() {
-  say '第15步：Fail2ban（防火墙生效后，只封 SSH 端口）'
+  step 15 'Fail2ban（防火墙生效后，只封 SSH 端口）'
   if [[ "${FIREWALL_READY:-0}" != 1 ]]; then
     warn '防火墙没有确认生效，跳过 Fail2ban。'
     module_result fail2ban skipped 'firewall not ready'; return 0
@@ -2151,7 +2239,7 @@ ufw_sysctl_keys() {
 }
 
 firewall_stage() {
-  say '第14步：防火墙（需要新 SSH 窗口确认）'
+  step 14 '防火墙（需要新 SSH 窗口确认）'
   FIREWALL_READY=0
   command -v ufw >/dev/null || { warn '还没有安装 ufw，请先运行一键开荒。'; module_result firewall skipped 'ufw missing'; return 0; }
   local state rules p ip unit deadline since ssh_verb=limit web=0 line key value
@@ -2471,7 +2559,7 @@ ssh_enable_pubkey() {
 }
 
 ssh_harden_stage() {
-  say '第13步：SSH 登录加固（可选）'
+  step 13 'SSH 登录加固（可选）'
   local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail
   local -a overridden=()
   if [[ -z "${SSH_CHOICE:-}" ]]; then
@@ -3570,43 +3658,134 @@ menu_action() {
   fi
 }
 
+# Main menu entries: group, number, label (menu below maps numbers to actions).
+menu_entries() {
+  printf '%s\t%s\t%s\n' \
+    开荒 1 '体检（只检查，不修改）' \
+    开荒 2 '一键开荒' \
+    开荒 3 '开荒验收（重启后做一次）' \
+    日常管理 4 '端口管理' \
+    日常管理 5 '单项设置' \
+    日常管理 6 'Fail2ban 封禁记录' \
+    日常管理 7 '安全排查（只读）' \
+    日常管理 8 '重启服务器' \
+    安全加固 9 '防火墙和 SSH 防爆破' \
+    安全加固 10 'SSH 登录加固' \
+    记录与撤销 11 '操作记录和配置备份' \
+    记录与撤销 12 '撤销本工具的设置' \
+    本工具 13 '卸载本工具（保留优化效果）' \
+    本工具 14 '检查更新'
+}
+
+# The menu for a terminal WIDTH columns wide: the groups in pairs side by side
+# when both columns fit, otherwise one under another (a phone, a narrow window).
+# Widths are measured on the plain text; colours are added after the padding.
+menu_render() {
+  local width="$1" group key label cell w left_w=0 right_w=0 i n pad
+  local -a order=() left=() right=()
+  local -A body=()
+  while IFS=$'\t' read -r group key label; do
+    if [[ -z "${body[$group]+set}" ]]; then order+=("$group"); body[$group]=''; fi
+    printf -v cell '%3s. %s' "$key" "$label"
+    body[$group]+="$cell"$'\n'
+  done < <(menu_entries)
+  for ((i = 0; i < ${#order[@]}; i++)); do
+    while IFS= read -r cell; do
+      ui_width w "$cell"
+      if ((i % 2 == 0 && w > left_w)); then left_w=$w; fi
+      if ((i % 2 == 1 && w > right_w)); then right_w=$w; fi
+    done <<< " ${order[i]}"$'\n'"${body[${order[i]}]%$'\n'}"
+  done
+  if ((width < left_w + 4 + right_w)); then
+    for group in "${order[@]}"; do
+      printf '%s %s%s\n%s\n' "${C_BOLD-}" "$group" "${C_RESET-}" "${body[$group]%$'\n'}"
+    done
+  else
+    for ((i = 0; i < ${#order[@]}; i += 2)); do
+      mapfile -t left <<< " ${order[i]}"$'\n'"${body[${order[i]}]%$'\n'}"
+      right=()
+      if ((i + 1 < ${#order[@]})); then mapfile -t right <<< " ${order[i + 1]}"$'\n'"${body[${order[i + 1]}]%$'\n'}"; fi
+      n=${#left[@]}
+      if ((${#right[@]} > n)); then n=${#right[@]}; fi
+      for ((w = 0; w < n; w++)); do
+        cell="${left[w]:-}"
+        ui_width pad "$cell"
+        pad=$((left_w + 4 - pad))
+        if [[ -z "${right[w]:-}" ]]; then pad=0; fi
+        if ((w == 0)); then
+          printf '%s%s%*s%s%s\n' "${C_BOLD-}" "$cell" "$pad" '' "${right[w]:-}" "${C_RESET-}"
+        else
+          printf '%s%*s%s\n' "$cell" "$pad" '' "${right[w]:-}"
+        fi
+      done
+    done
+  fi
+  printf '%3s. %s      %s. %s\n' h 使用说明 0 退出
+}
+
+# The address the user reached this machine on (the SSH session's), or the one
+# the default route would leave from; nothing is sent anywhere.
+menu_ip() {
+  local addr=''
+  read -r _ _ addr _ <<< "${SSH_CONNECTION:-}" || true
+  if [[ -z "$addr" ]]; then
+    addr="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}' || true)"
+  fi
+  printf '%s\n' "${addr:-IP 未知}"
+}
+
+# Who this machine is and how it stands: the title, a machine line and a
+# status line. Only cheap reads, since it is drawn before every choice.
+menu_header() {
+  local name ram cores report='' file conclusion setup check fw f2b
+  name="$(hostname -s 2>/dev/null || true)"
+  ram="$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo 2>/dev/null || true)"
+  cores="$(nproc 2>/dev/null || echo '?')"
+  printf '\n%s%sVPS 机器管家 %s%s%s\n' "${C_TITLE-}" "${UI_OPEN-【}" "${SCRIPT_VERSION:-}" "${UI_CLOSE-】}" "${C_RESET-}"
+  printf ' %s · %s · %s %s · %s 核 · %s GiB 内存 · %s GB 硬盘\n' "${name:-本机}" "$(menu_ip)" "${OS^}" "${OS_VERSION:-}" "$cores" "${ram:-?}" "${ROOT_GIB:-?}"
+  setup="${C_DIM-}${SYM_SKIP-○} 还没开荒${C_RESET-}"
+  for file in "${STATE_ROOT:-/nonexistent}"/modules/*; do
+    if [[ -f "$file" && ! -L "$file" ]]; then setup="${C_OK-}${SYM_OK-✔}${C_RESET-} 已开荒"; break; fi
+  done
+  check="${C_DIM-}${SYM_SKIP-○} 还没验收${C_RESET-}"
+  for file in "${LOG_DIR:-/nonexistent}"/verify-*.txt; do
+    if [[ -f "$file" && ! -L "$file" ]]; then report="$file"; fi
+  done
+  if [[ -n "$report" ]]; then
+    conclusion="$(sed -n 's/\x1b\[[0-9;]*m//g; s/^结论：//p' -- "$report" 2>/dev/null | head -n 1)"
+    if [[ "$conclusion" =~ ([0-9]+)\ 项未生效 ]] && ((BASH_REMATCH[1] > 0)); then
+      check="${C_FAIL-}${SYM_FAIL-✖}${C_RESET-} 验收：${BASH_REMATCH[1]} 项未生效"
+    elif [[ "$conclusion" =~ ^([0-9]+)\ 项正常 ]]; then
+      check="${C_OK-}${SYM_OK-✔}${C_RESET-} 验收：${BASH_REMATCH[1]} 项正常"
+    fi
+  fi
+  fw='防火墙 关'
+  if ! command -v ufw >/dev/null; then fw='防火墙 没装'
+  elif grep -qsx 'ENABLED=yes' "${UFW_CONF:-/etc/ufw/ufw.conf}"; then fw='防火墙 开'; fi
+  f2b='Fail2ban 关'
+  if systemctl is-active -q fail2ban 2>/dev/null; then f2b='Fail2ban 开'; fi
+  printf ' %s · %s · %s · %s\n' "$setup" "$check" "$fw" "$f2b"
+}
+
 menu() {
-  local self choice action before=''
+  local self choice action before='' width
   [[ -t 0 ]] || die '菜单需要交互终端；请登录 SSH 后输入 vps。'
   self="$(readlink -f -- "${BASH_SOURCE[0]}")" || die '无法确定本工具所在位置。'
   [[ -f "$self" && -r "$self" ]] || die '无法读取本工具的脚本文件。'
   while :; do
-    say "VPS 机器管家 V$SCRIPT_VERSION"
+    menu_header
+    # The alerts: what is waiting for the user.
     menu_reboot_hint
     menu_pending_reboot_hint
-    if setup_tmux_running; then printf '\033[1;33m一键开荒正在 tmux 里运行（可能是之前 SSH 断线了）：选 2 回到那个界面。\033[0m\n'; fi
-    cat <<'MENU_TEXT'
- 开荒
-   1. 给机器做体检（只检查，不修改）
-   2. 一键开荒（更新系统并优化机器）
-   3. 开荒验收（检查优化是否真的生效，适合重启后）
- 日常管理
-   4. 端口管理（放行 / 关闭端口）
-   5. 单项设置（逐项开启或关闭某一项）
-   6. 查看 Fail2ban 封禁记录（可以解封某个 IP）
-   7. 重启服务器（先说明是否需要重启，确认后才重启）
- 安全加固（一键开荒里已经包含，这里可以单独再做）
-   8. 设置防火墙和 SSH 防爆破
-   9. SSH 登录加固（只允许密钥登录，可选新建管理员并禁止 root 直接登录）
- 记录与撤销
-  10. 查看操作记录和配置备份
-  11. 撤销本工具的设置（全部或只撤销某一项）
- 本工具
-  12. 卸载本工具，保留优化效果
-  13. 检查更新（有新版本时直接更新本工具）
-   h. 查看使用说明
-   0. 退出
-
-第一次用：先选 1 体检，再选 2 一键开荒；重启后选 3 验收。以后想单独改哪一项选 5，需要重启选 7。
-撤销设置会保留已安装/升级的软件（可选卸载本工具新装的包），不会还原整台机器。
-卸载会删除工具、记录和备份；删除备份后无法可靠回退。
-MENU_TEXT
-    if ! read -r -p '请输入选项 [0-13 或 h]: ' choice; then printf '\n'; return 0; fi
+    if setup_tmux_running; then printf '%s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" '一键开荒正在 tmux 里运行（可能是之前 SSH 断线了）：选 2 回到那个界面。' "${C_RESET-}"; fi
+    echo
+    width="$(stty size 2>/dev/null < /dev/tty | awk '{print $2}' || true)"
+    [[ "$width" =~ ^[0-9]+$ ]] || width="${COLUMNS:-80}"
+    menu_render "$width"
+    if [[ ! -d "$STATE_ROOT/modules" ]]; then
+      printf '\n第一次用：先选 1 体检，再选 2 一键开荒，重启后选 3 验收。以后单独改哪一项选 5。\n'
+    fi
+    if ! read -r -p $'\n请输入选项 [0-14 或 h]: ' choice; then printf '\n'; return 0; fi
     case "$choice" in
       0) return 0 ;;
       1) action=plan ;;
@@ -3615,15 +3794,16 @@ MENU_TEXT
       4) action=port ;;
       5) action=item ;;
       6) action=bans ;;
-      7) action=reboot ;;
-      8) action=firewall ;;
-      9) action=ssh ;;
-      10) action=records ;;
-      11) action=rollback ;;
-      12) action=uninstall ;;
-      13) action=update ;;
+      7) echo '安全排查还在开发中，会在 2.8.0 里加上。'; action='' ;;
+      8) action=reboot ;;
+      9) action=firewall ;;
+      10) action=ssh ;;
+      11) action=records ;;
+      12) action=rollback ;;
+      13) action=uninstall ;;
+      14) action=update ;;
       h|H) /bin/bash -- "$self" help; action='' ;;
-      *) echo '无效选项，请输入 0 至 13 或 h。'; continue ;;
+      *) echo '无效选项，请输入 0 至 14 或 h。'; continue ;;
     esac
     if [[ "$action" == update ]]; then before="$(sha256sum -- "$self" 2>/dev/null || true)"; fi
     if [[ -n "$action" ]]; then menu_action "$self" "$action"; fi
@@ -5245,16 +5425,22 @@ VERIFY_EXIT=0
 VERIFY_NA=0
 VERIFY_UNKNOWN=0
 VERIFY_REBOOT=0
+VERIFY_ISSUES=()
+# STATUS LABEL TEXT: one line of the acceptance report. What needs a look
+# (failed, waiting for a reboot, unknown) is also kept for the conclusion.
 verify_line() {
+  local mark color='' word
   case "$1" in
-    pass) VERIFY_PASS=$((VERIFY_PASS + 1)); printf '\033[1;32m[✅ 生效]\033[0m   %s：%s\n' "$2" "$3" ;;
-    healthy) VERIFY_PASS=$((VERIFY_PASS + 1)); printf '\033[1;32m[✅ 正常]\033[0m   %s：%s\n' "$2" "$3" ;;
-    fail) VERIFY_FAIL=$((VERIFY_FAIL + 1)); printf '\033[1;31m[❌ 未生效]\033[0m %s：%s\n' "$2" "$3" ;;
-    na) VERIFY_NA=$((VERIFY_NA + 1)); printf '[➖ 未处理] %s：%s\n' "$2" "$3" ;;
+    pass) VERIFY_PASS=$((VERIFY_PASS + 1)) mark="${SYM_OK-✔}" color="${C_OK-}" word='生效' ;;
+    healthy) VERIFY_PASS=$((VERIFY_PASS + 1)) mark="${SYM_OK-✔}" color="${C_OK-}" word='正常' ;;
+    fail) VERIFY_FAIL=$((VERIFY_FAIL + 1)) mark="${SYM_FAIL-✖}" color="${C_FAIL-}" word='未生效' ;;
+    na) VERIFY_NA=$((VERIFY_NA + 1)) mark="${SYM_SKIP-○}" word='未处理' ;;
     # Expected to take effect with the next boot: not a failure.
-    reboot) VERIFY_REBOOT=$((${VERIFY_REBOOT:-0} + 1)); printf '\033[1;33m[⏳ 待重启]\033[0m %s：%s\n' "$2" "$3" ;;
-    *) VERIFY_UNKNOWN=$((VERIFY_UNKNOWN + 1)); printf '\033[1;33m[❓ 无法确认]\033[0m %s：%s\n' "$2" "$3" ;;
+    reboot) VERIFY_REBOOT=$((${VERIFY_REBOOT:-0} + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='待重启' ;;
+    *) VERIFY_UNKNOWN=$((VERIFY_UNKNOWN + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='无法确认' ;;
   esac
+  printf '%s%s %s%s  %s：%s\n' "$color" "$mark" "$word" "${C_RESET-}" "$2" "$3"
+  case "$1" in fail|reboot|unknown) VERIFY_ISSUES+=("$color$mark $word${C_RESET-}  $2：$3") ;; esac
 }
 
 # Applies the recorded expectation: only applied/present results are checked
@@ -5585,14 +5771,14 @@ verify_reboot_state() {
     [[ -n "$newest_boot" ]] || newest_boot=other
   done
   case "$newest_boot" in
-    same) echo '⚠ 有设置是本次开机后才做的，还没有经过重启验证：以下结果只代表当前运行状态。' ;;
-    other) echo '✅ 开荒之后已经重启过（启动 ID 已变化），以下结果代表重启后的真实状态。' ;;
+    same) printf '%s %s\n' "${SYM_WARN-⚠}" '有设置是本次开机后才做的，还没有经过重启验证：以下结果只代表当前运行状态。' ;;
+    other) printf '%s %s\n' "${SYM_OK-✔}" '开荒之后已经重启过（启动 ID 已变化），以下结果代表重启后的真实状态。' ;;
     *) echo '没有找到开荒记录，只检查系统当前状态。' ;;
   esac
 }
 
-verify_summary() {
-  say '开荒验收（只读）'
+# Every acceptance line, in order (verify_summary shows them under the conclusion).
+verify_checks() {
   verify_reboot_state
   verify_kernel
   verify_module bbr 'BBR 网络优化' check_bbr
@@ -5613,12 +5799,30 @@ verify_summary() {
   verify_module fail2ban 'Fail2ban 防爆破' check_fail2ban
   if docker_present; then verify_line unknown 'Docker' '已安装：用 -p 发布的容器端口会绕过防火墙，请确认这些端口确实需要对外'; fi
   verify_health
-  echo
+}
+
+# The acceptance report, conclusion first: the counts and what needs a look,
+# then every line under "详细".
+verify_summary() {
+  local details issue
+  VERIFY_ISSUES=()
+  details="$(mktemp)" || die '无法创建临时文件。'
+  verify_checks > "$details"
+  say '开荒验收（只读）'
   printf '结论：%s 项正常，%s 项未生效，%s 项按计划未处理，%s 项无法确认' "$VERIFY_PASS" "$VERIFY_FAIL" "$VERIFY_NA" "$VERIFY_UNKNOWN"
   if ((${VERIFY_REBOOT:-0})); then printf '，%s 项等重启后生效' "$VERIFY_REBOOT"; fi
   echo '。'
+  if ((${#VERIFY_ISSUES[@]})); then
+    echo '需要你看一下：'
+    for issue in "${VERIFY_ISSUES[@]}"; do printf '  %s\n' "$issue"; done
+  else
+    printf '%s%s 没有需要处理的项目。%s\n' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}"
+  fi
   if ((VERIFY_FAIL)); then echo '“未生效”的项目请按说明处理；处理后可再次运行 vps check。'; fi
-  if ((${VERIFY_REBOOT:-0})); then echo '“待重启”的项目重启后自动生效：选菜单 7 重启，重启后再选 3 验收。'; fi
+  if ((${VERIFY_REBOOT:-0})); then echo '“待重启”的项目重启后自动生效：选菜单 8 重启，重启后再选 3 验收。'; fi
+  printf '\n%s详细：%s\n' "${C_BOLD-}" "${C_RESET-}"
+  cat -- "$details"
+  rm -f -- "$details"
 }
 
 ufw_mentions() {
@@ -5666,6 +5870,7 @@ verify_main() {
     verify_summary > "$file"
     chmod 600 -- "$file" 2>/dev/null || true
     cat -- "$file"
+    sed -i 's/\x1b\[[0-9;]*m//g' -- "$file" 2>/dev/null || true
     printf '验收报告已保存：%s\n' "$file"
   else
     verify_summary
@@ -5700,7 +5905,7 @@ menu_reboot_hint() {
   ((seen)) || return 0
   if [[ -f "$STATE_ROOT/verified_boot" ]]; then verified="$(cat "$STATE_ROOT/verified_boot" 2>/dev/null || true)"; fi
   [[ "$verified" != "$current" ]] || return 0
-  printf '\033[1;33m检测到开荒后已经重启，建议选 3 做开荒验收，确认优化真的生效。\033[0m\n'
+  printf '%s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" '检测到开荒后已经重启，建议选 3 做开荒验收，确认优化真的生效。' "${C_RESET-}"
 }
 
 # Menu banner: an update waits for a reboot (a kernel installed after this
@@ -5725,7 +5930,7 @@ menu_pending_reboot_hint() {
   if [[ "$since" =~ ^[0-9]+$ ]] && (( $(date +%s) - since >= 86400 )); then
     days="（已等 $(( ($(date +%s) - since) / 86400 )) 天）"
   fi
-  printf '\033[1;33m%s%s：方便时选 7 重启。\033[0m\n' "$text" "$days"
+  printf '%s%s %s%s：方便时选 8 重启。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$text" "$days" "${C_RESET-}"
 }
 
 # ---- Port management ------------------------------------------------------
@@ -6589,6 +6794,7 @@ main() {
       warn '防火墙没有确认生效，跳过 Fail2ban。'
     fi
   else
+    UI_STEPS=15
     # Time first (APT validates Release dates), every question next, ZRAM
     # before a large upgrade; the steps that need the user come last.
     stage_run ntp ntp_stage
