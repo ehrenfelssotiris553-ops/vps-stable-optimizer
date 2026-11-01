@@ -112,6 +112,18 @@ sudo bash "$CI/journal-probe.sh" > "$LOGS/journal-probe.log" 2>&1 || rc=$?
 notice "journal probe ($mode, $(uname -m))" "$LOGS/journal-probe.log"
 ((rc == 0)) || fail 'the health report counts journal lines on a fresh machine (see the journal probe notice)'
 
+# NAME KEY CHOICE...: one `vps item` run that picks KEY in the menu, answers
+# CHOICE... in turn in the item's own menu, and is then back at the menu and
+# leaves it. Stage questions are answered as in the custom setup.
+item_do() {
+  local name="$1" key="$2" index rules="$LOGS/$1.rules"
+  shift 2
+  index="$(item_index "$key")" || fail "no single item $key"
+  { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq %s\n' "$index" "$*"
+    cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$rules"
+  drive "$rules" "$name" sudo vps item || fail "single item $key ($*) exited with $?"
+}
+
 check_all() {
   local name="$1" rc=0
   drive check.rules "$name" sudo vps check || rc=$?
@@ -151,22 +163,19 @@ if [[ "$mode" == alt ]]; then
   if grep -q '^ufw allow from ' "$LOGS/ufw-added.log"; then fail 'an allowlist rule although the allowlist was declined'; fi
   endgroup
 else
+if [[ "$mode" == upgrade ]] && grep -q 'Could not get lock' "$LOGS/setup-old.log"; then
+  # The previous release waited only 120 seconds for the package lock that the
+  # automatic update it had just started still held: this version finishes
+  # what that left undone (Fail2ban needs the package).
+  group "Fail2ban again, by $version (the previous release lost the package lock)"
+  item_do item-fail2ban-after-upgrade fail2ban 1
+  endgroup
+fi
 group 'Acceptance check'
 check_all check
 check_facts check
 endgroup
 
-# NAME KEY CHOICE...: one `vps item` run that picks KEY in the menu, answers
-# CHOICE... in turn in the item's own menu, and is then back at the menu and
-# leaves it. Stage questions are answered as in the custom setup.
-item_do() {
-  local name="$1" key="$2" index rules="$LOGS/$1.rules"
-  shift 2
-  index="$(item_index "$key")" || fail "no single item $key"
-  { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq %s\n' "$index" "$*"
-    cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$rules"
-  drive "$rules" "$name" sudo vps item || fail "single item $key ($*) exited with $?"
-}
 group 'Single items: each switched off (back to how the system was) and on again'
 item_do item-bbr-off bbr 2
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "$before_cc" ]] || fail 'BBR off: congestion control not back'

@@ -15,6 +15,7 @@ pkgs="$(awk -v since="${1:-}" '
   /^Commandline:/ {
     system_upgrade = $0 ~ / (upgrade|full-upgrade|dist-upgrade)( |$)/ || $0 ~ /unattended-upgrade/ || $0 ~ /linux-(image|modules|headers)/
   }
+  system_upgrade && /^Upgrade:/ {print "@system-upgrade"}
   /^Upgrade:/ || (system_upgrade && /^(Install|Remove|Purge):/) {
     sub(/^[A-Za-z]+: /, "")
     n = split($0, items, /\), /)
@@ -22,6 +23,7 @@ pkgs="$(awk -v since="${1:-}" '
   }
 ' "$history" | sort -u)"
 for p in $pkgs; do
+  if [[ "$p" == @system-upgrade ]]; then echo 'systemupgrade yes'; continue; fi
   printf 'upgradepkg %s\n' "$p"
   { dpkg -L "$p" 2>/dev/null || true; } |
     awk -F/ '/^\/etc\// {print "upgradefile " $0} /\/systemd\/system\/[^\/]+\.(service|timer|socket|path|target|mount)$/ {print "upgradeunit " $NF}'

@@ -25,7 +25,9 @@ export LC_ALL=C
   find /etc -xdev -type l -printf 'link %p -> %l\n'
   find /etc -xdev -xtype l -printf 'dangling %p\n'
   find /etc -xdev -type d -printf 'dir %p\n'
-  for d in /usr/local /var/lib/vps-stable-opt /var/backups/vps-stable-opt /var/log/vps-stable-opt; do
+  # Where the tool installs itself and keeps its data (packages put their own
+  # things under /usr/local/share, for example fonts).
+  for d in /usr/local/bin /usr/local/lib /var/lib/vps-stable-opt /var/backups/vps-stable-opt /var/log/vps-stable-opt; do
     if [[ -e "$d" ]]; then find "$d" -xdev -printf 'local %p\n'; fi
   done
   crontab -l -u root 2>/dev/null | sed 's/^/cron /' || true

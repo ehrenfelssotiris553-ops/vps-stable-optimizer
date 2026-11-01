@@ -125,6 +125,9 @@ def main():
     a, b = load(args.before), load(args.after)
     up = load(args.upgrades) if args.upgrades else {}
     up_pkgs, up_files = set(up.get('upgradepkg', [])), set(up.get('upgradefile', []))
+    # A real system upgrade (apt upgrade, unattended-upgrade) ran, not only
+    # dependencies brought up to date by an install.
+    system_upgrade = bool(up.get('systemupgrade'))
     unexplained, explained, warnings = [], [], []
 
     # Kernel parameters. After a reboot into a newer kernel its own defaults
@@ -201,6 +204,10 @@ def main():
         warnings.append('UFW rewrote user.rules/user6.rules in its own layout (logging and limit chains); none of the tool\'s rules are left')
         a['ufwrule'] = b.get('ufwrule', [])
 
+    # Units (compared further down; the links below need them too).
+    ua_units, ub_units = pairs(a, 'unit', ' '), pairs(b, 'unit', ' ')
+    up_units = set(up.get('upgradeunit', []))
+
     # Files, links and directories under /etc.
     fa, fb = files(a), files(b)
     dangling = set(b.get('dangling', [])) - set(a.get('dangling', []))
@@ -214,6 +221,10 @@ def main():
         what = 'file added' if path not in fa else 'file removed' if path not in fb else 'file changed'
         if path in PKG_SCRIPT_FILES and up_pkgs and (PKG_SCRIPT_FILES[path] is None or PKG_SCRIPT_FILES[path] in up_pkgs):
             explained.append(f'{what}: {path} (kept by package scripts during upgrades)')
+            continue
+        if (system_upgrade and what == 'file removed' and 'vps-stable' not in path
+                and path.rsplit('/', 1)[0] not in SHARED_DIRS):
+            explained.append(f'{what}: {path} (dropped by the system upgrade)')
             continue
         if up_pkgs and 'vps-stable' not in path and (path in TRIGGERED or path.rsplit('/', 1)[0] in up_dirs):
             explained.append(f'{what}: {path} (package upgrades)')
@@ -237,6 +248,13 @@ def main():
         rc_link = RC_LINK.match(path)
         unit = path.rsplit('/', 1)[-1]
         if SNAPD.match(path):
+            continue
+        if system_upgrade and path.startswith('/etc/alternatives/'):
+            explained.append(f'alternative set by a package of the system upgrade: {path}')
+            continue
+        if (system_upgrade and re.match(r'^/etc/systemd/system/[^/]+\.(wants|requires)/', path)
+                and (unit in up_units or (unit in ua_units) != (unit in ub_units))):
+            explained.append(f'enablement link of a unit the system upgrade changed: {path}')
             continue
         if CERTS.match(path) and 'ca-certificates' in up_pkgs:
             explained.append(f'certificate link rebuilt by the ca-certificates upgrade: {path}')
@@ -269,8 +287,6 @@ def main():
         (explained if path in up_files else unexplained).append(f'directory removed: {path}')
 
     # Everything else must be exactly as before.
-    ua_units, ub_units = pairs(a, 'unit', ' '), pairs(b, 'unit', ' ')
-    up_units = set(up.get('upgradeunit', []))
     rc_pkgs = set(b.get('pkgconf', []))
     for name in sorted(set(ua_units) | set(ub_units)):
         if 'transient' in (ua_units.get(name), ub_units.get(name)) or SNAPD.match(name):
