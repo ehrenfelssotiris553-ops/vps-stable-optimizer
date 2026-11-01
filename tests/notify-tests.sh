@@ -265,11 +265,12 @@ DOCKER_ON=1 DOCKER_MONO=''
 active() { [[ "$1" == docker ]] && ((DOCKER_ON)); }
 systemctl() { if [[ "$*" == 'show docker -p ActiveEnterTimestampMonotonic --value' ]]; then echo "$DOCKER_MONO"; fi; }
 docker() { if [[ "$*" == 'info --format {{.LoggingDriver}}' ]]; then echo json-file; fi; }
-# Docker started SECONDS ago (its start time since the boot, in microseconds).
-docker_since() { DOCKER_MONO=$((($(date +%s) - $1 - boot) * 1000000)); }
-docker_since 600; touch -d "@$(($(date +%s) - 60))" "$DOCKER_DAEMON_FILE"
+# Docker started 5 seconds after the boot (systemd counts in microseconds
+# since then); a CI machine may have booted only minutes ago.
+DOCKER_MONO=5000000
+touch -d "@$(date +%s)" "$DOCKER_DAEMON_FILE"
 check_dockerlog; [[ "$VERIFY_STATUS" == update && "$VERIFY_TEXT" == *'还没重启'* ]] || fail "written after Docker started: $VERIFY_STATUS $VERIFY_TEXT"
-touch -d "@$(($(date +%s) - 1200))" "$DOCKER_DAEMON_FILE"
+touch -d "@$((boot - 100))" "$DOCKER_DAEMON_FILE"
 check_dockerlog; [[ "$VERIFY_STATUS" == pass ]] || fail "Docker started after the file was written: $VERIFY_STATUS $VERIFY_TEXT"
 DOCKER_ON=0
 check_dockerlog; [[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'启动时就会用上'* ]] || fail "Docker not running: $VERIFY_STATUS $VERIFY_TEXT"

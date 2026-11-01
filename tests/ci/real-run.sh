@@ -294,7 +294,7 @@ item_do item-journal-on journal 1
 # (or the runtime journal's half, where nothing is kept on disk).
 # shellcheck disable=SC2024
 sudo journalctl -q --since "$journal_since" -t systemd-journald -o cat --no-pager > "$LOGS/journald-limit.log" 2>&1 || true
-grep -Eq '^(System Journal .* max 100\.0M|Runtime Journal .* max 50\.0M)' "$LOGS/journald-limit.log" ||
+grep -Eq '^(System Journal .* max 100(\.0)?M|Runtime Journal .* max 50(\.0)?M)' "$LOGS/journald-limit.log" ||
   fail "journal limit on: journald does not use 100 MiB: $(tail -n 5 "$LOGS/journald-limit.log" | tr '\n' ' ')"
 
 item_do item-trim-off trim 2
@@ -487,16 +487,29 @@ check_now() {
 }
 check_now
 used0="$(counted)" bytes0="$(nic_bytes)"
+cat /proc/net/dev > "$LOGS/net-dev-before.txt" 2>&1 || true
 if [[ ! "$used0" =~ ^[0-9]+$ ]] || ((used0 < 5000)); then fail "traffic counted at the start: $used0 MB (5000 MB were used already)"; fi
 curl -fsS --max-time 180 --max-filesize 40000000 -r 0-29999999 -o /dev/null \
   https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img || fail 'the test download failed'
 bytes1="$(nic_bytes)"
+cat /proc/net/dev > "$LOGS/net-dev-after.txt" 2>&1 || true
 check_now
 used1="$(counted)"
 want=$(((bytes1 - bytes0) / 1000000)) got=$((used1 - used0))
 printf 'Traffic through %s: %s MB by the card, %s MB by the alert\n' "$iface" "$want" "$got"
-((want >= 25)) || fail "only $want MB went through $iface for the 30 MB download"
-((got >= want - 2 && got <= want + 5)) || fail "the traffic alert counted $got MB, the network card $want MB"
+{ printf 'iface %s: bytes %s -> %s, counted %s -> %s MB\n' "$iface" "${bytes0:-none}" "${bytes1:-none}" "$used0" "$used1"
+  echo '-- /proc/net/dev before:'; cat "$LOGS/net-dev-before.txt"; echo '-- after:'; cat "$LOGS/net-dev-after.txt"
+  echo '-- links:'; ip -o link 2>&1 | cut -c1-160
+  echo '-- masters:'; for d in /sys/class/net/*; do if [[ -e "$d/master" ]]; then printf '%s -> %s\n' "${d##*/}" "$(readlink -f "$d/master")"; fi; done
+  echo '-- drivers:'; for d in /sys/class/net/*; do printf '%s %s\n' "${d##*/}" "$(readlink -f "$d/device/driver" 2>/dev/null || echo none)"; done
+  echo '-- route:'; ip route get "$(getent ahostsv4 cloud-images.ubuntu.com | awk 'NR == 1 {print $1}')" 2>&1
+  echo '-- the tool:'; sudo cat /var/lib/vps-stable-opt/notify/traffic /var/lib/vps-stable-opt/quota.conf 2>&1
+} > "$LOGS/traffic-diagnosis.txt" 2>&1
+notice "traffic count ($mode, $(uname -m))" "$LOGS/traffic-diagnosis.txt"
+traffic_problem=''
+if ((want < 25)); then traffic_problem="only $want MB went through $iface for the 30 MB download (see the traffic count notice)"
+elif ((got < want - 2 || got > want + 5)); then traffic_problem="the traffic alert counted $got MB, the network card $want MB"; fi
+if [[ -n "$traffic_problem" ]]; then printf '::error::%s\n' "$traffic_problem"; fi
 
 # Docker's log limit, where the runner has Docker: the rest of daemon.json kept,
 # and back exactly as it was when turned off.
@@ -658,5 +671,7 @@ python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt"
 cat "$LOGS/snapdiff.log"
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup
+# Found at the traffic check and kept until here, so that the rest still ran.
+[[ -z "${traffic_problem:-}" ]] || fail "$traffic_problem"
 printf 'PASS: real run (%s) on %s: install, setup, check, single items, ports, rollback, uninstall.\n' \
   "$mode" "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"
