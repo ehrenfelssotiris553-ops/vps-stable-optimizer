@@ -199,6 +199,16 @@ if ((old)); then
   vm 'sshd -t; echo "sshd -t: $?"; ls -ld /run/sshd; systemctl is-active ssh.socket ssh.service; ss -H -lntp "( sport = :22 )"; systemctl show ssh.socket -p Listen --value; dpkg-query -W openssh-server' \
     > "$LOGS/ssh-after-upgrade.log" 2>&1 || true
   notice "SSH after the upgrade ($system)" "$LOGS/ssh-after-upgrade.log"
+  # Seen once on Ubuntu 24.04's old image (the firewall ended up off): what
+  # the firewall step said, and the logins sshd wrote to the journal.
+  if ! grep -Fq '已在系统日志里看到新窗口登录成功，自动确认' "$LOGS/setup-runlog.log"; then
+    { echo '-- the firewall step in the run log:'
+      grep -n -E '防火墙|确认|恢复|登录' "$LOGS/setup-runlog.log" | tail -n 20
+      echo '-- sshd in the journal since the boot:'
+      vm "journalctl -q --since '$snapshot_since' _UID=0 -t sshd -t sshd-session -o short-iso --no-pager | grep -E 'Accepted|listening|signal|terminat' | tail -n 15" || true
+    } > "$LOGS/firewall-confirm.txt" 2>&1
+    notice "firewall confirmation in tmux ($system)" "$LOGS/firewall-confirm.txt"
+  fi
   has setup-runlog '已在系统日志里看到新窗口登录成功，自动确认'
   has setup-runlog '本次流程已完成'
   ssh_facts setup-runlog
