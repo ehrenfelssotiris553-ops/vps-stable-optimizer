@@ -7,6 +7,8 @@
 # Worded without "防火墙" in front when asked from the single-item menu.
 同时放行网站端口 ==> n
 请输入端口 ==> 8080
+# A parameter, asked after "3. 调整参数" (the TCP cap, in MiB).
+新的值（直接回车不改 ==> 40
 只允许某个 IP 访问吗？ ==>
 协议：1\) TCP ==> 1
 仍然对所有人开放吗？ ==> y

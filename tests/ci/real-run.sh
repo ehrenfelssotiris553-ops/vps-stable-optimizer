@@ -296,6 +296,35 @@ sudo test -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local || fail 'Fail2ban on:
 systemctl is-active -q fail2ban || fail 'Fail2ban on: not running'
 endgroup
 
+group 'Parameters: the TCP cap recommended, adjusted, exported, reset and imported'
+# The recommendation, worked out here from the RAM (16 MiB below 1 GiB, 32
+# below 4 GiB, 64 above), must be what the tool shows and what the kernel has.
+mem_mib="$(awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo)"
+want=64; if ((mem_mib < 4096)); then want=32; fi; if ((mem_mib < 1024)); then want=16; fi
+# The transcript belongs to the CI user; only the tool runs as root.
+# shellcheck disable=SC2024
+sudo vps params > "$LOGS/params.log" 2>&1 || fail 'vps params failed'
+cat "$LOGS/params.log"
+has params "现在用 $want MiB（自动）· 本机推荐 $want MiB"
+[[ "$(tcp_rmem_max)" == $((want * 1048576)) ]] || fail "tcp_rmem is $(tcp_rmem_max), not the recommended $want MiB"
+# Adjusted from the single item (item.rules answers 40).
+item_do item-tcp-adjust tcp 3
+[[ "$(tcp_rmem_max)" == $((40 * 1048576)) ]] || fail "adjusted to 40 MiB: tcp_rmem is $(tcp_rmem_max)"
+sudo grep -Fxq 'tcp_buffer_mib=40' /var/lib/vps-stable-opt/params || fail 'the adjusted value is not stored'
+# shellcheck disable=SC2024
+sudo vps params export > "$LOGS/params-export.txt" || fail 'vps params export failed'
+grep -Fxq 'tcp_buffer_mib=40' "$LOGS/params-export.txt" || fail "export: $(cat "$LOGS/params-export.txt")"
+# Back to the recommendation from the single item.
+item_do item-tcp-reset tcp 4
+[[ "$(tcp_rmem_max)" == $((want * 1048576)) ]] || fail "reset: tcp_rmem is $(tcp_rmem_max), not $want MiB"
+if sudo grep -q tcp_buffer_mib /var/lib/vps-stable-opt/params; then fail 'reset left a stored value'; fi
+# Imported from the exported file, and applied to the item that is on.
+drive params.rules params-import sudo vps params import "$LOGS/params-export.txt" || fail "params import exited with $?"
+[[ "$(tcp_rmem_max)" == $((40 * 1048576)) ]] || fail "import: tcp_rmem is $(tcp_rmem_max), not 40 MiB"
+item_do item-tcp-reset-again tcp 4
+[[ "$(tcp_rmem_max)" == $((want * 1048576)) ]] || fail "second reset: tcp_rmem is $(tcp_rmem_max)"
+endgroup
+
 group 'Port management'
 # Through the menu: open TCP 8080 for everyone, then leave.
 item_do item-ports ports 1 0

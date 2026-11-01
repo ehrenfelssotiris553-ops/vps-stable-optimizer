@@ -116,9 +116,26 @@ printf 'PASS: every apt-get that changes the system runs with umask 022.\n'
 # NO_COLOR, a log or a saved report, and VPS_ASCII=1 reach every line.
 raw="$(grep -nF '\033[' "$TEST_SCRIPT" | grep -vF "C_OK=\$'" | grep -vF '\r\033[K' || true)"
 [[ -z "$raw" ]] || fail "a colour written out instead of a C_ variable: $raw"
-# The help text (which names the symbols) is left out by position.
+# The help text is left out by position, and a line naming the set itself
+# ("✔ ⚠ ...", in the symbols setting) is not a state either.
 symbols="$(awk '/<<.HELP.$/ {skip = 1} !skip {print NR ":" $0} $0 == "HELP" {skip = 0}' "$TEST_SCRIPT" |
-  grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vF "SYM_OK='" |
+  grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vF "SYM_OK='" | grep -vF '✔ ⚠' |
   sed -E 's/\$\{SYM_[A-Z]+-[^}]*\}//g' | grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' || true)"
 [[ -z "$symbols" ]] || fail "a state symbol written out instead of a SYM_ variable: $symbols"
 printf 'PASS: colours and state symbols come only from the interface block.\n'
+
+# Every parameter belongs to an existing single item, and on a small, a middle
+# and a large machine its recommendation is allowed and comes with a reason.
+(
+  load_optimizer_functions param_list param_recommended param_reason param_check
+  while IFS=$'\t' read -r name item label unit; do
+    grep -Fxq -- "$item" <(item_keys) || fail "parameter $name belongs to no single item ($item)"
+    [[ -n "$label" && -n "$unit" ]] || fail "parameter $name has no label or unit"
+    for MEM_MIB in 512 2048 16384; do
+      value="$(param_recommended "$name")" || fail "no recommendation for $name"
+      param_check "$name" "$value" > /dev/null || fail "recommendation for $name with $MEM_MIB MiB is not allowed: $value"
+      [[ -n "$(param_reason "$name")" ]] || fail "no reason for $name"
+    done
+  done < <(param_list)
+)
+printf 'PASS: every parameter belongs to a single item, and its recommendation is allowed and explained.\n'

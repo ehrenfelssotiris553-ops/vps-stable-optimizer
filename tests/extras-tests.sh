@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_ipv4_iface_values sysctl_config_files sysctl_key_configured sysctl_hardening_stage tcp_buffer_max tcp_buffer_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_ipv4_iface_values sysctl_config_files sysctl_key_configured sysctl_hardening_stage param_list param_recommended param_reason param_check param_caution param_read param_value param_mode param_store restore_sysctl_original tcp_buffer_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -260,8 +260,11 @@ printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys, records or
 # TCP buffer ceilings: sized by RAM, only ever raised, a key set elsewhere kept,
 # min and default of the three-number keys kept, originals recorded once.
 TCP_BUFFER_FILE="$TEST_ROOT/sysctl/99-vps-stable-tcp.conf"
-for pair in 1023:16777216 1024:33554432 4095:33554432 4096:67108864; do
-  MEM_MIB="${pair%%:*}"; [[ "$(tcp_buffer_max)" == "${pair#*:}" ]] || fail "buffer ceiling for $MEM_MIB MiB: $(tcp_buffer_max)"
+STATE_ROOT="$TEST_ROOT/state" PARAMS_FILE="$TEST_ROOT/state/params" RESTORE_ROOT="$TEST_ROOT/restore"
+mkdir -p "$STATE_ROOT" "$RESTORE_ROOT"
+state_secure_dir() { mkdir -p -- "$1"; }
+for pair in 1023:16 1024:32 4095:32 4096:64; do
+  MEM_MIB="${pair%%:*}"; [[ "$(param_value tcp_buffer_mib)" == "${pair#*:}" ]] || fail "buffer ceiling for $MEM_MIB MiB: $(param_value tcp_buffer_mib)"
 done
 SYSVAL[net.core.rmem_max]=212992 SYSVAL[net.core.wmem_max]=212992
 SYSVAL[net.ipv4.tcp_rmem]=$'4096\t131072\t6291456' SYSVAL[net.ipv4.tcp_wmem]=$'4096\t16384\t4194304'
@@ -303,6 +306,64 @@ tcp_buffer_stage
 grep -q '^result tcp preserved' "$TEST_ROOT/trace" || fail 'large enough buffers not reported as kept'
 unset 'SYSVAL[net.core.rmem_max]' 'SYSVAL[net.core.wmem_max]' 'SYSVAL[net.ipv4.tcp_rmem]' 'SYSVAL[net.ipv4.tcp_wmem]'
 printf 'PASS: TCP buffer ceilings follow RAM, are only raised and keep foreign keys.\n'
+
+# The cap is a parameter. A value set by the user is used (and kept by a new
+# setup); this tool's own file is written again for a new cap, compared with
+# the values from before the tool (its own are in force), and what the new
+# file no longer raises goes back to its value from before.
+(
+  sysctl() {
+    case "$1" in
+      -n) [[ -n "${SYSVAL[$2]:-}" ]] && echo "${SYSVAL[$2]}" ;;
+      -e) record "sysctl $*" ;;
+      -w) record "sysctl $*" ;;
+      *) fail "unexpected sysctl $*" ;;
+    esac
+  }
+  CONFIGURED=none MEM_MIB=2048 TCP_BUFFER_CHOICE=1
+  printf '%s\n' 'net.core.rmem_max=212992' 'net.core.wmem_max=212992' 'net.ipv4.tcp_rmem=4096 131072 6291456' \
+    'net.ipv4.tcp_wmem=4096 16384 4194304' > "$RESTORE_ROOT/tcp_sysctl_runtime"
+  # The user's value, first time.
+  param_store tcp_buffer_mib 64
+  [[ "$(param_value tcp_buffer_mib)" == 64 && "$(param_mode tcp_buffer_mib)" == '你调过' ]] || fail 'stored value not in force'
+  SYSVAL[net.core.rmem_max]=212992 SYSVAL[net.core.wmem_max]=212992
+  SYSVAL[net.ipv4.tcp_rmem]=$'4096\t131072\t6291456' SYSVAL[net.ipv4.tcp_wmem]=$'4096\t16384\t4194304'
+  reset; rm -f "$TCP_BUFFER_FILE"; OURS=0
+  tcp_buffer_stage
+  grep -Fxq 'net.core.rmem_max = 67108864' "$TCP_BUFFER_FILE" || fail "the user's 64 MiB not written: $(cat "$TCP_BUFFER_FILE")"
+  grep -q '^result tcp applied 64 MiB' "$TEST_ROOT/trace" || fail 'custom cap result not recorded'
+  # Lowered to 8 MiB while the 64 MiB file is in force: rewritten from the
+  # values before the tool, not from the 64 MiB now running.
+  SYSVAL[net.core.rmem_max]=67108864 SYSVAL[net.core.wmem_max]=67108864
+  SYSVAL[net.ipv4.tcp_rmem]=$'4096\t131072\t67108864' SYSVAL[net.ipv4.tcp_wmem]=$'4096\t16384\t67108864'
+  param_store tcp_buffer_mib 8
+  reset; OURS=1
+  tcp_buffer_stage
+  grep -Fxq 'net.core.rmem_max = 8388608' "$TCP_BUFFER_FILE" || fail "a lower cap was not written: $(cat "$TCP_BUFFER_FILE")"
+  grep -Fxq 'net.ipv4.tcp_rmem = 4096 131072 8388608' "$TCP_BUFFER_FILE" || fail 'lower cap of tcp_rmem not written'
+  grep -q '^result tcp applied 8 MiB' "$TEST_ROOT/trace" || fail 'lower cap not recorded'
+  # 5 MiB: tcp_rmem was 6 MiB before the tool, so the file no longer raises it
+  # and it goes back to that value now (not at the next boot).
+  param_store tcp_buffer_mib 5
+  reset; OURS=1
+  tcp_buffer_stage
+  if grep -Fq tcp_rmem "$TCP_BUFFER_FILE"; then fail 'tcp_rmem kept although 5 MiB is below its value from before'; fi
+  grep -Fxq 'sysctl -w net.ipv4.tcp_rmem=4096 131072 6291456' "$TEST_ROOT/trace" || fail "dropped key not set back: $(cat "$TEST_ROOT/trace")"
+  grep -Fxq 'net.core.rmem_max = 5242880' "$TCP_BUFFER_FILE" || fail 'rmem_max not at 5 MiB'
+  # A cap no larger than anything from before: the file goes, values go back.
+  printf '%s\n' 'net.core.rmem_max=8388608' 'net.core.wmem_max=8388608' 'net.ipv4.tcp_rmem=4096 131072 8388608' \
+    'net.ipv4.tcp_wmem=4096 16384 8388608' > "$RESTORE_ROOT/tcp_sysctl_runtime"
+  reset; OURS=1
+  tcp_buffer_stage
+  [[ ! -e "$TCP_BUFFER_FILE" ]] || fail "the tool's file stayed although nothing is raised: $(cat "$TCP_BUFFER_FILE")"
+  grep -Fxq 'sysctl -w net.core.rmem_max=8388608' "$TEST_ROOT/trace" || fail 'values not set back when the file went'
+  grep -q '^result tcp preserved system values already large enough' "$TEST_ROOT/trace" || fail "result: $(cat "$TEST_ROOT/trace")"
+  # Back to automatic: the file stores nothing for it.
+  param_store tcp_buffer_mib ''
+  [[ "$(param_mode tcp_buffer_mib)" == '自动' && "$(param_value tcp_buffer_mib)" == 32 ]] || fail 'reset did not go back to the recommendation'
+  if grep -q tcp_buffer_mib "$PARAMS_FILE"; then fail 'an automatic value was stored'; fi
+)
+printf 'PASS: the TCP cap follows the user value or the recommendation and rewrites its own file from the values before the tool.\n'
 
 # Real sysctl_key_configured against fixture files.
 (

@@ -47,6 +47,8 @@ FIREWALL_READY=0
 RESTORE_EXIT_CODE=0
 STATE_ROOT=/var/lib/vps-stable-opt
 BACKUP_ROOT=/var/backups/vps-stable-opt
+# Parameters the user set and per-machine settings (see param_list).
+PARAMS_FILE="$STATE_ROOT/params"
 PREFLIGHT_BLOCKERS=0
 SOURCE_REVIEW_REQUIRED=0
 PREFLIGHT_DONE=0
@@ -68,7 +70,7 @@ VNSTAT_CHOICE=''
 ZRAM_CHOICE=''
 HOSTS_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|setup|item|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
@@ -81,7 +83,8 @@ VPS 机器管家 V2.7.8 — Debian 12/13、Ubuntu 22.04/24.04/26.04
                    vps port open 8080 | 443-600 | 8080,9000-9100 [tcp|udp|both] [from IP]
                    vps port close 8080 [tcp|udp|both]
                    vps port list
-  vps item       单项设置：逐项开启或关闭某一项，不用重跑整个开荒
+  vps item       单项设置：逐项开启或关闭某一项，不用重跑整个开荒；能调的项目可以调整参数
+  vps params     参数总览（现在的值、推荐值和理由）；vps params export 导出，vps params import [文件] 导入
   vps bans       查看 Fail2ban 封禁记录，可以解封某个 IP
   vps reboot     重启服务器（先说明是否需要重启；防失联确认或软件安装没结束时不重启）
   vps firewall   设置防火墙与 SSH 防爆破（需已有 UFW）
@@ -114,7 +117,8 @@ fi
 # ambiguous-width symbols two columns wide, so nothing is aligned after one.
 UI_COLOR=0
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then UI_COLOR=1; fi
-if [[ "${VPS_ASCII:-0}" == 1 ]]; then
+# VPS_ASCII=0 or 1 wins over the setting saved from the single-item menu.
+if [[ "${VPS_ASCII:-}" == 1 ]] || [[ -z "${VPS_ASCII:-}" ]] && grep -qsx 'ui_ascii=1' "$PARAMS_FILE" 2>/dev/null; then
   SYM_OK='[OK]' SYM_WARN='[!]' SYM_FAIL='[X]' SYM_SKIP='[-]' SYM_NEXT='>' UI_OPEN='== ' UI_CLOSE=' =='
 else
   SYM_OK='✔' SYM_WARN='⚠' SYM_FAIL='✖' SYM_SKIP='○' SYM_NEXT='›' UI_OPEN='【' UI_CLOSE='】'
@@ -714,7 +718,7 @@ setup_questions() {
       if confirm_yes '没有 Swap：要配一个约 1/4 内存大小的 ZRAM 作为应急缓冲吗？（防止内存突然用尽时进程被杀）'; then ZRAM_CHOICE=1; else ZRAM_CHOICE=0; fi
     fi
     if confirm_default_yes '启用内核网络安全参数吗？（不接受 ICMP 重定向和源路由、开启 SYN Cookies 等；不影响代理和 Docker）'; then SYSCTL_CHOICE=1; else SYSCTL_CHOICE=0; fi
-    if confirm_yes "把 TCP 缓冲区上限加大到 $(($(tcp_buffer_max) / 1048576)) MiB 吗？（跨洲代理、远距离传大文件时单个连接更快；只提高上限，空闲连接不会多占内存）"; then TCP_BUFFER_CHOICE=1; else TCP_BUFFER_CHOICE=0; fi
+    if confirm_yes "把 TCP 缓冲区上限加大到 $(param_value tcp_buffer_mib) MiB 吗？（跨洲代理、远距离传大文件时单个连接更快；只提高上限，空闲连接不会多占内存）"; then TCP_BUFFER_CHOICE=1; else TCP_BUFFER_CHOICE=0; fi
     if ! hostname_resolves; then
       if confirm_default_yes "主机名 $(hostname) 无法解析（sudo 会提示 unable to resolve host）。在 /etc/hosts 里补上吗？"; then HOSTS_CHOICE=1; else HOSTS_CHOICE=0; fi
     fi
@@ -1630,34 +1634,290 @@ sysctl_hardening_stage() {
 # x 200 ms = 25 MB, while the kernels of Debian 12/13 and Ubuntu 22.04/24.04
 # stop at 6 MiB (receive) and 4 MiB (send). Kernels from mid-2025 on allow
 # 32 MiB for receiving.
-tcp_buffer_max() {
-  if ((MEM_MIB < 1024)); then echo 16777216
-  elif ((MEM_MIB < 4096)); then echo 33554432
-  else echo 67108864; fi
+# Tunable parameters. Each one is either automatic, the value recommended for
+# this machine, worked out again whenever it is used (so it follows a RAM or
+# disk upgrade), or a value the user set, kept in PARAMS_FILE until reset and
+# kept by a new setup too. The file holds "name=value" lines; only known names
+# with valid values count, anything else in it is ignored.
+# Lines: name, single item it belongs to, label, unit.
+param_list() {
+  printf '%s\t%s\t%s\t%s\n' \
+    tcp_buffer_mib tcp 'TCP 缓冲区上限' MiB
+}
+
+# NAME: the value recommended for this machine.
+param_recommended() {
+  case "$1" in
+    tcp_buffer_mib)
+      if ((${MEM_MIB:-0} < 1024)); then echo 16
+      elif ((MEM_MIB < 4096)); then echo 32
+      else echo 64; fi ;;
+    *) return 1 ;;
+  esac
+}
+
+# NAME: why that value, in a sentence.
+param_reason() {
+  local mib
+  case "$1" in
+    tcp_buffer_mib)
+      mib="$(param_recommended tcp_buffer_mib)"
+      printf '内存 %s MiB：%s MiB 能让一个连接在 200 ms 延迟的线路上跑到约 %s Mbps，连接多时也不会占太多内存（内存小于 1 GiB 用 16，1–4 GiB 用 32，更大用 64）。\n' \
+        "${MEM_MIB:-?}" "$mib" "$((mib * 1048576 * 8 / 200000))" ;;
+  esac
+}
+
+# NAME VALUE: true when VALUE is allowed; otherwise says what is.
+param_check() {
+  case "$1" in
+    tcp_buffer_mib)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 4 && 10#$2 <= 256)); then return 0; fi
+      echo '请输入 4 到 256 之间的整数（单位 MiB）。' ;;
+    *) echo "没有这个参数：$1" ;;
+  esac
+  return 1
+}
+
+# NAME VALUE: what an unusual value costs; nothing when it is a sensible one.
+param_caution() {
+  local recommended
+  recommended="$(param_recommended "$1" 2>/dev/null || echo 0)"
+  case "$1" in
+    tcp_buffer_mib)
+      if ((10#$2 > recommended * 2)); then
+        echo "比本机推荐的 $recommended MiB 大很多：只有少数连接要跑很高带宽时才用得上；连接多又同时跑满时，内核按总的 TCP 内存限制收紧，网速反而可能变慢。"
+      elif ((10#$2 < 8)); then
+        echo '比 Linux 默认的接收上限（6 MiB）大不了多少：本工具不会调低系统已有的值，这一项基本不起作用。'
+      fi ;;
+  esac
+}
+
+# NAME: the value the user set, when there is a valid one.
+param_read() {
+  local value
+  [[ -f "$PARAMS_FILE" && ! -L "$PARAMS_FILE" ]] || return 1
+  value="$(awk -F= -v k="$1" '$1 == k {v = substr($0, length(k) + 2)} END {if (v == "") exit 1; print v}' "$PARAMS_FILE")" || return 1
+  param_check "$1" "$value" > /dev/null || return 1
+  printf '%s\n' "$value"
+}
+
+# NAME: the value in force, the user's or the recommended one.
+param_value() {
+  param_read "$1" || param_recommended "$1"
+}
+
+# NAME: "你调过" or "自动".
+param_mode() {
+  if param_read "$1" > /dev/null; then echo '你调过'; else echo '自动'; fi
+}
+
+# NAME VALUE: keeps VALUE for NAME; an empty VALUE goes back to automatic.
+param_store() {
+  local name="$1" value="$2" temp
+  [[ "$name" =~ ^[a-z][a-z0-9_]*$ ]] || return 1
+  state_secure_dir "$STATE_ROOT"
+  temp="$(mktemp "$STATE_ROOT/.params.XXXXXX")" || return 1
+  if [[ -f "$PARAMS_FILE" && ! -L "$PARAMS_FILE" ]] && ! awk -F= -v k="$name" '$1 != k' "$PARAMS_FILE" > "$temp"; then
+    rm -f -- "$temp"; return 1
+  fi
+  if [[ -n "$value" ]] && ! printf '%s=%s\n' "$name" "$value" >> "$temp"; then rm -f -- "$temp"; return 1; fi
+  if ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$PARAMS_FILE"; then rm -f -- "$temp"; return 1; fi
+}
+
+# KEY: the parameters of one single item.
+param_names() {
+  local name item _label _unit
+  while IFS=$'\t' read -r name item _label _unit; do
+    if [[ "$item" == "$1" ]]; then printf '%s\n' "$name"; fi
+  done < <(param_list)
+}
+
+# NAME: label<TAB>unit.
+param_info() {
+  local name item label unit
+  while IFS=$'\t' read -r name item label unit; do
+    if [[ "$name" == "$1" ]]; then printf '%s\t%s\n' "$label" "$unit"; return 0; fi
+  done < <(param_list)
+  return 1
+}
+
+# KEY: true when the single item is on (its last result was applied).
+param_item_on() {
+  local info
+  info="$(module_expect "$1" 2>/dev/null)" || return 1
+  [[ "${info%%$'\t'*}" == applied || "${info%%$'\t'*}" == present ]]
+}
+
+# KEY: asks for each parameter of a single item. When the item is on it is
+# applied again; otherwise the next "开启" uses the new values.
+param_adjust() {
+  local key="$1" name label unit value answer note changed=0
+  local -a names=()
+  # Read first: inside the loop, read must get the user's answers.
+  mapfile -t names < <(param_names "$key")
+  for name in "${names[@]}"; do
+    IFS=$'\t' read -r label unit <<< "$(param_info "$name")"
+    value="$(param_value "$name")"
+    printf '%s：现在 %s %s（%s），本机推荐 %s %s。\n' "$label" "$value" "$unit" "$(param_mode "$name")" "$(param_recommended "$name")" "$unit"
+    param_reason "$name"
+    while :; do
+      read -r -p '新的值（直接回车不改，输入 auto 用推荐值）: ' answer || return 0
+      if [[ -z "$answer" ]]; then break; fi
+      if [[ "$answer" == auto ]]; then param_store "$name" '' || die '无法保存参数。'; changed=1; break; fi
+      if ! note="$(param_check "$name" "$answer")"; then echo "$note"; continue; fi
+      answer="$((10#$answer))"
+      note="$(param_caution "$name" "$answer")"
+      if [[ -n "$note" ]]; then
+        warn "$note"
+        confirm_yes "仍然用 $answer $unit 吗？" || continue
+      fi
+      param_store "$name" "$answer" || die '无法保存参数。'
+      changed=1; break
+    done
+  done
+  ((changed)) || { ok '参数没有改动。'; return 0; }
+  param_apply "$key"
+}
+
+# KEY: the parameters of a single item back to automatic.
+param_reset() {
+  local key="$1" name
+  while IFS= read -r name; do param_store "$name" '' || die '无法保存参数。'; done < <(param_names "$key")
+  ok "「$(item_label "$key")」的参数已恢复成本机推荐值。"
+  param_apply "$key"
+}
+
+# KEY: applies the item again with its current parameters when it is on.
+param_apply() {
+  if param_item_on "$1"; then
+    echo '这一项已经开启：按新的参数重新应用。'
+    item_turn_on "$1"
+  else
+    ok '这一项还没开启：开启时就会用新的参数。'
+  fi
+}
+
+# Every parameter on one screen: the value in force, the recommendation and why.
+params_overview() {
+  local name item label unit value recommended note
+  say '参数总览'
+  while IFS=$'\t' read -r name item label unit; do
+    value="$(param_value "$name")" recommended="$(param_recommended "$name")"
+    printf ' %s%s%s（单项设置：%s）\n' "${C_BOLD-}" "$label" "${C_RESET-}" "$(item_label "$item")"
+    printf '   现在用 %s %s（%s）· 本机推荐 %s %s\n' "$value" "$unit" "$(param_mode "$name")" "$recommended" "$unit"
+    printf '   %s\n' "$(param_reason "$name")"
+    note="$(param_caution "$name" "$value")"
+    if [[ -n "$note" ]]; then printf '   %s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$note" "${C_RESET-}"; fi
+  done < <(param_list)
+  echo '要改哪一项：单项设置里选那一项，再选「调整参数」或「恢复推荐值」。'
+}
+
+# The parameters as lines to paste on another machine (vps params import).
+params_export() {
+  local name _item _label _unit value
+  printf '# VPS 机器管家 %s 的参数，来自 %s，%s\n' "${SCRIPT_VERSION:-}" "$(hostname -s 2>/dev/null || echo 本机)" "$(date +%F)"
+  echo '# 在另一台机器上运行 vps params import（或单项设置里选 i），把下面几行粘贴进去。auto 表示用那台机器自己的推荐值。'
+  while IFS=$'\t' read -r name _item _label _unit; do
+    value="$(param_read "$name" || echo auto)"
+    printf '%s=%s\n' "$name" "$value"
+  done < <(param_list)
+}
+
+# [FILE]: lines from params_export, read from FILE or pasted (up to an empty
+# line); checked one by one, shown, then kept on a yes. The items that are on
+# are applied again with the new values on request.
+params_import() {
+  local file="${1:-}" line name value label unit
+  local -a names=() values=() items=() lines=()
+  if [[ -n "$file" ]]; then
+    [[ -f "$file" && -r "$file" ]] || die "读不到文件：$file"
+    mapfile -t lines < "$file"
+  else
+    echo '把另一台机器导出的几行粘贴进来，最后输入一个空行结束：'
+    while IFS= read -r line; do
+      [[ -n "${line%$'\r'}" ]] || break
+      lines+=("$line")
+    done
+  fi
+  for line in "${lines[@]}"; do
+    line="${line%$'\r'}"
+    [[ -n "$line" ]] || continue
+    [[ "$line" == '#'* ]] && continue
+    name="${line%%=*}" value="${line#*=}"
+    if [[ "$line" != *=* ]] || ! param_info "$name" > /dev/null; then warn "不认识这一行，跳过：$line"; continue; fi
+    if [[ "$value" != auto ]] && ! param_check "$name" "$value" > /dev/null; then warn "值不在允许范围内，跳过：$line"; continue; fi
+    names+=("$name") values+=("$value")
+  done
+  ((${#names[@]})) || { ok '没有可以导入的参数。'; return 0; }
+  echo '将改成：'
+  for ((line = 0; line < ${#names[@]}; line++)); do
+    IFS=$'\t' read -r label unit <<< "$(param_info "${names[line]}")"
+    if [[ "${values[line]}" == auto ]]; then printf '  %s：自动（本机推荐 %s %s）\n' "$label" "$(param_recommended "${names[line]}")" "$unit"
+    else printf '  %s：%s %s\n' "$label" "${values[line]}" "$unit"; fi
+  done
+  confirm_yes '确认导入吗？' || { ok '已取消。'; return 0; }
+  for ((line = 0; line < ${#names[@]}; line++)); do
+    value="${values[line]}"
+    if [[ "$value" == auto ]]; then value=''; else value="$((10#$value))"; fi
+    param_store "${names[line]}" "$value" || die '无法保存参数。'
+    while IFS=$'\t' read -r name label _ _; do
+      if [[ "$name" == "${names[line]}" && " ${items[*]} " != *" $label "* ]]; then items+=("$label"); fi
+    done < <(param_list)
+  done
+  ok '参数已导入。'
+  for line in "${items[@]}"; do
+    if param_item_on "$line" && confirm_default_yes "「$(item_label "$line")」已经开启，现在就按新的参数重新应用吗？"; then item_turn_on "$line"; fi
+  done
+}
+
+# vps params [show|export|import [FILE]]
+params_main() {
+  [[ $EUID -eq 0 ]] || die '参数保存在 root 的目录里：请用 sudo vps params。'
+  case "${MODE_ARGS[0]:-show}" in
+    show) params_overview ;;
+    export) params_export ;;
+    import)
+      validate_vm
+      start_logging
+      prepare_run_state
+      stage_run backup backup_configs
+      restore_prepare
+      params_import "${MODE_ARGS[1]:-}"
+      finish_run_state ;;
+    *) die '用法：vps params [show|export|import [文件]]' ;;
+  esac
 }
 
 # Only the maxima grow, never shrink: buffers are still allocated on demand and
 # the kernel's total TCP memory limit (tcp_mem) is left alone, so idle
 # connections cost nothing more. A key set in any other file keeps its value.
+# The value KEY had before this tool first changed it, as recorded in FILE.
+restore_sysctl_original() {
+  local file="$RESTORE_ROOT/${2:-sysctl_runtime}"
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  awk -F= -v k="$1" '$1 == k {print substr($0, length(k) + 2); found = 1; exit} END {exit !found}' "$file"
+}
+
 tcp_buffer_stage() {
   step 7 'TCP 缓冲区上限（可选）'
-  local max key current text='' min def top
+  local mib max key current text='' min def top content old='' ours=0
   local -a kept=() originals=()
   if [[ "${TCP_BUFFER_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改 TCP 缓冲区。'; module_result tcp declined 'not requested'; return 0; fi
-  max="$(tcp_buffer_max)"
-  # Values read while the file is in force are not originals: re-apply only.
+  mib="$(param_value tcp_buffer_mib)"
+  max=$((mib * 1048576))
   if [[ -e "$TCP_BUFFER_FILE" || -L "$TCP_BUFFER_FILE" ]]; then
     if ! restore_file_ours tcp_file; then
       warn "$TCP_BUFFER_FILE 已经存在，不是本工具上次写入的内容，保持不变。"; module_result tcp preserved 'file differs'; return 0
     fi
-    top="$(awk '/ = / {print $NF}' "$TCP_BUFFER_FILE" | sort -n | tail -n 1)"
-    if sysctl -e -p "$TCP_BUFFER_FILE" >/dev/null; then
-      ok 'TCP 缓冲区上限已经是本工具的设置，已重新加载。'; module_result tcp applied "$((${top:-0} / 1048576)) MiB"
-    else warn 'TCP 缓冲区参数没有生效，请查看日志。'; module_result tcp failed 'sysctl -p failed'; fi
-    return 0
+    ours=1 old="$(cat -- "$TCP_BUFFER_FILE")"
   fi
   for key in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
-    read -r min def top <<< "$(sysctl -n "$key" 2>/dev/null || true)"
+    # While this tool's file is in force the running values are its own: the
+    # new cap is compared with the values from before the tool instead.
+    if ((ours == 0)) || ! current="$(restore_sysctl_original "$key" tcp_sysctl_runtime)"; then
+      current="$(sysctl -n "$key" 2>/dev/null || true)"
+    fi
+    read -r min def top <<< "$current"
     if sysctl_key_configured "$key" "$TCP_BUFFER_FILE"; then kept+=("$key"); continue; fi
     if [[ "$key" == net.core.* ]]; then
       [[ "$min" =~ ^[0-9]+$ && -z "$def" ]] || continue
@@ -1671,18 +1931,43 @@ tcp_buffer_stage() {
     originals+=("$key=$current")
   done
   if ((${#kept[@]})); then ok "已有其他配置的参数保持不变：${kept[*]}"; fi
-  if [[ -z "$text" ]]; then
-    if ((${#kept[@]} == 0)); then ok "TCP 缓冲区上限已经不小于 $((max / 1048576)) MiB，不用修改。"; fi
-    module_result tcp preserved 'already large enough or set elsewhere'; return 0
+  content="# VPS Stable Optimizer v2.7: larger socket buffer ceilings"$'\n'"${text%$'\n'}"
+  if ((ours)) && [[ "$old" == "$content" ]]; then
+    if sysctl -e -p "$TCP_BUFFER_FILE" >/dev/null; then
+      ok "TCP 缓冲区上限已经是 $mib MiB（$(param_mode tcp_buffer_mib)），已重新加载。"; module_result tcp applied "$mib MiB"
+    else warn 'TCP 缓冲区参数没有生效，请查看日志。'; module_result tcp failed 'sysctl -p failed'; fi
+    return 0
   fi
-  if ! put_file "$TCP_BUFFER_FILE" "# VPS Stable Optimizer v2.7: larger socket buffer ceilings"$'\n'"${text%$'\n'}"; then
+  # The new cap changes this tool's own file: it is written again, and what
+  # the new one no longer raises goes back to its value from before the tool.
+  if ((ours)); then
+    rm -f -- "$TCP_BUFFER_FILE"
+    while IFS= read -r key; do
+      [[ -n "$key" && "$text" != *"$key = "* ]] || continue
+      if current="$(restore_sysctl_original "$key" tcp_sysctl_runtime)"; then
+        sysctl -w "$key=$current" >/dev/null 2>&1 || warn "无法把 $key 恢复成原来的 $current；重启后会恢复。"
+      fi
+    done < <(awk '/ = / {print $1}' <<< "$old")
+  fi
+  if [[ -z "$text" ]]; then
+    if ((ours)); then
+      ok "上限 $mib MiB 不比系统原来的值大：本工具的设置不再需要，已恢复成系统原来的值。"
+      module_result tcp preserved 'system values already large enough'
+    else
+      if ((${#kept[@]} == 0)); then ok "TCP 缓冲区上限已经不小于 $mib MiB，不用修改。"; fi
+      module_result tcp preserved 'already large enough or set elsewhere'
+    fi
+    return 0
+  fi
+  if ! put_file "$TCP_BUFFER_FILE" "$content"; then
     module_result tcp preserved 'sysctl file conflict'; return 0
   fi
+  # Only a key seen for the first time is recorded (the first value is kept).
   for key in "${originals[@]}"; do
     restore_record_sysctl "${key%%=*}" "${key#*=}" tcp_sysctl_runtime || warn "无法记录 ${key%%=*} 的原值；回退后要重启才会恢复默认。"
   done
   if sysctl -e -p "$TCP_BUFFER_FILE" >/dev/null; then
-    ok "TCP 缓冲区上限已加大到 $((max / 1048576)) MiB（内存 ${MEM_MIB} MiB）。"; module_result tcp applied "$((max / 1048576)) MiB"
+    ok "TCP 缓冲区上限：$mib MiB（$(param_mode tcp_buffer_mib)，内存 ${MEM_MIB} MiB）。"; module_result tcp applied "$mib MiB"
   else warn 'TCP 缓冲区参数没有生效，请查看日志。'; module_result tcp failed 'sysctl -p failed'; fi
 }
 
@@ -5425,6 +5710,7 @@ VERIFY_EXIT=0
 VERIFY_NA=0
 VERIFY_UNKNOWN=0
 VERIFY_REBOOT=0
+VERIFY_UPDATE=0
 VERIFY_ISSUES=()
 # STATUS LABEL TEXT: one line of the acceptance report. What needs a look
 # (failed, waiting for a reboot, unknown) is also kept for the conclusion.
@@ -5435,12 +5721,14 @@ verify_line() {
     healthy) VERIFY_PASS=$((VERIFY_PASS + 1)) mark="${SYM_OK-✔}" color="${C_OK-}" word='正常' ;;
     fail) VERIFY_FAIL=$((VERIFY_FAIL + 1)) mark="${SYM_FAIL-✖}" color="${C_FAIL-}" word='未生效' ;;
     na) VERIFY_NA=$((VERIFY_NA + 1)) mark="${SYM_SKIP-○}" word='未处理' ;;
+    # In force, but a parameter now asks for another value: not a failure.
+    update) VERIFY_UPDATE=$((${VERIFY_UPDATE:-0} + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='可更新' ;;
     # Expected to take effect with the next boot: not a failure.
     reboot) VERIFY_REBOOT=$((${VERIFY_REBOOT:-0} + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='待重启' ;;
     *) VERIFY_UNKNOWN=$((VERIFY_UNKNOWN + 1)) mark="${SYM_WARN-⚠}" color="${C_WARN-}" word='无法确认' ;;
   esac
   printf '%s%s %s%s  %s：%s\n' "$color" "$mark" "$word" "${C_RESET-}" "$2" "$3"
-  case "$1" in fail|reboot|unknown) VERIFY_ISSUES+=("$color$mark $word${C_RESET-}  $2：$3") ;; esac
+  case "$1" in fail|reboot|unknown|update) VERIFY_ISSUES+=("$color$mark $word${C_RESET-}  $2：$3") ;; esac
 }
 
 # Applies the recorded expectation: only applied/present results are checked
@@ -5688,7 +5976,10 @@ check_tcp() {
   done < <(sysctl_file_mismatch "$TCP_BUFFER_FILE")
   if [[ -n "$bad" ]]; then verify_set fail "这些参数的当前值和配置不一致：${bad# }"
   elif [[ -n "$missing" ]]; then verify_set unknown "其余已生效；这些参数读不到，无法确认：${missing# }"
-  else verify_set pass "已生效（上限 $1）"; fi
+  elif [[ "$1" != "$(param_value tcp_buffer_mib) MiB" ]]; then
+    if param_read tcp_buffer_mib > /dev/null; then verify_set update "生效的上限是 $1，你设置的是 $(param_value tcp_buffer_mib) MiB：选 5 单项设置 → TCP 缓冲区上限 → 开启，就会按新值应用"
+    else verify_set update "生效的上限是 $1，本机现在推荐 $(param_value tcp_buffer_mib) MiB（内存 ${MEM_MIB:-?} MiB）：选 5 单项设置 → TCP 缓冲区上限 → 开启，就会更新"; fi
+  else verify_set pass "已生效（上限 $1，$(param_mode tcp_buffer_mib)）"; fi
 }
 
 check_autoreboot() {
@@ -5811,6 +6102,7 @@ verify_summary() {
   say '开荒验收（只读）'
   printf '结论：%s 项正常，%s 项未生效，%s 项按计划未处理，%s 项无法确认' "$VERIFY_PASS" "$VERIFY_FAIL" "$VERIFY_NA" "$VERIFY_UNKNOWN"
   if ((${VERIFY_REBOOT:-0})); then printf '，%s 项等重启后生效' "$VERIFY_REBOOT"; fi
+  if ((${VERIFY_UPDATE:-0})); then printf '，%s 项可以按新的参数更新' "$VERIFY_UPDATE"; fi
   echo '。'
   if ((${#VERIFY_ISSUES[@]})); then
     echo '需要你看一下：'
@@ -6501,9 +6793,14 @@ item_action() {
     timezone) echo '1. 修改时区   2. 恢复成原来的时区   0. 返回' ;;
     autoreboot) echo '1. 设置自动重启时间   2. 取消（撤销本工具的设置）   0. 返回' ;;
     ssh) echo '1. 加固（只允许密钥登录，可选禁止 root）   2. 撤销（恢复密码和 root 登录）   0. 返回' ;;
-    *) echo '1. 开启   2. 关闭（撤销本工具的修改）   0. 返回' ;;
+    *) if [[ -n "$(param_names "$key")" ]]; then echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 调整参数   4. 恢复推荐值   0. 返回'
+       else echo '1. 开启   2. 关闭（撤销本工具的修改）   0. 返回'; fi ;;
   esac
   read -r -p '请选择: ' choice || return 0
+  if [[ ( "$choice" == 3 || "$choice" == 4 ) && -n "$(param_names "$key")" ]]; then
+    if [[ "$choice" == 3 ]]; then param_adjust "$key"; else param_reset "$key"; fi
+    return 0
+  fi
   case "$key:$choice" in
     firewall:2) item_firewall_pause ;;
     firewall:3) item_turn_off firewall ;;
@@ -6513,6 +6810,19 @@ item_action() {
     *:2) item_turn_off "$key" ;;
     *) return 0 ;;
   esac
+}
+
+# The symbols for terminals that cannot draw them: a saved setting (VPS_ASCII
+# on the command line still wins), in force from the next start.
+item_symbols() {
+  if grep -qsx 'ui_ascii=1' "$PARAMS_FILE"; then
+    confirm_yes '改回 ✔ ⚠ ✖ ○ 这套符号吗？' || return 0
+    param_store ui_ascii '' || die '无法保存设置。'
+  else
+    confirm_yes '改用纯 ASCII 符号（[OK] [!] [X] [-]）吗？终端把 ✔ ⚠ 显示成乱码或方框时用。' || return 0
+    param_store ui_ascii 1 || die '无法保存设置。'
+  fi
+  ok '已保存，下次打开时生效。'
 }
 
 item_menu() {
@@ -6526,9 +6836,16 @@ item_menu() {
       i=$((i + 1))
       printf '%3s. %s  [%s]\n' "$i" "$(item_label "$key")" "$(item_status "$key")"
     done
-    echo '  0. 返回'
-    read -r -p "请选择要修改的项目 [1-$i，0 返回]: " choice || return 0
+    printf '  p. 参数总览（现在的值、推荐值和理由）   e. 导出参数   i. 导入参数\n'
+    printf '  u. 界面符号（现在：%s）   0. 返回\n' "$(if [[ "${SYM_OK-}" == '[OK]' ]]; then echo '纯 ASCII'; else echo '✔ ⚠ ✖ ○'; fi)"
+    read -r -p "请选择要修改的项目 [1-$i，p/e/i/u，0 返回]: " choice || return 0
     if [[ -z "$choice" || "$choice" == 0 ]]; then return 0; fi
+    case "$choice" in
+      p|P) params_overview; continue ;;
+      e|E) say '导出参数'; params_export; continue ;;
+      i|I) say '导入参数'; params_import; continue ;;
+      u|U) item_symbols; continue ;;
+    esac
     if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= i)); then
       item_action "${keys[choice - 1]}"
     else
@@ -6766,6 +7083,7 @@ main() {
     plan) plan; return 0 ;;
     port) port_main; return 0 ;;
     item) item_main; return 0 ;;
+    params) params_main; return 0 ;;
     reboot) reboot_main; return 0 ;;
     update) update_main; return 0 ;;
     bans) bans_main; return 0 ;;

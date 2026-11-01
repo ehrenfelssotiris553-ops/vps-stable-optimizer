@@ -1,0 +1,3 @@
+# `vps params import FILE`: take the lines, and apply them to the items that are on.
+确认导入吗？ ==> y
+现在就按新的参数重新应用吗？ ==> y
