@@ -9,7 +9,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove tg_call notify_stage \
-  quota_status menu_quota_alert dockerlog_text dockerlog_merge check_dockerlog iface_accelerated check_notify check_quota check_timer_ok verify_set audit_when audit_clean_text \
+  quota_status menu_quota_alert dockerlog_text dockerlog_merge check_dockerlog check_notify check_quota check_timer_ok verify_set audit_when audit_clean_text \
   param_list param_kind param_recommended param_check param_read param_value param_caution
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -240,18 +240,6 @@ reset; quota_stage <<< $'1000\n32\n1\n' > /dev/null
 grep -q '^result quota declined bad day' "$TEST_ROOT/trace" || fail 'reset day 32 accepted'
 printf 'PASS: the traffic alert takes the quota, the reset day, the mode and what is used already.\n'
 
-# Azure's accelerated network card (driver mana) under the interface: warned of.
-mkdir -p "$T/sysnet/eth0" "$T/sysnet/ens1/device" "$T/sysnet/ens2/device" "$T/drivers/mana" "$T/drivers/mlx5_core"
-if ln -s "$T/sysnet/eth0" "$T/sysnet/ens1/master" 2>/dev/null && [[ -L "$T/sysnet/ens1/master" ]]; then
-  ln -s "$T/drivers/mlx5_core" "$T/sysnet/ens1/device/driver"
-  if iface_accelerated eth0 "$T/sysnet"; then fail 'another driver taken for mana'; fi
-  rm -f "$T/sysnet/ens1/device/driver"; ln -s "$T/drivers/mana" "$T/sysnet/ens1/device/driver"
-  iface_accelerated eth0 "$T/sysnet" || fail 'mana under eth0 not found'
-  if iface_accelerated ens2 "$T/sysnet"; then fail 'mana found under an interface it does not belong to'; fi
-  printf 'PASS: an accelerated card of Azure (mana) under the interface is found.\n'
-else
-  printf 'PASS (partly): no symbolic links here for the accelerated card fixture.\n'
-fi
 
 # Docker: the limits from the parameters, merged into an existing daemon.json.
 printf 'docker_log_max_mb=20\n' >> "$PARAMS_FILE"

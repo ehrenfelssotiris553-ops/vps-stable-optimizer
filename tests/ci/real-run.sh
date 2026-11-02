@@ -473,11 +473,11 @@ fi
 grep -Fxq 'OnCalendar=*:0/5' /etc/systemd/system/vps-stable-check.timer || fail 'the traffic alert alone does not run every 5 minutes'
 # What it counts is what the kernel counts for that network card, in and out:
 # its counters (read between the test's own reads around each check), exactly
-# what they grew by, and that as MB of 10^6 bytes on top of the 5000 MB. The
-# size of a download proves nothing here: on GitHub's Azure machines (their
-# accelerated card, driver mana) 30 MB left the kernel's counters of both cards
-# almost unchanged (seen in CI), which the tool warns of. A check of the timer
-# at the same moment makes ours skip, so it runs until the count is newer.
+# what they grew by, and that as MB of 10^6 bytes on top of the 5000 MB; and a
+# 30 MB download is in it. (The download must be checked itself: the image URL
+# answers with a redirect, which curl without -L takes as success with 367
+# bytes; that once looked like counters missing the traffic.) A check of the
+# timer at the same moment makes ours skip, so it runs until the count is newer.
 iface="$(sudo sed -n 's/^iface=//p' /var/lib/vps-stable-opt/quota.conf)"
 nic() { awk -v i="$iface:" '$1 == i {print $2, $10}' /proc/net/dev; }
 tool_traffic() { sudo cat /var/lib/vps-stable-opt/notify/traffic; }
@@ -491,15 +491,12 @@ check_now() {
   done
   fail 'the traffic check did not run'
 }
-for d in /sys/class/net/*; do
-  if [[ "$(readlink -f "$d/master" 2>/dev/null || true)" == */"$iface" && "$(readlink -f "$d/device/driver" 2>/dev/null || true)" == */mana ]]; then
-    has item-quota-on '加速网卡（mana）'
-  fi
-done
 check_now
 read -r _ rx1 tx1 arx1 atx1 < <(tool_traffic)
 read -r krx0 ktx0 < <(nic)
-curl -fsS --max-time 60 -o /dev/null https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS || fail 'the test download failed'
+got_bytes="$(curl -fsSL --max-time 180 --max-filesize 40000000 -r 0-29999999 -o /dev/null -w '%{size_download}' \
+  https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img)" || fail 'the test download failed'
+[[ "$got_bytes" == 30000000 ]] || fail "the test download brought $got_bytes bytes, not 30000000"
 read -r krx1 ktx1 < <(nic)
 check_now
 read -r _ rx2 tx2 arx2 atx2 < <(tool_traffic)
@@ -517,7 +514,7 @@ done
 if [[ -n "$traffic_problem" ]]; then :
 elif ! ((rx1 <= krx0 && krx1 <= rx2 && rx2 <= krx2 && tx1 <= ktx0 && ktx1 <= tx2 && tx2 <= ktx2)); then
   traffic_problem="the traffic alert did not read the kernel's counters of $iface (see the traffic count notice)"
-elif ((rx2 - rx1 + tx2 - tx1 <= 0)); then traffic_problem="the counters of $iface did not move between the two checks"
+elif ((rx2 - rx1 < 30000000)); then traffic_problem="$iface received $((rx2 - rx1)) bytes between the checks, less than the 30 MB downloaded"
 elif ((arx2 - arx1 != rx2 - rx1 || atx2 - atx1 != tx2 - tx1)); then
   traffic_problem="the traffic alert added $((arx2 - arx1))/$((atx2 - atx1)) bytes, the counters grew by $((rx2 - rx1))/$((tx2 - tx1))"
 elif ((shown != (arx2 + atx2) / 1000000 + 5000)); then

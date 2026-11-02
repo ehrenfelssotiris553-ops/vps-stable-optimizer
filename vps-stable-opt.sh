@@ -5813,19 +5813,6 @@ notify_stage() {
   else module_result notify failed 'check timer'; fi
 }
 
-# IFACE has Azure's accelerated network card (driver mana) enslaved to it. On
-# GitHub's Azure machines a 30 MB download left the kernel's counters of both
-# cards almost unchanged: the traffic alert would count far too little there.
-# NET is for isolated tests.
-iface_accelerated() {
-  local d net="${2:-/sys/class/net}"
-  for d in "$net"/*; do
-    [[ "$(readlink -f -- "$d/master" 2>/dev/null || true)" == */"$1" ]] || continue
-    if [[ "$(readlink -f -- "$d/device/driver" 2>/dev/null || true)" == */mana ]]; then return 0; fi
-  done
-  return 1
-}
-
 quota_stage() {
   say '月流量提醒'
   local iface quota day mode used temp conf="$STATE_ROOT/quota.conf"
@@ -5833,9 +5820,6 @@ quota_stage() {
   iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}' || true)"
   if [[ ! "$iface" =~ ^[A-Za-z0-9._-]+$ ]] || ! grep -q "^ *$iface:" /proc/net/dev; then warn '找不到上网用的网卡，不能统计流量。'; module_result quota unsupported 'no interface'; return 0; fi
   echo "统计网卡 $iface 的流量（每 5 分钟累计一次，重启后接着算）。只提醒，不断网；数字以服务商面板为准。"
-  if iface_accelerated "$iface"; then
-    warn "$iface 用的是 Azure 的加速网卡（mana）：在这类机器上见过系统的网卡计数漏掉几乎全部流量，这里统计的会偏少很多，一定以服务商面板为准。"
-  fi
   read -r -p '每月流量额度（GB，例如 1000）: ' quota || return 0
   if [[ ! "$quota" =~ ^[0-9]{1,7}$ ]] || ((10#$quota < 1)); then warn '额度要写整数（GB）。'; module_result quota declined 'bad quota'; return 0; fi
   read -r -p '每月几号重置（1–31，月份没这一天就算最后一天）: ' day || return 0
