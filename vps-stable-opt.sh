@@ -541,9 +541,15 @@ ssh_detect() {
 # empty ufw chains and plain jumps into them (seen on Debian 13). Those are
 # inert and ignored, as are "#" comment lines (newer nft prints notes there);
 # any other rule, set, map or non-accept policy counts and is printed.
+# With XTABLES=1 (iptables itself runs on nftables) the tables of iptables
+# (ip/ip6 filter, nat, raw, mangle, security) are left to iptables-save, which
+# shows the same rules in a form that tells Docker's apart; iptables 1.8.7
+# (Ubuntu 22.04) does not mark them as its own in nft's listing.
 nft_ruleset_has_policy() {
-  awk '
+  awk -v xt="${1:-0}" '
     {line=$0; sub(/^[ \t]+/,"",line); sub(/[ \t]+$/,"",line)}
+    xt == 1 && !skip && line ~ /^table (ip|ip6) (filter|nat|raw|mangle|security) \{$/ {skip = 1; depth = 0}
+    skip {o = line; c = line; depth += gsub(/\{/, "", o) - gsub(/\}/, "", c); if (depth <= 0) skip = 0; next}
     line=="" || line=="}" || line ~ /^#/ {next}
     line ~ /^table [a-z0-9]+ [A-Za-z0-9_.-]+ \{$/ {next}
     line ~ /^chain [A-Za-z0-9_.-]+ \{$/ {next}
@@ -554,26 +560,44 @@ nft_ruleset_has_policy() {
 }
 
 # The same for iptables-save: what `ufw disable` leaves is empty ufw chains and
-# plain "-j ufw-..." jumps with ACCEPT policies. Any other rule (Docker, other
-# tools, a rule inside a ufw chain) or a DROP/REJECT policy counts and is printed.
+# plain "-j ufw-..." jumps with ACCEPT policies. Docker's own rules do not
+# count either: its DOCKER* chains, the jumps into them, rules for its
+# interfaces (docker0, br-..., docker_gwbridge), its hairpin masquerade, and
+# the FORWARD policy DROP it sets. UFW only adds INPUT/OUTPUT/FORWARD rules of
+# its own after them, so containers keep working (seen on Ubuntu 22.04 with
+# Docker 29). Any other rule (other tools, a rule inside a ufw chain), any
+# other DROP/REJECT policy, or a table iptables cannot show counts and the first
+# one is printed.
 iptables_save_has_policy() {
   awk '
+    function hit(text) {if (!found) first = text; found = 1}
+    /^\*/ {table = substr($0, 2); next}
+    /^# .*incompatible/ {hit($0); next}
+    /^:DOCKER[A-Za-z0-9_-]* / {docker = 1; next}
+    /^:FORWARD[ \t]+(DROP|REJECT)/ {forward = $0; next}
+    /^:[^ \t]+[ \t]+(DROP|REJECT)/ {hit($0); next}
     /^-A [A-Za-z0-9_-]+ -j ufw6?-[a-z0-9-]+$/ {next}
-    /^-A[ \t]/ || /^:[^ \t]+[ \t]+(DROP|REJECT)/ {print; found=1; exit}
-    END {exit !found}'
+    /^-A DOCKER[A-Za-z0-9_-]* / {next}
+    /^-A [A-Z]+ .*-j DOCKER[A-Za-z0-9_-]*$/ {next}
+    /(^| )-[io] (docker0|docker_gwbridge|br-[0-9a-f]+)( |$)/ {next}
+    table == "nat" && /^-A POSTROUTING -s [^ ]+ -d [^ ]+ .*-j MASQUERADE$/ {split($0, w, " "); if (w[4] == w[6]) next}
+    /^-A[ \t]/ {hit($0)}
+    END {if (forward != "" && !docker) hit(forward); if (found) print first; exit !found}'
 }
 
 # Each finding names the service or the exact line, so a refusal can be checked.
 firewall_conflict() {
   if active firewalld; then warn '检测到 firewalld 正在运行。'; return 0; fi
   if active nftables; then warn '检测到 nftables 服务正在运行（它会加载自己的防火墙规则）。'; return 0; fi
-  local rules bin offender inspected=0
+  local rules bin offender inspected=0 xtables=0
+  # iptables on nftables: its tables are read through iptables-save below.
+  if [[ "$(iptables -V 2>/dev/null || true)" == *nf_tables* ]] && command -v iptables-save >/dev/null && command -v ip6tables-save >/dev/null; then xtables=1; fi
   if command -v nft >/dev/null; then
     inspected=1
     if ! rules="$(nft list ruleset 2>/dev/null)"; then
       warn '无法读取 nftables 规则，不自动接管防火墙。'; return 0
     fi
-    if offender="$(nft_ruleset_has_policy <<< "$rules")"; then
+    if offender="$(nft_ruleset_has_policy "$xtables" <<< "$rules")"; then
       warn "nftables 里有其他防火墙规则：${offender:0:160}"; return 0
     fi
   fi
@@ -3597,6 +3621,47 @@ ssh_limit_unexempt() {
   done < <(cat -- "$record")
 }
 
+# `ufw disable` sets every built-in policy to ACCEPT, FORWARD too (its own
+# ufw_stop does), while a Docker host had FORWARD at DROP (Docker sets it).
+# The DROP policies from before UFW first went on are recorded, and put back
+# whenever this tool turns UFW off; elsewhere there is nothing to put back.
+ufw_forward_record() {
+  local file exe policy temp
+  [[ "${RESTORE_READY:-0}" == 1 && -n "${RESTORE_ROOT:-}" ]] || return 0
+  file="$RESTORE_ROOT/ufw_forward_policy"
+  [[ ! -e "$file" && ! -L "$file" ]] || return 0
+  temp="$(mktemp "$RESTORE_ROOT/.write.XXXXXX")" || return 1
+  for exe in iptables ip6tables; do
+    command -v "$exe" >/dev/null || continue
+    policy="$("$exe" -S FORWARD 2>/dev/null | awk '$1 == "-P" && $2 == "FORWARD" {p = $3} END {print p}' || true)"
+    if [[ "$policy" == DROP ]]; then printf '%s DROP\n' "$exe" >> "$temp"; fi
+  done
+  if ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$file"; then rm -f -- "$temp"; return 1; fi
+}
+
+# Puts the recorded FORWARD policies back (right after `ufw disable`).
+ufw_forward_restore() {
+  local file="${RESTORE_ROOT:-/nonexistent}/ufw_forward_policy" exe policy
+  [[ -f "$file" && ! -L "$file" ]] || return 0
+  while read -r exe policy; do
+    case "$exe:$policy" in
+      iptables:DROP|ip6tables:DROP)
+        "$exe" -P FORWARD DROP || warn "没能把 $exe 的转发策略恢复成原来的 DROP（Docker 重启时会自己设回）。" ;;
+    esac
+  done < "$file"
+}
+
+# The same as shell commands to append, for the guard timer (it runs on its own).
+ufw_forward_restore_cmd() {
+  local file="${RESTORE_ROOT:-/nonexistent}/ufw_forward_policy" exe policy bin
+  [[ -f "$file" && ! -L "$file" ]] || return 0
+  while read -r exe policy; do
+    [[ "$exe:$policy" =~ ^(iptables|ip6tables):DROP$ ]] || continue
+    bin="$(command -v "$exe" || true)"
+    if [[ "$bin" == /* ]]; then printf '; %s -P FORWARD DROP' "$bin"; fi
+  done < "$file"
+}
+
 # Rewrites the single IPV6= assignment of /etc/default/ufw.
 ufw_set_ipv6() {
   local value="$1" file=/etc/default/ufw temp
@@ -3774,7 +3839,8 @@ firewall_stage() {
     grep -Fxq "ufw $ssh_verb $p/tcp" <<< "$rules" || die "SSH 端口 $p 没有成功放行，已停止。"
   done
   unit="vps-stable-ufw-rollback-$(date +%s)-$$"
-  guard_arm "$unit" /usr/sbin/ufw --force disable || die '无法启用自动撤销计时器，防火墙保持关闭。'
+  ufw_forward_record || warn '无法记录开防火墙之前的转发策略；撤销防火墙后，Docker 的转发策略要等 Docker 重启才会恢复。'
+  guard_arm "$unit" /bin/sh -c "/usr/sbin/ufw --force disable$(ufw_forward_restore_cmd)" || die '无法启用自动撤销计时器，防火墙保持关闭。'
   # Count the confirmation window from arming, not from completion of ufw enable.
   deadline=$((SECONDS + 180))
   ok "已启用 240 秒自动撤销计时器：$unit.timer"
@@ -3808,11 +3874,12 @@ firewall_stage() {
   warn '这次没有确认成功，正在关闭防火墙恢复原样；可以稍后重试。'
   module_result firewall failed 'second SSH login not confirmed; UFW disabled'
   if ufw --force disable; then
+    ufw_forward_restore
     systemctl stop "$unit.timer" || true
   else
     warn '立即关闭防火墙失败，保留或重新启用自动撤销计时器。'
     if ! active "$unit.timer"; then
-      guard_arm "$unit-retry" /usr/sbin/ufw --force disable || warn '无法重新启用自动撤销计时器，请用服务商控制台检查防火墙。'
+      guard_arm "$unit-retry" /bin/sh -c "/usr/sbin/ufw --force disable$(ufw_forward_restore_cmd)" || warn '无法重新启用自动撤销计时器，请用服务商控制台检查防火墙。'
     fi
   fi
   ufw status verbose || true
@@ -7400,7 +7467,7 @@ restore_apply_one() {
       esac ;;
     ufw_runtime)
       case "$value" in
-        inactive|absent) if ufw_active; then ufw --force disable >/dev/null || return 1; fi ;;
+        inactive|absent) if ufw_active; then ufw --force disable >/dev/null || return 1; ufw_forward_restore; fi ;;
         active) warn '回退不会自动重新开启防火墙；如需要，请手动执行 ufw enable。'; return 1 ;;
         *) return 1 ;;
       esac
@@ -7571,7 +7638,10 @@ restore_firewall_group() {
   restore_resource svc_ufw
   # The kernel settings UFW applied stay after it stops; the security
   # parameters, when kept, still set some of the same keys themselves.
-  if ! ufw_active; then restore_sysctl_runtime ufw_sysctl_runtime "$SYSCTL_HARDENING_FILE" "$TCP_BUFFER_FILE"; fi
+  if ! ufw_active; then
+    restore_sysctl_runtime ufw_sysctl_runtime "$SYSCTL_HARDENING_FILE" "$TCP_BUFFER_FILE"
+    rm -f -- "$RESTORE_ROOT/ufw_forward_policy"
+  fi
 }
 
 # Both SSH drop-ins (key-only, and the key-login switch for images that had it
@@ -9463,6 +9533,7 @@ item_firewall_pause() {
   echo '临时关闭后，所有正在监听的端口都会直接暴露在公网，Fail2ban 的封禁也不起作用；重启后也保持关闭，排查完记得回到这里重新开启。'
   if ! confirm_yes '临时关闭防火墙吗？'; then ok '已取消。'; return 0; fi
   ufw --force disable >/dev/null
+  ufw_forward_restore
   restore_adopt ufw_runtime || warn '无法更新防火墙的回退记录。'
   ok '防火墙已临时关闭。重新开启：单项设置 → 防火墙 → 开启。'
 }

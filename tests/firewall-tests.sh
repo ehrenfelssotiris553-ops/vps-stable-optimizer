@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_since guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt ssh_limit_exempt_one f2b_allowlist firewall_stage fail2ban_stage
+load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_since guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt ssh_limit_exempt_one f2b_allowlist firewall_stage fail2ban_stage ufw_forward_record ufw_forward_restore ufw_forward_restore_cmd
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
