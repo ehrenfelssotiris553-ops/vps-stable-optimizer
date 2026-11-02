@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_since guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt ssh_limit_exempt_one f2b_allowlist firewall_stage fail2ban_stage ufw_forward_record ufw_forward_restore ufw_forward_restore_cmd
+load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_since guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt ssh_limit_exempt_one f2b_allowlist firewall_stage fail2ban_stage ufw_forward_record ufw_forward_restore ufw_forward_restore_cmd ping_ufw_reapply
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -30,7 +30,15 @@ ssh_login_seen() { ((LOGIN_SEEN)); }
 # UFW's own kernel settings (IPT_SYSCTL): their running values are kept for
 # the rollback before UFW is turned on, and only then.
 ufw_sysctl_keys() { printf '%s\n' net.ipv4.conf.default.accept_redirects; }
-sysctl() { [[ "$*" == '-n net.ipv4.conf.default.accept_redirects' ]] || fail "unexpected sysctl $*"; echo 1; }
+# Not answering ping (a case writes the file): applied again once UFW is on.
+PING_FILE="$TEST_ROOT/noping.conf"
+sysctl() {
+  case "$*" in
+    '-n net.ipv4.conf.default.accept_redirects') echo 1 ;;
+    "-e -p $PING_FILE") record "sysctl $* (ufw $(cat "$CASE_DIR/ufw-active"))" ;;
+    *) fail "unexpected sysctl $*" ;;
+  esac
+}
 restore_record_sysctl() {
   printf 'record %s=%s %s (ufw %s)\n' "$1" "$2" "$3" "$(cat "$CASE_DIR/ufw-active")" >> "$CASE_DIR/calls"
 }
@@ -197,8 +205,18 @@ if grep -q '^ask ' "$CASE_DIR/calls"; then fail 'asked about other services alth
 grep -Fxq 'record net.ipv4.conf.default.accept_redirects=1 ufw_sysctl_runtime (ufw 0)' "$CASE_DIR/calls" ||
   fail "UFW's kernel settings were not kept before UFW was turned on"
 [[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] || fail 'confirmed firewall not enabled at boot (ufw.service)'
+if grep -q '^sysctl -e -p' "$CASE_DIR/calls"; then fail 'a ping file that is not there was applied'; fi
 # Started too, so the next run does not take the reboot for an outside change.
 [[ "$(cat "$CASE_DIR/ufw-service")" == active ]] || fail 'ufw.service left inactive after the firewall was confirmed'
+
+# Not answering ping: UFW set it back as it started (its sysctl.conf has
+# icmp_echo_ignore_all=0), so the tool's file is applied again once UFW is on.
+reset_case ping_kept
+printf 'net.ipv4.icmp_echo_ignore_all = 1\n' > "$PING_FILE"
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input"
+grep -Fxq "sysctl -e -p $PING_FILE (ufw 1)" "$CASE_DIR/calls" || fail 'not answering ping not applied again after UFW started'
+rm -f "$PING_FILE"
 
 reset_case key_only_ssh
 KEY_ONLY=1

@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions sysctl_owned_apply restore_sysctl_original conntrack_stage ping_stage check_conntrack check_ping \
+load_optimizer_functions sysctl_owned_apply restore_sysctl_original conntrack_stage ping_stage ping_ufw_sync ping_ufw_text check_conntrack check_ping \
   verify_conntrack_usage verify_line verify_set param_value param_read param_recommended param_check param_caution param_store \
   ipv6_broken append_line_safely ipv4_stage check_ipv4 apt_time_apply check_keepalive param_kind
 TEST_ROOT="$(mktemp -d)"
@@ -24,7 +24,10 @@ reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 STATE_ROOT="$TEST_ROOT/state" PARAMS_FILE="$TEST_ROOT/state/params" RESTORE_ROOT="$TEST_ROOT/restore"
 mkdir -p "$STATE_ROOT" "$RESTORE_ROOT"
 state_secure_dir() { mkdir -p -- "$1"; }
-CONNTRACK_FILE="$TEST_ROOT/conntrack.conf" CONNTRACK_MODULE_FILE="$TEST_ROOT/conntrack-module.conf" PING_FILE="$TEST_ROOT/noping.conf"
+CONNTRACK_FILE="$TEST_ROOT/conntrack.conf" CONNTRACK_MODULE_FILE="$TEST_ROOT/conntrack-module.conf" PING_FILE="$TEST_ROOT/noping.conf" PING_UFW_FILE="$TEST_ROOT/ufw-noping.conf"
+systemctl() { record "systemctl $*"; }
+UFW_KEYS=''
+ufw_sysctl_keys() { printf '%s' "$UFW_KEYS"; }
 declare -A SYSVAL=()
 sysctl() {
   case "$1" in
@@ -37,7 +40,7 @@ sysctl() {
 CONFIGURED=none
 sysctl_key_configured() { [[ "$1" == "$CONFIGURED" ]]; }
 restore_record_sysctl() { record "orig $1=$2 $3"; grep -q "^$1=" "$RESTORE_ROOT/$3" 2>/dev/null || printf '%s=%s\n' "$1" "$2" >> "$RESTORE_ROOT/$3"; }
-put_file() { [[ ! -e "$1" ]] || return 1; printf '%s\n' "$2" > "$1"; }
+put_file() { if [[ -e "$1" ]]; then [[ "$(cat -- "$1")" == "$2" ]]; return; fi; printf '%s\n' "$2" > "$1"; }
 module_result() { record "result $1 $2 ${3:-}"; }
 OURS=0
 restore_file_ours() { ((OURS)); }
@@ -100,10 +103,27 @@ grep -Fxq 'net.ipv4.icmp_echo_ignore_all = 1' "$PING_FILE" && grep -Fxq 'net.ipv
 grep -Fxq 'orig net.ipv6.icmp.echo_ignore_all=0 ping_sysctl_runtime' "$TEST_ROOT/trace" || fail 'IPv6 original not recorded'
 check_ping ''
 [[ "$VERIFY_STATUS" == pass ]] || fail 'ping check'
+# UFW applies its own sysctl.conf (net/ipv4/icmp_echo_ignore_all=0) whenever it
+# starts: on a real Debian 13 VPS ping was answered again after every reboot.
+# A drop-in for ufw.service applies this tool's file again after it.
+grep -Fxq "ExecStartPost=-/sbin/sysctl -q -e -p $PING_FILE" "$PING_UFW_FILE" && grep -Fxq '[Service]' "$PING_UFW_FILE" ||
+  fail "no UFW drop-in: $(cat "$PING_UFW_FILE" 2>/dev/null)"
+grep -Fxq 'systemctl daemon-reload' "$TEST_ROOT/trace" || fail 'systemd not told about the UFW drop-in'
+# Answered again because UFW set it back: said so, with what to do.
+SYSVAL[net.ipv4.icmp_echo_ignore_all]=0 UFW_KEYS=$'net.ipv4.conf.all.accept_redirects\nnet.ipv4.icmp_echo_ignore_all\n'
+check_ping ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'/etc/ufw/sysctl.conf'* ]] || fail "ping set back by UFW: $VERIFY_STATUS $VERIFY_TEXT"
+SYSVAL[net.ipv4.icmp_echo_ignore_all]=1 UFW_KEYS=''
 # A key set in another file stays as it is.
 rm -f "$PING_FILE"; CONFIGURED=net.ipv6.icmp.echo_ignore_all SYSVAL[net.ipv4.icmp_echo_ignore_all]=0
 reset; ping_stage
 if grep -q ipv6 "$PING_FILE"; then fail 'a key set elsewhere was written'; fi
+[[ -f "$PING_UFW_FILE" ]] || fail 'the UFW drop-in went although IPv4 ping is still off'
+# IPv4 set elsewhere: the drop-in has nothing to apply again and goes.
+CONFIGURED=net.ipv4.icmp_echo_ignore_all SYSVAL[net.ipv6.icmp.echo_ignore_all]=0
+reset; OURS=1; ping_stage; OURS=0
+[[ ! -e "$PING_UFW_FILE" ]] || fail 'the UFW drop-in stayed without the IPv4 key'
+rm -f "$PING_FILE"
 CONFIGURED=none
 # Not this tool's file: kept, reported.
 printf 'net.ipv4.icmp_echo_ignore_all = 0\n' > "$PING_FILE"

@@ -8,7 +8,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one ufw_forward_restore restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group ufw_sysctl_keys restore_record_dir restore_created_dirs restore_ssh_group restore_zram_group restore_tool_packages restore_packages_offer \
-  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid pkg_file_unchanged pkg_changed_configs
+  restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid pkg_file_unchanged pkg_changed_configs ping_ufw_reapply
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 WARNINGS=0
@@ -324,11 +324,36 @@ value_baseline() {
   chmod 600 "$RESTORE_ROOT/ufw_sysctl_runtime"
   SYSCTL_HARDENING_FILE="$TMP/fw-order/98-hardening.conf" TCP_BUFFER_FILE="$TMP/fw-order/none.conf"
   printf 'net.ipv4.conf.default.accept_redirects = 0\n' > "$SYSCTL_HARDENING_FILE"
+  PING_FILE="$TMP/fw-order/none-noping.conf"
   sysctl() { [[ "$1" == -w ]] || die "unexpected sysctl $*"; printf 'sysctl %s\n' "$2" >> "$TRACE"; }
   restore_firewall_group
   expect "$(cat "$TRACE")" $'disable\ndelete\nsysctl net.ipv4.icmp_echo_ignore_broadcasts=0'
   expect "$(restore_read ufw_runtime state)" restored
   [[ ! -e "$RESTORE_ROOT/ufw_sysctl_runtime" ]] || die 'restored UFW kernel values kept'
+  expect "$RESTORE_PARTIAL" 0
+)
+
+# Not answering ping stays when the firewall alone is undone: UFW set the key
+# (its sysctl.conf has icmp_echo_ignore_all=0) and its value from before UFW
+# came back, so ping was answered again while that item was still on.
+(
+  value_fixture fw-ping
+  value_baseline ufw_runtime inactive active
+  ufw() {
+    case "$*" in
+      '--force disable') printf 'disable\n' >> "$TRACE"; RUNTIME=inactive ;;
+      'show added') printf 'Added user rules:\n' ;;
+      *) die "unexpected fixture UFW: $*" ;;
+    esac
+  }
+  printf 'net.ipv4.icmp_echo_ignore_all=0\nnet.ipv4.conf.all.log_martians=1\n' > "$RESTORE_ROOT/ufw_sysctl_runtime"
+  chmod 600 "$RESTORE_ROOT/ufw_sysctl_runtime"
+  SYSCTL_HARDENING_FILE="$TMP/fw-ping/none.conf" TCP_BUFFER_FILE="$TMP/fw-ping/none.conf"
+  PING_FILE="$TMP/fw-ping/99-noping.conf"
+  printf '# VPS Stable Optimizer v2.8: ping\nnet.ipv4.icmp_echo_ignore_all = 1\n' > "$PING_FILE"
+  sysctl() { printf 'sysctl %s\n' "$*" >> "$TRACE"; }
+  restore_firewall_group
+  expect "$(cat "$TRACE")" $'disable\nsysctl -w net.ipv4.conf.all.log_martians=1\nsysctl -e -p '"$PING_FILE"
   expect "$RESTORE_PARTIAL" 0
 )
 

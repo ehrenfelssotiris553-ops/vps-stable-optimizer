@@ -376,7 +376,15 @@ item_do item-ping-on ping 1
 item_do item-ping-off ping 2
 [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == "$before_ping" ]] || fail 'ping back: not as it was'
 if sudo test -e /etc/sysctl.d/99-vps-stable-noping.conf; then fail 'ping back: file left'; fi
+if sudo test -e /etc/systemd/system/ufw.service.d/99-vps-stable-noping.conf; then fail 'ping back: the UFW drop-in left'; fi
 item_do item-ping-on-again ping 1
+# UFW applies its own sysctl.conf whenever it starts, and the stock one answers
+# ping (net/ipv4/icmp_echo_ignore_all=0): on a real Debian 13 VPS ping was
+# answered again after every reboot, which no run here had covered. Started
+# as at boot, it must stay off.
+[[ "$(ufw_line)" == 'Status: active' ]] || fail "the firewall is not on for the ping check: $(ufw_line)"
+sudo systemctl restart ufw.service
+[[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == 1 ]] || fail 'ping answered again after ufw.service started (as at boot)'
 
 # Preferring IPv4 (/etc/gai.conf): the line in, then the file exactly as it
 # was; left on for the rollback.
@@ -554,8 +562,12 @@ item_do item-fail2ban-off fail2ban 2
 if sudo test -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local; then fail 'Fail2ban off: jail left'; fi
 item_do item-firewall-off firewall 3
 [[ "$(ufw_line)" == "$before_ufw" ]] || fail "firewall off: $(ufw_line)"
+# Not answering ping is still on: neither UFW's values from before it was
+# turned on nor its sysctl.conf at the start again may take that back.
+[[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == 1 ]] || fail 'firewall off: ping answered again (that item is still on)'
 item_do item-firewall-on firewall 1
 [[ "$(ufw_line)" == 'Status: active' ]] || fail 'firewall on: not active'
+[[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == 1 ]] || fail 'firewall on: ping answered again (that item is still on)'
 item_do item-fail2ban-on fail2ban 1
 sudo test -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local || fail 'Fail2ban on: no jail'
 systemctl is-active -q fail2ban || fail 'Fail2ban on: not running'
@@ -648,7 +660,7 @@ has rollback '撤销完成'
 for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-tcp.conf /etc/sysctl.d/99-vps-stable-bbr.conf \
     /etc/fail2ban/jail.d/99-vps-stable-sshd.local /etc/fail2ban/action.d/vps-stable-ufw-sshd.conf /etc/fail2ban/fail2ban.d/99-vps-stable.local \
     /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
-    /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf \
+    /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf /etc/systemd/system/ufw.service.d/99-vps-stable-noping.conf \
     /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login /etc/profile.d/zz-vps-stable-login.sh \
     /etc/systemd/system/vps-stable-check.timer /etc/systemd/system/vps-stable-check.service; do
   if sudo test -e "$f"; then fail "$f left after rollback"; fi

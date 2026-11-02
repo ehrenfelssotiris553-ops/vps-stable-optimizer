@@ -34,6 +34,9 @@ CONNTRACK_FILE=/etc/sysctl.d/99-vps-stable-conntrack.conf
 CONNTRACK_MODULE_FILE=/etc/modules-load.d/99-vps-stable-conntrack.conf
 # Not answering ping (optional).
 PING_FILE=/etc/sysctl.d/99-vps-stable-noping.conf
+# UFW applies its own sysctl.conf whenever it starts, and the stock one answers
+# ping: this drop-in applies the file above again right after ufw.service.
+PING_UFW_FILE=/etc/systemd/system/ufw.service.d/99-vps-stable-noping.conf
 # Disk swap (only where no other swap exists): the file and its systemd unit.
 SWAP_FILE=/swapfile
 SWAP_UNIT_FILE=/etc/systemd/system/swapfile.swap
@@ -2865,8 +2868,37 @@ ping_stage() {
   local -a pairs=(net.ipv4.icmp_echo_ignore_all=1)
   if sysctl -n net.ipv6.icmp.echo_ignore_all >/dev/null 2>&1; then pairs+=(net.ipv6.icmp.echo_ignore_all=1); fi
   sysctl_owned_apply ping ping_file "$PING_FILE" ping_sysctl_runtime "${pairs[@]}" || return 0
+  ping_ufw_sync
   if [[ -f "$PING_FILE" ]]; then ok '已经不回应 ping 了。'; module_result ping applied 'echo ignored'
   else ok '本来就不回应 ping，保持不变。'; module_result ping present 'echo ignored already'; fi
+}
+
+# UFW applies its own sysctl.conf whenever it starts (at boot, ufw enable, ufw
+# reload), and the stock one has net/ipv4/icmp_echo_ignore_all=0: on a real
+# Debian 13 VPS ping was answered again after every reboot. While this tool's
+# file sets that key, a drop-in applies the file again right after ufw.service
+# (written without UFW too: the firewall may come later).
+ping_ufw_sync() {
+  if [[ -f "$PING_FILE" ]] && grep -Fxq 'net.ipv4.icmp_echo_ignore_all = 1' "$PING_FILE"; then
+    put_file "$PING_UFW_FILE" "$(ping_ufw_text)" || { warn "没能写入 $PING_UFW_FILE：开着防火墙时，重启后可能又会回应 ping。"; return 0; }
+  elif [[ -f "$PING_UFW_FILE" ]] && restore_file_ours ping_ufw; then
+    rm -f -- "$PING_UFW_FILE"
+  else
+    return 0
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+ping_ufw_text() {
+  printf '%s\n' '# VPS Stable Optimizer v2.8: not answering ping, again after UFW applied its sysctl.conf' \
+    '[Service]' "ExecStartPost=-/sbin/sysctl -q -e -p $PING_FILE"
+}
+
+# After this tool started or reloaded UFW itself, which applied its sysctl.conf.
+ping_ufw_reapply() {
+  if [[ -f "$PING_FILE" ]] && ! sysctl -e -p "$PING_FILE" >/dev/null 2>&1; then
+    warn "没能重新套用 $PING_FILE：现在会回应 ping，重启后恢复。"
+  fi
 }
 
 # The value KEY had before this tool first changed it, as recorded in FILE.
@@ -3896,6 +3928,8 @@ firewall_stage() {
   if ! ufw --force enable; then
     warn '开启防火墙失败，自动撤销计时器保持启用。'; module_result firewall failed 'ufw enable failed'; return 0
   fi
+  # UFW applied its own sysctl.conf as it started (see ping_ufw_sync).
+  ping_ufw_reapply
   # Only logins after this moment went through the enabled firewall.
   since="$(guard_since)"
   ufw status numbered
@@ -5209,7 +5243,7 @@ backup_configs() {
       /etc/ufw/after.rules /etc/ufw/after6.rules /etc/ufw/user.rules /etc/ufw/user6.rules \
       /etc/sysctl.conf /etc/systemd/journald.conf /etc/default/zramswap \
       /etc/apt/apt.conf /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/sources.list /etc/fail2ban/jail.conf /etc/fail2ban/jail.local \
-      /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE" "$SWAP_UNIT_FILE" "$CONNTRACK_FILE" "$CONNTRACK_MODULE_FILE" "$PING_FILE" \
+      /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE" "$SWAP_UNIT_FILE" "$CONNTRACK_FILE" "$CONNTRACK_MODULE_FILE" "$PING_FILE" "$PING_UFW_FILE" \
       "$KEEPALIVE_FILE" "$GAI_FILE" "$APT_TIME_FILE"; do
     backup_config_path "$file"
   done
@@ -6961,7 +6995,7 @@ restore_ids() {
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     swap) printf '%s\n' swap_unit swap_file zram_sysctl_file ;;
     conntrack) printf '%s\n' conntrack_file conntrack_module ;;
-    ping) printf '%s\n' ping_file ;;
+    ping) printf '%s\n' ping_file ping_ufw ;;
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
     login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
@@ -6987,7 +7021,7 @@ restore_ids() {
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file notify_conf quota_conf check_timer check_service_file check_timer_file check_script_file dockerlog_file sshport_dropin
+  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file ping_ufw keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file notify_conf quota_conf check_timer check_service_file check_timer_file check_script_file dockerlog_file sshport_dropin
 }
 
 restore_label() {
@@ -6997,6 +7031,7 @@ restore_label() {
     zram_file) echo 'ZRAM 配置' ;; zram_swap) echo 'ZRAM 交换空间' ;; zram_sysctl_file) echo 'ZRAM 配套内存参数' ;;
     swap_unit) echo '硬盘 Swap 的启动配置' ;; swap_file) echo '硬盘 Swap 文件' ;;
     conntrack_file) echo '连接跟踪参数' ;; conntrack_module) echo '连接跟踪模块的开机加载' ;; ping_file) echo '禁止 ping 的参数' ;;
+    ping_ufw) echo 'UFW 启动后重新禁止 ping' ;;
     keepalive_file) echo 'SSH 保活配置' ;; gai_file) echo '地址优先顺序（/etc/gai.conf）' ;; apt_time_file) echo '每天自动更新的时间' ;;
     login_pam) echo '登录记录（common-session 里的那一行）' ;; login_pam_file) echo '登录记录的 PAM 设置' ;; login_hook_file) echo '登录记录脚本' ;; login_profile_file) echo '登录时显示提示的脚本' ;;
     notify_conf) echo 'TG 通知的设置' ;; quota_conf) echo '月流量提醒的设置' ;; check_timer) echo '检查定时任务（开关）' ;;
@@ -7037,6 +7072,7 @@ restore_path() {
     swap_unit) printf '%s\n' "$SWAP_UNIT_FILE" ;;
     conntrack_file) printf '%s\n' "$CONNTRACK_FILE" ;; conntrack_module) printf '%s\n' "$CONNTRACK_MODULE_FILE" ;;
     ping_file) printf '%s\n' "$PING_FILE" ;;
+    ping_ufw) printf '%s\n' "$PING_UFW_FILE" ;;
     keepalive_file) printf '%s\n' "$KEEPALIVE_FILE" ;; gai_file) printf '%s\n' "$GAI_FILE" ;;
     login_pam_file) printf '%s\n' "$LOGIN_PAM_FILE" ;; login_hook_file) printf '%s\n' "$STATE_ROOT/login-hook" ;;
     login_profile_file) printf '%s\n' "$LOGIN_PROFILE_FILE" ;;
@@ -7683,11 +7719,14 @@ restore_firewall_group() {
   restore_fw_rules_apply
   restore_resource svc_ufw
   # The kernel settings UFW applied stay after it stops; the security
-  # parameters, when kept, still set some of the same keys themselves.
+  # parameters and not answering ping, when kept, still set some of the same
+  # keys themselves (otherwise undoing the firewall alone answered ping again).
   if ! ufw_active; then
-    restore_sysctl_runtime ufw_sysctl_runtime "$SYSCTL_HARDENING_FILE" "$TCP_BUFFER_FILE"
+    restore_sysctl_runtime ufw_sysctl_runtime "$SYSCTL_HARDENING_FILE" "$TCP_BUFFER_FILE" "$PING_FILE"
     rm -f -- "$RESTORE_ROOT/ufw_forward_policy"
   fi
+  # A reload above (IPv6 filtering put back) applied UFW's sysctl.conf again.
+  ping_ufw_reapply
 }
 
 # Both SSH drop-ins (key-only, and the key-login switch for images that had it
@@ -7996,7 +8035,7 @@ restore_group_ids() {
     zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
     swap) printf '%s\n' swap_unit swap_file ;;
     conntrack) printf '%s\n' conntrack_file conntrack_module ;;
-    ping) printf '%s\n' ping_file ;;
+    ping) printf '%s\n' ping_file ping_ufw ;;
     keepalive) printf '%s\n' keepalive_file ;;
     ipv4) printf '%s\n' gai_file ;;
     login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
@@ -8079,6 +8118,8 @@ restore_group_apply() {
       systemctl daemon-reload >/dev/null 2>&1 || true ;;
     ping)
       restore_resource ping_file
+      restore_resource ping_ufw
+      systemctl daemon-reload >/dev/null 2>&1 || true
       if [[ "$(restore_read ping_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime ping_sysctl_runtime; fi ;;
     journal)
       # "applied" while already at the original: an earlier journald restart failed.
@@ -8409,7 +8450,11 @@ check_conntrack() {
 }
 
 check_ping() {
-  if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" == 1 ]]; then verify_set pass '不回应 ping'
+  local keys
+  if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" == 1 ]]; then verify_set pass '不回应 ping'; return 0; fi
+  keys="$(ufw_sysctl_keys)"
+  if grep -Fxq net.ipv4.icmp_echo_ignore_all <<< "$keys"; then
+    verify_set fail '又在回应 ping 了：UFW 启动或重新加载（ufw reload、ufw enable）时按它的 /etc/ufw/sysctl.conf 改了回来。在单项设置里再开一次禁止 ping 就好'
   else verify_set fail '又在回应 ping 了（net.ipv4.icmp_echo_ignore_all 不是 1）'; fi
 }
 

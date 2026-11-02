@@ -446,6 +446,17 @@ vm "grep -Fxq 'hostname: vps-ci-renamed' /etc/cloud/cloud.cfg.d/99-vps-stable-ho
 vm "grep -Fxq 'display_name=测试机-一号' /var/lib/vps-stable-opt/params" || fail 'display name not saved'
 endgroup
 
+group 'Not answering ping, on through the reboot'
+# UFW applies its own sysctl.conf whenever it starts, and the stock one answers
+# ping (net/ipv4/icmp_echo_ignore_all=0): on a real Debian 13 VPS ping was
+# answered again after every reboot, which no reboot here had covered.
+index="$(item_index ping)" || fail 'no single item ping'
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '仍然禁止 ping 吗？ ==> y' > "$WORK/ping.rules"
+vm_drive "$WORK/ping.rules" ping-on vps item || fail "ping on exited with $?"
+[[ "$(vm 'sysctl -n net.ipv4.icmp_echo_ignore_all')" == 1 ]] || fail 'ping on: echo still answered'
+[[ "$(vm 'ufw status | head -n 1')" == 'Status: active' ]] || fail 'the firewall is not on for the ping check'
+endgroup
+
 group 'Reboot'
 vm 'systemctl reboot' || true
 sleep 20
@@ -455,6 +466,8 @@ has check-after-reboot '开荒之后已经重启过'
 # cloud-init sets the name from the seed at every boot unless told otherwise.
 [[ "$(vm hostname)" == vps-ci-renamed ]] || fail "the name was changed back at boot: $(vm hostname)"
 passed check-after-reboot '主机名'
+passed check-after-reboot '禁止 ping'
+[[ "$(vm 'sysctl -n net.ipv4.icmp_echo_ignore_all')" == 1 ]] || fail 'ping answered again after the reboot'
 probe journal-probe-after-reboot
 endgroup
 
