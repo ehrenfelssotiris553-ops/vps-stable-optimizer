@@ -586,9 +586,21 @@ passed check-hardened 'SSH 登录加固'
 endgroup
 
 group 'Full rollback and uninstall'
-# Root has no SSH login now: the admin rolls back, which brings it back.
-VM_AS=$VM_OPS_HOST vm_drive rollback.rules rollback sudo vps rollback || fail "rollback exited with $?"
+# The SSH port changed again and left so: the full rollback itself puts it back
+# and must delete the rule it lets port 22 in with again (a real Debian 13 VPS
+# kept "limit 22/tcp" in UFW after that; the single item above hid it, as it
+# records that rule itself). The admin confirms on the new port.
+index="$(item_index sshport)" || fail 'no single item sshport'
+# ($ADMIN_PW is answer.exp's to expand.)
+# shellcheck disable=SC2016
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+  "等待确认（剩余 ==> !ssh ${VM_NEW_OPTS[*]} $VM_OPS_HOST sleep 10" '\[sudo[^]]*\] [Pp]assword ==> $ADMIN_PW' > "$LOGS/sshport-again.rules"
+VM_AS=$VM_OPS_HOST vm_drive "$LOGS/sshport-again.rules" sshport-again sudo vps item || fail "the second port change exited with $?"
+has sshport-again 'SSH 端口已改成 2244'
+# Root has no SSH login now: the admin rolls back (on port 2244), which brings it back.
+drive rollback.rules rollback ssh "${VM_NEW_OPTS[@]}" -tt "$VM_OPS_HOST" 'TERM=xterm sudo vps rollback' || fail "rollback exited with $?"
 has rollback '撤销完成'
+grep -Eq '已删除本工具添加的规则：ufw (allow|limit) 22/tcp' "$LOGS/rollback.log" || fail 'the full rollback left the rule it let port 22 in with again'
 has rollback '已恢复 SSH 原来的登录设置'
 vm true || fail 'root cannot log in after the rollback'
 lc_mark 'after the rollback (packages removed)'

@@ -122,7 +122,26 @@ restore_resource() { record "resource $1"; rm -f "$SSH_PORT_DROPIN"; }
 restore_sshport_group
 order="$(grep -nE '^(ufw limit 22/tcp|exempt|resource sshport_dropin|ssh reload)' "$TEST_ROOT/trace" | cut -d: -f2- | tr '\n' '|')"
 [[ "$order" == 'ufw limit 22/tcp|exempt|resource sshport_dropin|ssh reload|' && "$LISTEN" == 22 ]] || fail "rollback order: $order"
-printf 'PASS: rollback lets the original port in (allowlisted addresses unlimited again) before SSH goes back to it.\n'
+# A full rollback (vps rollback) records nothing new (RESTORE_READY=0), yet the
+# rule letting the old port in again is this tool's: the firewall group, undone
+# after it, must delete it (a real Debian 13 VPS kept "limit 22/tcp" in UFW
+# after the full rollback).
+start; ssh_port_stage <<< 2244 > /dev/null
+if grep -Fxq 'ufw limit 22/tcp' "$RESTORE_ROOT/fw_rules"; then fail 'the old port rule still recorded after the change'; fi
+: > "$TEST_ROOT/trace"; RESTORE_READY=0
+restore_sshport_group
+RESTORE_READY=1
+grep -Fxq 'ufw limit 22/tcp' "$TEST_ROOT/ufw" && grep -Fxq 'ufw limit 22/tcp' "$RESTORE_ROOT/fw_rules" ||
+  fail "the old port, let in again by a full rollback, is not recorded as this tool's rule: $(cat "$RESTORE_ROOT/fw_rules")"
+# Someone else's rule for the old port stayed through the change: still theirs.
+start; grep -vxF 'ufw limit 22/tcp' "$RESTORE_ROOT/fw_rules" > "$TEST_ROOT/fw.new" || true; mv "$TEST_ROOT/fw.new" "$RESTORE_ROOT/fw_rules"
+ssh_port_stage <<< 2244 > /dev/null
+grep -Fxq 'ufw limit 22/tcp' "$TEST_ROOT/ufw" || fail "someone else's rule for the old port was deleted"
+: > "$TEST_ROOT/trace"; RESTORE_READY=0
+restore_sshport_group
+RESTORE_READY=1
+if grep -Fxq 'ufw limit 22/tcp' "$RESTORE_ROOT/fw_rules"; then fail "someone else's rule for the old port recorded as this tool's"; fi
+printf 'PASS: rollback lets the original port in (allowlisted addresses unlimited again) before SSH goes back to it, by a rule of its own.\n'
 
 # vps check: sshd listens on the ports of the file, the firewall lets them in.
 printf 'Port 2244\n' > "$SSH_PORT_DROPIN"; LISTEN='2244 '; printf 'ufw limit 2244/tcp\n' > "$TEST_ROOT/ufw"

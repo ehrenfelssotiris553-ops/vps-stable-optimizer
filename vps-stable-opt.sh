@@ -4455,9 +4455,13 @@ restore_sshport_group() {
   restore_needed sshport_dropin || return 0
   port="$(sed -n 's/^port=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)" verb="$(sed -n 's/^verb=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)"
   if [[ "$port" =~ ^[0-9]{1,5}$ ]] && ufw_active; then
-    if ! ufw_rule "${verb:-allow}" "$port"; then warn "防火墙没能放行原来的 SSH 端口 $port：SSH 端口保持不变。"; RESTORE_PARTIAL=1; return 0; fi
+    # What is let in again here is this tool's own (the change took its rules
+    # away) and recorded so, also in a full rollback, which records nothing new
+    # otherwise: the firewall group deletes it then (a real Debian 13 VPS kept
+    # "limit 22/tcp" in UFW after a full rollback). A rule already there stays.
+    if ! RESTORE_READY=1 ufw_rule "${verb:-allow}" "$port"; then warn "防火墙没能放行原来的 SSH 端口 $port：SSH 端口保持不变。"; RESTORE_PARTIAL=1; return 0; fi
     # The change took the old port's exemptions away with its rules.
-    if [[ "$verb" == limit ]]; then ssh_limit_exempt; fi
+    if [[ "$verb" == limit ]]; then RESTORE_READY=1 ssh_limit_exempt; fi
   fi
   restore_resource sshport_dropin
   if ! ssh_port_reload; then warn 'SSH 重新加载失败：重启 SSH 后才回到原来的端口。'; RESTORE_PARTIAL=1; fi
