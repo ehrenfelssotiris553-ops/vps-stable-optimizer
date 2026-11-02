@@ -192,3 +192,20 @@ grep -q '请输入 zstd、lz4 或 lzo-rle' "$TEST_ROOT/out" || fail 'a wrong alg
 printf 'zram_algorithm=zstd\nzram_algorithm=gzip\nzram_percent=040\n\n' | params_import > "$TEST_ROOT/out"
 [[ "$(param_value zram_algorithm)" == zstd && "$(param_value zram_percent)" == 40 ]] || fail "import: $(cat "$TEST_ROOT/out")"
 printf 'PASS: a word parameter is chosen from its list and kept as a word.\n'
+
+# The resource view lists a service under two names once (on a real Debian 13
+# VPS sshd.service, an alias of ssh.service, made SSH appear twice).
+load_optimizer_functions resources_line
+systemctl() {
+  case "$*" in
+    'show -p Id --value ssh.service'|'show -p Id --value sshd.service') echo ssh.service ;;
+    'show -p Id --value fail2ban.service') echo fail2ban.service ;;
+    'show -p ActiveState --value '*) echo active ;;
+    'show -p MemoryCurrent --value '*) echo 8388608 ;;
+    'show -p CPUUsageNSec --value '*) echo 2000000000 ;;
+  esac
+}
+out="$(resources_line ssh ssh.service SSH x; resources_line ssh sshd.service SSH x; resources_line fail2ban fail2ban.service Fail2ban y)"
+[[ "$(grep -c '^  SSH：内存 8 MiB，开机以来 CPU 2 秒。x$' <<< "$out")" == 1 && "$out" == *'Fail2ban：内存 8 MiB'* ]] || fail "resources: $out"
+unset -f systemctl
+printf 'PASS: the resource view lists a service under two names once.\n'

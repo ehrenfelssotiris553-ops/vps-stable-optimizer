@@ -1817,8 +1817,12 @@ updates_stage() {
   step 10 '自动安全更新'
   if (( !AUTO_UPDATES )); then ok '自动更新策略保持不变。'; module_result updates declined 'not requested'; return 0; fi
   installed unattended-upgrades || { warn '没有安装 unattended-upgrades。'; module_result updates unsupported 'package missing'; return 0; }
-  local periodic key value text='' custom='' off=0 files result=applied detail='periodic updates'
+  local periodic key value text='' custom='' off=0 masked=0 files result=applied detail='periodic updates' timer
   periodic="$(apt-config dump 2>/dev/null | grep -E '^APT::Periodic::(Update-Package-Lists|Unattended-Upgrade) ' || true)"
+  # Timers masked on purpose (a provider image did, next to its own "0" policy).
+  for timer in apt-daily.timer apt-daily-upgrade.timer; do
+    case "$(systemctl is-enabled "$timer" 2>/dev/null || true)" in masked*) masked=1 ;; esac
+  done
   for key in Update-Package-Lists Unattended-Upgrade; do
     value="$(awk -v k="APT::Periodic::$key" '$1 == k {v = $2} END {gsub(/^"|";?$/, "", v); print v}' <<< "$periodic")"
     if [[ -z "$value" ]]; then text+="APT::Periodic::$key \"1\";"$'\n'
@@ -1831,6 +1835,9 @@ updates_stage() {
     files="$(grep -lsE 'Periodic' /etc/apt/apt.conf /etc/apt/apt.conf.d/* 2>/dev/null | tr '\n' ' ' || true)"
     warn "已有的更新策略关闭了自动更新（${custom% }），按原样保留：自动安全更新现在没有开启。要开启，先把这一项改成 \"1\"（可能在：${files:-/etc/apt/apt.conf.d}），再选开启。"
     result=preserved detail='原有策略关闭了自动安全更新，没有开启'
+  elif ((masked)); then
+    warn 'APT 的定时器被屏蔽了（masked，多半是服务商的镜像这样设的）：自动安全更新不会运行，按原样保留。要开启，先运行 systemctl unmask apt-daily.timer apt-daily-upgrade.timer，再选开启。'
+    result=preserved detail='APT 定时器被屏蔽（masked），没有开启'
   elif [[ -n "$custom" ]]; then
     warn "已有自定义的定期更新策略（${custom% }），不覆盖。"; result=preserved
   elif [[ -z "$text" ]]; then ok '自动安全更新原本就已开启。'; result=present
@@ -1838,6 +1845,9 @@ updates_stage() {
   elif [[ -n "$periodic" ]]; then
     ok "原有策略里缺少的设置已补上：$(tr '\n' ' ' <<< "${text%$'\n'}")"
   fi
+  # Kept off (by the policy, or masked timers): the timers stay as they are; on
+  # a real Ubuntu 22.04 VPS enabling masked ones failed and the item read as failed.
+  if ((off || masked)); then module_result updates "$result" "$detail"; return 0; fi
   apt_timers_postpone
   if systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then
     apt_time_apply
@@ -5411,9 +5421,13 @@ perf_main() {
 # KEY UNIT LABEL CAN: one resident service: its memory and CPU time (from its
 # cgroup), and whether it can be turned off and what that costs.
 resources_line() {
-  local unit="$2" mem cpu state
+  local unit="$2" mem cpu state id
   state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
   [[ "$state" == active ]] || return 0
+  # One service under two names once (Debian 13: sshd.service is ssh.service).
+  id="$(systemctl show -p Id --value "$unit" 2>/dev/null || true)"
+  [[ " ${RESOURCES_SHOWN:-} " != *" ${id:-$unit} "* ]] || return 0
+  RESOURCES_SHOWN+=" ${id:-$unit}"
   mem="$(systemctl show -p MemoryCurrent --value "$unit" 2>/dev/null || true)"
   cpu="$(systemctl show -p CPUUsageNSec --value "$unit" 2>/dev/null || true)"
   if [[ "$mem" =~ ^[0-9]+$ ]]; then mem="$((mem / 1048576)) MiB"; else mem='未知'; fi

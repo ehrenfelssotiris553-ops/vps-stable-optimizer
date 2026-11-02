@@ -117,6 +117,18 @@ reset; APT_DUMP=$'APT::Periodic::Update-Package-Lists "0";\nAPT::Periodic::Unatt
 updates_stage
 [[ ! -e "$APT_FILE" ]] || fail 'an administrator policy that turned updates off was overridden'
 grep -q '^result updates preserved' "$TEST_ROOT/trace" || fail 'kept update policy not recorded'
+# Kept off: its timers are left alone too (a real Ubuntu 22.04 VPS had them
+# masked next to its "0" policy; enabling them failed and the item read as failed).
+if grep -q '^systemctl enable' "$TEST_ROOT/trace"; then fail 'the timers of a policy kept off were switched on'; fi
+# Masked timers without such a policy: kept as they are, said plainly, nothing written.
+systemctl() { record "systemctl $*"; if [[ "$1" == is-enabled ]]; then echo masked; fi; }
+reset; APT_DUMP=''
+updates_stage
+[[ ! -e "$APT_FILE" ]] || fail 'an update policy written although its timers are masked'
+grep -q '^result updates preserved APT 定时器被屏蔽' "$TEST_ROOT/trace" && ! grep -q '^systemctl enable' "$TEST_ROOT/trace" ||
+  fail "masked timers: $(cat "$TEST_ROOT/trace")"
+grep -q '^WARN .*masked' "$TEST_ROOT/log" || fail 'masked timers not said plainly'
+systemctl() { record "systemctl $*"; }
 reset; APT_DUMP=''
 updates_stage
 grep -Fxq 'APT::Periodic::Unattended-Upgrade "1";' "$APT_FILE" || fail 'update policy not written when none existed'
