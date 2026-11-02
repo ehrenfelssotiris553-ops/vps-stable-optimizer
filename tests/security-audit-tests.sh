@@ -8,7 +8,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions verify_line audit_known audit_flag audit_heading audit_owned_paths audit_unowned audit_when audit_clean_text \
-  audit_passwd_state audit_logins audit_integrity audit_mark_menu login_recent
+  audit_passwd_state audit_logins audit_integrity audit_mark_menu login_recent audit_cloud_init_file
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -88,6 +88,16 @@ if grep -Fq "$F/usr/local/bin/vps" "$TEST_ROOT/out"; then fail "this tool's own 
 grep -Fq "✖ 可疑  系统目录里的程序：$F/usr/bin/evil 不属于任何软件包" "$TEST_ROOT/out" || fail "a program of no package: $(cat "$TEST_ROOT/out")"
 if grep -Fq "$F/usr/bin/ls " "$TEST_ROOT/out"; then fail 'a program of a package was flagged'; fi
 grep -Fq "✖ 可疑  临时目录里的程序：$F/tmp/.x" "$TEST_ROOT/out" || fail 'a program in /tmp not flagged'
+# The provider's first-boot script that cloud-init put in /tmp (a real Debian
+# 13 VPS: /tmp/network_script, named in its runcmd) is a notice, not suspect.
+CLOUD_INSTANCE_DIR="$F/cloud"; mkdir -p "$F/cloud/scripts"
+printf '#!/bin/sh\n' > "$F/tmp/network_script"; chmod +x "$F/tmp/network_script"
+printf "#!/bin/sh\nbash %s\n" "$F/tmp/network_script" > "$F/cloud/scripts/runcmd"
+reset_report; audit_software > "$TEST_ROOT/out"
+grep -Fq "⚠ 注意  临时目录里的程序：$F/tmp/network_script：服务商的开机初始化（cloud-init）放进来的" "$TEST_ROOT/out" &&
+  ! grep -Fq "✖ 可疑  临时目录里的程序：$F/tmp/network_script" "$TEST_ROOT/out" || fail "cloud-init's script: $(grep network_script "$TEST_ROOT/out")"
+grep -Fq "✖ 可疑  临时目录里的程序：$F/tmp/.x" "$TEST_ROOT/out" || fail 'a program in /tmp no longer flagged next to the cloud-init one'
+rm -f "$F/tmp/network_script"; rm -rf "$F/cloud"; CLOUD_INSTANCE_DIR="$F/no-cloud"
 printf 'PASS: the audit lists new packages, own programs and programs of no package or in temporary directories.\n'
 
 # 4. Running: a deleted program is suspect (a replaced one only a notice), one
@@ -138,6 +148,16 @@ grep -Fq '账户 root 的定时任务：@reboot /tmp/.x' "$TEST_ROOT/out" || fai
 # (The label is the path, rewritten to the fixture here.)
 grep -Fq "✖ 可疑  $F/etc/ld.so.preload：让每个程序先加载：/lib/libhide.so" "$TEST_ROOT/out" || fail 'ld.so.preload not suspect'
 printf 'PASS: the audit lists own units, cron jobs and crontabs, and flags ld.so.preload.\n'
+
+# No part sets off the error trap where a fresh system lacks a directory it
+# looks in, or nothing is left to list (the tool printed "出错：第 N 行" three
+# times in vps audit on a real Debian 13 VPS).
+rm -rf "$F/usr/local/sbin" "$F/usr/local/lib" "$F/etc/cron.hourly"; : > "$TEST_ROOT/errs"
+trap 'printf "%s\n" "$LINENO" >> "$TEST_ROOT/errs"' ERR
+reset_report; audit_software > /dev/null; audit_autostart > /dev/null; audit_running > /dev/null
+trap - ERR
+[[ ! -s "$TEST_ROOT/errs" ]] || fail "the audit set off the error trap $(grep -c . "$TEST_ROOT/errs") times"
+printf 'PASS: no part of the audit sets off the error trap on missing directories or empty lists.\n'
 
 # 6. System files: a changed program is suspect, a changed configuration file
 # only listed, a missing file a notice.

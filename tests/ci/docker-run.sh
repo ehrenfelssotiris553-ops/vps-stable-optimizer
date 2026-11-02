@@ -100,4 +100,6 @@ python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt"
 cat "$LOGS/snapdiff.log"
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup
+# shellcheck disable=SC2119
+no_tool_errors
 printf 'PASS: Docker machine: firewall and Fail2ban on, container reachable and online throughout, FORWARD policy kept, clean rollback.\n'

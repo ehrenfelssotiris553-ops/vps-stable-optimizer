@@ -59,6 +59,8 @@ SSH_PORT_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-port.conf
 SSH_PUBKEY_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-pubkey.conf
 # Tells cloud-init to keep a hostname set with vps (it sets the provider's at boot).
 CLOUD_HOSTNAME_FILE=/etc/cloud/cloud.cfg.d/99-vps-stable-hostname.cfg
+# cloud-init's data for this machine (the provider's first-boot configuration).
+CLOUD_INSTANCE_DIR=/var/lib/cloud/instance
 WARNINGS=0
 # This run's log (set by start_logging); apt writes its full output there.
 RUN_LOG=''
@@ -2565,7 +2567,7 @@ ipv6_broken() {
   local -a addrs6=()
   host_has_global_ipv6 || return 1
   if [[ "$OS" == ubuntu ]]; then host=archive.ubuntu.com; else host=deb.debian.org; fi
-  mapfile -t addrs6 < <(getent ahostsv6 "$host" 2>/dev/null | awk '$2 == "STREAM" && !seen[$1]++ && n++ < 3 {print $1}')
+  mapfile -t addrs6 < <(getent ahostsv6 "$host" 2>/dev/null | awk '$2 == "STREAM" && !seen[$1]++ && n++ < 3 {print $1}' || true)
   addr4="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 {print $1}')"
   ((${#addrs6[@]})) && [[ -n "$addr4" ]] || return 1
   for round in 1 2; do
@@ -6081,7 +6083,11 @@ audit_software() {
   else verify_line healthy '新装的软件包' "最近 30 天只有本工具装的${ours:+：${ours# }}"; fi
   # Somebody's own programs (xray and the like) and programs in system directories
   # that no package owns.
-  mapfile -t audit_files < <(find /usr/local/bin /usr/local/sbin /opt -maxdepth 3 -type f -perm /111 2>/dev/null | grep -vx /usr/local/bin/vps | head -n 50)
+  # Each "|| true": a pipeline that fails inside < <(...) sets off the error
+  # trap in its subshell ("出错：第 N 行", seen on a real Debian 13 VPS) although
+  # the audit goes on: find on a directory a fresh system lacks, grep -v with
+  # nothing left, head cutting the writer off.
+  mapfile -t audit_files < <(find /usr/local/bin /usr/local/sbin /opt -maxdepth 3 -type f -perm /111 2>/dev/null | grep -vx /usr/local/bin/vps | head -n 50 || true)
   for file in "${audit_files[@]}"; do
     audit_known file "$file" || audit_flag notice '自己装的程序' "$(audit_clean_text <<< "$file")：是你装的就标记为正常" file "$file"
   done
@@ -6089,11 +6095,24 @@ audit_software() {
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     audit_known file "$file" || audit_flag suspect '系统目录里的程序' "$(audit_clean_text <<< "$file") 不属于任何软件包：系统命令被换掉或藏了程序时会这样" file "$file"
-  done < <(audit_unowned "${audit_files[@]}" | head -n 30)
-  mapfile -t audit_files < <(find /tmp /var/tmp /dev/shm -xdev -maxdepth 4 -type f -perm /111 2>/dev/null | head -n 30)
+  done < <(audit_unowned "${audit_files[@]}" | head -n 30 || true)
+  mapfile -t audit_files < <(find /tmp /var/tmp /dev/shm -xdev -maxdepth 4 -type f -perm /111 2>/dev/null | head -n 30 || true)
   for file in "${audit_files[@]}"; do
-    audit_known file "$file" || audit_flag suspect '临时目录里的程序' "$(audit_clean_text <<< "$file")：恶意程序常放在这里" file "$file"
+    audit_known file "$file" && continue
+    if audit_cloud_init_file "$file"; then
+      audit_flag notice '临时目录里的程序' "$(audit_clean_text <<< "$file")：服务商的开机初始化（cloud-init）放进来的，它的开机配置里写着这个文件，多半是用来配网络、主机名的；用不着了可以删掉，或者标记为正常" file "$file"
+    else
+      audit_flag suspect '临时目录里的程序' "$(audit_clean_text <<< "$file")：恶意程序常放在这里" file "$file"
+    fi
   done
+}
+
+# PATH is named in cloud-init's configuration of this machine: the provider's
+# first-boot script (a real Debian 13 VPS had /tmp/network_script from it).
+audit_cloud_init_file() {
+  local dir="${CLOUD_INSTANCE_DIR:-/var/lib/cloud/instance}"
+  [[ -d "$dir" ]] || return 1
+  grep -Fqs -- "$1" "$dir/user-data.txt" "$dir/cloud-config.txt" "$dir/scripts/runcmd"
 }
 
 # 4. What runs: deleted or temporary programs, programs of no package, CPU hogs.
@@ -6124,13 +6143,13 @@ audit_running() {
   while IFS= read -r exe; do
     [[ -n "$exe" ]] || continue
     audit_known exe "$exe" || audit_flag notice '不属于软件包的程序在运行' "$(audit_clean_text <<< "$exe")：是你装的就标记为正常" exe "$exe"
-  done < <(audit_unowned "${plain[@]}" | head -n 30)
+  done < <(audit_unowned "${plain[@]}" | head -n 30 || true)
   while read -r pid pcpu secs comm; do
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     exe="$(readlink "/proc/$pid/exe" 2>/dev/null || echo "$comm")"
     audit_known exe "$exe" && continue
     audit_flag notice "进程 $(audit_clean_text <<< "$comm")（$pid）" "运行 $((secs / 60)) 分钟，平均占 ${pcpu}% CPU：一直吃满 CPU 的陌生程序多半是挖矿的" exe "$exe"
-  done < <(ps -eo pid=,pcpu=,etimes=,comm= 2>/dev/null | awk '$2 >= 80 && $3 >= 600' | head -n 5)
+  done < <(ps -eo pid=,pcpu=,etimes=,comm= 2>/dev/null | awk '$2 >= 80 && $3 >= 600' | head -n 5 || true)
   ports="$(ss -H -tulpn 2>/dev/null | awk '$5 !~ /^(127\.|\[::1\]|::1)/ {n = split($5, a, ":"); p = a[n]; match($0, /\("[^"]*"/); prog = substr($0, RSTART + 2, RLENGTH - 3); k = p "/" $1 (prog != "" ? "(" prog ")" : ""); if (!(k in s)) {s[k] = 1; printf "%s ", k}}' || true)"
   verify_line healthy '对外监听的端口' "$(if [[ -n "${ports// /}" ]]; then echo "${ports% }"; else echo 没有; fi)"
 }
@@ -6140,13 +6159,13 @@ audit_autostart() {
   local file line
   local -a audit_files=()
   audit_heading '五、开机自启和定时任务'
-  mapfile -t audit_files < <(find /etc/systemd/system /usr/local/lib/systemd/system -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' -o -name '*.socket' -o -name '*.path' \) ! -name 'vps-stable-*' 2>/dev/null)
+  mapfile -t audit_files < <(find /etc/systemd/system /usr/local/lib/systemd/system -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' -o -name '*.socket' -o -name '*.path' \) ! -name 'vps-stable-*' 2>/dev/null || true)
   for file in "${audit_files[@]}"; do
     audit_known file "$file" && continue
     line="$(grep -m1 -E '^(ExecStart|OnCalendar|OnBootSec|ListenStream)=' "$file" 2>/dev/null | audit_clean_text | cut -c1-100 || true)"
     audit_flag notice '自己加的服务' "$(audit_clean_text <<< "$file")（${line:-没有 ExecStart}）：是你装的就标记为正常" file "$file"
   done
-  mapfile -t audit_files < <(find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -maxdepth 1 -type f ! -name .placeholder 2>/dev/null)
+  mapfile -t audit_files < <(find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -maxdepth 1 -type f ! -name .placeholder 2>/dev/null || true)
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     audit_known file "$file" || audit_flag notice '定时任务' "$(audit_clean_text <<< "$file") 不属于任何软件包：是你加的就标记为正常" file "$file"

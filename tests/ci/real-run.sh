@@ -218,6 +218,8 @@ if [[ "$mode" == keep ]]; then
   (($(tcp_rmem_max) > before_tcp_rmem)) || fail 'the TCP buffers are not raised any more'
   [[ "$(tz)" == Asia/Shanghai ]] || fail "timezone: $(tz)"
   endgroup
+  # shellcheck disable=SC2119
+  no_tool_errors
   printf 'PASS: real run (keep) on %s: uninstalled with the settings kept, nothing left running, installed and set up again.\n' \
     "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"
   exit 0
@@ -683,6 +685,8 @@ python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt"
 cat "$LOGS/snapdiff.log"
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup
+# shellcheck disable=SC2119
+no_tool_errors
 # Found at the traffic check and kept until here, so that the rest still ran.
 [[ -z "${traffic_problem:-}" ]] || fail "$traffic_problem"
 printf 'PASS: real run (%s) on %s: install, setup, check, single items, ports, rollback, uninstall.\n' \

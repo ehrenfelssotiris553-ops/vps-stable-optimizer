@@ -92,6 +92,22 @@ item_index() {
 }
 lacks() { if grep -Fq -- "$2" "$LOGS/$1.log"; then fail "$1: \"$2\" should not be there"; fi; }
 
+# The tool's error trap ("出错：第 N 行") in any transcript or saved output is
+# never part of a healthy run, also where the run went on: a pipeline failing
+# in a process substitution printed it three times in vps audit on a real
+# Debian 13 VPS, and no check looked for it. NAME... are runs where it may
+# appear on purpose (Ctrl+C in the middle of a setup).
+no_tool_errors() {
+  local f name skip hits=''
+  for f in "$LOGS"/*.log; do
+    [[ -f "$f" ]] || continue
+    skip=0
+    for name in "$@"; do if [[ "${f##*/}" == "$name.log" ]]; then skip=1; fi; done
+    if ((skip == 0)) && grep -Eq '出错：第 [0-9]+ 行' "$f"; then hits+=" ${f##*/}: $(grep -Em1 '出错：第 [0-9]+ 行' "$f")"; fi
+  done
+  [[ -z "$hits" ]] || fail "the tool hit its error trap:$hits"
+}
+
 # An acceptance line "✔ 生效  LABEL：…" (or "✔ 正常" for health lines).
 passed() {
   grep -Eq "^✔ (生效|正常)[[:space:]]+$2：" "$LOGS/$1.log" || {

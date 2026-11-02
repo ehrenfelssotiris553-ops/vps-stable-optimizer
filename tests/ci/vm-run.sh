@@ -613,4 +613,6 @@ if ((rc)); then
 fi
 ((rc == 0)) || fail 'differences after rollback and uninstall (listed above)'
 endgroup
+# Ctrl+C in the middle of a setup may stop it anywhere.
+no_tool_errors interrupt
 printf 'PASS: %s VM (%s MiB): setup, check, allowlisted logins, reboot, tmux reconnect, SSH hardening (dropped and kept), rollback, uninstall.\n' "$system" "$memory"
