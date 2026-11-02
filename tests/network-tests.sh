@@ -180,6 +180,25 @@ timeout() { [[ " $OK_ADDR " == *" $(sed 's#.*/dev/tcp/\([^/]*\)/.*#\1#' <<< "$*"
 OK_ADDR='192.0.2.80'; ipv6_broken || fail 'a broken IPv6 not detected'
 OK_ADDR='192.0.2.80 2001:db8::80'; if ipv6_broken; then fail 'a working IPv6 called broken'; fi
 OK_ADDR=''; if ipv6_broken; then fail 'no network at all called a broken IPv6'; fi
+# One lost IPv6 connection is no reason (seen on a real Debian 13 VPS whose
+# IPv6 works): every address is tried twice.
+sleep() { :; }
+TRIES=0
+timeout() {
+  local a; a="$(sed 's#.*/dev/tcp/\([^/]*\)/.*#\1#' <<< "$*")"
+  if [[ "$a" == *:* ]]; then TRIES=$((TRIES + 1)); if [[ -n "${FLAKY:-}" && "$TRIES" == 1 ]]; then return 1; fi; fi
+  [[ " $OK_ADDR " == *" $a "* ]]
+}
+FLAKY=1 OK_ADDR='192.0.2.80 2001:db8::80'; if ipv6_broken; then fail 'one lost IPv6 connection called a broken IPv6'; fi
+FLAKY=''
+# Several addresses of the mirror: one of them reachable is enough.
+getent() {
+  case "$1" in ahostsv6) printf '%s\n' '2001:db8::80 STREAM deb.debian.org' '2001:db8::80 DGRAM' '2001:db8::81 STREAM' ;;
+    ahostsv4) echo '192.0.2.80 STREAM deb.debian.org' ;; ahosts) echo "${FIRST:-192.0.2.80} STREAM deb.debian.org" ;; esac
+}
+OK_ADDR='192.0.2.80 2001:db8::81'; if ipv6_broken; then fail 'a mirror reachable on its second IPv6 address called broken'; fi
+OK_ADDR='192.0.2.80'; ipv6_broken || fail 'a broken IPv6 with several addresses not detected'
+unset -f sleep
 GLOBAL6=0 OK_ADDR='192.0.2.80'; if ipv6_broken; then fail 'a host without IPv6 called broken'; fi
 GAI_FILE="$TEST_ROOT/gai.conf"
 printf '#precedence ::ffff:0:0/96  100\n' > "$GAI_FILE"

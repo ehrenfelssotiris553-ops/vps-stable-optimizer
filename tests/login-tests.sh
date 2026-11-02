@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions login_pam_text login_hook_text login_profile_text login_pam_enabled login_stage login_recent menu_login_alert check_login verify_set \
+load_optimizer_functions login_pam_text login_hook_text login_profile_text login_pam_enabled login_stage login_known_seed f2b_allowlist port_source_valid login_recent menu_login_alert check_login verify_set \
   restore_value restore_apply_one restore_path
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -132,11 +132,21 @@ pam-auth-update() {
   esac
 }
 printf 'session required pam_unix.so\n' > "$PAM_COMMON_SESSION"
+F2B_FILE="$TEST_ROOT/no-jail.local" F2B_IGNORE_CHOICE=''
 reset; LOGIN_CHOICE=1; login_stage
 [[ "$(cat "$STATE_ROOT/login-hook")" == "$(login_hook_text)" && -f "$LOGIN_PAM_FILE" && "$(cat "$LOGIN_PROFILE_FILE")" == "$(login_profile_text)" ]] &&
   login_pam_enabled && grep -q '^result login applied' "$TEST_ROOT/trace" ||
   fail "login on: $(cat "$TEST_ROOT/trace")"
 [[ "$(restore_value login_pam)" == enabled ]] || fail 'login_pam value'
+# The administrator's addresses are known from the start: the one it is turned
+# on from, the setup's allowlist choice and single IPs on the allowlist (on a
+# real Debian 13 VPS the address just allowlisted was shown in red).
+: > "$STATE_ROOT/known"
+printf '[sshd]\nignoreip = 127.0.0.1/8 ::1 203.0.113.9 198.18.0.0/24\n' > "$F2B_FILE"
+SSH_CONNECTION='198.51.100.7 50000 192.0.2.1 22' F2B_IGNORE_CHOICE='198.51.100.8'
+reset; login_stage; login_stage
+[[ "$(sort "$STATE_ROOT/known" | tr '\n' ' ')" == 'ip 198.51.100.7 ip 198.51.100.8 ip 203.0.113.9 ' ]] || fail "known at the start: $(cat "$STATE_ROOT/known")"
+unset SSH_CONNECTION; F2B_IGNORE_CHOICE=''; rm -f "$F2B_FILE"; : > "$STATE_ROOT/known"
 reset; login_stage
 [[ "$(grep -c login-hook "$PAM_COMMON_SESSION")" == 1 && "$(grep -c pam-auth-update "$TEST_ROOT/trace")" == 0 ]] || fail 'turned on twice'
 restore_read() { [[ "$2" == origin_value ]] && echo absent; }

@@ -2557,15 +2557,24 @@ keepalive_stage() {
 
 # A host that has public IPv6 but cannot reach the distribution's mirror over
 # it, while IPv4 works: programs that try IPv6 first then hang for a while.
+# Broken only when every IPv6 address of the mirror (up to 3) fails twice: on a
+# real Debian 13 VPS whose IPv6 works, a single lost connection once turned
+# IPv4 first on for good.
 ipv6_broken() {
-  local host addr6 addr4
+  local host addr addr4 round
+  local -a addrs6=()
   host_has_global_ipv6 || return 1
   if [[ "$OS" == ubuntu ]]; then host=archive.ubuntu.com; else host=deb.debian.org; fi
-  addr6="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR == 1 {print $1}')"
+  mapfile -t addrs6 < <(getent ahostsv6 "$host" 2>/dev/null | awk '$2 == "STREAM" && !seen[$1]++ && n++ < 3 {print $1}')
   addr4="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 {print $1}')"
-  [[ -n "$addr6" && -n "$addr4" ]] || return 1
-  if timeout 5 bash -c "exec 3<>/dev/tcp/$addr6/80" 2>/dev/null; then return 1; fi
-  timeout 5 bash -c "exec 3<>/dev/tcp/$addr4/80" 2>/dev/null
+  ((${#addrs6[@]})) && [[ -n "$addr4" ]] || return 1
+  for round in 1 2; do
+    for addr in "${addrs6[@]}"; do
+      if timeout 4 bash -c "exec 3<>/dev/tcp/$addr/80" 2>/dev/null; then return 1; fi
+    done
+    if ((round == 1)); then sleep 1; fi
+  done
+  timeout 4 bash -c "exec 3<>/dev/tcp/$addr4/80" 2>/dev/null
 }
 
 # Prefers IPv4 in getaddrinfo (/etc/gai.conf; glibc programs only, IPv6 stays
@@ -2713,6 +2722,25 @@ exit 0
 HOOK
 }
 
+# The addresses known to be the administrator's when the record starts: the
+# one it is turned on from and those on the Fail2ban allowlist (single IPs).
+# Otherwise the first login after the setup is shown in red as a stranger's
+# (seen on a real Debian 13 VPS, for the address just put on the allowlist).
+login_known_seed() {
+  local ip known="$STATE_ROOT/known"
+  local -a ips=()
+  ip="${SSH_CONNECTION:-}"; ip="${ip%% *}"
+  if [[ -n "$ip" ]]; then ips+=("$ip"); fi
+  if [[ "${F2B_IGNORE_CHOICE:-none}" != none ]]; then ips+=("$F2B_IGNORE_CHOICE"); fi
+  while IFS= read -r ip; do if [[ "$ip" != */* ]]; then ips+=("$ip"); fi; done < <(f2b_allowlist)
+  for ip in "${ips[@]}"; do
+    if [[ "$ip" == */* ]] || ! port_source_valid "$ip"; then continue; fi
+    if [[ -f "$known" ]] && grep -Fxq -- "ip $ip" "$known"; then continue; fi
+    printf 'ip %s\n' "$ip" >> "$known"
+  done
+  if [[ -f "$known" ]]; then chmod 600 -- "$known"; fi
+}
+
 # Enabled: common-session has this tool's line.
 login_pam_enabled() {
   grep -Fq "$STATE_ROOT/login-hook" "$PAM_COMMON_SESSION" 2>/dev/null
@@ -2743,6 +2771,7 @@ login_stage() {
     pam-auth-update --package --enable vps-stable-login || true
   fi
   if login_pam_enabled; then
+    login_known_seed || warn '没能把你现在的 IP 记成认识的：下次登录时它会标成第一次出现。'
     ok '登录记录和提醒已开启：下次登录起每次记一行（vps 选 7 安全排查里能看到），登录时显示上次登录。'
     module_result login applied 'pam_exec in common-session'
   else
