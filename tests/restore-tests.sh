@@ -32,6 +32,7 @@ ZRAM_VENDOR_FILE="$TMP/zram-vendor.conf"
 UFW_CONF="$TMP/ufw.conf"
 SYSCTL_HARDENING_FILE="$TMP/no-hardening.conf"
 TCP_BUFFER_FILE="$TMP/no-tcp.conf"
+PING_FILE="$TMP/no-noping.conf"
 mkdir -p "$RESTORE_ROOT"
 chmod 700 "$STATE_ROOT" "$RESTORE_ROOT"
 module_result() { :; }
@@ -324,7 +325,6 @@ value_baseline() {
   chmod 600 "$RESTORE_ROOT/ufw_sysctl_runtime"
   SYSCTL_HARDENING_FILE="$TMP/fw-order/98-hardening.conf" TCP_BUFFER_FILE="$TMP/fw-order/none.conf"
   printf 'net.ipv4.conf.default.accept_redirects = 0\n' > "$SYSCTL_HARDENING_FILE"
-  PING_FILE="$TMP/fw-order/none-noping.conf"
   sysctl() { [[ "$1" == -w ]] || die "unexpected sysctl $*"; printf 'sysctl %s\n' "$2" >> "$TRACE"; }
   restore_firewall_group
   expect "$(cat "$TRACE")" $'disable\ndelete\nsysctl net.ipv4.icmp_echo_ignore_broadcasts=0'
