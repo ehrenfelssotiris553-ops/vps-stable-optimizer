@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove tg_call notify_stage \
+load_optimizer_functions notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove restore_path tg_call notify_stage \
   quota_status menu_quota_alert dockerlog_text dockerlog_merge check_dockerlog check_notify check_quota check_timer_ok verify_set audit_when audit_clean_text \
   param_list param_kind param_recommended param_check param_read param_value param_caution
 TEST_ROOT="$(mktemp -d)"
@@ -176,6 +176,60 @@ sent | grep -Fq '每日汇总（过去 24 小时）' && sent | grep -Fq '失败�
 if sent | grep -Fq 每日汇总; then fail 'a second summary the same day'; fi
 printf 'PASS: the daily summary carries the failed logins, once a day.\n'
 
+# The summary with the acceptance check: by default only when an item failed
+# (its conclusion and the failed items, at most 5); every day; or never (the
+# check does not even run). Switched off: no summary, the count starts again.
+summary_day() { printf '1999-01-01\n' > "$D/summary-date"; : > "$T/sent"; rm -f "$T/checked"; run; }
+cat > "$T/main.sh" <<EOF
+#!/bin/bash
+[ "\$1" = check ] || exit 9
+: > '$T/checked'
+printf '\033[1m结论：\033[0m%s\n' "\$(cat '$T/conclusion')"
+printf '需要你看一下：\n'
+for i in 1 2 3 4 5 6; do printf '  ✖ 未生效  第 %s 项：说明\n' "\$i"; done
+printf '  ⚠ 注意  转发：提醒\n\n详细：\n  ✖ 未生效  第 1 项：说明\n'
+exit "\$(cat '$T/check-rc')"
+EOF
+printf '10 项正常，6 项未生效，0 项按计划未处理，0 项无法确认。\n' > "$T/conclusion"; printf '3\n' > "$T/check-rc"
+summary_day
+[[ -e "$T/checked" ]] && sent | grep -Fxq '验收：10 项正常，6 项未生效，0 项按计划未处理，0 项无法确认。' || fail "summary with a failed check: $(sent)"
+[[ "$(sent | grep -c '^✖ 未生效  第 [0-9] 项：说明$')" == 5 ]] || fail "failed items in the summary: $(sent)"
+if sent | grep -Fq '转发'; then fail 'a notice sent as a failed item'; fi
+printf '0\n' > "$T/check-rc"; printf '16 项正常，0 项未生效。\n' > "$T/conclusion"
+summary_day
+[[ -e "$T/checked" ]] && sent | grep -Fq 每日汇总 || fail 'no summary when the check passed'
+if sent | grep -Fq '验收'; then fail 'a passing check attached although only failures were asked for'; fi
+printf 'notify_summary_check=always\n' >> "$PARAMS_FILE"; summary_day
+sent | grep -Fxq '验收：16 项正常，0 项未生效。' || fail "a passing check not attached with always: $(sent)"
+printf 'notify_summary_check=never\n' >> "$PARAMS_FILE"; printf '3\n' > "$T/check-rc"; summary_day
+[[ ! -e "$T/checked" ]] && sent | grep -Fq 每日汇总 && ! sent | grep -Fq '验收' || fail "never: check run or attached: $(sent)"
+sed -i '/^notify_summary_check=/d' "$PARAMS_FILE"
+printf 'notify_summary=no\n' >> "$PARAMS_FILE"; printf '7\n' > "$D/failed"; summary_day
+[[ -z "$(sent)" && ! -e "$T/checked" && "$(cat "$D/failed")" == 0 && "$(cat "$D/summary-date")" == "$(date +%F)" ]] ||
+  fail "summary switched off: sent $(sent), failed $(cat "$D/failed")"
+sed -i '/^notify_summary=/d' "$PARAMS_FILE"; : > "$T/main.sh"
+printf 'PASS: the summary can be switched off; the acceptance check is attached when an item failed, always, or never (then not run).\n'
+
+# Only the notifications asked for; the thresholds for CPU and memory.
+printf 'notify_events=login disk\n' >> "$PARAMS_FILE"
+printf '%s\troot\t203.0.113.8\tpublickey\tssh\t0\n' "$(($(date +%s) + 20))" >> "$STATE_ROOT/logins"
+printf '%s.1 host useradd[1]: new user: name=intruder, UID=1009\n' "$(date +%s)" > "$T/journal"
+printf 'boot-3\n' > "$F/proc/sys/kernel/random/boot_id"; rm -f "$D/five"; : > "$T/sent"; run
+sent | grep -Fq '登录：root 来自 203.0.113.8' || fail "a login asked for not sent: $(sent)"
+if sent | grep -Fq '开机了' || sent | grep -Fq '新建了账户'; then fail "notifications not asked for were sent: $(sent)"; fi
+sed -i '/^notify_events=/d' "$PARAMS_FILE"; : > "$T/journal"
+# CPU: 50% and above for 5 minutes (one check); memory: under 50% available.
+printf 'notify_cpu_percent=50\nnotify_cpu_minutes=5\nnotify_mem_percent=50\n' >> "$PARAMS_FILE"
+printf 'cpu 100 0 100 800 0 0 0 0 0 0\n' > "$F/proc/stat"; rm -f "$D/five" "$D/cpu" "$D/cpu-hot" "$D/flag-cpu"; run
+printf 'cpu 700 0 100 1200 0 0 0 0 0 0\n' > "$F/proc/stat"; rm -f "$D/five"; : > "$T/sent"; run
+sent | grep -Fq 'CPU 已经连续 5 分钟以上占用 50% 以上（现在 60%）' || fail "CPU threshold: $(sent)"
+if sent | grep -Fq '内存快不够了'; then fail 'memory told with 60% available'; fi
+printf 'MemTotal: 1000000 kB\nMemAvailable: 400000 kB\n' > "$F/proc/meminfo"; rm -f "$D/five"; : > "$T/sent"; run
+sent | grep -Fq '内存快不够了：只剩 40% 可用' || fail "memory threshold: $(sent)"
+printf 'MemTotal: 1000000 kB\nMemAvailable: 600000 kB\n' > "$F/proc/meminfo"
+sed -i '/^notify_cpu_percent=/d; /^notify_cpu_minutes=/d; /^notify_mem_percent=/d' "$PARAMS_FILE"
+printf 'PASS: only the notifications asked for are sent; the CPU and memory thresholds are parameters.\n'
+
 # The timer: every minute with TG, every 5 minutes for the traffic alert only,
 # gone with neither; quiet in the journal.
 put_file() { [[ ! -e "$1" ]] || [[ "$(cat "$1")" == "$2" ]] || return 1; mkdir -p -- "$(dirname -- "$1")"; printf '%s\n' "$2" > "$1"; }
@@ -187,7 +241,8 @@ reset; check_reconcile
 grep -Fxq 'OnCalendar=*:0/1' "$CHECK_TIMER_FILE" && grep -Fxq 'LogLevelMax=notice' "$CHECK_SERVICE_FILE" && [[ "$(cat "$STATE_ROOT/notify-check")" == "$(notify_check_text)" ]] ||
   fail "timer with TG: $(cat "$CHECK_TIMER_FILE")"
 grep -Fxq 'systemctl enable --now vps-stable-check.timer' "$TEST_ROOT/trace" && grep -Fxq 'adopt check_timer_file' "$TEST_ROOT/trace" || fail "timer not started or adopted: $(cat "$TEST_ROOT/trace")"
-grep -Fq "ExecStart=/usr/bin/timeout 50 /bin/bash $STATE_ROOT/notify-check" "$CHECK_SERVICE_FILE" || fail 'the check is not limited in time'
+# Limited in time; long enough for the acceptance check of the daily summary (60 s).
+grep -Fq "ExecStart=/usr/bin/timeout 110 /bin/bash $STATE_ROOT/notify-check" "$CHECK_SERVICE_FILE" || fail 'the check is not limited in time'
 mv "$STATE_ROOT/notify.conf" "$T/notify.conf.saved"
 reset; check_reconcile
 grep -Fxq 'OnCalendar=*:0/5' "$CHECK_TIMER_FILE" || fail "timer for traffic only: $(cat "$CHECK_TIMER_FILE")"
@@ -195,10 +250,16 @@ rm -f "$STATE_ROOT/quota.conf"
 reset; check_reconcile
 [[ ! -e "$CHECK_TIMER_FILE" && ! -e "$CHECK_SERVICE_FILE" && ! -e "$STATE_ROOT/notify-check" && ! -e "$D" ]] && grep -Fxq 'systemctl disable --now vps-stable-check.timer' "$TEST_ROOT/trace" ||
   fail "timer not taken away: $(cat "$TEST_ROOT/trace")"
-# A unit someone changed stays.
+# A unit someone changed stays; one an earlier version wrote (what this tool
+# last wrote, its text older than this version's) goes.
 mkdir -p "$T/units"; printf '[Timer]\nOnCalendar=hourly\n' > "$CHECK_TIMER_FILE"
+restore_file_ours() { return 1; }
 reset; check_remove
 [[ -f "$CHECK_TIMER_FILE" ]] && grep -q '被改过' "$TEST_ROOT/log" || fail 'a changed unit was removed'
+restore_file_ours() { [[ "$1" == check_timer_file ]]; }
+reset; check_remove
+[[ ! -e "$CHECK_TIMER_FILE" ]] && ! grep -q '被改过' "$TEST_ROOT/log" || fail "the unit an earlier version wrote stayed"
+restore_file_ours() { return 0; }
 rm -f "$CHECK_TIMER_FILE"
 printf 'PASS: the timer runs every minute with TG, every 5 minutes for traffic only, and goes when neither is on.\n'
 
@@ -281,10 +342,12 @@ unset -f active systemctl docker
 printf 'PASS: the Docker line is in force only once Docker started after daemon.json was written.\n'
 
 # The new parameters.
-for good in 'notify_services xray nginx' 'notify_services none' 'quota_alerts 50 100' 'notify_summary_time 23:59' 'notify_disk_percent 80' 'docker_log_files 5'; do
+for good in 'notify_services xray nginx' 'notify_services none' 'quota_alerts 50 100' 'notify_summary_time 23:59' 'notify_disk_percent 80' 'docker_log_files 5' \
+    'notify_summary no' 'notify_summary_check always' 'notify_events all' 'notify_events login console traffic' 'notify_cpu_percent 100' 'notify_cpu_minutes 5' 'notify_mem_percent 50'; do
   param_check ${good%% *} "${good#* }" > /dev/null || fail "refused: $good"
 done
-for bad in 'notify_services x;y' 'quota_alerts 0' 'quota_alerts 101' 'notify_summary_time 24:00' 'notify_disk_percent 100' 'notify_sudo_args maybe' 'docker_log_max_mb 0'; do
+for bad in 'notify_services x;y' 'quota_alerts 0' 'quota_alerts 101' 'notify_summary_time 24:00' 'notify_disk_percent 100' 'notify_sudo_args maybe' 'docker_log_max_mb 0' \
+    'notify_summary maybe' 'notify_summary_check sometimes' 'notify_events login;id' 'notify_events logins' 'notify_cpu_percent 49' 'notify_cpu_minutes 4' 'notify_mem_percent 0' 'notify_mem_percent 51'; do
   if param_check ${bad%% *} "${bad#* }" > /dev/null; then fail "accepted: $bad"; fi
 done
 [[ -n "$(param_caution notify_sudo_args yes)" ]] || fail 'whole sudo commands not explained'

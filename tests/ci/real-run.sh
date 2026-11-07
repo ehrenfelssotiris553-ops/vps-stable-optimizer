@@ -480,6 +480,16 @@ sudo systemctl start vps-stable-check.service
 cat "$LOGS/tg-sent.log"
 grep -Fq 'sudo：runner 运行了 /usr/bin/true' "$LOGS/tg-sent.log" || fail 'a sudo did not reach TG'
 grep -Fq '登录：runner 来自 192.0.2.8' "$LOGS/tg-sent.log" || fail 'a login did not reach TG'
+# The daily summary as the timer sends it, here with the acceptance check's
+# conclusion every day: the service runs vps check for real, within its time.
+sudo sh -c "printf 'notify_summary_time=00:00\nnotify_summary_check=always\n' >> /var/lib/vps-stable-opt/params; printf '1999-01-01\n' > /var/lib/vps-stable-opt/notify/summary-date"
+summary_at=$SECONDS
+sudo systemctl start vps-stable-check.service
+printf 'The check with the daily summary took %s s.\n' "$((SECONDS - summary_at))"
+cat "$LOGS/tg-sent.log"
+grep -Fq '每日汇总（过去 24 小时）' "$LOGS/tg-sent.log" || fail 'no daily summary reached TG'
+grep -Eq '^验收：[0-9]+ 项正常，[0-9]+ 项未生效' "$LOGS/tg-sent.log" || fail 'the daily summary has no conclusion of the acceptance check'
+sudo sed -i '/^notify_summary_time=/d; /^notify_summary_check=/d' /var/lib/vps-stable-opt/params
 # As root: the CI user may not read the system journal (an empty answer then proves nothing).
 # shellcheck disable=SC2024
 sudo journalctl -u vps-stable-check.service --since "$check_started" --no-pager -q > "$LOGS/check-journal.log" 2>&1 || true

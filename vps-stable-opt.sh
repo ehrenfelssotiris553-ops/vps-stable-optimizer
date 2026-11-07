@@ -2054,8 +2054,14 @@ param_list() {
     f2b_bantime_min fail2ban 'Fail2ban 首次封禁时长' 分钟 \
     f2b_increment fail2ban 'Fail2ban 再犯加倍' '' \
     f2b_maxtime_days fail2ban 'Fail2ban 最长封禁时长' 天 \
+    notify_summary notify 'TG 每日汇总' '' \
     notify_summary_time notify 'TG 每日汇总的时间' '' \
+    notify_summary_check notify '每日汇总附上验收结论' '' \
+    notify_events notify 'TG 要发的提醒' '' \
     notify_disk_percent notify '系统盘用到多少时提醒' % \
+    notify_mem_percent notify '可用内存低于多少时提醒' % \
+    notify_cpu_percent notify 'CPU 占用到多少算吃满' % \
+    notify_cpu_minutes notify 'CPU 吃满多久才提醒' 分钟 \
     notify_sudo_args notify 'sudo 通知里显示整条命令' '' \
     notify_services notify '停了要提醒的服务' '' \
     quota_alerts quota '流量到额度的百分之几时提醒' '' \
@@ -2063,10 +2069,15 @@ param_list() {
     docker_log_files dockerlog '每个容器保留的日志文件数' 个
 }
 
+# The TG notifications that can be switched one by one (notify_events).
+notify_event_names() {
+  printf '%s' 'boot（开机重启）、login（登录）、console（服务商控制台登录）、account（新建账户和改密码）、sudo、oom（内存不够杀进程）、package（装删软件包）、key（加公钥）、port（新开端口）、autostart（开机自启和定时任务）、cpu、disk（系统盘）、memory（内存）、reboot（等重启）、service（盯的服务）、traffic（流量）'
+}
+
 # NAME: "int" (a whole number) or "word" (one of a few names).
 param_kind() {
   case "$1" in
-    zram_algorithm|apt_upgrade_time|tools_list|f2b_increment|notify_summary_time|notify_sudo_args|notify_services|quota_alerts) echo word ;;
+    zram_algorithm|apt_upgrade_time|tools_list|f2b_increment|notify_summary|notify_summary_time|notify_summary_check|notify_events|notify_sudo_args|notify_services|quota_alerts) echo word ;;
     *) echo int ;;
   esac
 }
@@ -2104,8 +2115,14 @@ param_recommended() {
     f2b_bantime_min) echo 60 ;;
     f2b_increment) echo yes ;;
     f2b_maxtime_days) echo 7 ;;
+    notify_summary) echo yes ;;
     notify_summary_time) echo 09:00 ;;
+    notify_summary_check) echo issues ;;
+    notify_events) echo all ;;
     notify_disk_percent) echo 90 ;;
+    notify_mem_percent) echo 5 ;;
+    notify_cpu_percent) echo 90 ;;
+    notify_cpu_minutes) echo 10 ;;
     notify_sudo_args) echo no ;;
     notify_services) echo none ;;
     quota_alerts) echo '80 90 100' ;;
@@ -2143,8 +2160,14 @@ param_reason() {
     f2b_bantime_min) echo '首次封 1 小时：自己输错了等一会儿还能登录，猜密码的程序多半就换别的目标了。' ;;
     f2b_increment) echo 'yes：同一个 IP 再犯，封禁时间加倍（1 小时、2 小时、4 小时……），反复来的越封越久。封禁历史至少保留 7 天，才认得出再犯。' ;;
     f2b_maxtime_days) echo '最长封 7 天：反复来的扫描基本挡住了，又不会把以后分给别人的 IP 一直封着。' ;;
+    notify_summary) echo 'yes：每天发一条汇总（登录、失败的登录、封禁、硬盘、内存、流量）。不想每天收到就改成 no，其他提醒照常发。' ;;
     notify_summary_time) echo '每天 09:00（服务器时间）发前一天的汇总：登录、失败的登录、封禁、硬盘、内存、流量。' ;;
+    notify_summary_check) echo 'issues：发汇总前跑一次开荒验收（只读，几秒钟），有项目未生效时把结论和这几项附上；always 每天都附；never 不附，也不跑验收。' ;;
+    notify_events) printf '%s\n' "all：下面这些都发。只想收其中几类就写它们的名字，用空格隔开：$(notify_event_names)。" ;;
     notify_disk_percent) echo '用到 90% 提醒：还来得及清理；再晚满了会出各种奇怪的错误。' ;;
+    notify_mem_percent) echo '可用内存低于总内存的 5% 时提醒：再少就可能有进程被杀。回到这个数加 10 以上才算恢复，免得来回提醒。' ;;
+    notify_cpu_percent) echo '90%：跑任务时短时间吃满很正常，持续吃满才值得看一眼。降到这个数减 20 以下才算恢复，免得来回提醒。' ;;
+    notify_cpu_minutes) echo '10 分钟：吃满这么久才提醒（每 5 分钟看一次，按 5 分钟往上取整）。' ;;
     notify_sudo_args) echo 'no：只说运行了哪个程序。整条命令里可能有密码，发到 Telegram 就收不回来了。' ;;
     notify_services) echo 'none：不盯任何服务。写上你自己的服务名（例如 xray nginx，用空格隔开），它们停了、恢复了都会提醒。' ;;
     quota_alerts) echo '用到 80%、90%、100% 各提醒一次：有时间换套餐或者省着用。数字以服务商面板为准。' ;;
@@ -2209,12 +2232,37 @@ param_check() {
     f2b_maxtime_days)
       if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 1 && 10#$2 <= 365)); then return 0; fi
       echo '请输入 1 到 365 之间的整数（天）。' ;;
+    notify_summary)
+      case "$2" in yes|no) return 0 ;; esac
+      echo '请输入 yes（每天发汇总）或 no（不发）。' ;;
     notify_summary_time)
       if [[ "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then return 0; fi
       echo '请输入 24 小时制的时间，例如 09:00。' ;;
+    notify_summary_check)
+      case "$2" in always|issues|never) return 0 ;; esac
+      echo '请输入 always（每天都附）、issues（有问题时才附）或 never（不附）。' ;;
+    notify_events)
+      local event known count=0
+      [[ "$2" == all ]] && return 0
+      known=" $(notify_event_names | sed 's/（[^）]*）//g; s/、/ /g') "
+      for event in $2; do
+        count=$((count + 1))
+        [[ "$known" == *" $event "* ]] || { echo "不认识的提醒：$event（可以写：$(notify_event_names)，或者 all）"; return 1; }
+      done
+      if ((count >= 1 && count <= 20)); then return 0; fi
+      echo '请输入 all，或者要发的提醒的名字（用空格隔开）。' ;;
     notify_disk_percent)
       if [[ "$2" =~ ^[0-9]{2}$ ]] && ((10#$2 >= 50 && 10#$2 <= 99)); then return 0; fi
       echo '请输入 50 到 99 之间的整数（%）。' ;;
+    notify_mem_percent)
+      if [[ "$2" =~ ^[0-9]{1,2}$ ]] && ((10#$2 >= 1 && 10#$2 <= 50)); then return 0; fi
+      echo '请输入 1 到 50 之间的整数（%）。' ;;
+    notify_cpu_percent)
+      if [[ "$2" =~ ^[0-9]{2,3}$ ]] && ((10#$2 >= 50 && 10#$2 <= 100)); then return 0; fi
+      echo '请输入 50 到 100 之间的整数（%）。' ;;
+    notify_cpu_minutes)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 5 && 10#$2 <= 120)); then return 0; fi
+      echo '请输入 5 到 120 之间的整数（分钟）。' ;;
     notify_sudo_args)
       case "$2" in yes|no) return 0 ;; esac
       echo '请输入 yes（显示整条命令）或 no（只显示程序）。' ;;
@@ -2287,6 +2335,14 @@ param_caution() {
       if ((10#$2 > 30)); then echo '超过 30 天：这个 IP 以后分给别人，别人也连不上；封禁历史也要保留这么久，数据库会大一些。'; fi ;;
     notify_sudo_args)
       if [[ "$2" == yes ]]; then echo '整条命令会发到 Telegram：命令里带密码或 Token 时（例如 mysql -p密码），它们也会发出去，而且收不回来。'; fi ;;
+    notify_summary)
+      if [[ "$2" == no ]]; then echo '不发每日汇总：失败的登录次数只在汇总里报，关掉就看不到了（Fail2ban 照常封）。'; fi ;;
+    notify_events)
+      if [[ "$2" != all && " $2 " != *' login '* ]]; then echo '不发登录提醒：有人登录（包括第一次出现的 IP）你不会马上知道。'; fi ;;
+    notify_mem_percent)
+      if ((10#$2 > 20)); then echo '超过 20%：内存还很宽裕时也会提醒。'; fi ;;
+    notify_cpu_percent)
+      if ((10#$2 < 70)); then echo '低于 70%：正常跑任务时也会经常提醒。'; fi ;;
     docker_log_max_mb)
       if ((10#$2 < 2)); then echo '太小：日志轮换得很快，出了问题往回看不到多少。'; fi ;;
   esac
@@ -5992,10 +6048,15 @@ param() {
 clean() { LC_ALL=C tr -d '\000-\037\177' | cut -c1-"${1:-120}"; }
 when() { date -d "@$1" '+%m-%d %H:%M' 2>/dev/null || echo '?'; }
 tg=0; [ -s "$conf" ] && tg=1
-# TEXT: queued for TG (newlines kept as one line), at most 200 waiting.
+# NAME DEFAULT: a whole-number parameter (DEFAULT for anything else).
+num() { v="$(param "$1" "$2")"; case "$v" in ''|*[!0-9]*) v="$2" ;; esac; printf '%s' "$v"; }
+events=" $(param notify_events all) "
+# KIND TEXT: queued for TG (newlines kept as one line) when that kind of
+# notification is wanted ("-" always is), at most 200 waiting.
 queue() {
   [ "$tg" = 1 ] || return 0
-  { printf '%s' "$1" | tr '\n' "$us"; echo; } >> "$dir/queue"
+  case "$1" in -) ;; *) case "$events" in *' all '*|*" $1 "*) ;; *) return 0 ;; esac ;; esac
+  { printf '%s' "$2" | tr '\n' "$us"; echo; } >> "$dir/queue"
   if [ "$(wc -l < "$dir/queue")" -gt 200 ]; then tail -n 200 "$dir/queue" > "$dir/queue.new" && mv -f "$dir/queue.new" "$dir/queue"; fi; }
 # Each message one request; the token goes in through stdin, never on the
 # command line. Sent ones leave the queue at once, so a run cut short never
@@ -6044,7 +6105,7 @@ say_method() { case "$1" in publickey) echo 密钥 ;; password|keyboard-interact
 # Started again since the last run.
 boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 if [ -f "$dir/boot" ] && [ "$(cat "$dir/boot")" != "$boot" ]; then
-  queue "开机了：上次检查在 $(when "$(cat "$dir/last-run" 2>/dev/null || echo 0)")，之后关机或重启过。"
+  queue boot "开机了：上次检查在 $(when "$(cat "$dir/last-run" 2>/dev/null || echo 0)")，之后关机或重启过。"
 fi
 printf '%s\n' "$boot" > "$dir/boot"
 
@@ -6067,16 +6128,16 @@ if [ "$tg" = 1 ]; then
     while IFS="$tab" read -r t u from m _ n; do
       u="$(printf '%s' "$u" | clean 32)" from="$(printf '%s' "$from" | clean 64)"
       case "$from" in
-        console:*) queue "服务商控制台登录：$u（${from#console:}，$(when "$t")）。不是你登录的，先改服务商面板的密码。" ;;
-        *) if [ "$n" = 1 ]; then queue "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）
+        console:*) queue console "服务商控制台登录：$u（${from#console:}，$(when "$t")）。不是你登录的，先改服务商面板的密码。" ;;
+        *) if [ "$n" = 1 ]; then queue login "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）
 ⚠ 第一次从这个 IP 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 7 安全排查。"
-           else queue "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）"; fi ;;
+           else queue login "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）"; fi ;;
       esac
     done < "$dir/logins.new"
   else
     journal_new logins -t sshd -t sshd-session | awk -F'\t' '{split($3, f, " "); if (f[1] == "Accepted" && f[3] == "for" && f[5] == "from") print f[4] "\t" f[6] "\t" f[2]}' |
       while IFS="$tab" read -r u from m; do
-        queue "登录：$(printf '%s' "$u" | clean 32) 来自 $(printf '%s' "$from" | clean 64)（$(say_method "$m")）"
+        queue login "登录：$(printf '%s' "$u" | clean 32) 来自 $(printf '%s' "$from" | clean 64)（$(say_method "$m")）"
       done
   fi
 fi
@@ -6087,15 +6148,15 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge 290 ]; then
   printf '%s\n' "$now" > "$dir/five"
   journal_new events -t useradd -t passwd -t chpasswd -t sudo -t kernel -t sshd -t sshd-session > "$dir/events"
   awk -F'\t' '$2 == "useradd" && $3 ~ /^new user: name=/ {s = $3; sub(/^new user: name=/, "", s); sub(/,.*/, "", s); print s}' "$dir/events" | sort -u |
-    while read -r u; do queue "新建了账户：$(printf '%s' "$u" | clean 32)"; done
+    while read -r u; do queue account "新建了账户：$(printf '%s' "$u" | clean 32)"; done
   awk -F'\t' '($2 == "passwd" || $2 == "chpasswd") && $3 ~ /password changed for/ {s = $3; sub(/.*password changed for /, "", s); sub(/ .*/, "", s); print s}' "$dir/events" | sort -u |
-    while read -r u; do queue "改了密码：账户 $(printf '%s' "$u" | clean 32)"; done
+    while read -r u; do queue account "改了密码：账户 $(printf '%s' "$u" | clean 32)"; done
   # sudo: the program only, unless asked for the whole command (it can hold a password).
   awk -F'\t' -v full="$(param notify_sudo_args no)" '$2 == "sudo" && index($3, "COMMAND=") {u = $3; sub(/ *:.*/, "", u); c = substr($3, index($3, "COMMAND=") + 8); if (full != "yes") sub(/ .*/, "", c); n[u " 运行了 " c]++}
     END {for (k in n) print k (n[k] > 1 ? "（" n[k] " 次）" : "")}' "$dir/events" | head -n 10 |
-    while IFS= read -r line; do queue "sudo：$(printf '%s' "$line" | clean 200)"; done
+    while IFS= read -r line; do queue sudo "sudo：$(printf '%s' "$line" | clean 200)"; done
   awk -F'\t' '$2 == "kernel" && $3 ~ /Out of memory: Killed process/ {s = $3; sub(/.*Killed process [0-9]+ \(/, "", s); sub(/\).*/, "", s); print s}' "$dir/events" | sort -u |
-    while read -r p; do queue "内存不够：系统杀掉了进程 $(printf '%s' "$p" | clean 40)。"; done
+    while read -r p; do queue oom "内存不够：系统杀掉了进程 $(printf '%s' "$p" | clean 40)。"; done
   failed="$(awk -F'\t' '($2 == "sshd" || $2 == "sshd-session") && $3 ~ /^(Failed password|Invalid user)/' "$dir/events" | wc -l)"
   printf '%s\n' $(($(cat "$dir/failed" 2>/dev/null || echo 0) + failed)) > "$dir/failed"
   # Packages put on or taken off.
@@ -6103,7 +6164,7 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge 290 ]; then
   [ "$size" -ge "$off" ] || off=0
   tail -c +$((off + 1)) /var/log/dpkg.log 2>/dev/null | awk '$3 == "install" || $3 == "remove" || $3 == "purge" {sub(/:.*/, "", $4); w[$3] = w[$3] " " $4}
     END {if (w["install"] != "") print "装了软件包：" substr(w["install"], 2); if (w["remove"] w["purge"] != "") print "删了软件包：" substr(w["remove"] w["purge"], 2)}' |
-    while IFS= read -r line; do queue "$(printf '%s' "$line" | clean 300)"; done
+    while IFS= read -r line; do queue package "$(printf '%s' "$line" | clean 300)"; done
   printf '%s\n' "$size" > "$dir/dpkg.off"
   # Keys that can log in, listening ports, things that start by themselves.
   keys() {
@@ -6113,23 +6174,24 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge 290 ]; then
         [ -f "$f" ] && ssh-keygen -l -f "$f" 2>/dev/null | awk -v a="$name" '$2 ~ /^SHA256:/ {c = $3; print a " " $2 " " c}'
       done
     done; }
-  new_lines keys keys | while read -r a fp c; do queue "加了公钥：账户 $(printf '%s' "$a" | clean 32)，$fp（$(printf '%s' "$c" | clean 60)）"; done
+  new_lines keys keys | while read -r a fp c; do queue key "加了公钥：账户 $(printf '%s' "$a" | clean 32)，$fp（$(printf '%s' "$c" | clean 60)）"; done
   ports() { ss -H -tulpn | awk '$5 !~ /^(127\.|\[::1\]|::1)/ {n = split($5, a, ":"); match($0, /\("[^"]*"/); p = substr($0, RSTART + 2, RLENGTH - 3); print a[n] "/" $1 (p != "" ? "（" p "）" : "")}'; }
-  new_lines ports ports | while read -r p; do queue "新开了端口：$(printf '%s' "$p" | clean 60)"; done
+  new_lines ports ports | while read -r p; do queue port "新开了端口：$(printf '%s' "$p" | clean 60)"; done
   autostart() {
     find /etc/systemd/system -maxdepth 2 \( -name '*.service' -o -name '*.timer' \) ! -name 'vps-stable-*' -printf '%p\n'
     find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron/crontabs -maxdepth 1 -type f -printf '%p\n'; }
-  new_lines autostart autostart | head -n 10 | while read -r p; do queue "新加了开机自启或定时任务：$(printf '%s' "$p" | clean 120)"; done
-  # The CPU busy for 10 minutes and more (two checks in a row).
+  new_lines autostart autostart | head -n 10 | while read -r p; do queue autostart "新加了开机自启或定时任务：$(printf '%s' "$p" | clean 120)"; done
+  # The CPU busy for a while (that many checks in a row, one every 5 minutes).
   set -- $(awk '$1 == "cpu" {print $2 + $3 + $4 + $6 + $7 + $8 + $9, $5}' /proc/stat)
   busy="$1" idle="$2"
+  cpu_pct="$(num notify_cpu_percent 90)" cpu_runs=$((($(num notify_cpu_minutes 10) + 4) / 5))
   if read -r b0 i0 2>/dev/null < "$dir/cpu" && [ $((busy + idle - b0 - i0)) -gt 0 ]; then
     pct=$(((busy - b0) * 100 / (busy + idle - b0 - i0)))
     hot="$(cat "$dir/cpu-hot" 2>/dev/null || echo 0)"
-    if [ "$pct" -ge 90 ]; then hot=$((hot + 1)); elif [ "$pct" -lt 70 ]; then hot=0; fi
+    if [ "$pct" -ge "$cpu_pct" ]; then hot=$((hot + 1)); elif [ "$pct" -lt $((cpu_pct - 20)) ]; then hot=0; fi
     printf '%s\n' "$hot" > "$dir/cpu-hot"
-    if once cpu [ "$hot" -ge 2 ]; then
-      queue "CPU 已经连续 10 分钟以上被吃满（${pct}%）。最忙的进程：$(ps -eo comm=,pid= --sort=-pcpu | head -n 1 | clean 40)"
+    if once cpu [ "$hot" -ge "$cpu_runs" ]; then
+      queue cpu "CPU 已经连续 $((cpu_runs * 5)) 分钟以上占用 ${cpu_pct}% 以上（现在 ${pct}%）。最忙的进程：$(ps -eo comm=,pid= --sort=-pcpu | head -n 1 | clean 40)"
     fi
   fi
   printf '%s %s\n' "$busy" "$idle" > "$dir/cpu"
@@ -6138,14 +6200,15 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge 290 ]; then
   disk="$(df -P / | awk 'NR == 2 {sub(/%/, "", $5); print $5}')"
   # Told once; again only after it went well below the line (no repeats while it hovers).
   if [ "${disk:-0}" -ge "$limit" ] && [ ! -f "$dir/flag-disk" ]; then
-    : > "$dir/flag-disk"; queue "系统盘快满了：已用 ${disk}%。满了会出各种奇怪的错误，先清理日志、备份和不用的文件。"
+    : > "$dir/flag-disk"; queue disk "系统盘快满了：已用 ${disk}%。满了会出各种奇怪的错误，先清理日志、备份和不用的文件。"
   elif [ "${disk:-0}" -lt $((limit - 5)) ]; then rm -f "$dir/flag-disk"; fi
   mem="$(awk '$1 == "MemTotal:" {t = $2} $1 == "MemAvailable:" {a = $2} END {printf "%d", a * 100 / t}' /proc/meminfo)"
-  if [ "${mem:-100}" -lt 5 ] && [ ! -f "$dir/flag-memory" ]; then
-    : > "$dir/flag-memory"; queue "内存快不够了：只剩 ${mem}% 可用，再多一点就可能有进程被杀。"
-  elif [ "${mem:-100}" -ge 15 ]; then rm -f "$dir/flag-memory"; fi
+  mem_pct="$(num notify_mem_percent 5)"
+  if [ "${mem:-100}" -lt "$mem_pct" ] && [ ! -f "$dir/flag-memory" ]; then
+    : > "$dir/flag-memory"; queue memory "内存快不够了：只剩 ${mem}% 可用，再多一点就可能有进程被杀。"
+  elif [ "${mem:-100}" -ge $((mem_pct + 10)) ]; then rm -f "$dir/flag-memory"; fi
   if once reboot [ -f /var/run/reboot-required ]; then
-    queue "有更新要重启才生效：$(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null | clean 120)。方便时 vps 选 8 重启。"
+    queue reboot "有更新要重启才生效：$(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null | clean 120)。方便时 vps 选 8 重启。"
   fi
   # The services you named.
   for unit in $(param notify_services none); do
@@ -6153,8 +6216,8 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge 290 ]; then
     unit="$(printf '%s' "$unit" | tr -cd 'A-Za-z0-9@._-')"
     st="$(systemctl is-active "$unit" 2>/dev/null)"
     was="$(cat "$dir/service-$unit" 2>/dev/null || echo "$st")"
-    if [ "$was" = active ] && [ "$st" != active ]; then queue "服务停了：$unit（现在是 ${st:-unknown}）"; fi
-    if [ "$was" != active ] && [ "$st" = active ]; then queue "服务恢复了：$unit"; fi
+    if [ "$was" = active ] && [ "$st" != active ]; then queue service "服务停了：$unit（现在是 ${st:-unknown}）"; fi
+    if [ "$was" != active ] && [ "$st" = active ]; then queue service "服务恢复了：$unit"; fi
     printf '%s\n' "$st" > "$dir/service-$unit"
   done
 fi
@@ -6182,7 +6245,7 @@ if [ -s "$tconf" ]; then
     [ "$drx" -ge 0 ] || drx="$rx"; [ "$dtx" -ge 0 ] || dtx="$tx"
     arx=$((arx + drx)) atx=$((atx + dtx))
     if [ "$p0" != "$period" ]; then
-      queue "新的流量周期从 $period 开始；上个周期用了 $(cat "$dir/traffic-used" 2>/dev/null || echo '?') MB。"
+      queue traffic "新的流量周期从 $period 开始；上个周期用了 $(cat "$dir/traffic-used" 2>/dev/null || echo '?') MB。"
       arx=0 atx=0; rm -f "$dir"/flag-traffic-*; sed -i '/^used_mb=/d' "$tconf"
     fi
   else p0="$period" arx=0 atx=0; fi
@@ -6193,16 +6256,17 @@ if [ -s "$tconf" ]; then
   printf '%s\n' "$used" > "$dir/traffic-used"
   for p in $(param quota_alerts '80 90 100' | tr -cd '0-9 '); do
     if [ $((used * 100)) -ge $((quota * p)) ] && once "traffic-$p" true; then
-      queue "流量提醒：这个周期（从 $period 起）已用 $used MB，到了额度 $quota MB 的 ${p}%。数字以服务商面板为准。"
+      queue traffic "流量提醒：这个周期（从 $period 起）已用 $used MB，到了额度 $quota MB 的 ${p}%。数字以服务商面板为准。"
     fi
   done
 fi
 
-# Once a day: the summary, with the failed logins (never sent one by one).
+# Once a day: the summary (unless switched off), with the failed logins
+# (never sent one by one) and, as chosen, an acceptance check's conclusion.
 at="$(param notify_summary_time 09:00)"
 today="$(date +%F)"
 if [ "$tg" = 1 ] && [ "$(cat "$dir/summary-date" 2>/dev/null)" != "$today" ] && [[ ! "$(date +%H:%M)" < "$at" ]]; then
-  if [ "$first" = 0 ] && [ -f "$dir/summary-date" ]; then
+  if [ "$first" = 0 ] && [ -f "$dir/summary-date" ] && [ "$(param notify_summary yes)" != no ]; then
     logins="$(awk -F'\t' -v t=$((now - 86400)) 'NF == 6 && $1 > t {n++; ip[$3] = 1} END {c = 0; for (i in ip) c++; printf "%d 次（%d 个 IP）", n, c}' "$state/logins" 2>/dev/null)"
     bans="$(fail2ban-client get sshd banip 2>/dev/null | wc -w)"
     disk="$(df -P / | awk 'NR == 2 {print $5}')"
@@ -6213,7 +6277,25 @@ if [ "$tg" = 1 ] && [ "$(cat "$dir/summary-date" 2>/dev/null)" != "$today" ] && 
 系统盘已用 $disk，内存已用 $mem，已运行 $(awk '{printf "%d", $1 / 86400}' /proc/uptime) 天"
     if [ -s "$dir/traffic-used" ]; then line="$line
 本周期流量：$(cat "$dir/traffic-used") MB / $(setting quota_mb "$tconf") MB"; fi
-    queue "$line"
+    # The acceptance check (read-only): every day, only when an item failed, or never.
+    with="$(param notify_summary_check issues)"
+    if [ "$with" = always ] || [ "$with" = issues ]; then
+      out="$(timeout 60 /bin/bash '@MAIN@' check < /dev/null 2>&1)"; rc=$?
+      out="$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')"
+      if [ "$with" = always ] || [ "$rc" = 3 ]; then
+        line="$line
+验收：$(printf '%s\n' "$out" | sed -n 's/^结论：//p' | head -n 1 | clean 200)"
+        [ -n "$(printf '%s\n' "$out" | sed -n 's/^结论：//p')" ] || line="${line}没有得到结果（退出码 $rc）"
+        fails="$(printf '%s\n' "$out" | awk '/^需要你看一下：$/ {f = 1; next} f && /^  / {print; next} f {exit}' | grep -F '未生效' | head -n 5)"
+        while IFS= read -r f; do
+          [ -n "$f" ] && line="$line
+$(printf '%s' "$f" | sed 's/^ *//' | clean 160)"
+        done <<EOF
+$fails
+EOF
+      fi
+    fi
+    queue - "$line"
   fi
   printf '0\n' > "$dir/failed"
   printf '%s\n' "$today" > "$dir/summary-date"
@@ -6227,7 +6309,7 @@ CHECK
 
 check_service_text() {
   printf '%s\n' '# VPS Stable Optimizer v2.8: the notification and traffic check' '[Unit]' 'Description=VPS Stable Optimizer check' '[Service]' 'Type=oneshot' \
-    "ExecStart=/usr/bin/timeout 50 /bin/bash $STATE_ROOT/notify-check" 'Nice=10' 'IOSchedulingClass=idle' \
+    "ExecStart=/usr/bin/timeout 110 /bin/bash $STATE_ROOT/notify-check" 'Nice=10' 'IOSchedulingClass=idle' \
     '# It runs every minute or five: nothing of it in the journal.' 'LogLevelMax=notice'
 }
 
@@ -6267,11 +6349,14 @@ check_remove() {
   if [[ "$(systemctl is-enabled vps-stable-check.timer 2>/dev/null || true)" == enabled ]] || systemctl is-active -q vps-stable-check.timer 2>/dev/null; then
     systemctl disable --now vps-stable-check.timer >/dev/null 2>&1 || warn '检查定时任务没能停下。'
   fi
-  for file in "$CHECK_TIMER_FILE" "$CHECK_SERVICE_FILE" "$STATE_ROOT/notify-check"; do
+  # The text this version writes, or what this tool last wrote (an earlier
+  # version's, after an upgrade): anything else was changed by someone.
+  for id in check_timer_file check_service_file check_script_file; do
+    file="$(restore_path "$id")" || continue
     [[ -f "$file" ]] || continue
     case "$(cat -- "$file")" in
       "$(check_timer_text 1)"|"$(check_timer_text 5)"|"$(check_service_text)"|"$(notify_check_text)") rm -f -- "$file" ;;
-      *) warn "$file 被改过，保持不变。" ;;
+      *) if restore_file_ours "$id"; then rm -f -- "$file"; else warn "$file 被改过，保持不变。"; fi ;;
     esac
   done
   systemctl daemon-reload >/dev/null 2>&1 || true

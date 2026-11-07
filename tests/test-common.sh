@@ -36,3 +36,6 @@ load_optimizer_functions() {
     eval "$definition"
   done
 }
+# The TG notification names, which the parameter checks (loaded by many tests)
+# use; quiet when the script under test has none (an older one).
+load_optimizer_functions notify_event_names 2>/dev/null || true
