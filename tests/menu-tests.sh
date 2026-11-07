@@ -79,11 +79,12 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
   menu_action() { printf '%s\n' "$2" >> "$TEST_ROOT/menu-actions"; }
   : > "$TEST_ROOT/menu-actions"
   # 1 opens the read-only checks: 1 the plan, 2 performance, 3 resources.
-  { printf '1\n1\n\n'; for n in $(seq 2 14) 15; do printf '%s\n\n' "$n"; done; printf '1\n2\n\n1\n3\n\n1\n\n'; } > "$TEST_ROOT/menu-input"
+  # 7 opens the security audit (1) and the login record (2).
+  { printf '1\n1\n\n'; for n in $(seq 2 14) 15; do if ((n == 7)); then printf '7\n1\n\n'; else printf '%s\n\n' "$n"; fi; done
+    printf '1\n2\n\n1\n3\n\n1\n\n7\n2\n\n7\n\n'; } > "$TEST_ROOT/menu-input"
   printf '0\n' >> "$TEST_ROOT/menu-input"
   menu < "$TEST_ROOT/menu-input" > "$TEST_ROOT/menu-out"
-  # 7 is the security audit.
-  expected='plan setup check port item bans audit reboot firewall ssh records rollback uninstall update perf resources '
+  expected='plan setup check port item bans audit reboot firewall ssh records rollback uninstall update perf resources logins '
   [[ "$(tr '\n' ' ' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' ' ' < "$TEST_ROOT/menu-actions")"
   if grep -Fq '还在开发中' "$TEST_ROOT/menu-out"; then fail '7 still says the security audit is to come'; fi
   grep -Fq '无效选项，请输入 0 至 14 或 h' "$TEST_ROOT/menu-out" || fail 'number 15 not rejected'

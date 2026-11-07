@@ -330,6 +330,13 @@ cat "$LOGS/audit.log"
 has audit '结论：'
 # A fresh cloud image with only this tool on it: anything "suspect" is a false alarm.
 if grep -F '✖ 可疑' "$LOGS/audit.log"; then fail 'the audit calls something on a clean image suspect (listed above)'; fi
+# The login record of the recommended set, read back: root's key logins from
+# outside (QEMU's user network shows them from 10.0.2.2), and a summary.
+vm 'vps logins 5' > "$LOGS/logins.log" 2>&1 || fail "vps logins exited with $?"
+cat "$LOGS/logins.log"
+has logins '来源：本工具的登录记录'
+has logins 'root 来自 10.0.2.2（密钥）'
+grep -Eq '^  10\.0\.2\.2：[0-9]+ 次，最后一次 ' "$LOGS/logins.log" || fail 'vps logins has no summary for 10.0.2.2'
 endgroup
 
 group 'SSH with the listening socket only (as right after an OpenSSH update)'

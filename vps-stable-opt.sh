@@ -119,7 +119,7 @@ CHECK_TIMER_FILE=/etc/systemd/system/vps-stable-check.timer
 DOCKER_DAEMON_FILE=/etc/docker/daemon.json
 NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE='' SSHPORT_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|audit|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|audit|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
@@ -129,6 +129,7 @@ VPS 机器管家 V2.8.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
   vps perf       性能体检（只读）：CPU 是否被抢、内存和硬盘压力、换页、网络重传、连接跟踪
   vps resources  资源占用一览（只读）：常驻服务各占多少内存和 CPU、能不能关、封禁规则多少
   vps audit      安全排查（只读）：谁登录过、账户和公钥、装过什么、正在运行什么、开机自启和定时任务、系统文件
+  vps logins [N] 查看登录记录（只读）：最近 N 次登录（默认 30），第一次出现的 IP 标红，再按 IP 汇总
   vps setup      一键开荒：更新系统并优化机器（可选推荐设置，一次问完）
   vps check      开荒验收：逐项检查优化是否真的生效（适合重启后运行）
   vps port       端口管理；也可直接用：
@@ -2821,6 +2822,66 @@ login_stage() {
 login_recent() {
   [[ -f "$STATE_ROOT/logins" && ! -L "$STATE_ROOT/logins" ]] || return 0
   tail -n "${1:-20}" -- "$STATE_ROOT/logins" | awk -F'\t' 'NF == 6 && $1 ~ /^[0-9]+$/'
+}
+
+# vps logins [N] (menu 7 → 2, and the login item's 3): read-only.
+logins_main() {
+  local n="${MODE_ARGS[0]:-30}"
+  [[ $EUID -eq 0 ]] || die '登录记录只有 root 能读：请用 sudo vps logins。'
+  if [[ ! "$n" =~ ^[0-9]{1,4}$ ]] || ((10#$n < 1 || 10#$n > 1000)); then die '用法：vps logins [条数，1 到 1000，默认 30]'; fi
+  logins_show "$((10#$n))"
+}
+
+# [N]: the last N logins, newest first, then every address with its count.
+# From the login record; without it, the SSH logins the journal still has
+# (console logins are not there). Every field is cleaned before it is shown.
+logins_show() {
+  local n="${1:-30}" lines source total when user from method kind new where how mark
+  say '登录记录'
+  if [[ -s "$STATE_ROOT/logins" ]]; then
+    lines="$(login_recent 20000)" source='本工具的登录记录'
+  else
+    lines="$(journalctl -q _UID=0 -t sshd -t sshd-session -o short-unix --no-pager 2>/dev/null |
+      awk '$4 == "Accepted" && $6 == "for" && $8 == "from" {sub(/\..*/, "", $1); print $1 "\t" $7 "\t" $9 "\t" $5 "\tssh\t0"}' || true)"
+    source='系统日志'
+    if login_pam_enabled; then echo '登录记录开着，但还没有记下登录。下面是系统日志里还在的 SSH 登录。'
+    else echo '登录记录没开（单项设置第 26 项「登录记录和提醒」，开了以后保存一年，服务商控制台的登录也记）。下面是系统日志里还在的 SSH 登录，日志删到哪里就只能查到哪里。'; fi
+  fi
+  lines="$(awk -F'\t' 'NF == 6 && $1 ~ /^[0-9]+$/' <<< "$lines")"
+  if [[ -z "$lines" ]]; then ok "没有找到登录（来源：$source）。"; return 0; fi
+  total="$(grep -c . <<< "$lines")"
+  printf '最近 %s 次登录，新的在前（一共 %s 次；来源：%s）：\n' "$((n < total ? n : total))" "$total" "$source"
+  while IFS=$'\t' read -r when user from method kind new; do
+    user="$(tr -cd 'A-Za-z0-9._-' <<< "$user" | cut -c1-32)"
+    from="$(tr -cd 'A-Za-z0-9.:/_-' <<< "$from" | cut -c1-64)"
+    case "$method" in publickey) how=密钥 ;; password|keyboard-interactive) how=密码 ;; console) how=控制台 ;; *) how=其他方式 ;; esac
+    if [[ "$kind" == console ]]; then where="服务商控制台（${from#console:}）"; else where="来自 $from"; fi
+    mark=''
+    if [[ "$new" == 1 && "$kind" != console ]]; then
+      if [[ -f "$STATE_ROOT/known" ]] && grep -Fxq -- "ip $from" "$STATE_ROOT/known"; then mark='（第一次出现，已标记为正常）'
+      else mark="${C_FAIL-}  ← 第一次从这个 IP 登录${C_RESET-}"; fi
+    fi
+    printf '  %s  %s %s（%s）%s\n' "$(date -d "@$when" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')" "${user:-?}" "$where" "$how" "$mark"
+  done < <(tail -n "$n" <<< "$lines" | tac)
+  echo '按 IP 汇总（最后一次登录新的在前，最多 20 个）：'
+  awk -F'\t' '
+    $5 == "ssh" {ip = $3; c[ip]++; if ($1 > l[ip]) l[ip] = $1; if (!(ip in f) || $1 < f[ip]) f[ip] = $1
+      if (index(" " u[ip] " ", " " $2 " ") == 0) u[ip] = u[ip] " " $2
+      if (index(" " m[ip] " ", " " $4 " ") == 0) m[ip] = m[ip] " " $4}
+    $5 == "console" {cc++; if ($1 > cl) cl = $1}
+    END {for (ip in c) print l[ip] "\t" ip "\t" c[ip] "\t" f[ip] "\t" substr(u[ip], 2) "\t" substr(m[ip], 2)
+      if (cc) print cl "\tconsole\t" cc "\t-\t-\t-"}' <<< "$lines" | sort -t $'\t' -k1,1nr | head -n 20 |
+    while IFS=$'\t' read -r when from total new user method; do
+      if [[ "$from" == console ]]; then
+        printf '  服务商控制台：%s 次，最后一次 %s\n' "$total" "$(date -d "@$when" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+        continue
+      fi
+      method="$(tr -cd 'a-z -' <<< "$method" | cut -c1-60 | sed 's/publickey/密钥/g; s/keyboard-interactive/密码/g; s/password/密码/g')"
+      printf '  %s：%s 次，最后一次 %s，第一次 %s，账户 %s，%s\n' "$(tr -cd 'A-Za-z0-9.:/_-' <<< "$from" | cut -c1-64)" "$total" \
+        "$(date -d "@$when" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')" "$(date -d "@$new" '+%Y-%m-%d' 2>/dev/null || echo '?')" \
+        "$(tr -cd 'A-Za-z0-9._ -' <<< "$user" | cut -c1-80)" "$method"
+    done
+  echo '不认识的 IP：马上改密码、删掉不认识的公钥，再用 vps audit（菜单 7 → 1）安全排查；是你自己的，可以在那里标记为正常。'
 }
 
 # The menu's red line: first-time addresses of the last 3 days that were not
@@ -5785,7 +5846,7 @@ record_config_change() {
 # would suppress errexit inside that function; a separate /bin/bash avoids it.
 menu_action() {
   local self="$1" action="$2" code
-  case "$action" in plan|perf|resources|audit|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
+  case "$action" in plan|perf|resources|audit|logins|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
   # The new interpreter keeps its own errexit even inside the parent's if.
   if /bin/bash -- "$self" "$action"; then
     echo '本项已结束；请查看上方结果、跳过项和注意事项。'
@@ -6756,7 +6817,7 @@ menu_entries() {
     日常管理 4 '端口管理' \
     日常管理 5 '单项设置' \
     日常管理 6 'Fail2ban 封禁记录' \
-    日常管理 7 '安全排查（只读）' \
+    日常管理 7 '安全排查和登录记录' \
     日常管理 8 '重启服务器' \
     安全加固 9 '防火墙和 SSH 防爆破' \
     安全加固 10 'SSH 登录加固' \
@@ -6888,7 +6949,9 @@ menu() {
       4) action=port ;;
       5) action=item ;;
       6) action=bans ;;
-      7) action=audit ;;
+      7)
+        read -r -p '1) 安全排查（只读）   2) 查看登录记录   回车返回: ' choice || choice=''
+        case "$choice" in 1) action=audit ;; 2) action=logins ;; *) continue ;; esac ;;
       8) action=reboot ;;
       9) action=firewall ;;
       10) action=ssh ;;
@@ -10119,6 +10182,7 @@ item_action() {
     hostname) echo '1. 修改显示名   2. 修改主机名   3. 撤销主机名修改（恢复原来的名字）   0. 返回' ;;
     fail2ban) echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 管理白名单（不会被封的 IP）   4. 调整参数   5. 恢复推荐值   0. 返回' ;;
     autoreboot) echo '1. 设置自动重启时间   2. 取消（撤销本工具的设置）   0. 返回' ;;
+    login) echo '1. 开启   2. 关闭（撤销本工具的修改，已有的记录保留）   3. 查看登录记录   0. 返回' ;;
     ssh) echo '1. 加固（只允许密钥登录，可选禁止 root）   2. 撤销（恢复密码和 root 登录）   0. 返回' ;;
     sshport) echo '1. 修改端口（新旧端口先同时开着，新端口能登录才关旧的）   2. 恢复原来的端口   0. 返回' ;;
     *) if [[ -n "$(param_names "$key")" ]]; then echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 调整参数   4. 恢复推荐值   0. 返回'
@@ -10139,6 +10203,7 @@ item_action() {
     hostname:3) item_turn_off hostname ;;
     hostname:*) return 0 ;;
     firewall:2) item_firewall_pause ;;
+    login:3) logins_show 30 ;;
     firewall:3) item_turn_off firewall ;;
     upgrade:1|kernel:1) item_turn_on "$key" ;;
     upgrade:*|kernel:*) return 0 ;;
@@ -10427,6 +10492,7 @@ main() {
     perf) perf_main; return 0 ;;
     resources) resources_main; return 0 ;;
     audit) audit_main; return 0 ;;
+    logins) logins_main; return 0 ;;
     port) port_main; return 0 ;;
     item) item_main; return 0 ;;
     params) params_main; return 0 ;;

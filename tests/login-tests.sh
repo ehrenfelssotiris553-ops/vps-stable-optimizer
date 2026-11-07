@@ -183,3 +183,46 @@ printf '# older\n' > "$STATE_ROOT/login-hook"; check_login ''
 pam-auth-update --package --remove vps-stable-login; check_login ''
 [[ "$VERIFY_STATUS" == fail ]] || fail 'a removed PAM line passed'
 printf 'PASS: vps check sees the PAM line, an older hook and the number of logins.\n'
+
+# vps logins: the last logins newest first, a first-time address not marked
+# as normal in red, then every address with its count; from the journal when
+# there is no record (saying so). Everything shown is cleaned.
+(
+  load_optimizer_functions logins_show logins_main
+  C_FAIL='<red>' C_RESET='</red>'
+  ok() { printf 'OK %s\n' "$*"; }
+  : > "$PAM_COMMON_SESSION"
+  rm -f "$STATE_ROOT/known"; mkdir -p "$STATE_ROOT"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    1700000000 root 203.0.113.9 publickey ssh 1 \
+    1700000100 ops 203.0.113.9 publickey ssh 0 \
+    1700000200 root console:tty1 console console 0 \
+    1700000300 root 198.51.100.7 password ssh 1 \
+    1700000400 "evil$(printf '\033')[2J" 192.0.2.5 password ssh 1 > "$STATE_ROOT/logins"
+  printf 'ip 203.0.113.9\n' > "$STATE_ROOT/known"
+  out="$(logins_show 3)"
+  [[ "$(grep -c '^  20[0-9][0-9]-' <<< "$out")" == 3 ]] || fail "not the last 3 logins: $out"
+  first="$(grep -m1 '^  20[0-9][0-9]-' <<< "$out")"
+  [[ "$first" == *'来自 192.0.2.5（密码）<red>  ← 第一次从这个 IP 登录</red>' && "$first" != *$'\033'* && "$first" == *' evil2J '* ]] ||
+    fail "newest login, cleaned and red: $first"
+  grep -q '服务商控制台（tty1）（控制台）' <<< "$out" || fail 'console login not shown'
+  if grep -q '203.0.113.9（密钥）<red>' <<< "$out"; then fail 'a known address shown in red'; fi
+  grep -q '一共 5 次；来源：本工具的登录记录' <<< "$out" || fail "count and source: $out"
+  grep -q '203.0.113.9：2 次，最后一次 .*，账户 root ops，密钥' <<< "$out" || fail "summary per address: $out"
+  grep -q '服务商控制台：1 次' <<< "$out" || fail 'console logins not counted'
+  out="$(logins_show 30)"
+  grep -q '203.0.113.9（密钥）（第一次出现，已标记为正常）' <<< "$out" || fail "a first-time address marked as normal: $out"
+  # No record yet, login record off: sshd's lines from the journal.
+  rm -f "$STATE_ROOT/logins"
+  journalctl() { printf '%s\n' '1700000500.123456 host sshd-session[42]: Accepted publickey for alice from 203.0.113.20 port 5 ssh2: ED25519 SHA256:x' \
+    '1700000600.1 host sshd[43]: Failed password for root from 192.0.2.66 port 6 ssh2'; }
+  out="$(logins_show 30)"
+  [[ "$out" == *'登录记录没开'* && "$out" == *'alice 来自 203.0.113.20（密钥）'* && "$out" == *'来源：系统日志'* && "$out" != *192.0.2.66* ]] || fail "from the journal: $out"
+  journalctl() { :; }
+  [[ "$(logins_show 30)" == *'没有找到登录'* ]] || fail 'no logins at all not said'
+  # The command line: a number from 1 to 1000.
+  for bad in 0 1001 abc -5; do
+    if (MODE_ARGS=("$bad"); EUID=0 logins_main) > /dev/null 2>&1; then fail "vps logins $bad accepted"; fi
+  done
+)
+printf 'PASS: vps logins shows the last logins newest first (first-time addresses in red, cleaned), a summary per address, and the journal without a record.\n'
