@@ -5824,7 +5824,9 @@ run_state_mark_start() {
 
 # True when something changed since run_state_mark_start: a file under /etc,
 # a package (dpkg's log), or this tool's own state. Its run records and logs,
-# the background check's files and the login record change by themselves.
+# the background check's files and the login record change by themselves, and
+# vps check notes the boot it checked (verified_boot): a check run just before
+# (as on the CI, within the second the mark goes back) changed nothing.
 run_state_changed() {
   local mark="$RUN_STATE_DIR/.started" etc="${RUN_CHANGE_ETC:-/etc}" dpkg_log="${RUN_CHANGE_DPKG_LOG:-/var/log/dpkg.log}"
   [[ -f "$mark" ]] || return 0
@@ -5832,7 +5834,7 @@ run_state_changed() {
   if [[ -f "$dpkg_log" && "$dpkg_log" -nt "$mark" ]]; then return 0; fi
   [[ -n "$(find "$STATE_ROOT" -mindepth 1 -xdev -newer "$mark" ! -path "$STATE_ROOT/run-*" ! -path "$LOG_DIR" ! -path "$LOG_DIR/*" \
     ! -path "$STATE_ROOT/notify" ! -path "$STATE_ROOT/notify/*" ! -name 'logins*' ! -name latest ! -name '.latest.*' ! -name optimizer.lock \
-    -print -quit 2>/dev/null)" ]]
+    ! -name verified_boot -print -quit 2>/dev/null)" ]]
 }
 
 # PREVIOUS: a menu session only looked: its record, configuration backup and

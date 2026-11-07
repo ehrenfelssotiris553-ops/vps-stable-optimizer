@@ -663,12 +663,21 @@ passed check-hardened 'SSH 登录加固'
 # is on again, and vps check says which line of which file did it.
 vm_ops_sudo cp -p "$PROVIDER_CONF" /root/provider.keep
 vm_ops_sudo sed -i "'s/^#vps-stable-off(ssh,[0-9-]*): //'" "$PROVIDER_CONF"
+# A connection made while sshd reloads is reset (seen on Debian 12 and the old
+# Ubuntu 22.04 image): wait until ops logs in again.
+ssh_back() {
+  local i
+  for ((i = 0; i < 30; i++)); do vm_ops true 2>/dev/null && return 0; sleep 2; done
+  fail "$1: ops cannot log in after sshd reloaded"
+}
 vm_ops_sudo systemctl try-reload-or-restart ssh.service
+ssh_back 'the provider line written back'
 vm_ops_sudo vps check > "$LOGS/check-written-back.log" 2>&1 || true
 grep -q '当前生效的 SSH 配置仍允许密码登录：.*00-aaa-provider.conf 第 2 行' "$LOGS/check-written-back.log" ||
   fail "vps check did not name the line written back: $(grep -m1 'SSH 登录加固' "$LOGS/check-written-back.log" || true)"
 vm_ops_sudo mv -f /root/provider.keep "$PROVIDER_CONF"
 vm_ops_sudo systemctl try-reload-or-restart ssh.service
+ssh_back 'the provider line commented out again'
 hardened 'with the provider line commented out again'
 endgroup
 

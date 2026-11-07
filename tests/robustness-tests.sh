@@ -237,7 +237,10 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
     later="@$(($(stat -c %Y "$RUN_STATE_DIR/.started") + 5))"
   }
   session
-  for f in "$STATE_ROOT/logins" "$STATE_ROOT/logins.lock" "$STATE_ROOT/notify/queue" "$RUN_LOG" "$RUN_STATE_DIR/stages.tsv" "$STATE_ROOT/latest"; do
+  # (verified_boot: a vps check right before the session, as on the CI, where
+  # it fell inside the second the mark goes back and kept the record.)
+  for f in "$STATE_ROOT/logins" "$STATE_ROOT/logins.lock" "$STATE_ROOT/notify/queue" "$RUN_LOG" "$RUN_STATE_DIR/stages.tsv" "$STATE_ROOT/latest" \
+      "$STATE_ROOT/optimizer.lock" "$STATE_ROOT/verified_boot"; do
     touch -d "$later" "$f"
   done
   if run_state_changed; then fail 'a session that only looked counted as a change'; fi
