@@ -7,13 +7,16 @@ umask 077
 
 # Download location and the main script's hash; update the hash on every release.
 RELEASE_BASE_URL='https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main'
-EXPECTED_SHA256='14574f7cf616839ae8008279ff7ba06213a67d828abb6ed751d88f0f5bd9a293'
+EXPECTED_SHA256='15017a654e7f1dfa0a9a3fa5df7b8c66cc9beb7e471695776249eb20c9ac88ff'
 PAYLOAD_NAME='vps-stable-opt.sh'
 INSTALL_DIR=/usr/local/lib/vps-stable-opt
 INSTALL_FILE="$INSTALL_DIR/vps-stable-opt.sh"
 MARKER_FILE="$INSTALL_DIR/.installer-owner"
 HASH_FILE="$INSTALL_DIR/.installed-sha256"
 LAUNCHER_FILE=/usr/local/bin/vps
+# The launchers of earlier versions (SHA-256), replaced in place on an upgrade:
+# 2.6 to 2.8 (no root check). The main script lists the same (tool_known_launchers).
+KNOWN_LAUNCHERS='58f666a01bd07f0d78b3cc8bed1bcceb9180b3f9700684248c30ed7e3480fef6'
 BASE_URL="$RELEASE_BASE_URL"
 LOCAL_FILE=''
 NO_RUN=0
@@ -150,6 +153,18 @@ install_existing_action() {
   else echo refuse; fi
 }
 
+# The launcher in place, from two SHA-256 values: keep (this version's),
+# replace (an earlier version's, in KNOWN_LAUNCHERS) or refuse (anything else).
+install_launcher_action() {
+  local existing="$1" wanted="$2" known
+  [[ "$existing" =~ ^[0-9a-f]{64}$ && "$wanted" =~ ^[0-9a-f]{64}$ ]] || { echo refuse; return 0; }
+  if [[ "$existing" == "$wanted" ]]; then echo keep; return 0; fi
+  for known in $KNOWN_LAUNCHERS; do
+    if [[ "$existing" == "$known" ]]; then echo replace; return 0; fi
+  done
+  echo refuse
+}
+
 # Staging files are published with ln/mv and cleaned on exit; only a power loss
 # leaves them behind. Remove those (fixed mktemp names, owned by this user); a
 # directory left with nothing else and no launcher is removed for a fresh install.
@@ -207,6 +222,10 @@ cat > "$TMP_DIR/launcher" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+if (( EUID != 0 )); then
+  printf '%s\n' "vps 需要 root 权限：请用 sudo vps${*:+ $*}（root 用户直接输入 vps）。" >&2
+  exit 1
+fi
 if (( $# == 0 )); then set -- menu; fi
 exec /bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh "$@"
 EOF
@@ -221,7 +240,9 @@ if [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" || -e "$LAUNCHER_FILE" || -L "$LAUN
   secure_dir "$INSTALL_DIR"
   for existing in "$MARKER_FILE" "$HASH_FILE" "$INSTALL_FILE" "$LAUNCHER_FILE"; do secure_file "$existing"; done
   cmp -s -- "$TMP_DIR/marker" "$MARKER_FILE" || die '已有目录不属于本安装器，未覆盖。'
-  cmp -s -- "$TMP_DIR/launcher" "$LAUNCHER_FILE" || die '已有启动命令内容不同，未覆盖。'
+  launcher_sha="$(sha256sum -- "$LAUNCHER_FILE")"; wanted_sha="$(sha256sum -- "$TMP_DIR/launcher")"
+  launcher_action="$(install_launcher_action "${launcher_sha%% *}" "${wanted_sha%% *}")"
+  [[ "$launcher_action" != refuse ]] || die '已有启动命令内容不同，未覆盖。'
   entries="$(find -P "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
   [[ "$entries" == $'.installed-sha256\n.installer-owner\nvps-stable-opt.sh' ]] || die '已有安装目录包含其他文件，未接管。'
   installed_sha="$(sha256sum -- "$INSTALL_FILE")"; installed_sha="${installed_sha%% *}"
@@ -244,6 +265,15 @@ if [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" || -e "$LAUNCHER_FILE" || -L "$LAUN
       printf '已更新到这个版本。\n' ;;
     *) die '已安装的主脚本和它的校验记录对不上（可能被手动改过），未覆盖。请先检查 /usr/local/lib/vps-stable-opt/。' ;;
   esac
+  # An earlier version's launcher goes last: should this stop before, running
+  # the installer again finds this version in place and replaces it then.
+  if [[ "$launcher_action" == replace ]]; then
+    LAUNCHER_STAGE="$(mktemp /usr/local/bin/.vps.XXXXXXXX)"
+    install -m 755 -- "$TMP_DIR/launcher" "$LAUNCHER_STAGE"
+    mv -fT -- "$LAUNCHER_STAGE" "$LAUNCHER_FILE"; LAUNCHER_STAGE=''
+    cmp -s -- "$TMP_DIR/launcher" "$LAUNCHER_FILE" || die '替换启动命令后核对失败；请重新运行安装命令。'
+    printf '启动命令 /usr/local/bin/vps 已换成这个版本的。\n'
+  fi
 else
   mkdir -m 755 -- "$INSTALL_DIR"
   CREATED_DIR=1

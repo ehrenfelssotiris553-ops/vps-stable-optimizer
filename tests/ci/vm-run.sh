@@ -446,11 +446,16 @@ banned() { [[ "$(vm 'fail2ban-client status sshd')" == *10.0.3.2* ]]; }
 for ((i = 0; i < 30; i++)); do banned && break; sleep 2; done
 banned || { vm 'fail2ban-client status sshd; journalctl -u ssh -u sshd -n 15 --no-pager -o cat' || true; fail 'the stranger was not banned'; }
 if reachable; then fail 'the banned stranger still reaches sshd'; fi
+# The ban is an element of the nftables set, not a UFW rule.
+in_vm_set() { vm 'nft list set inet vps-stable-f2b sshd4' 2>/dev/null | grep -Fw -- "$1" > /dev/null; }
+in_vm_set 10.0.3.2 || fail "the ban is not in the nftables set: $(vm 'nft list table inet vps-stable-f2b' 2>&1)"
+if vm 'ufw show added' | grep -F 10.0.3.2 > /dev/null; then fail 'the ban is a UFW rule'; fi
 vm true || fail 'the allowlisted address lost its access as well'
 vm_drive bans.rules bans vps bans || fail "bans exited with $?"
 grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}.*封禁.*10\.0\.3\.2' "$LOGS/bans.log" ||
   fail 'vps bans lists no timed ban of the stranger'
 if banned; then fail 'the stranger is still banned after the unban in vps bans'; fi
+if in_vm_set 10.0.3.2; then fail 'the unbanned stranger is still in the nftables set'; fi
 # UFW also limits SSH to 6 new connections per 30 seconds from one address.
 sleep 30
 reachable || fail 'the stranger is still blocked after the unban'
@@ -496,9 +501,19 @@ vm_drive "$WORK/ping.rules" ping-on vps item || fail "ping on exited with $?"
 endgroup
 
 group 'Reboot'
+# Across the reboot a ban Fail2ban runs comes back into the set; what the
+# kernel held besides (as a ban that ran out while the machine was down,
+# which the UFW action of 2.8 left in UFW for good) does not.
+vm 'fail2ban-client set sshd banip 198.51.100.80' > /dev/null || fail 'cannot ban before the reboot'
+vm "nft add element inet vps-stable-f2b sshd4 '{ 198.51.100.81 }'" || fail 'cannot add to the set before the reboot'
+if ! in_vm_set 198.51.100.80 || ! in_vm_set 198.51.100.81; then fail "the set before the reboot: $(vm 'nft list set inet vps-stable-f2b sshd4' 2>&1)"; fi
 vm 'systemctl reboot' || true
 sleep 20
 wait_ssh
+for ((i = 0; i < 15; i++)); do in_vm_set 198.51.100.80 && break; sleep 2; done
+in_vm_set 198.51.100.80 || fail "a running ban did not come back after the reboot: $(vm 'nft list table inet vps-stable-f2b' 2>&1)"
+if in_vm_set 198.51.100.81; then fail 'an element Fail2ban does not know is in the set after the reboot'; fi
+vm 'fail2ban-client set sshd unbanip 198.51.100.80' > /dev/null || fail 'cannot unban after the reboot'
 check_all check-after-reboot
 has check-after-reboot '开荒之后已经重启过'
 # cloud-init sets the name from the seed at every boot unless told otherwise.

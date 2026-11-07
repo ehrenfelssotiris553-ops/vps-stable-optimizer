@@ -229,6 +229,17 @@ ufw() { [[ "$*" == '--force disable' ]] || fail "unexpected ufw $*"; record 'ufw
 restore_adopt() { record "adopt $1"; }
 reset; item_firewall_pause
 [[ "$(cat "$TEST_ROOT/trace")" == $'ufw off\nadopt ufw_runtime' ]] || fail 'firewall pause must record the new state'
+# What the pause says of Fail2ban follows its ban action: the UFW rules of
+# 2.8 stop working with UFW, the nftables sets do not.
+(
+  F2B_ACTION_FILE="$TEST_ROOT/f2b-action.conf"
+  f2b_action_legacy_text > "$F2B_ACTION_FILE"; UFW_ON=1
+  out="$(item_firewall_pause)"
+  [[ "$out" == *'Fail2ban 的封禁也不起作用'* ]] || fail "pause with the UFW bans: $out"
+  f2b_action_text > "$F2B_ACTION_FILE"; UFW_ON=1
+  out="$(item_firewall_pause)"
+  [[ "$out" == *'Fail2ban 的封禁照常'* && "$out" != *不起作用* ]] || fail "pause with the nftables bans: $out"
+)
 item_turn_on() { record "on $1"; }
 item_status() { echo status; }
 port_menu() { record 'port menu'; }

@@ -124,8 +124,17 @@ NFT_RULES=$'table ip filter {\n\tchain INPUT {\n\t\ttype filter hook input prior
 if firewall_conflict; then fail 'nft jumps into empty UFW chains blocked takeover'; fi
 NFT_RULES=$'table ip filter {\n\tchain INPUT {\n\t\ttype filter hook input priority filter; policy accept;\n\t\tjump DOCKER-USER\n\t}\n}'
 firewall_conflict || fail 'nft jump into a non-UFW chain missed'
+# This tool's Fail2ban table (only the bans, as nft lists it) is no other
+# firewall (the firewall paused with Fail2ban on); a table after it still
+# counts, and so does one of that name in another family.
+NFT_RULES=$'table inet vps-stable-f2b {\n\tset sshd4 {\n\t\ttype ipv4_addr\n\t\telements = { 198.51.100.7, 203.0.113.9,\n\t\t\t     192.0.2.44 }\n\t}\n\tset sshd6 {\n\t\ttype ipv6_addr\n\t}\n\tchain input {\n\t\ttype filter hook input priority filter - 1; policy accept;\n\t\tct state new tcp dport { 22, 2222 } ip saddr @sshd4 drop\n\t\tct state new tcp dport { 22, 2222 } ip6 saddr @sshd6 drop\n\t}\n}'
+if firewall_conflict; then fail "this tool's Fail2ban table blocked takeover"; fi
+NFT_RULES+=$'\ntable inet administrator {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}'
+firewall_conflict || fail "a table after this tool's Fail2ban table missed"
+NFT_RULES=$'table ip vps-stable-f2b {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\ttcp dport 22 drop\n\t}\n}'
+firewall_conflict || fail 'a table of that name in another family passed'
 NFT_RULES=''
-printf 'PASS: real IPv4/IPv6/nftables policies block takeover; inert empty chains and the UFW skeleton do not.\n'
+printf 'PASS: real IPv4/IPv6/nftables policies block takeover; inert empty chains, the UFW skeleton and the Fail2ban table do not.\n'
 
 # Docker's own rules, exactly as Docker 29 wrote them on Ubuntu 22.04 (iptables
 # 1.8.7 on nftables, whose nft listing does not mark its tables): not a

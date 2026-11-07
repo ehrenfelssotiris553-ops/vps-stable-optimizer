@@ -676,12 +676,21 @@ f2b_fixture() {
   mkdir -p "$F2B_DIR/jail.d" "$F2B_DIR/action.d"
   TRACE="$TMP/$1/trace"; : > "$TRACE"
   RESTORE_PARTIAL=0
-  load_optimizer_functions restore_value restore_fingerprint
+  load_optimizer_functions restore_value restore_fingerprint f2b_action_text f2b_action_legacy_text f2b_action_kind
   restore_snapshot f2b_jail; restore_snapshot f2b_action
   printf '[sshd]\naction = vps-stable-ufw-sshd[port="%%(port)s"]\n' > "$F2B_FILE"
-  printf '[Definition]\n' > "$F2B_ACTION_FILE"
+  # The UFW action up to 2.8 (its bans are UFW rules).
+  f2b_action_legacy_text > "$F2B_ACTION_FILE"
   restore_mark f2b_jail applied; restore_mark f2b_action applied
   active() { [[ "$1" == fail2ban ]]; }
+  NFT_LEFT=0
+  nft() {
+    case "$*" in
+      'list table inet vps-stable-f2b') ((NFT_LEFT)) ;;
+      'delete table inet vps-stable-f2b') printf 'nft delete\n' >> "$TRACE"; NFT_LEFT=0 ;;
+      *) die "unexpected nft $*" ;;
+    esac
+  }
   fail2ban-client() {
     case "$*" in
       'get sshd banip') echo '198.51.100.7 2001:db8::9' ;;
@@ -707,7 +716,19 @@ f2b_fixture() {
   [[ -e "$F2B_FILE" && -e "$F2B_ACTION_FILE" ]] || die 'shared action was removed'
   expect "$RESTORE_PARTIAL" 1
 )
-printf 'PASS: Fail2ban rollback unbans first, keeps shared actions and reloads a pre-existing service.\n'
+(
+  # The nftables sets: nothing is lifted one by one (Fail2ban's stop takes the
+  # table away); a table still there (no clean stop) goes as well.
+  f2b_fixture f2b-nft
+  f2b_action_text > "$F2B_ACTION_FILE"
+  NFT_LEFT=1
+  fail2ban-client() { die "the nftables bans were lifted one by one: $*"; }
+  restore_fail2ban_group
+  expect "$(cat "$TRACE")" $'restart\nnft delete'
+  [[ ! -e "$F2B_FILE" && ! -e "$F2B_ACTION_FILE" ]] || die 'tool Fail2ban files survived rollback'
+  expect "$RESTORE_PARTIAL" 0
+)
+printf 'PASS: Fail2ban rollback unbans the UFW bans of 2.8 first, takes the nftables table away, keeps shared actions and reloads a pre-existing service.\n'
 
 # SSH: removing the key-only drop-in restores password login after a reload.
 (

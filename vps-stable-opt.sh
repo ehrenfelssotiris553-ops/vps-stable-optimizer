@@ -567,11 +567,13 @@ ssh_detect() {
 # With XTABLES=1 (iptables itself runs on nftables) the tables of iptables
 # (ip/ip6 filter, nat, raw, mangle, security) are left to iptables-save, which
 # shows the same rules in a form that tells Docker's apart; iptables 1.8.7
-# (Ubuntu 22.04) does not mark them as its own in nft's listing.
+# (Ubuntu 22.04) does not mark them as its own in nft's listing. This tool's
+# Fail2ban table (only the bans, see f2b_action_text) is no other firewall.
 nft_ruleset_has_policy() {
   awk -v xt="${1:-0}" '
     {line=$0; sub(/^[ \t]+/,"",line); sub(/[ \t]+$/,"",line)}
     xt == 1 && !skip && line ~ /^table (ip|ip6) (filter|nat|raw|mangle|security) \{$/ {skip = 1; depth = 0}
+    !skip && line == "table inet vps-stable-f2b {" {skip = 1; depth = 0}
     skip {o = line; c = line; depth += gsub(/\{/, "", o) - gsub(/\}/, "", c); if (depth <= 0) skip = 0; next}
     line=="" || line=="}" || line ~ /^#/ {next}
     line ~ /^table [a-z0-9]+ [A-Za-z0-9_.-]+ \{$/ {next}
@@ -3737,9 +3739,42 @@ f2b_ignore_address() {
   esac
 }
 
-# `ufw prepend` places each ban first within its own IPv4 or IPv6 rule list;
-# `insert 1` fails for an IPv6 address while rule 1 is an IPv4 rule.
+# Bans go into two nftables sets (IPv4, IPv6) of this tool's own table, whose
+# chain comes before UFW's (priority -1). A ban is one element, not a UFW rule
+# that costs a run of ufw (slow with hundreds of bans), and the sets live in
+# the kernel only: a ban that ran out while Fail2ban was down (a hard reboot)
+# is not left behind, Fail2ban puts back those still running. Only new TCP
+# connections to the SSH ports are dropped; established ones go on.
+# Fail2ban's own nftables action cuts established ones too and is written
+# differently in 0.11, 1.0 and 1.1. The start makes the table afresh in one
+# transaction (add, delete, create: no error when it was not there). A ban
+# tries the IPv4 set, then the IPv6 one (an IPv6 address is no IPv4 element).
+# "%%" is a "%" for Fail2ban's configuration reader. The file keeps its name
+# from v2.6, when bans were UFW rules (f2b_action_legacy_text).
 f2b_action_text() {
+  cat <<'F2B_ACTION'
+# VPS Stable Optimizer v2.9: bans are elements of nftables sets (table inet
+# vps-stable-f2b, before UFW); new TCP connections to the SSH ports only,
+# established ones go on. Nothing stays after a reboot: Fail2ban puts back
+# the bans still running.
+[Definition]
+actionstart_on_demand = false
+actionstart = printf '%%s\n' 'add table inet vps-stable-f2b' 'delete table inet vps-stable-f2b' 'table inet vps-stable-f2b {' 'set sshd4 { type ipv4_addr; }' 'set sshd6 { type ipv6_addr; }' 'chain input {' 'type filter hook input priority -1; policy accept;' 'ct state new tcp dport { <port> } ip saddr @sshd4 drop' 'ct state new tcp dport { <port> } ip6 saddr @sshd6 drop' '}' '}' | /usr/sbin/nft -f -
+actionstop = /usr/sbin/nft delete table inet vps-stable-f2b
+actionflush = /usr/sbin/nft flush set inet vps-stable-f2b sshd4
+              /usr/sbin/nft flush set inet vps-stable-f2b sshd6
+actioncheck = /usr/sbin/nft list chain inet vps-stable-f2b input > /dev/null
+actionban = /usr/sbin/nft add element inet vps-stable-f2b sshd4 '{ <ip> }' 2> /dev/null || /usr/sbin/nft add element inet vps-stable-f2b sshd6 '{ <ip> }'
+actionunban = /usr/sbin/nft delete element inet vps-stable-f2b sshd4 '{ <ip> }' 2> /dev/null || /usr/sbin/nft delete element inet vps-stable-f2b sshd6 '{ <ip> }'
+
+[Init]
+port = 22
+F2B_ACTION
+}
+
+# The action from v2.6 to v2.8: a UFW rule for each ban (`ufw prepend` puts it
+# first within its own IPv4 or IPv6 list). Recognised to be replaced in place.
+f2b_action_legacy_text() {
   cat <<'F2B_ACTION'
 # VPS Stable Optimizer v2.6: ban new TCP connections to SSH ports only.
 # UFW must be active. Existing established connections are not killed.
@@ -3753,6 +3788,60 @@ actionunban = /usr/sbin/ufw delete deny proto tcp from <ip> to any port <port>
 [Init]
 port = 22
 F2B_ACTION
+}
+
+# Which ban action this tool's file holds: nft (v2.9 on), ufw (v2.6 to v2.8),
+# other (changed by hand) or none.
+f2b_action_kind() {
+  local text
+  if [[ ! -f "$F2B_ACTION_FILE" || -L "$F2B_ACTION_FILE" ]] || ! text="$(cat -- "$F2B_ACTION_FILE" 2>/dev/null)"; then echo none; return 0; fi
+  if [[ "$text" == "$(f2b_action_text)" ]]; then echo nft
+  elif [[ "$text" == "$(f2b_action_legacy_text)" ]]; then echo ufw
+  else echo other; fi
+}
+
+# ADDRESS: blocked by this tool's ban action now (in its nftables set; with
+# the action up to v2.8, a UFW rule).
+f2b_ban_seen() {
+  local set=sshd4
+  if [[ "$(f2b_action_kind)" == ufw ]]; then ufw_mentions "$1"; return; fi
+  [[ "$1" != *:* ]] || set=sshd6
+  nft list set inet vps-stable-f2b "$set" 2>/dev/null | grep -Fw -- "$1" > /dev/null
+}
+
+# PORTS (comma list): the bans the UFW action up to v2.8 left in UFW, as rules
+# for `ufw delete`: one address denied on some of PORTS ("deny proto tcp from
+# ADDRESS to any port 22", however `ufw show added` words it). Fail2ban took
+# them back on each unban, not those that ran out while it was down.
+f2b_ufw_bans() {
+  local allowed=",$1," line p fits rule src ports
+  local re='^ufw (prepend |insert [0-9]+ )?(deny (proto tcp )?from ([0-9A-Fa-f:.]+) to any port ([0-9]+(,[0-9]+)*)( proto tcp)?)$'
+  command -v ufw >/dev/null || return 0
+  while IFS= read -r line; do
+    [[ "$line" =~ $re ]] || continue
+    [[ -n "${BASH_REMATCH[3]}" || -n "${BASH_REMATCH[7]}" ]] || continue
+    # Kept before port_source_valid, whose own match replaces BASH_REMATCH.
+    rule="${BASH_REMATCH[2]}" src="${BASH_REMATCH[4]}" ports="${BASH_REMATCH[5]}"
+    port_source_valid "$src" || continue
+    fits=1
+    for p in ${ports//,/ }; do [[ "$allowed" == *",$p,"* ]] || fits=0; done
+    if ((fits)); then printf '%s\n' "$rule"; fi
+  done < <(ufw show added 2>/dev/null || true)
+}
+
+# PORTS: the old bans go (bans still running are in the nftables set now).
+f2b_ufw_bans_clean() {
+  local rule deleted_n=0 left_n=0
+  local -a rules=() words=()
+  mapfile -t rules < <(f2b_ufw_bans "$1")
+  ((${#rules[@]})) || return 0
+  echo "UFW 里有 ${#rules[@]} 条旧版留下的封禁规则：封禁现在在 nftables 集合里（还在期内的 Fail2ban 已经放回去），这些规则逐条删除，每条约 1 秒……"
+  for rule in "${rules[@]}"; do
+    read -r -a words <<< "$rule"
+    if ufw --force delete "${words[@]}" > /dev/null 2>&1; then deleted_n=$((deleted_n + 1)); else left_n=$((left_n + 1)); fi
+  done
+  ok "已删除 $deleted_n 条旧的 UFW 封禁规则。"
+  if ((left_n)); then warn "还有 $left_n 条没能删除：可以用 ufw status numbered 查看后手动删除。"; fi
 }
 
 # The only permitted replacement is an exact, known v2.6 state transition.
@@ -3812,7 +3901,7 @@ fail2ban_stage() {
   fi
   # Every early return below leaves Fail2ban unconfigured.
   module_result fail2ban failed 'setup incomplete; see run log'
-  local joined guard jail action current='' previous='' ignore='' pkg
+  local joined guard jail action current='' previous='' ignore='' pkg legacy=0 old_ports=''
   local needed=()
   joined="$(IFS=,; echo "${SSH_PORTS[*]}")"
   guard="$(f2b_bootstrap_text)"
@@ -3831,9 +3920,12 @@ fail2ban_stage() {
   # An existing managed jail keeps its allowlist line (also when an earlier
   # version's jail is upgraded); without one, the allowlist choice applies.
   if [[ "$current" != "$guard" ]]; then ignore="$(grep '^ignoreip = ' <<< "$current" || true)"; fi
+  # The ports of the jail before: old bans may name them (cleaned up below).
+  old_ports="$(awk -F' = ' '$1 == "port" {print $2; exit}' <<< "$current")"
   if [[ -n "$ignore" ]]; then jail="$(f2b_jail_text "$joined")"$'\n'"$ignore"
   else jail="$(f2b_jail_text "$joined" "$(f2b_ignore_address)")"; fi
-  for pkg in fail2ban python3-systemd; do
+  # nftables: the nft command the ban action runs.
+  for pkg in fail2ban python3-systemd nftables; do
     installed "$pkg" && continue
     # A fresh image may have no package index yet: refresh it once first.
     available "$pkg" || apt_index_ready || true
@@ -3846,7 +3938,10 @@ fail2ban_stage() {
   # Install the action and disabled guard BEFORE apt can invoke package postinst.
   # put_file preserves every differing file; no distribution ufw action is edited.
   if [[ -L "$F2B_ACTION_FILE" ]]; then warn "封禁动作文件是链接，保持不变：$F2B_ACTION_FILE"; return 0; fi
-  put_file "$F2B_ACTION_FILE" "$action" || return 0
+  # The UFW action up to v2.8 is replaced once nft is installed (below):
+  # until Fail2ban restarts it keeps banning with the old one.
+  if [[ "$(f2b_action_kind)" == ufw ]]; then legacy=1
+  else put_file "$F2B_ACTION_FILE" "$action" || return 0; fi
   if [[ -z "$current" ]]; then
     put_file "$F2B_FILE" "$guard" || return 0
     current="$guard"
@@ -3854,8 +3949,14 @@ fail2ban_stage() {
   if ((${#needed[@]})) && ! install_pkgs "${needed[@]}"; then
     warn 'Fail2ban 安装失败，SSH 规则保持停用状态。'; return 0
   fi
-  if ! command -v fail2ban-client >/dev/null || ! installed python3-systemd; then
-    warn '缺少 Fail2ban 或它读取系统日志的组件，不启用规则。'; return 0
+  if ! command -v fail2ban-client >/dev/null || ! installed python3-systemd || ! command -v nft >/dev/null; then
+    warn '缺少 Fail2ban、它读取系统日志的组件或 nftables，不启用规则。'; return 0
+  fi
+  if ((legacy)); then
+    if ! f2b_replace_owned_file "$F2B_ACTION_FILE" "$(f2b_action_legacy_text)" "$action"; then
+      warn '封禁动作文件在设置过程中被改动，没有替换。'; return 0
+    fi
+    ok '封禁改为 nftables 集合：以前每封一个 IP 加一条 UFW 规则。'
   fi
   f2b_db_apply
   if foreign_f2b_config; then
@@ -3885,8 +3986,9 @@ fail2ban_stage() {
     if ! systemctl start fail2ban; then warn '无法启动 Fail2ban。'; return 0; fi
   fi
   if f2b_jail_ready; then
-    ok "Fail2ban 已就绪：只封禁 SSH 端口 $joined 的 TCP 连接；$(f2b_policy_text)。"
+    ok "Fail2ban 已就绪：封禁放进 nftables 集合，只拦 SSH 端口 $joined 的新 TCP 连接；$(f2b_policy_text)。"
     module_result fail2ban applied "sshd jail on $joined"
+    f2b_ufw_bans_clean "$joined${old_ports:+,$old_ports}"
   else
     warn 'Fail2ban 已启动，但 SSH 规则没有加载，请查看状态和日志。'
   fi
@@ -6417,10 +6519,15 @@ resources_main() {
   if [[ -r /sys/block/zram0/mm_stat ]] && size="$(awk '{printf "%d %d", $1 / 1048576, $3 / 1048576}' /sys/block/zram0/mm_stat)" && [[ -n "$size" ]]; then
     printf 'ZRAM：存了 %s MiB 的数据，实际占内存 %s MiB（压缩后）。\n' "${size% *}" "${size#* }"
   fi
-  if command -v ufw >/dev/null; then
+  # The bans of the nftables action are set elements (cheap however many);
+  # those of the UFW action up to v2.8 each reload UFW's rules.
+  if [[ "$(f2b_action_kind)" != ufw ]] && active fail2ban && command -v fail2ban-client >/dev/null; then
+    rules="$(fail2ban-client get sshd banip 2>/dev/null | wc -w || true)"
+    printf 'Fail2ban 正在封禁：%s 个 IP（在 nftables 集合里，封得再多也不用重新加载防火墙规则）。\n' "${rules:-0}"
+  elif command -v ufw >/dev/null; then
     rules="$(ufw show added 2>/dev/null | grep -cE '^ufw (prepend |insert [0-9]+ )?deny ' || true)"
     if ((rules > 300)); then
-      printf '%s%s Fail2ban 的封禁规则有 %s 条：每次封禁、解封都要让 UFW 重新加载规则，攻击很多时会占不少 CPU。可以缩短封禁时间，或者让来源 IP 多的服务只对需要的人开放。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$rules" "${C_RESET-}"
+      printf '%s%s Fail2ban 的封禁规则有 %s 条：每次封禁、解封都要让 UFW 重新加载规则，攻击很多时会占不少 CPU。在单项设置里重新开启一次 Fail2ban，就换成 nftables 集合封禁。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$rules" "${C_RESET-}"
     else printf '防火墙里的封禁规则：%s 条。\n' "$rules"; fi
   fi
 }
@@ -7706,6 +7813,8 @@ decision_report() {
     decision_line '保留现状' 'SSH 防爆破' '已有其他 Fail2ban 管理配置，保留并提示，不接管。'
   elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && grep -Fxq 'bantime = 43200' "$F2B_FILE" && grep -Fq 'vps-stable-ufw-sshd' "$F2B_FILE"; then
     decision_line '准备调整' 'SSH 防爆破' '本工具旧版的 Fail2ban 规则每次封 12 小时：改为首次 1 小时、同一 IP 再犯加倍（最长 7 天）；已有的白名单保持不变，没有的会问你。'
+  elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" && "$(f2b_action_kind)" == ufw ]]; then
+    decision_line '准备调整' 'SSH 防爆破' '封禁从每个 IP 一条 UFW 规则改成 nftables 集合（封得多时也快，重启后不留过期封禁）；还在期内的封禁照旧，旧的 UFW 封禁规则清掉。'
   elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && active fail2ban; then
     decision_line '保留现状' 'SSH 防爆破' '本工具的 Fail2ban 规则已经在运行，执行时仍会核验。'
   else
@@ -7738,14 +7847,26 @@ tool_secure_file() {
   (( (8#$mode & 8#022) == 0 ))
 }
 
+# The launcher install.sh writes (the same text, checked by consistency-tests).
+# This script can only be read by root: anyone else is told to use sudo.
 tool_expected_launcher() {
   cat <<'LAUNCHER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+if (( EUID != 0 )); then
+  printf '%s\n' "vps 需要 root 权限：请用 sudo vps${*:+ $*}（root 用户直接输入 vps）。" >&2
+  exit 1
+fi
 if (( $# == 0 )); then set -- menu; fi
 exec /bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh "$@"
 LAUNCHER
+}
+
+# The launchers of earlier versions (SHA-256), as install.sh's KNOWN_LAUNCHERS:
+# 2.6 to 2.8.
+tool_known_launchers() {
+  echo '58f666a01bd07f0d78b3cc8bed1bcceb9180b3f9700684248c30ed7e3480fef6'
 }
 
 tool_fixed_paths() {
@@ -7847,7 +7968,12 @@ tool_install_owned() {
   [[ "${actual%% *}" == "$expected" ]] || return 1
   actual="$(cat -- /usr/local/bin/vps)" || return 1
   expected="$(tool_expected_launcher)" || return 1
-  [[ "$actual" == "$expected" && "$(stat -c '%s' -- /usr/local/bin/vps)" == "$((${#expected}+1))" ]] || return 1
+  if [[ "$actual" != "$expected" || "$(stat -c '%s' -- /usr/local/bin/vps)" != "$((${#expected}+1))" ]]; then
+    # An earlier version's launcher: an upgrade stopped before replacing it
+    # (running the installer again finishes the job).
+    actual="$(sha256sum -- /usr/local/bin/vps)" || return 1
+    [[ " $(tool_known_launchers) " == *" ${actual%% *} "* ]] || return 1
+  fi
   entries="$(find -P "$directory" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)" || return 1
   [[ "$entries" == $'.installed-sha256\n.installer-owner\nvps-stable-opt.sh' ]]
 }
@@ -8611,10 +8737,12 @@ f2b_action_referenced_elsewhere() {
 }
 
 # Removes only this tool's jail and action. A Fail2ban that existed before keeps
-# running with its own configuration; bans made through this tool's UFW action
-# are lifted first because the action has no stop hook that would clear them.
+# running with its own configuration. The nftables action takes its table away
+# when Fail2ban stops or restarts (once more below, should it not have); bans
+# made through the UFW action up to v2.8 are lifted first because that action
+# has no stop hook that would clear them.
 restore_fail2ban_group() {
-  local id ips ip pending=0
+  local id ips ip pending=0 kind
   local -a banned=()
   for id in f2b_jail f2b_action f2b_db_file svc_fail2ban; do
     if restore_needed "$id"; then pending=1; fi
@@ -8625,7 +8753,8 @@ restore_fail2ban_group() {
     warn '其他 Fail2ban 规则也在使用本工具的封禁动作；Fail2ban 部分整体保留，请人工检查。'
     RESTORE_PARTIAL=1; return 0
   fi
-  if active fail2ban && command -v fail2ban-client >/dev/null && [[ -f "$F2B_FILE" ]] && grep -Fq 'vps-stable-ufw-sshd' "$F2B_FILE"; then
+  kind="$(f2b_action_kind)"
+  if [[ "$kind" == ufw ]] && active fail2ban && command -v fail2ban-client >/dev/null && [[ -f "$F2B_FILE" ]] && grep -Fq 'vps-stable-ufw-sshd' "$F2B_FILE"; then
     if ips="$(fail2ban-client get sshd banip 2>/dev/null)"; then
       read -r -a banned <<< "$ips"
       for ip in "${banned[@]}"; do
@@ -8645,6 +8774,9 @@ restore_fail2ban_group() {
   if active fail2ban; then
     if systemctl restart fail2ban; then ok '原有 Fail2ban 已按它自己的配置重新加载。'
     else warn 'Fail2ban 重新加载失败，请人工检查。'; RESTORE_PARTIAL=1; fi
+  fi
+  if command -v nft >/dev/null && nft list table inet vps-stable-f2b > /dev/null 2>&1; then
+    nft delete table inet vps-stable-f2b || { warn '没能删除本工具的封禁表：nft delete table inet vps-stable-f2b'; RESTORE_PARTIAL=1; }
   fi
 }
 
@@ -9711,20 +9843,35 @@ check_firewall() {
 }
 
 check_fail2ban() {
-  local status failed banned actions want have key
+  local status failed banned actions want have key kind old
   if ! active fail2ban || ! command -v fail2ban-client >/dev/null; then verify_set fail 'Fail2ban 服务没有运行'; return 0; fi
-  # This tool's ban action is a UFW rule: without a running UFW nothing is blocked.
-  if ! ufw_active; then verify_set fail '防火墙没有运行：Fail2ban 的封禁要靠防火墙执行，现在封不住任何 IP'; return 0; fi
+  kind="$(f2b_action_kind)"
+  case "$kind" in
+    none) verify_set fail "本工具的封禁动作文件不见了：$F2B_ACTION_FILE"; return 0 ;;
+    other) verify_set fail "本工具的封禁动作文件被改过：$F2B_ACTION_FILE"; return 0 ;;
+  esac
+  # The action up to v2.8 bans with UFW rules: without a running UFW nothing is blocked.
+  if [[ "$kind" == ufw ]] && ! ufw_active; then verify_set fail '防火墙没有运行：Fail2ban 的封禁要靠防火墙执行，现在封不住任何 IP'; return 0; fi
   if ! status="$(fail2ban-client status sshd 2>/dev/null)"; then verify_set fail 'sshd 规则没有加载'; return 0; fi
   failed="$(awk -F: '/Total failed/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
   banned="$(awk -F: '/Total banned/ {gsub(/[ \t]/, "", $2); print $2}' <<< "$status")"
   actions="$(fail2ban-client get sshd actions 2>/dev/null || true)"
-  if [[ "$actions" != *vps-stable-ufw-sshd* ]]; then verify_set fail 'sshd 规则没有使用本工具的 UFW 封禁动作'; return 0; fi
+  if [[ "$actions" != *vps-stable-ufw-sshd* ]]; then verify_set fail 'sshd 规则没有使用本工具的封禁动作'; return 0; fi
+  if [[ "$kind" == ufw ]]; then
+    verify_set update '封禁还是旧版的做法（每封一个 IP 加一条 UFW 规则，封得多时很慢，服务商硬重启后过期的封禁会一直留着）：选 5 单项设置 → Fail2ban 防爆破 → 1 开启，换成 nftables 集合'; return 0
+  fi
+  if ! nft list chain inet vps-stable-f2b input > /dev/null 2>&1; then
+    verify_set fail 'nftables 里没有本工具的封禁表（inet vps-stable-f2b），封不住任何 IP：运行 systemctl restart fail2ban 后再查'; return 0
+  fi
   # The values in force against the parameters (changed and not applied yet).
   want="$(f2b_jail_text x | awk -F' = ' '$1 == "maxretry" || $1 == "findtime" || $1 == "bantime" {printf "%s ", $2}')"
   have="$(for key in maxretry findtime bantime; do printf '%s ' "$(fail2ban-client get sshd "$key" 2>/dev/null | tr -d '[:space:]')"; done)"
   if [[ "$have" != "$want" ]]; then
     verify_set update "生效的是（次数 时间窗口 封禁秒数）${have% }，参数要求 ${want% }：选 5 单项设置 → Fail2ban 防爆破 → 1 开启，就会按新值应用"; return 0
+  fi
+  old="$(f2b_ufw_bans "$(awk -F' = ' '$1 == "port" {print $2; exit}' "$F2B_FILE" 2>/dev/null)" | grep -c . || true)"
+  if ((old)); then
+    verify_set update "UFW 里还有 $old 条旧版留下的封禁规则（现在封禁在 nftables 集合里）：选 5 单项设置 → Fail2ban 防爆破 → 1 开启，会清掉"; return 0
   fi
   if [[ "${failed:-0}" == 0 ]]; then
     verify_set pass '规则已加载；暂无失败登录记录（刚开机或还没被扫描，过一阵再查）'
@@ -9974,22 +10121,33 @@ ufw_mentions() {
 }
 
 # Optional end-to-end ban test with documentation-only addresses (RFC 5737 /
-# RFC 3849). It bans, verifies the UFW rule, unbans and verifies removal.
+# RFC 3849). It bans, finds the address where the action blocks it (the
+# nftables set; a UFW rule with the action up to v2.8), unbans and finds it
+# gone. The sets take IPv6 whatever UFW's IPV6 says.
 verify_f2b_live_test() {
-  local ip i lines matched
+  local ip i lines matched where gone
   local -a ips=(192.0.2.123)
-  if [[ -r /etc/default/ufw && "$(audit_ufw_ipv6 < /etc/default/ufw)" == yes ]]; then ips+=(2001:db8::123); fi
+  if [[ "$(f2b_action_kind)" == ufw ]]; then
+    where='UFW 中出现了对应的拦截规则'
+    if [[ -r /etc/default/ufw && "$(audit_ufw_ipv6 < /etc/default/ufw)" == yes ]]; then ips+=(2001:db8::123); fi
+  else
+    where='nftables 封禁集合里出现了这个地址'
+    if [[ -e /proc/net/if_inet6 ]]; then ips+=(2001:db8::123); fi
+  fi
   say 'Fail2ban 实弹测试'
   tool_lifecycle_lock
   for ip in "${ips[@]}"; do
     if ! fail2ban-client set sshd banip "$ip" >/dev/null 2>&1; then verify_line fail "封禁 $ip" 'Fail2ban 拒绝执行封禁'; continue; fi
-    for ((i = 0; i < 10; i++)); do ufw_mentions "$ip" && break; sleep 1; done
-    if ufw_mentions "$ip"; then verify_line pass "封禁 $ip" 'UFW 中出现了对应的拦截规则'
-    else verify_line fail "封禁 $ip" 'UFW 中没有出现拦截规则（封禁动作执行失败）'; fi
+    for ((i = 0; i < 10; i++)); do f2b_ban_seen "$ip" && break; sleep 1; done
+    if f2b_ban_seen "$ip"; then verify_line pass "封禁 $ip" "$where"
+    else verify_line fail "封禁 $ip" '没有拦截（封禁动作执行失败）'; fi
     fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 || true
-    for ((i = 0; i < 10; i++)); do ufw_mentions "$ip" || break; sleep 1; done
-    if ufw_mentions "$ip"; then verify_line fail "解封 $ip" "规则仍在，请手动删除：ufw delete deny from $ip"
-    else verify_line pass "解封 $ip" '拦截规则已删除，恢复原样'; fi
+    for ((i = 0; i < 10; i++)); do f2b_ban_seen "$ip" || break; sleep 1; done
+    if [[ "$(f2b_action_kind)" == ufw ]]; then gone="规则仍在，请手动删除：ufw delete deny from $ip"
+    elif [[ "$ip" == *:* ]]; then gone="地址仍在集合里，请手动删除：nft delete element inet vps-stable-f2b sshd6 { $ip }"
+    else gone="地址仍在集合里，请手动删除：nft delete element inet vps-stable-f2b sshd4 { $ip }"; fi
+    if f2b_ban_seen "$ip"; then verify_line fail "解封 $ip" "$gone"
+    else verify_line pass "解封 $ip" '拦截已撤掉，恢复原样'; fi
   done
   if command -v fail2ban-regex >/dev/null && command -v timeout >/dev/null; then
     lines="$(timeout 120s fail2ban-regex systemd-journal sshd 2>/dev/null | grep -E '^Lines:' || true)"
@@ -10694,7 +10852,11 @@ item_turn_off() {
 # the normal firewall stage with its SSH confirmation.
 item_firewall_pause() {
   if ! ufw_active; then ok '防火墙现在没有开启。'; return 0; fi
-  echo '临时关闭后，所有正在监听的端口都会直接暴露在公网，Fail2ban 的封禁也不起作用；重启后也保持关闭，排查完记得回到这里重新开启。'
+  if [[ "$(f2b_action_kind)" == ufw ]]; then
+    echo '临时关闭后，所有正在监听的端口都会直接暴露在公网，Fail2ban 的封禁也不起作用；重启后也保持关闭，排查完记得回到这里重新开启。'
+  else
+    echo '临时关闭后，所有正在监听的端口都会直接暴露在公网（Fail2ban 的封禁照常，它不靠 UFW）；重启后也保持关闭，排查完记得回到这里重新开启。'
+  fi
   if ! confirm_yes '临时关闭防火墙吗？'; then ok '已取消。'; return 0; fi
   ufw --force disable >/dev/null
   ufw_forward_restore

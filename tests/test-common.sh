@@ -42,6 +42,10 @@ load_optimizer_functions() {
 # The TG notification names, which the parameter checks (loaded by many tests)
 # use; quiet when the script under test has none (an older one). Likewise the other lists the parameter checks use, and the size text.
 load_optimizer_functions notify_event_names setup_skippable menu_alert_names menu_alert_on sysctl_hardening_all param_check_words mib_text names_only 2>/dev/null || true
+# Which Fail2ban ban action is in place (the check, the plan, the firewall
+# pause and the resources read it); none unless a test writes the file.
+load_optimizer_functions f2b_action_text f2b_action_legacy_text f2b_action_kind 2>/dev/null || true
+F2B_ACTION_FILE="${F2B_ACTION_FILE:-/nonexistent/vps-test-f2b-action}"
 # The parameters: many functions read theirs. Without a PARAMS_FILE of the
 # test's own, every one is the recommended value; a test that sets one, or
 # mocks param_value, still does so after this.

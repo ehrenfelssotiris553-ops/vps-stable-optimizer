@@ -131,6 +131,11 @@ if [[ "$mode" == upgrade ]]; then
   group "Upgrade in place to $version"
   sudo bash "$ROOT/install.sh" --local-file "$ROOT/vps-stable-opt.sh" --no-run
   [[ "$(sudo vps --version)" == "$version" ]] || fail 'the upgrade did not install this version'
+  # The previous release's launcher is replaced by this one's.
+  cmp -s /usr/local/bin/vps <(awk '/^cat > "\$TMP_DIR\/launcher" <</ {f = 1; next} f && /^EOF$/ {exit} f' "$ROOT/install.sh") ||
+    fail "the launcher of $old_version was not replaced: $(cat /usr/local/bin/vps)"
+  # Its Fail2ban bans stay UFW rules until Fail2ban is turned on again.
+  F2B_BANS=ufw
   endgroup
 else
   group 'Install from the checkout'
@@ -158,6 +163,11 @@ else
   endgroup
 fi
 
+# Anyone but root is told to use sudo by the launcher (the main script is
+# root's only: bash used to say "Permission denied").
+rc=0; out="$(vps item 2>&1)" || rc=$?
+[[ "$rc" == 1 && "$out" == 'vps 需要 root 权限：请用 sudo vps item（root 用户直接输入 vps）。' ]] || fail "vps item without sudo: $rc $out"
+
 # The health report must raise no false alarm on a fresh machine.
 # The transcript belongs to the CI user; only the probe runs as root.
 rc=0
@@ -183,12 +193,35 @@ check_all() {
   drive check.rules "$name" sudo vps check || rc=$?
   cat "$LOGS/$name.log"
   [[ "$rc" == 0 || "$rc" == 3 ]] || fail "$name exited with $rc"
-  for item in 'BBR 网络优化' '内核网络安全参数' 'TCP 缓冲区上限' '常用工具' '时区' '防火墙' 'Fail2ban 防爆破'; do
+  for item in 'BBR 网络优化' '内核网络安全参数' 'TCP 缓冲区上限' '常用工具' '时区' '防火墙'; do
     passed "$name" "$item"
   done
-  has "$name" '封禁 192.0.2.123：UFW 中出现了对应的拦截规则'
-  has "$name" '解封 192.0.2.123：拦截规则已删除'
+  f2b_checked "$name"
   [[ "$(tz)" == Asia/Shanghai ]] || fail "$name: timezone is $(tz)"
+}
+# NAME: the Fail2ban lines of a vps check. With the bans of the previous
+# release (F2B_BANS=ufw: upgraded, Fail2ban not turned on again yet) the
+# switch to the nftables sets is offered and the live test finds a UFW rule;
+# otherwise the check passes and the live test finds the address in the set.
+F2B_BANS=nft
+f2b_checked() {
+  if [[ "$F2B_BANS" == ufw ]]; then
+    grep -Eq '^⚠ 可更新[[:space:]]+Fail2ban 防爆破：封禁还是旧版的做法' "$LOGS/$1.log" || fail "$1: the switch to the nftables sets is not offered"
+    has "$1" '封禁 192.0.2.123：UFW 中出现了对应的拦截规则'
+  else
+    passed "$1" 'Fail2ban 防爆破'
+    has "$1" '封禁 192.0.2.123：nftables 封禁集合里出现了这个地址'
+  fi
+  has "$1" '解封 192.0.2.123：拦截已撤掉，恢复原样'
+}
+# ADDRESS: in this tool's IPv4 ban set (no -q: under pipefail nft's SIGPIPE
+# would fail a match).
+in_ban_set() { sudo nft list set inet vps-stable-f2b sshd4 2>/dev/null | grep -Fw -- "$1" > /dev/null; }
+# Up to 30 seconds for the jail after a (re)start of Fail2ban.
+f2b_wait() {
+  local i
+  for ((i = 0; i < 30; i++)); do sudo fail2ban-client status sshd > /dev/null 2>&1 && return 0; sleep 1; done
+  fail 'the sshd jail did not come back'
 }
 if [[ "$mode" == keep ]]; then
   group 'Uninstall without the rollback: the settings stay, nothing of the tool runs or is called any more'
@@ -221,9 +254,8 @@ if [[ "$mode" == keep ]]; then
   [[ "$rc" == 0 || "$rc" == 3 ]] || fail "check after the setup again exited with $rc"
   # Its own earlier files with exactly its text are taken up again; without the
   # records it cannot tell the others (TCP buffers) from an administrator's.
-  for item in 'BBR 网络优化' '内核网络安全参数' '常用工具' '防火墙' 'Fail2ban 防爆破' '自动安全更新' '登录记录和提醒'; do passed check-again "$item"; done
-  has check-again '封禁 192.0.2.123：UFW 中出现了对应的拦截规则'
-  has check-again '解封 192.0.2.123：拦截规则已删除'
+  for item in 'BBR 网络优化' '内核网络安全参数' '常用工具' '防火墙' '自动安全更新' '登录记录和提醒'; do passed check-again "$item"; done
+  f2b_checked check-again
   grep -Fq /var/lib/vps-stable-opt/login-hook /etc/pam.d/common-session || fail 'the login record is not on again'
   (($(tcp_rmem_max) > before_tcp_rmem)) || fail 'the TCP buffers are not raised any more'
   [[ "$(tz)" == Asia/Shanghai ]] || fail "timezone: $(tz)"
@@ -267,6 +299,7 @@ if [[ "$mode" == upgrade ]] && grep -q 'Could not get lock' "$LOGS/setup-old.log
   # what that left undone (Fail2ban needs the package).
   group "Fail2ban again, by $version (the previous release lost the package lock)"
   item_do item-fail2ban-after-upgrade fail2ban 1
+  F2B_BANS=nft
   endgroup
 fi
 group 'Acceptance check'
@@ -285,6 +318,52 @@ sudo ip link delete tun-ci0
 has check-route '转发：这台机器在转发流量（有 tun-ci0 接口）'
 has check-route 'ufw route allow in on tun-ci0 out on'
 if grep -q 'tun-ci0' "$LOGS/check.log"; then fail 'the forwarding note named an interface that was not there yet'; fi
+endgroup
+
+if [[ "$F2B_BANS" == ufw ]]; then
+  group "Fail2ban: the UFW bans of $old_version become nftables sets"
+  # A ban Fail2ban still runs, and one that ran out while it was down (only
+  # UFW has it, as after a hard reboot): the first goes into the set, the
+  # second is gone, and so is every UFW rule of the old action.
+  sudo fail2ban-client set sshd banip 198.51.100.77 > /dev/null || fail "cannot ban with the action of $old_version"
+  sudo ufw prepend deny proto tcp from 198.51.100.78 to any port 22 > /dev/null || fail 'cannot add a left-over ban'
+  for ((i = 0; i < 10; i++)); do ufw_added > "$LOGS/ufw-before-nft.log"; grep -F 198.51.100.77 "$LOGS/ufw-before-nft.log" > /dev/null && break; sleep 1; done
+  if ! grep -F 198.51.100.77 "$LOGS/ufw-before-nft.log" > /dev/null || ! grep -F 198.51.100.78 "$LOGS/ufw-before-nft.log" > /dev/null; then
+    fail "the bans of $old_version are not UFW rules: $(cat "$LOGS/ufw-before-nft.log")"
+  fi
+  item_do item-fail2ban-nft fail2ban 1
+  has item-fail2ban-nft '封禁改为 nftables 集合'
+  ufw_added > "$LOGS/ufw-after-nft.log"
+  if grep -E '198\.51\.100\.7[78]' "$LOGS/ufw-after-nft.log"; then fail 'UFW rules of the old bans left'; fi
+  for ((i = 0; i < 10; i++)); do in_ban_set 198.51.100.77 && break; sleep 1; done
+  in_ban_set 198.51.100.77 || fail "the running ban is not in the set: $(sudo nft list table inet vps-stable-f2b 2>&1)"
+  if in_ban_set 198.51.100.78; then fail 'the ban that ran out came back'; fi
+  sudo fail2ban-client set sshd unbanip 198.51.100.77 > /dev/null || fail 'cannot unban from the set'
+  if in_ban_set 198.51.100.77; then fail 'the unbanned address is still in the set'; fi
+  F2B_BANS=nft
+  check_all check-nft
+  endgroup
+fi
+
+group 'Fail2ban: what its sets hold without it knowing goes when it starts'
+# A ban left in the kernel when Fail2ban did not stop cleanly (killed: no
+# unban, no stop action; with the UFW action of the previous release such a
+# rule stayed for good): its start makes the table afresh and puts back only
+# the bans it runs. Started again by systemd (Restart=on-failure) or here.
+sudo nft add element inet vps-stable-f2b sshd4 '{ 198.51.100.79 }' || fail "cannot add to the set: $(sudo nft list ruleset 2>&1 | head -n 20)"
+in_ban_set 198.51.100.79 || fail 'the element added by hand is not in the set'
+sudo systemctl kill -s KILL fail2ban
+sleep 3
+sudo systemctl start fail2ban
+f2b_wait
+# The killed one's table is there until the jail's start action runs.
+for ((i = 0; i < 15; i++)); do in_ban_set 198.51.100.79 || break; sleep 1; done
+if in_ban_set 198.51.100.79; then fail 'an element Fail2ban does not know stayed in the set over its unclean restart'; fi
+# The listing belongs to the CI user; only nft runs as root.
+# shellcheck disable=SC2024
+sudo nft list chain inet vps-stable-f2b input > "$LOGS/f2b-chain.txt" 2>&1 || fail "no ban chain after the restart: $(cat "$LOGS/f2b-chain.txt")"
+cat "$LOGS/f2b-chain.txt"
+grep -E 'ct state new tcp dport (22|\{ 22 \}) ip saddr @sshd4 drop' "$LOGS/f2b-chain.txt" > /dev/null || fail 'the chain does not drop new SSH connections from the IPv4 set'
 endgroup
 
 group 'Single items: each switched off (back to how the system was) and on again'
@@ -690,7 +769,7 @@ grep -Eq '都正常|项要留意' "$LOGS/perf.log" || fail 'vps perf: no summary
 sudo vps resources > "$LOGS/resources.log" 2>&1 || fail "vps resources exited with $?"
 cat "$LOGS/resources.log"
 has resources 'Fail2ban：内存'
-has resources '防火墙里的封禁规则'
+has resources 'Fail2ban 正在封禁：'
 # The security audit, without a terminal (no deep check, nothing marked): all
 # six parts and the conclusion; a runner image is full of programs of its own,
 # so what it finds is not judged here (vm-run does that on clean images).

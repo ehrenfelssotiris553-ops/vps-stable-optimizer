@@ -7,7 +7,7 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe tool_fixed_paths tool_data_owned tool_expected_launcher tool_install_owned tool_tree_safe tool_no_pending_firewall
+load_optimizer_functions state_path_safe tool_fixed_paths tool_data_owned tool_expected_launcher tool_known_launchers tool_install_owned tool_tree_safe tool_no_pending_firewall
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -50,7 +50,14 @@ tool_secure_file() { local path; path="$(fixture_path "$1")" || return 1; [[ -f 
 # tool_expected_launcher writes its text with a plain `cat <<EOF`; pass that through.
 cat() { local path; if (($# == 0)); then command cat; return; fi; [[ "$1" == -- && $# == 2 ]] || return 99; path="$(fixture_path "$2")" || return 98; command cat -- "$path"; }
 stat() { local path; [[ "$1" == -c && "$2" == %s && "$3" == -- && $# == 4 ]] || return 99; path="$(fixture_path "$4")" || return 98; command stat -c '%s' -- "$path"; }
-sha256sum() { [[ "$1" == -- && "$2" == /usr/local/lib/vps-stable-opt/vps-stable-opt.sh ]] || return 99; printf '%064d  fixture\n' 0; }
+sha256sum() {
+  [[ "$1" == -- && $# == 2 ]] || return 99
+  case "$2" in
+    /usr/local/lib/vps-stable-opt/vps-stable-opt.sh) printf '%064d  fixture\n' 0 ;;
+    /usr/local/bin/vps) command sha256sum -- "$TEST_ROOT/launcher" ;;
+    *) return 98 ;;
+  esac
+}
 find() { printf '%s\n' .installer-owner vps-stable-opt.sh .installed-sha256; }
 tool_data_owned /var/lib/vps-stable-opt || fail 'exact V2.6 data marker rejected'
 printf '\n' >> "$TEST_ROOT/data/.tool-owner"
@@ -61,13 +68,24 @@ if tool_data_owned /tmp/vps-stable-opt; then fail 'unknown data root accepted'; 
 tool_install_owned || fail 'matching installer marker/hash/launcher rejected'
 printf '\n' >> "$TEST_ROOT/launcher"
 if tool_install_owned; then fail 'modified launcher accepted'; fi
+# This version's launcher tells anyone but root to use sudo (install-tests
+# runs it); the launcher of 2.6 to 2.8 did not: an upgrade stopped before
+# replacing it (the
+# installer finishes it when run again), so the uninstall still knows it.
+printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin' \
+  'if (( $# == 0 )); then set -- menu; fi' 'exec /bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh "$@"' > "$TEST_ROOT/launcher"
+[[ "$(tool_expected_launcher)" == *'if (( EUID != 0 )); then'*'请用 sudo vps'* ]] || fail 'the launcher does not tell anyone but root to use sudo'
+cmp -s "$TEST_ROOT/launcher" <(tool_expected_launcher) && fail 'the launcher of 2.8 is this one'
+tool_install_owned || fail 'the launcher of 2.8 rejected'
+printf '# edited\n' >> "$TEST_ROOT/launcher"
+if tool_install_owned; then fail 'an edited launcher of 2.8 accepted'; fi
 tool_expected_launcher > "$TEST_ROOT/launcher"
 printf '%s\n' 'vps-stable-opt-installer:1' > "$TEST_ROOT/install/.installer-owner"
 if tool_install_owned; then fail 'old installer owner marker accepted'; fi
 printf '%s\n' 'vps-stable-opt-installer:2.6' > "$TEST_ROOT/install/.installer-owner"
 find() { printf '%s\n' .installer-owner vps-stable-opt.sh .installed-sha256 unknown-file; }
 if tool_install_owned; then fail 'extra install directory contents accepted'; fi
-printf 'PASS: data/install ownership requires exact markers, payload hash, launcher and file list.\n'
+printf 'PASS: data/install ownership requires exact markers, payload hash, launcher (this one or a known earlier one) and file list.\n'
 
 tool_data_owned() { [[ "$1" == /var/lib/vps-stable-opt ]]; }
 FIND_OUTPUT='' FIND_STATUS=0 MOUNTS=$'/\n/var'

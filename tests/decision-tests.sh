@@ -17,10 +17,12 @@ load_function() {
   eval "$definition"
 }
 for name in journal_policy_paths sysctl_config_files trim_support decision_line decision_file_state decision_journal_state decision_report \
-    param_value param_read param_recommended param_check journal_config_text mib_text; do load_function "$name"; done
+    param_value param_read param_recommended param_check journal_config_text mib_text \
+    f2b_action_text f2b_action_legacy_text f2b_action_kind f2b_jail_text f2b_jail_values_text; do load_function "$name"; done
 SWAP_FILE=/swapfile PARAMS_FILE=/nonexistent/params
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
+F2B_ACTION_FILE="$TEST_ROOT/no-f2b-action.conf"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 WARNINGS=0
@@ -131,7 +133,17 @@ decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '改为首次 1 小时、同一 IP 再犯加倍'
 assert_contains '已有的白名单保持不变，没有的会问你'
 assert_absent '本工具的 Fail2ban 规则已经在运行'
-rm -f "$F2B_FILE"; F2B_RUNNING=0
+# The UFW bans of 2.8 and earlier: the switch to the nftables sets is announced.
+f2b_jail_text 22 > "$F2B_FILE"; F2B_ACTION_FILE="$TEST_ROOT/f2b-action.conf"
+f2b_action_legacy_text > "$F2B_ACTION_FILE"
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '封禁从每个 IP 一条 UFW 规则改成 nftables 集合'
+assert_absent '本工具的 Fail2ban 规则已经在运行'
+f2b_action_text > "$F2B_ACTION_FILE"
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '本工具的 Fail2ban 规则已经在运行'
+assert_absent 'nftables 集合'
+rm -f "$F2B_FILE" "$F2B_ACTION_FILE"; F2B_RUNNING=0
 assert_absent '计划配置约内存一半大小的 ZRAM'
 ZRAM_MODULE=1
 decision_report 0 0 > "$TEST_ROOT/report"

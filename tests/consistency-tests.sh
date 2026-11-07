@@ -210,8 +210,9 @@ declare -A FIXED_NUMBERS=(
   [f2b_policy_text]='0 60'
   # Bans are remembered at least a week, longer with a longer longest ban (f2b_maxtime_days).
   [f2b_db_text]='86400 604800'
-  # Fail2ban's default port, replaced by each jail's own.
-  [f2b_action_text]='22'
+  # Fail2ban's default port, replaced by each jail's own; priority -1 (the
+  # ban chain before UFW's at 0); 2> (an IPv6 address is no IPv4 element).
+  [f2b_action_text]='1 2 22'
   # Positional $1 and the root switch (0/1); the limits are parameters.
   [ssh_dropin_text]='0 1'
   # Nice=10 (in the background); 110 s: room for the daily summary's acceptance check (60 s).
@@ -247,3 +248,17 @@ while IFS=$'\t' read -r name _item label _unit; do
   grep -Fq "| $label |" "$README_FILE" || fail "parameter $name ($label) is not in the README's table"
 done < <(param_list)
 printf 'PASS: every parameter is in the README, by the name the menu shows.\n'
+
+# The launcher install.sh writes is the one the main script knows (the
+# uninstall checks it), and both know the same earlier ones (replaced on an
+# upgrade, accepted until then).
+INSTALL_SH="$(dirname -- "$TEST_SCRIPT")/install.sh"
+[[ -r "$INSTALL_SH" ]] || INSTALL_SH="$HERE/../install.sh"
+(
+  load_optimizer_functions tool_expected_launcher tool_known_launchers
+  launcher="$(awk '/^cat > "\$TMP_DIR\/launcher" <</ {f = 1; next} f && /^EOF$/ {exit} f' "$INSTALL_SH")"
+  [[ -n "$launcher" && "$launcher" == "$(tool_expected_launcher)" ]] || fail 'install.sh writes another launcher than tool_expected_launcher'
+  known="$(sed -n "s/^KNOWN_LAUNCHERS='\(.*\)'$/\1/p" "$INSTALL_SH")"
+  [[ -n "$known" && "$known" == "$(tool_known_launchers)" ]] || fail "earlier launchers: install.sh $known, tool_known_launchers $(tool_known_launchers)"
+)
+printf 'PASS: install.sh writes the launcher the main script knows, and both know the same earlier ones.\n'

@@ -53,8 +53,8 @@ rc=0; drive check.rules check sudo vps check || rc=$?
 cat "$LOGS/check.log"
 [[ "$rc" == 0 || "$rc" == 3 ]] || fail "check exited with $rc"
 for item in 'BBR 网络优化' '内核网络安全参数' 'TCP 缓冲区上限' '常用工具' '时区' '防火墙' 'Fail2ban 防爆破'; do passed check "$item"; done
-has check '封禁 192.0.2.123：UFW 中出现了对应的拦截规则'
-has check '解封 192.0.2.123：拦截规则已删除'
+has check '封禁 192.0.2.123：nftables 封禁集合里出现了这个地址'
+has check '解封 192.0.2.123：拦截已撤掉，恢复原样'
 has check 'Docker：已安装：用 -p 发布的容器端口会绕过防火墙'
 # grep reads all of it: -q would stop early, and under pipefail the writer's
 # SIGPIPE would hide a match.

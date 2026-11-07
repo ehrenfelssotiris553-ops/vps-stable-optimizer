@@ -5,7 +5,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test-common.sh
 source "$HERE/test-common.sh"
-load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_replace_owned_file f2b_jail_ready fail2ban_stage \
+load_optimizer_functions f2b_distribution_config foreign_f2b_config f2b_bootstrap_text f2b_jail_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address port_source_valid f2b_action_text f2b_action_legacy_text f2b_action_kind f2b_ufw_bans f2b_ufw_bans_clean f2b_replace_owned_file f2b_jail_ready fail2ban_stage \
   f2b_jail_values_text f2b_policy_text f2b_db_text f2b_db_apply f2b_optional ssh_effective_value param_value param_read param_recommended param_check
 # Backup policy is exercised by backup-tests.sh and entry-tests.sh. This test
 # replaces only that dependency while testing the actual Fail2ban transition.
@@ -26,7 +26,8 @@ new_case() {
   F2B_ACTION_FILE="$F2B_DIR/action.d/vps-stable-ufw-sshd.conf"
   F2B_DB_FILE="$F2B_DIR/fail2ban.d/99-vps-stable.local" PARAMS_FILE="$CASE_DIR/params" DB_OURS=0 F2B_CHOICE=1
   : > "$CASE_DIR/conffiles"; : > "$CASE_DIR/events"; : > "$CASE_DIR/ok"; : > "$CASE_DIR/warn"; : > "$CASE_DIR/results"
-  FIREWALL_READY=1 UFW_ACTIVE=1 SSH_OK=1 PKG_FAIL2BAN=0 PKG_SYSTEMD=0 SERVICE_ACTIVE=0 TEST_STATUS=0 JAIL_STATUS=0
+  FIREWALL_READY=1 UFW_ACTIVE=1 SSH_OK=1 PKG_FAIL2BAN=0 PKG_SYSTEMD=0 PKG_NFT=0 SERVICE_ACTIVE=0 TEST_STATUS=0 JAIL_STATUS=0 UFW_ADDED=''
+  : > "$CASE_DIR/ufw"
   EXPECT_JAIL="$(f2b_jail_text '22,2222')" F2B_IGNORE_CHOICE='' ALLOW_YES=0 SSH_CONNECTION=''
 }
 # The allowlist question (only when a jail has no allowlist line yet).
@@ -49,7 +50,17 @@ ssh_detect() { SSH_PORTS=(22 2222); ((SSH_OK)); }
 available() { [[ ! -e "$CASE_DIR/no-index" ]]; }
 apt_index_ready() { printf 'refresh\n' >> "$CASE_DIR/events"; rm -f -- "$CASE_DIR/no-index"; }
 installed() {
-  case "$1" in fail2ban) ((PKG_FAIL2BAN));; python3-systemd) ((PKG_SYSTEMD));; *) return 1;; esac
+  case "$1" in fail2ban) ((PKG_FAIL2BAN));; python3-systemd) ((PKG_SYSTEMD));; nftables) ((PKG_NFT));; *) return 1;; esac
+}
+# The ban action's command (its package is nftables); never run here.
+nft() { fail "nft run by the setup: $*"; }
+# Stored rules (`ufw show added`) and the deletions asked for.
+ufw() {
+  case "$1 ${2:-}" in
+    'show added') printf "Added user rules (see 'ufw status' for running firewall):\n"; [[ -z "$UFW_ADDED" ]] || printf '%s\n' "$UFW_ADDED" ;;
+    '--force delete') shift 2; printf 'delete %s\n' "$*" >> "$CASE_DIR/ufw" ;;
+    *) fail "unexpected ufw command: $*" ;;
+  esac
 }
 active() { ((SERVICE_ACTIVE)); }
 put_file() {
@@ -61,12 +72,19 @@ put_file() {
   printf '%s\n' "$contents" > "$dest"
 }
 install_pkgs() {
+  printf '%s\n' "$*" >> "$CASE_DIR/installed"
   # Assert the package's postinst would read an explicitly disabled sshd jail.
-  [[ "$(cat "$F2B_FILE")" == "$(f2b_bootstrap_text)" ]] || fail 'package installation was not guarded'
-  printf 'install:guard\n' >> "$CASE_DIR/events"
+  if [[ " $* " == *' fail2ban '* ]]; then
+    [[ "$(cat "$F2B_FILE")" == "$(f2b_bootstrap_text)" ]] || fail 'package installation was not guarded'
+    printf 'install:guard\n' >> "$CASE_DIR/events"
+  else
+    # Only nft for a running Fail2ban: the old action stays until it is there.
+    printf 'install:%s\n' "$*" >> "$CASE_DIR/events"
+    [[ "$(f2b_action_kind)" == ufw ]] || fail "the action was replaced before nft was installed: $(f2b_action_kind)"
+  fi
   local pkg
   for pkg in "$@"; do
-    case "$pkg" in fail2ban) PKG_FAIL2BAN=1;; python3-systemd) PKG_SYSTEMD=1;; esac
+    case "$pkg" in fail2ban) PKG_FAIL2BAN=1;; python3-systemd) PKG_SYSTEMD=1;; nftables) PKG_NFT=1;; esac
   done
   default_file "$F2B_DIR/jail.conf" $'[DEFAULT]\nenabled = false'
   default_file "$F2B_DIR/jail.d/defaults-debian.conf" $'[sshd]\nenabled = true'
@@ -124,9 +142,19 @@ new_case fresh
 fail2ban_stage
 expected=$'install:guard\ntest\nenable\nstart\nstatus'
 [[ "$(cat "$CASE_DIR/events")" == "$expected" ]] || fail 'installation/test/service ordering'
-# prepend keeps IPv6 bans valid; `insert 1` fails while rule 1 is an IPv4 rule.
-grep -Fxq 'actionban = /usr/sbin/ufw prepend deny proto tcp from <ip> to any port <port>' "$F2B_ACTION_FILE" || fail 'port-specific prepend ban command missing'
-if grep -Fq 'insert 1' "$F2B_ACTION_FILE"; then fail 'IPv6-incompatible insert position remains'; fi
+[[ "$(cat "$CASE_DIR/installed")" == 'fail2ban python3-systemd nftables' ]] || fail "packages: $(cat "$CASE_DIR/installed")"
+# Bans are elements of nftables sets (an IPv6 address goes to the IPv6 one);
+# only new connections to the jail's ports are dropped, before UFW's chains.
+[[ "$(f2b_action_kind)" == nft ]] || fail "action: $(cat "$F2B_ACTION_FILE")"
+grep -Fxq "actionban = /usr/sbin/nft add element inet vps-stable-f2b sshd4 '{ <ip> }' 2> /dev/null || /usr/sbin/nft add element inet vps-stable-f2b sshd6 '{ <ip> }'" "$F2B_ACTION_FILE" || fail 'ban into the sets missing'
+grep -Fxq "actionunban = /usr/sbin/nft delete element inet vps-stable-f2b sshd4 '{ <ip> }' 2> /dev/null || /usr/sbin/nft delete element inet vps-stable-f2b sshd6 '{ <ip> }'" "$F2B_ACTION_FILE" || fail 'unban from the sets missing'
+grep -F 'actionstart = ' "$F2B_ACTION_FILE" | grep -F "'type filter hook input priority -1; policy accept;' 'ct state new tcp dport { <port> } ip saddr @sshd4 drop' 'ct state new tcp dport { <port> } ip6 saddr @sshd6 drop'" > /dev/null ||
+  fail 'the chain does not drop only new connections to the ports before UFW'
+grep -Fxq 'actionstop = /usr/sbin/nft delete table inet vps-stable-f2b' "$F2B_ACTION_FILE" && grep -Fxq 'actionstart_on_demand = false' "$F2B_ACTION_FILE" || fail 'table not made at start and taken away at stop'
+# Fail2ban's configuration reader takes "%" for its own and a " ;" for a comment.
+if grep -v '^#' "$F2B_ACTION_FILE" | sed 's/%%//g' | grep -F '%' > /dev/null; then fail 'a single % in the action'; fi
+if grep -v '^#' "$F2B_ACTION_FILE" | grep -E '[[:space:]];' > /dev/null; then fail 'a ";" after a space in the action (read as a comment)'; fi
+if grep -Fq ufw "$F2B_ACTION_FILE"; then fail 'the action still uses UFW'; fi
 grep -Fq 'Fail2ban 已就绪' "$CASE_DIR/ok" || fail 'ready status missing'
 grep -Fq '输错 5 次（10 分钟内）封 1 小时，同一 IP 再犯时间加倍，最长 7 天' "$CASE_DIR/ok" || fail "policy not described: $(cat "$CASE_DIR/ok")"
 grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'applied Fail2ban result missing'
@@ -178,7 +206,7 @@ passed 'an empty package index is refreshed before Fail2ban is reported missing'
 # (first ban 1 hour, doubled on repeat, at most a week), keeps its allowlist
 # line without asking again, and Fail2ban is restarted with it.
 new_case legacy_upgrade
-PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 SSH_CONNECTION='203.0.113.50 50000 192.0.2.1 22'
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 PKG_NFT=1 SERVICE_ACTIVE=1 SSH_CONNECTION='203.0.113.50 50000 192.0.2.1 22'
 { f2b_jail_legacy_text '22,2222'; printf 'ignoreip = 127.0.0.1/8 ::1 203.0.113.9\n'; } > "$F2B_FILE"
 EXPECT_JAIL="$(f2b_jail_text '22,2222' 203.0.113.9)"
 fail2ban_stage
@@ -191,7 +219,7 @@ passed 'an earlier fixed-ban jail is upgraded in place and keeps its allowlist'
 
 # An earlier jail without an allowlist: the question is asked now (Enter = yes).
 new_case legacy_upgrade_allowlist
-PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 SSH_CONNECTION='203.0.113.50 50000 192.0.2.1 22' ALLOW_YES=1
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 PKG_NFT=1 SERVICE_ACTIVE=1 SSH_CONNECTION='203.0.113.50 50000 192.0.2.1 22' ALLOW_YES=1
 f2b_jail_legacy_text '22,2222' > "$F2B_FILE"
 EXPECT_JAIL="$(f2b_jail_text '22,2222' 203.0.113.50)"
 fail2ban_stage
@@ -200,7 +228,7 @@ passed 'upgrading a jail without allowlist asks for the current address'
 
 # A failed configuration test puts the earlier jail back.
 new_case legacy_upgrade_bad_test
-PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 TEST_STATUS=1 F2B_IGNORE_CHOICE=none
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 PKG_NFT=1 SERVICE_ACTIVE=1 TEST_STATUS=1 F2B_IGNORE_CHOICE=none
 f2b_jail_legacy_text '22,2222' > "$F2B_FILE"
 legacy="$(cat "$F2B_FILE")"
 fail2ban_stage
@@ -208,10 +236,53 @@ fail2ban_stage
 [[ "$(cat "$CASE_DIR/events")" == 'test' ]] || fail 'service restarted after a failed test'
 passed 'a failed test after the upgrade restores the earlier jail'
 
+# Upgraded from 2.8: the UFW action becomes the nftables one in place, after
+# nft is installed (Fail2ban runs with the old one until its restart); then
+# the bans that action left in UFW go: one address on the SSH ports, now or
+# in the jail before (2200), however `ufw show added` words them. Rules of
+# other kinds stay: a network, another port or protocol, the rate limit.
+new_case legacy_action
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
+f2b_jail_text 2200 > "$F2B_FILE"
+f2b_action_legacy_text > "$F2B_ACTION_FILE"
+UFW_ADDED='ufw limit 22/tcp
+ufw allow 80/tcp
+ufw deny proto tcp from 198.51.100.7 to any port 22,2222
+ufw prepend deny proto tcp from 2001:db8::7 to any port 2222
+ufw deny from 203.0.113.9 to any port 22 proto tcp
+ufw deny proto tcp from 198.51.100.10 to any port 2200
+ufw deny proto tcp from 198.51.100.0/24 to any port 22
+ufw deny proto tcp from 198.51.100.8 to any port 80
+ufw deny proto udp from 198.51.100.9 to any port 22
+ufw deny from 198.51.100.11 to any port 22
+ufw deny proto tcp from 198.51.100.12 to any port 22,8080'
+fail2ban_stage
+[[ "$(f2b_action_kind)" == nft ]] || fail "the UFW action was not replaced: $(cat "$F2B_ACTION_FILE")"
+[[ "$(cat "$CASE_DIR/events")" == $'install:nftables\ntest\nenable\nrestart\nstatus' ]] || fail "upgrade sequence: $(tr '\n' ' ' < "$CASE_DIR/events")"
+[[ "$(cat "$CASE_DIR/ufw")" == 'delete deny proto tcp from 198.51.100.7 to any port 22,2222
+delete deny proto tcp from 2001:db8::7 to any port 2222
+delete deny from 203.0.113.9 to any port 22 proto tcp
+delete deny proto tcp from 198.51.100.10 to any port 2200' ]] || fail "old bans deleted: $(cat "$CASE_DIR/ufw")"
+grep -Fq '已删除 4 条旧的 UFW 封禁规则' "$CASE_DIR/ok" && grep -Fq '封禁改为 nftables 集合' "$CASE_DIR/ok" || fail "not told: $(cat "$CASE_DIR/ok")"
+grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'the upgraded action not recorded as applied'
+# Run again: nothing left to delete, nothing replaced.
+: > "$CASE_DIR/events"; : > "$CASE_DIR/ufw"; UFW_ADDED='ufw limit 22/tcp'
+fail2ban_stage
+[[ ! -s "$CASE_DIR/ufw" && "$(cat "$CASE_DIR/events")" == $'test\nenable\nrestart\nstatus' ]] || fail "second run: $(cat "$CASE_DIR/ufw" "$CASE_DIR/events")"
+# An action changed by hand is neither of the two: kept, Fail2ban not touched.
+new_case edited_action
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 PKG_NFT=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
+f2b_jail_text '22,2222' > "$F2B_FILE"
+{ f2b_action_legacy_text; echo '# mine'; } > "$F2B_ACTION_FILE"
+edited="$(cat "$F2B_ACTION_FILE")"
+fail2ban_stage
+[[ "$(cat "$F2B_ACTION_FILE")" == "$edited" && ! -s "$CASE_DIR/events" ]] || fail 'an edited action was replaced or Fail2ban restarted'
+passed 'the UFW action of 2.8 is replaced in place once nft is there, and its bans left in UFW go'
+
 # The SSH port changed (vps item, SSH 端口): this tool's jail for the old port
 # is still its own and watches the new one.
 new_case port_changed
-PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 PKG_NFT=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
 f2b_jail_text 2222 > "$F2B_FILE"
 EXPECT_JAIL="$(f2b_jail_text '22,2222')"
 fail2ban_stage
@@ -221,7 +292,7 @@ passed 'a jail of this tool follows a changed SSH port'
 # Parameters changed: this tool's jail with any values is still its own and
 # is written again with the new ones; back to the recommendation, again.
 new_case params
-PKG_FAIL2BAN=1 PKG_SYSTEMD=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
+PKG_FAIL2BAN=1 PKG_SYSTEMD=1 PKG_NFT=1 SERVICE_ACTIVE=1 F2B_IGNORE_CHOICE=none
 f2b_jail_text '22,2222' > "$F2B_FILE"
 printf 'f2b_maxretry=3\nf2b_bantime_min=30\nf2b_increment=no\nf2b_maxtime_days=30\n' > "$PARAMS_FILE"
 EXPECT_JAIL="$(f2b_jail_text '22,2222')"

@@ -8,7 +8,8 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_health_units param_value param_read param_recommended param_check param_mode verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
   trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health audit_clean_text f2b_jail_text f2b_jail_values_text \
-  check_ssh_override sshd_setting_overrides sshd_config_walk sshd_include_args sshd_line_value
+  check_ssh_override sshd_setting_overrides sshd_config_walk sshd_include_args sshd_line_value \
+  f2b_action_text f2b_action_legacy_text f2b_action_kind f2b_ufw_bans f2b_ban_seen port_source_valid verify_f2b_live_test
 TEST_ROOT="$(mktemp -d)"
 # No sshd configuration here: nothing to name as winning over the tool's file.
 SSHD_CONFIG="$TEST_ROOT/sshd_config" SSH_DROPIN="$TEST_ROOT/sshd_config.d/01-vps-stable-keyonly.conf"
@@ -209,22 +210,79 @@ check_trim ''
 [[ "$VERIFY_STATUS" == pass ]] || fail 'supported TRIM with an active timer failed'
 printf 'PASS: TRIM checks the disk discard support before the timer.\n'
 
-# Fail2ban bans are UFW rules: no running firewall, no protection.
-UFW_ON=0
+# Fail2ban: which ban action is in place decides what has to run.
+UFW_ON=0 NFT_TABLE=1 UFW_ADDED='' SET4='' SET6=''
+F2B_ACTION_FILE="$TEST_ROOT/vps-stable-ufw-sshd.conf" F2B_FILE="$TEST_ROOT/99-vps-stable-sshd.local"
+f2b_jail_text '22,2222' > "$F2B_FILE"
 ufw_active() { ((UFW_ON)); }
 fail2ban-client() {
   case "$*" in
     'status sshd') printf 'Status for the jail: sshd\n|- Filter\n|  |- Total failed:\t3\n|- Actions\n   |- Total banned:\t1\n' ;;
     'get sshd actions') echo vps-stable-ufw-sshd ;;
     'get sshd maxretry') echo 5 ;; 'get sshd findtime') echo 600 ;; 'get sshd bantime') echo 3600 ;;
+    'set sshd banip '*:*) if ((BAN_WORKS)); then SET6+=" ${*: -1}"; fi ;;
+    'set sshd banip '*) if ((BAN_WORKS)); then SET4+=" ${*: -1}"; fi ;;
+    'set sshd unbanip '*) SET4="${SET4// ${*: -1}/}" SET6="${SET6// ${*: -1}/}" ;;
   esac
 }
+nft() {
+  case "$*" in
+    'list chain inet vps-stable-f2b input') ((NFT_TABLE)) ;;
+    'list set inet vps-stable-f2b sshd4') ((NFT_TABLE)) && printf 'table inet vps-stable-f2b {\n\tset sshd4 {\n\t\ttype ipv4_addr\n\t\telements = {%s }\n\t}\n}\n' "$SET4" ;;
+    'list set inet vps-stable-f2b sshd6') ((NFT_TABLE)) && printf 'table inet vps-stable-f2b {\n\tset sshd6 {\n\t\ttype ipv6_addr\n\t\telements = {%s }\n\t}\n}\n' "$SET6" ;;
+    *) return 1 ;;
+  esac
+}
+ufw() { case "$*" in 'show added') printf 'Added user rules:\n%s\n' "$UFW_ADDED" ;; esac; }
 active() { [[ "$1" == fail2ban ]]; }
+# Up to 2.8 bans were UFW rules: no running firewall, no protection; with
+# one, the switch to the nftables sets is offered.
+f2b_action_legacy_text > "$F2B_ACTION_FILE"
 check_fail2ban ''
-[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *防火墙没有运行* ]] || fail 'Fail2ban passed without a running firewall'
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *防火墙没有运行* ]] || fail 'Fail2ban with UFW bans passed without a running firewall'
 UFW_ON=1
 check_fail2ban ''
-[[ "$VERIFY_STATUS" == pass ]] || fail 'Fail2ban with a running firewall failed'
+[[ "$VERIFY_STATUS" == update && "$VERIFY_TEXT" == *旧版的做法*'1 开启'*nftables* ]] || fail "the UFW action not offered the switch: $VERIFY_STATUS $VERIFY_TEXT"
+# The nftables sets need no UFW, but their table.
+f2b_action_text > "$F2B_ACTION_FILE"
+UFW_ON=0
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == pass ]] || fail "Fail2ban with the nftables sets failed without UFW: $VERIFY_STATUS $VERIFY_TEXT"
+NFT_TABLE=0
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'inet vps-stable-f2b'* ]] || fail "a missing ban table passed: $VERIFY_STATUS $VERIFY_TEXT"
+NFT_TABLE=1 UFW_ON=1
+# Bans the UFW action left behind (one address on an SSH port) are counted;
+# other deny rules are not.
+UFW_ADDED=$'ufw deny proto tcp from 198.51.100.7 to any port 22
+ufw deny from 2001:db8::7 to any port 2222 proto tcp
+ufw deny proto tcp from 198.51.100.8 to any port 80
+ufw limit 22/tcp'
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == update && "$VERIFY_TEXT" == *'还有 2 条旧版留下的封禁规则'* ]] || fail "old UFW bans not counted: $VERIFY_STATUS $VERIFY_TEXT"
+UFW_ADDED=''
+# The action changed by hand, or gone.
+{ f2b_action_text; echo '# mine'; } > "$F2B_ACTION_FILE"
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *被改过* ]] || fail "an edited action passed: $VERIFY_STATUS $VERIFY_TEXT"
+rm -f -- "$F2B_ACTION_FILE"
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *不见了* ]] || fail "a missing action passed: $VERIFY_STATUS $VERIFY_TEXT"
+f2b_action_text > "$F2B_ACTION_FILE"
+check_fail2ban ''
+[[ "$VERIFY_STATUS" == pass ]] || fail 'Fail2ban with its nftables sets failed'
+# The live test finds the address in the IPv4 set and gone after the unban.
+(
+  tool_lifecycle_lock() { :; }; say() { :; }; sleep() { :; }
+  VERIFY_PASS=0 VERIFY_FAIL=0 VERIFY_NA=0 VERIFY_UNKNOWN=0 VERIFY_ISSUES=() BAN_WORKS=1 SET4='' SET6=''
+  out="$(verify_f2b_live_test)"
+  grep -Fq '封禁 192.0.2.123：nftables 封禁集合里出现了这个地址' <<< "$out" && grep -Fq '解封 192.0.2.123：拦截已撤掉' <<< "$out" || fail "live test: $out"
+  if grep -Fq '未生效' <<< "$out"; then fail "live test with a working ban failed: $out"; fi
+  BAN_WORKS=0
+  out="$(verify_f2b_live_test)"
+  grep -Fq '未生效  封禁 192.0.2.123：没有拦截' <<< "$out" || fail "a ban not in the set passed: $out"
+)
+printf 'PASS: Fail2ban needs UFW only with the bans of 2.8, its nftables table otherwise; old UFW bans and the switch are offered.\n'
 # A parameter changed and not applied yet: the values in force are shown.
 printf 'f2b_maxretry=3\n' >> "$PARAMS_FILE"
 check_fail2ban ''
@@ -293,7 +351,7 @@ UFW_BOOT=static
 check_firewall ''
 [[ "$VERIFY_STATUS" == unknown ]] || fail 'a static ufw.service was taken as enabled at boot'
 UFW_BOOT=enabled
-printf 'PASS: Fail2ban needs a running UFW; the firewall must also load at boot.\n'
+printf 'PASS: the firewall must also load at boot; a parameter changed for Fail2ban is shown.\n'
 
 # The usage sentence ends with ".", which must not be taken for the size.
 systemd-analyze() { printf '[Journal]\nSystemMaxUse=100M\nMaxRetentionSec=%s\n' "${DAYS:-90day}"; }
