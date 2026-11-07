@@ -20,8 +20,9 @@ Bot Token ==> $TG_TOKEN
 这个周期已经用了 ==> 5
 现在重启 Docker 让设置生效吗？ ==> n
 请输入端口 ==> 8080
-# A parameter, asked after "3. 调整参数" (the TCP cap, in MiB).
-新的值（直接回车不改 ==> 40
+# The parameters, asked after "3. 调整参数": the TCP cap (in MiB), then the
+# TCP switches, left automatic (40 is no answer for them: asked again).
+新的值（直接回车不改 ==> @seq 40 auto
 只允许某个 IP 访问吗？ ==>
 协议：1\) TCP ==> 1
 仍然对所有人开放吗？ ==> y

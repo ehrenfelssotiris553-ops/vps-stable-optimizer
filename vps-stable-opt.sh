@@ -6212,16 +6212,28 @@ run_latest_id() {
 # rollback baseline). A second early: a change in the same tick of the clock
 # as the mark would not be newer than it.
 run_state_mark_start() {
-  local mark="$RUN_STATE_DIR/.started"
+  local mark="$RUN_STATE_DIR/.started" now back
   : > "$mark"
-  touch -d "@$(($(date +%s) - 1))" -- "$mark" 2>/dev/null || true
+  # 50 ms back, a few ticks of the kernel clock that file times come from:
+  # a change right after the mark counts. Not further: what a command run
+  # just before wrote (the CI saw UFW's rules files written a second before,
+  # at the end of a vps check) is no change of this session. Where files keep
+  # whole seconds only, the mark goes one second back.
+  now="$(date +%s%N)"
+  [[ "$now" =~ ^[0-9]{19,}$ ]] || now="$(date +%s)000000000"
+  back=$((now - 50000000))
+  touch -d "@$((back / 1000000000)).$(printf '%09d' $((back % 1000000000)))" -- "$mark" 2>/dev/null || true
+  if [[ "$(stat -c %y -- "$mark" 2>/dev/null)" == *.000000000\ * ]]; then
+    touch -d "@$((now / 1000000000 - 1))" -- "$mark" 2>/dev/null || true
+  fi
 }
 
 # True when something changed since run_state_mark_start: a file under /etc,
 # a package (dpkg's log), or this tool's own state. Its run records and logs,
 # the background check's files and the login record change by themselves, and
-# vps check notes the boot it checked (verified_boot): a check run just before
-# (as on the CI, within the second the mark goes back) changed nothing.
+# vps check notes the boot it checked (verified_boot), which changes nothing
+# (where files keep whole seconds, a check just before falls in the second
+# the mark goes back).
 run_state_changed() {
   local mark="$RUN_STATE_DIR/.started" etc="${RUN_CHANGE_ETC:-/etc}" dpkg_log="${RUN_CHANGE_DPKG_LOG:-/var/log/dpkg.log}"
   [[ -f "$mark" ]] || return 0

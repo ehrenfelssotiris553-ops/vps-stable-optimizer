@@ -453,7 +453,8 @@ printf 'PASS: TCP buffer ceilings follow RAM, are only raised and keep foreign k
   grep -Fxq 'orig net.ipv4.tcp_mtu_probing=0' "$TEST_ROOT/trace" || fail 'original of mtu_probing not recorded'
   rm -f "$TCP_BUFFER_FILE"; SYSVAL[net.ipv4.tcp_mtu_probing]=2; CONFIGURED=net.ipv4.tcp_slow_start_after_idle
   reset; tcp_buffer_stage
-  if grep -q 'mtu_probing\|slow_start_after_idle' "$TCP_BUFFER_FILE"; then fail "a stricter or foreign switch was overridden: $(cat "$TCP_BUFFER_FILE")"; fi
+  # (Often no file at all: nothing else is raised.)
+  if grep -qs 'mtu_probing\|slow_start_after_idle' "$TCP_BUFFER_FILE"; then fail "a stricter or foreign switch was overridden: $(cat "$TCP_BUFFER_FILE")"; fi
   CONFIGURED=none; unset 'SYSVAL[net.ipv4.tcp_slow_start_after_idle]' 'SYSVAL[net.ipv4.tcp_mtu_probing]'
   # Back to automatic: the file stores nothing for it.
   param_store tcp_buffer_mib ''

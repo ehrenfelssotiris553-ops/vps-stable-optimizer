@@ -262,9 +262,25 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
     session; touch -d "$later" "$f"
     run_state_changed || fail "a change of ${f#"$T/rs/"} not seen"
   done
-  # The mark is a second early: a change in the same tick of the clock counts.
+  # The mark is a few ticks early: a change in the same tick of the clock counts.
   session; touch "$STATE_ROOT/params"
   run_state_changed || fail 'a change right after the mark not seen'
+  # Not a second early: what a command run just before wrote is no change of
+  # the session (the CI saw UFW's rules files written 1 to 1.5 seconds before
+  # the session, at the end of a vps check, keep a record).
+  session; t=$(($(date +%s%N) - 300000000))
+  # (The directory too: a new file there changed it then.)
+  touch -d "@$((t / 1000000000)).$(printf '%09d' $((t % 1000000000)))" "$RUN_CHANGE_ETC/ufw-user.rules" "$RUN_CHANGE_ETC"
+  if run_state_changed; then fail 'a file written 0.3 seconds before the session counted as its change'; fi
+  # Where files keep whole seconds only, the mark goes a second back: a change
+  # in the same second still counts.
+  stat() { if [[ "$*" == *%y* ]]; then echo '2026-11-08 02:44:04.000000000 +0800'; else command stat "$@"; fi; }
+  session; unset -f stat
+  mark_time="$(stat -c %y "$RUN_STATE_DIR/.started")"
+  [[ "$mark_time" == *.000000000\ * && "$(stat -c %Y "$RUN_STATE_DIR/.started")" -lt "$(date +%s)" ]] ||
+    fail "whole seconds: the mark is not a whole second back: $mark_time"
+  touch -d "@$(($(stat -c %Y "$RUN_STATE_DIR/.started") + 1))" "$STATE_ROOT/params"
+  run_state_changed || fail 'whole seconds: a change in the second the session started not seen'
 )
 # Pruned when a run finishes: a session taken back must not have pushed one out.
 [[ "$(awk '/^prepare_run_state\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" != *run_records_prune* ]] || fail 'old records pruned when a run starts'

@@ -18,8 +18,11 @@
 # exit code 3 instead of waiting. So does any other question no rule knows (a
 # number menu, a free answer): output that ends with ": " and stays so for two
 # looks ANSWER_IDLE seconds apart (120 by default). No matching output for 50
-# minutes (or ANSWER_TIMEOUT seconds) ends it with 4. Otherwise the exit code
-# is the command's own.
+# minutes (or ANSWER_TIMEOUT seconds) ends it with 4. One rule answering more
+# than ANSWER_REPEAT times (200 by default) ends it with 5: the same question
+# asked again and again, as when the tool refuses the answer (that kept output
+# coming, so only the job's time limit ended it). Otherwise the exit code is
+# the command's own.
 encoding system utf-8
 if {[llength $argv] < 3} {
   puts stderr "usage: answer.exp RULES LOG COMMAND \[ARG ...\]"
@@ -32,6 +35,8 @@ set limit 3000
 if {[info exists env(ANSWER_TIMEOUT)]} { set limit $env(ANSWER_TIMEOUT) }
 set idle 120
 if {[info exists env(ANSWER_IDLE)]} { set idle $env(ANSWER_IDLE) }
+set repeat 200
+if {[info exists env(ANSWER_REPEAT)]} { set repeat $env(ANSWER_REPEAT) }
 set timeout [expr {min($idle, $limit)}]
 # Seconds without a matching question so far, and the question-like end of
 # the output at the last look (a second look finding it unchanged fails).
@@ -60,11 +65,16 @@ while {[gets $f line] >= 0} {
 close $f
 
 proc respond {index} {
-  global rules seqpos answers waited last_tail
+  global rules seqpos answered repeat answers waited last_tail expect_out
   set waited 0
   set last_tail {}
   set answer [lindex $rules $index 1]
   puts $answers "[clock format [clock seconds] -format %H:%M:%S] [lindex $rules $index 0] ==> $answer"
+  incr answered($index)
+  if {$answered($index) > $repeat} {
+    puts stderr "\nanswer.exp: \"[lindex $rules $index 0]\" answered $repeat times, asked again: [string range $expect_out(buffer) end-300 end]"
+    exit 5
+  }
   if {[string range $answer 0 4] eq "@seq "} {
     set items [regexp -all -inline {\S+} [string range $answer 5 end]]
     set answer [lindex $items [expr {min($seqpos($index), [llength $items] - 1)}]]
@@ -104,6 +114,7 @@ set index 0
 foreach rule $rules {
   set pattern [lindex $rule 0]
   set seqpos($index) 0
+  set answered($index) 0
   lappend clauses -re "${pattern}\[^\n\]*${noise}" [list respond $index]
   incr index
 }
