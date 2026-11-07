@@ -387,7 +387,9 @@ grep -Fxq 'ufw allow from 10.0.2.2 to any port 22 proto tcp' "$LOGS/ufw-allow.lo
 endgroup
 
 group 'From outside: the firewall really blocks, opens and closes a port, over IPv4 and IPv6'
-vm 'nohup python3 -m http.server 8080 >/dev/null 2>&1 </dev/null &'
+# --bind :: (both families, IPv4 through a dual-stack socket): without it
+# http.server listens on 0.0.0.0 only (the first address getaddrinfo gives).
+vm 'nohup python3 -m http.server --bind :: 8080 >/dev/null 2>&1 </dev/null &'
 web() { curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/ || true; }
 # IPv6 from a network namespace on the VM: its packets come in on an interface
 # of their own and go through UFW's ip6tables rules like any from outside
@@ -402,14 +404,22 @@ sleep 2
 [[ -n "$(vm 'ss -H -lnt "( sport = :8080 )"')" ]] || fail 'the test web server on 8080 did not start'
 [[ "$(vm 'grep -E "^IPV6=" /etc/default/ufw')" == 'IPV6=yes' ]] || fail 'UFW does not guard IPv6 here'
 [[ "$(web)" != 200 ]] || fail 'port 8080 answered before it was opened'
-[[ "$(web6)" != 200 ]] || fail 'port 8080 answered over IPv6 before it was opened'
+# What the IPv6 path looks like when it fails; the run goes on, the failure
+# comes at the end (so that everything after this still runs).
+ipv6_why() {
+  vm 'ss -H -lnt "( sport = :8080 )"; ip6tables -S 2>&1 | grep -E "8080|ufw6-user-input|-P INPUT"; ip -6 addr show dev ci6-host; ip -n ci6 -6 addr; ip -n ci6 -6 route
+    ip netns exec ci6 curl -6 -sS -o /dev/null -m 5 -v "http://[fd00:6::1]:8080/" 2>&1 | tail -n 5' > "$LOGS/ipv6-why.log" 2>&1 || true
+  notice "IPv6 to 8080 from the namespace ($system): $1" "$LOGS/ipv6-why.log"
+  ipv6_problem="${ipv6_problem:-$1}"
+}
+[[ "$(web6)" != 200 ]] || ipv6_why 'port 8080 answered over IPv6 before it was opened'
 vm_drive port.rules port-open vps port open 8080 tcp || fail "port open exited with $?"
 [[ "$(web)" == 200 ]] || fail 'port 8080 does not answer after vps port open'
-[[ "$(web6)" == 200 ]] || fail 'port 8080 does not answer over IPv6 after vps port open'
+[[ "$(web6)" == 200 ]] || ipv6_why 'port 8080 does not answer over IPv6 after vps port open'
 vm_drive port.rules port-close vps port close 8080 tcp || fail "port close exited with $?"
 [[ "$(web)" != 200 ]] || fail 'port 8080 still answers after vps port close'
-[[ "$(web6)" != 200 ]] || fail 'port 8080 still answers over IPv6 after vps port close'
-vm 'pkill -f "http.server 8080"; ip netns del ci6' || true
+[[ "$(web6)" != 200 ]] || ipv6_why 'port 8080 still answers over IPv6 after vps port close'
+vm 'pkill -f "[h]ttp.server --bind"; ip netns del ci6' || true
 endgroup
 
 group 'From outside: a stranger guessing passwords is banned for real, then unbanned'
@@ -719,4 +729,6 @@ fi
 endgroup
 # Ctrl+C in the middle of a setup may stop it anywhere.
 no_tool_errors interrupt
+# Found at the IPv6 check and kept until here, so that the rest still ran.
+[[ -z "${ipv6_problem:-}" ]] || fail "$ipv6_problem"
 printf 'PASS: %s VM (%s MiB): setup, check, allowlisted logins, reboot, tmux reconnect, SSH hardening (dropped and kept), rollback, uninstall.\n' "$system" "$memory"

@@ -8484,9 +8484,32 @@ pkg_changed_configs() {
 # purged, so its configuration goes too, except configuration that predates
 # the tool ("rc" before its first run, or not known: recorded by an older
 # version) and changed configuration the user chooses to keep.
+# PACKAGE...: the systemd units these packages ship (read before they go).
+pkg_units() {
+  local pkg
+  for pkg in "$@"; do
+    { dpkg -L "$pkg" 2>/dev/null || true; } | sed -n 's#^/\(usr/\)\{0,1\}lib/systemd/system/\([^/]*\.\(service\|socket\|timer\|path\)\)$#\2#p'
+  done | LC_ALL=C sort -u
+}
+
+# UNIT...: units of packages just removed that still run, stopped: the
+# package's own scripts do not always do it (unattended-upgrades' shutdown
+# helper kept running after its removal on Ubuntu 22.04 and 24.04, until the
+# next reboot).
+pkg_units_stop() {
+  local unit
+  (($#)) || return 0
+  for unit in "$@"; do
+    if systemctl is-active -q "$unit" 2>/dev/null; then
+      systemctl stop "$unit" 2>/dev/null || warn "没能停下 $unit：它的软件包已经卸载，重启后就不在了。"
+    fi
+  done
+  systemctl daemon-reload 2>/dev/null || true
+}
+
 restore_packages_offer() {
   local dir="$RESTORE_ROOT/packages" sim pkg mode chosen='' bad changed path owner
-  local -a ours=() removed=() flags=() all=() purge=() kept=() old_rc=()
+  local -a ours=() removed=() flags=() all=() purge=() kept=() old_rc=() units=()
   mapfile -t all < <(restore_tool_packages)
   if (($#)); then
     for pkg in "${all[@]}"; do
@@ -8544,9 +8567,11 @@ restore_packages_offer() {
   fi
   flags=()
   [[ "$chosen" == autoremove ]] && flags=(--autoremove)
+  mapfile -t units < <(pkg_units "${removed[@]}")
   apt_wait_idle
   if apt_run -y -q -o DPkg::Lock::Timeout=900 remove "${flags[@]}" "${ours[@]}"; then
     ok '已卸载本工具新装的软件包。'
+    pkg_units_stop "${units[@]}"
     if [[ " ${ours[*]} " == *' systemd-zram-generator '* ]]; then ZRAM_PACKAGE_REMOVED=1; fi
     restore_packages_record
     # The packages are gone now: the purge only deletes what they left behind.

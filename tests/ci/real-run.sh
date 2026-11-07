@@ -295,9 +295,21 @@ runs() { sudo find /var/lib/vps-stable-opt /var/backups/vps-stable-opt -maxdepth
 runs_before="$(runs)" latest_before="$(sudo cat /var/lib/vps-stable-opt/latest)"
 printf '%s\n' '请选择要修改的项目 ==> 0' > "$LOGS/item-look.rules"
 drive "$LOGS/item-look.rules" item-look sudo vps item || fail "looking at the single items exited with $?"
-has item-look '这次只是查看，没有改动'
-[[ "$(runs)" == "$runs_before" && "$(sudo cat /var/lib/vps-stable-opt/latest)" == "$latest_before" ]] ||
-  fail "a session that only looked left a record: $runs_before -> $(runs) records and backups, latest $(sudo cat /var/lib/vps-stable-opt/latest)"
+# When it keeps its record: what was newer than its start (the run it kept
+# has the mark). The run goes on; the failure comes at the end.
+look_problem=''
+if ! grep -Fq '这次只是查看，没有改动' "$LOGS/item-look.log" || [[ "$(runs)" != "$runs_before" ]] ||
+   [[ "$(sudo cat /var/lib/vps-stable-opt/latest)" != "$latest_before" ]]; then
+  look_problem="a session that only looked kept its record: $runs_before -> $(runs) records and backups (see the notice)"
+  mark="/var/lib/vps-stable-opt/$(sudo cat /var/lib/vps-stable-opt/latest)/.started"
+  { printf 'mark %s\nnow  %s\n' "$(sudo stat -c %y "$mark" 2>&1)" "$(date '+%F %T.%N %z')"
+    printf 'dpkg.log %s\n' "$(stat -c %y /var/log/dpkg.log 2>&1)"
+    sudo find /etc /var/lib/vps-stable-opt -xdev -newer "$mark" ! -path '/var/lib/vps-stable-opt/run-*' \
+      ! -path '/var/lib/vps-stable-opt/logs*' -printf '%TY-%Tm-%Td %TT %y %p\n' 2>&1 | head -n 30
+  } > "$LOGS/item-look-why.log" 2>&1 || true
+  notice "item-look kept its record ($mode $(uname -m))" "$LOGS/item-look-why.log"
+  printf '::error::%s\n' "$look_problem"
+fi
 item_do item-bbr-off bbr 2
 [[ "$(sudo cat /var/lib/vps-stable-opt/latest)" != "$latest_before" ]] || fail 'a session that changed something left no record'
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "$before_cc" ]] || fail 'BBR off: congestion control not back'
@@ -740,5 +752,6 @@ endgroup
 no_tool_errors
 # Found at the traffic check and kept until here, so that the rest still ran.
 [[ -z "${traffic_problem:-}" ]] || fail "$traffic_problem"
+[[ -z "${look_problem:-}" ]] || fail "$look_problem"
 printf 'PASS: real run (%s) on %s: install, setup, check, single items, ports, rollback, uninstall.\n' \
   "$mode" "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"

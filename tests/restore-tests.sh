@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/test-common.sh"
-load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one ufw_forward_restore restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group ufw_sysctl_keys restore_record_dir restore_created_dirs restore_ssh_group sshd_off_files sshd_lines_on restore_zram_group restore_tool_packages restore_packages_offer \
+load_optimizer_functions state_path_safe state_secure_dir restore_ids restore_all_ids restore_label restore_path restore_unit restore_data_safe restore_write restore_read restore_service_value ufw_policy_value audit_ufw_ipv6 restore_value restore_fingerprint restore_snapshot restore_prepare restore_record_packages restore_record_fw_rule restore_record_sysctl restore_sysctl_runtime restore_before_stage restore_after_stage restore_capture_failure restore_record_hosts_line restore_hosts_line_present restore_hosts_lines_apply restore_needed restore_file_apply restore_service_apply restore_zram_safe restore_apply_one ufw_forward_restore restore_mark restore_at_origin restore_resource f2b_action_referenced_elsewhere restore_fail2ban_group restore_fw_rules_apply restore_firewall_group ufw_sysctl_keys restore_record_dir restore_created_dirs restore_ssh_group sshd_off_files sshd_lines_on restore_zram_group restore_tool_packages pkg_units pkg_units_stop restore_packages_offer \
   restore_packages_record restore_group_ids restore_group_pending restore_group_apply zram_swap_active zram_reset_idle restore_zram_settle restore_tool_package port_source_valid pkg_file_unchanged pkg_changed_configs ping_ufw_reapply
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
@@ -901,9 +901,28 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
     case "$1" in *改过的这些配置*) ((DELETE_CHANGED)) ;; *) ((ANSWER_REMOVE)) ;; esac
   }
   run() { : > "$TRACE"; restore_packages_offer > "$P/out"; }
+  # The units the removed packages ship; what still runs after the removal is
+  # stopped (unattended-upgrades' shutdown helper kept running after its
+  # removal on Ubuntu 22.04 and 24.04: found by the CI's snapshot of units).
+  dpkg() {
+    [[ "$1" == -L ]] || die "unexpected dpkg $*"
+    case "$2" in
+      fail2ban) printf '%s\n' /usr/lib/systemd/system/fail2ban.service /etc/fail2ban/jail.conf ;;
+      vnstat) printf '%s\n' /lib/systemd/system/vnstat.service ;;
+    esac
+  }
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >> "$P/units"
+    case "$*" in
+      'is-active -q fail2ban.service'|'stop fail2ban.service'|daemon-reload) return 0 ;;
+      'is-active -q '*) return 1 ;;
+      *) die "unexpected systemctl $*" ;;
+    esac
+  }
   # Nothing changed: removed, then purged, except the one with older leftovers.
-  run
+  : > "$P/units"; run
   expect "$(cat "$TRACE")" $'ask 确认卸载上述软件包吗？\nremove --autoremove ufw fail2ban vnstat\npurge ufw fail2ban python3-pyinotify'
+  expect "$(cat "$P/units")" $'systemctl is-active -q fail2ban.service\nsystemctl stop fail2ban.service\nsystemctl is-active -q vnstat.service\nsystemctl daemon-reload'
   grep -Fq '只卸载程序、配置留在原处：vnstat' "$P/out" || die 'the package with older leftovers is not named'
   grep -Fq 'Fail2ban 的封禁记录也会一起删除' "$P/out" || die 'losing the Fail2ban ban history is not said'
   # A changed conffile is listed and asked about; "n" keeps that package's configuration.
@@ -927,9 +946,10 @@ printf 'PASS: sysctl runtime originals and the UFW IPv6 switch are restored.\n'
   grep -Fq '/etc/ufw/user.rules（保存着 1 条规则）（ufw）' "$P/out" || die "stored UFW rules not listed: $(cat "$P/out")"
   expect "$(tail -n 1 "$TRACE")" 'purge fail2ban python3-pyinotify'
   UFW_RULES='(None)'
-  # Declined: nothing removed, nothing purged.
-  ANSWER_REMOVE=0; run
+  # Declined: nothing removed, nothing purged, nothing stopped.
+  ANSWER_REMOVE=0; : > "$P/units"; run
   expect "$(cat "$TRACE")" 'ask 确认卸载上述软件包吗？'
+  [[ ! -s "$P/units" ]] || die "units touched although nothing was removed: $(cat "$P/units")"
   ANSWER_REMOVE=1
   # Recorded by an older version (no list of leftovers): removal only.
   rm -f -- "$RESTORE_ROOT/packages/before-rc"; run
