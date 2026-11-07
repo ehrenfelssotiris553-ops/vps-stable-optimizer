@@ -192,6 +192,33 @@ restore_tool_packages() { :; }
 reset; STATE=([apt_file]=applied)
 item_turn_off updates
 if grep -q '^packages' "$TEST_ROOT/trace"; then fail 'a preinstalled unattended-upgrades was offered for removal'; fi
+# The SSH hardening undone on its own: password login works again, the
+# firewall stays on, Fail2ban is not there (left out on a key-only machine
+# under 1 GiB): turning it on is suggested; otherwise nothing is said.
+(
+  load_optimizer_functions f2b_password_note
+  restore_group_pending() { return 0; }
+  restore_group_apply() { record "apply $1"; }
+  restore_groups() { echo ssh; }
+  restore_tool_packages() { :; }
+  ufw_active() { ((UFW)); }
+  active() { [[ "$1" == fail2ban ]] && ((F2B)); }
+  ssh_password_disabled() { ((PW_OFF)); }
+  note() { grep -q 'Fail2ban 没有运行' "$TEST_ROOT/log"; }
+  UFW=1 F2B=0 PW_OFF=0
+  reset; item_turn_off ssh > "$TEST_ROOT/out"
+  note && grep -q '单项设置 → Fail2ban' "$TEST_ROOT/out" || fail 'turning Fail2ban on not suggested after password login came back'
+  reset; printf '1\n' > "$TEST_ROOT/pick"; RESTORE_PARTIAL=0
+  restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
+  note || fail 'not suggested after undoing the SSH hardening from the rollback menu'
+  for case in 'F2B=1' 'PW_OFF=1' 'UFW=0'; do
+    UFW=1 F2B=0 PW_OFF=0; eval "$case"
+    reset; item_turn_off ssh > /dev/null
+    if note; then fail "Fail2ban suggested although $case"; fi
+  done
+  UFW=1 F2B=0 PW_OFF=0; reset; item_turn_off bbr > /dev/null
+  if note; then fail 'Fail2ban suggested after undoing another item'; fi
+)
 restore_resource() { record "resource $1"; }
 reset; TOOLS_PACKAGES=(curl htop)
 item_turn_off tools

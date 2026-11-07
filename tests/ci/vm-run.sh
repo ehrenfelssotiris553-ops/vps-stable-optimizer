@@ -527,6 +527,8 @@ printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1'
 vm_drive "$LOGS/sshport-on.rules" sshport-on vps item || fail "the port change exited with $?"
 has sshport-on 'SSH 端口已改成 2244'
 has sshport-on '00-aaa-provider.conf 第 3 行：Port 22'
+# Fail2ban follows the port; systemd's lines about its SysV script stay out.
+if grep -q 'with SysV service script' "$LOGS/sshport-on.log"; then fail 'the port change printed the SysV lines of systemctl enable fail2ban'; fi
 ssh "${VM_NEW_OPTS[@]}" "$VM_HOST" true || fail 'no login on the new port 2244'
 if ssh "${VM_OPTS[@]}" -o ConnectTimeout=5 "$VM_HOST" true 2>/dev/null; then fail 'the old port 22 still lets logins in'; fi
 ssh "${VM_NEW_OPTS[@]}" "$VM_HOST" 'cat /etc/ssh/sshd_config.d/00-vps-stable-port.conf; ufw show added; fail2ban-client get sshd actions >/dev/null && grep "^port" /etc/fail2ban/jail.d/99-vps-stable-sshd.local' > "$LOGS/sshport-state.txt" 2>&1 || true

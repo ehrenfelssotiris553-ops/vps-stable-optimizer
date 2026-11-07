@@ -21,6 +21,8 @@ module_result() { printf '%s %s\n' "$1" "$2" >> "$CASE_DIR/results"; }
 ssh_detect() { SSH_PORTS=(22); return 0; }
 ssh_password_disabled() { ((KEY_ONLY)); }
 docker_firewall_note() { :; }
+# What ufw_route_hint says (tested on its own below); nothing unless a case sets it.
+ufw_route_hint() { printf '%s' "${ROUTE_HINT:-}"; }
 host_has_global_ipv6() { return 1; }
 audit_ufw_ipv6() { echo yes; }
 # Models the user accepting IPv6 protection before UFW is enabled.
@@ -462,3 +464,40 @@ if grep -q '^systemctl enable' "$CASE_DIR/calls"; then fail 'tried to enable a s
 grep -Fq 'static' "$CASE_DIR/messages" || fail 'static ufw.service not explained'
 
 printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports, services that would be blocked, boot loading and conservative takeover.\n'
+
+# UFW drops forwarded packets by default: a WireGuard or OpenVPN server behind
+# it lets clients connect but reach nothing. The firewall stage says how to let
+# them through, once the firewall is on (new or already running).
+ROUTE_HINT='转发提示'
+reset_case route_hint_new
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+firewall_stage < "$CASE_DIR/input" > /dev/null
+[[ "$FIREWALL_READY" == 1 ]] && grep -Fxq 'WARN 转发提示' "$CASE_DIR/messages" || fail 'forwarding not explained after turning the firewall on'
+reset_case route_hint_active
+printf '1\n' > "$CASE_DIR/ufw-active"; WEB_YES=0
+firewall_stage < "$CASE_DIR/input" > /dev/null
+grep -Fxq 'WARN 转发提示' "$CASE_DIR/messages" || fail 'forwarding not explained for a firewall already on'
+ROUTE_HINT=''
+(
+  load_optimizer_functions ufw_route_hint
+  ip() {
+    case "$*" in
+      '-o link show') printf '1: lo: <LOOPBACK>\n2: eth0: <UP>\n'; if [[ -n "$VPN" ]]; then printf '3: %s: <POINTOPOINT>\n' "$VPN"; fi ;;
+      '-4 route get 1.1.1.1') echo '1.1.1.1 via 192.0.2.1 dev ens3 src 192.0.2.10 uid 0' ;;
+    esac
+  }
+  sysctl() { [[ "$*" == '-n net.ipv4.ip_forward' ]] && echo "$FWD"; }
+  docker_present() { ((DOCKER)); }
+  D="$TEST_ROOT/default-ufw"; printf 'IPV6=yes\nDEFAULT_FORWARD_POLICY="DROP"\n' > "$D"
+  VPN=wg0 FWD=1 DOCKER=0
+  hint="$(ufw_route_hint "$D")"
+  [[ "$hint" == *'有 wg0 接口'*'ufw route allow in on wg0 out on ens3'* ]] || fail "WireGuard: $hint"
+  VPN=tun0 FWD=0; [[ "$(ufw_route_hint "$D")" == *'ufw route allow in on tun0 out on ens3'* ]] || fail 'OpenVPN tun0 not seen'
+  VPN='' FWD=1; [[ "$(ufw_route_hint "$D")" == *'net.ipv4.ip_forward=1'*'in on wg0 out on ens3'* ]] || fail 'forwarding on without an interface not explained'
+  VPN='' FWD=1 DOCKER=1; [[ -z "$(ufw_route_hint "$D")" ]] || fail 'Docker alone (which turns forwarding on) explained as a VPN'
+  VPN=wg0 DOCKER=1; [[ -n "$(ufw_route_hint "$D")" ]] || fail 'WireGuard next to Docker not explained'
+  VPN='' FWD=0 DOCKER=0; [[ -z "$(ufw_route_hint "$D")" ]] || fail 'explained without any forwarding'
+  printf 'DEFAULT_FORWARD_POLICY="ACCEPT"\n' > "$D"
+  VPN=wg0 FWD=1; [[ -z "$(ufw_route_hint "$D")" ]] || fail 'explained although UFW lets forwarded packets through'
+)
+printf 'PASS: forwarding (wg/tun/tap, or ip_forward without only Docker) that UFW drops is explained with the ufw route command.\n'

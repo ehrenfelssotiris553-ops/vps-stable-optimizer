@@ -67,6 +67,19 @@ grep -Fq 'TRIM：not effective' <<< "$out" || fail 'present module check result 
 grep -Fq 'ZRAM：按条件跳过（RAM >= 2GiB）' <<< "$out" || fail 'skipped module reported as checked'
 grep -Fq '日志：开荒时没有成功（journald restart failed）' <<< "$out" || fail 'failed module not reported as failed'
 grep -Fq 'SSH：没有开荒记录' <<< "$out" || fail 'unrecorded module not reported'
+# Items one-click setup never turns on: not "no setup record" (seen on a real
+# Debian 13 VPS for the hostname, which made it look like setup had not run).
+out="$(verify_module hostname '主机名' check_pass | sed $'s/\033\\[[0-9;]*m//g')"
+[[ "$out" == *'主机名：没有开启（一键开荒不管这一项'* && "$out" != *开荒记录* ]] || fail "hostname without a record: $out"
+# The list of such items matches what one-click setup really runs.
+setup_stages="$(awk '/^main\(\) \{$/,/^\}$/' "$TEST_SCRIPT" | sed -n 's/^ *stage_run \([a-z_]*\) .*/\1/p' | sort -u | tr '\n' ' ')"
+for module in hostname conntrack ping notify quota dockerlog sshport; do
+  [[ " $setup_stages " != *" $module "* ]] || fail "$module is set up by one-click setup, yet called an item it never touches"
+done
+for module in $(awk '/^verify_checks\(\) \{$/,/^\}$/' "$TEST_SCRIPT" | sed -n "s/^ *verify_module \([a-z_]*\) .*/\1/p"); do
+  case "$module" in hostname|conntrack|ping|notify|quota|dockerlog|sshport|upgrade|tools|traffic) continue ;; esac
+  [[ " $setup_stages " == *" $module "* ]] || fail "$module is not set up by one-click setup: add it to the items verify_module calls not part of it"
+done
 verify_module bbr 'BBR' check_pass > /dev/null
 verify_module trim 'TRIM' check_fail > /dev/null
 [[ "$VERIFY_PASS" == 1 && "$VERIFY_FAIL" == 1 ]] || fail 'verification counters'

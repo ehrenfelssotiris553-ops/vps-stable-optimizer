@@ -265,6 +265,16 @@ check_all check
 if [[ "$mode" != upgrade ]]; then passed check '自动安全更新'; fi
 apt_readable 'after the setup'
 check_facts check
+# A VPN server's tun interface behind UFW, which drops forwarded packets:
+# vps check says how to let them through (and says nothing once it is gone).
+printf '%s\n' '显示详细状态吗？ ==> n' '做一次 Fail2ban 实弹测试吗？ ==> n' > "$LOGS/check-route.rules"
+sudo ip tuntap add dev tun-ci0 mode tun
+rc=0; drive "$LOGS/check-route.rules" check-route sudo vps check || rc=$?
+sudo ip link delete tun-ci0
+[[ "$rc" == 0 || "$rc" == 3 ]] || fail "vps check with a tun interface exited with $rc"
+has check-route '转发：这台机器在转发流量（有 tun-ci0 接口）'
+has check-route 'ufw route allow in on tun-ci0 out on'
+if grep -q 'tun-ci0' "$LOGS/check.log"; then fail 'the forwarding note named an interface that was not there yet'; fi
 endgroup
 
 group 'Single items: each switched off (back to how the system was) and on again'

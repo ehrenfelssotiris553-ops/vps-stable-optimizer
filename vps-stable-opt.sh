@@ -294,12 +294,23 @@ confirm_default_yes() {
   [[ -z "$answer" || "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]]
 }
 active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+# systemctl ARGS, without the two lines about a SysV script that enable and
+# disable print for packages still shipping one (fail2ban, ufw): every other
+# message and the exit status stay.
+systemctl_quiet_sysv() {
+  local out rc=0
+  out="$(systemctl "$@" 2>&1)" || rc=$?
+  if [[ -n "$out" ]]; then
+    grep -vE '^(Synchronizing state of .* with SysV service script|Executing: .*systemd-sysv-install )' <<< "$out" >&2 || true
+  fi
+  return "$rc"
+}
 ufw_active() {
   local state
   state="$(ufw status 2>/dev/null)" || return 1
   grep -Fxq 'Status: active' <<< "$state"
 }
-installed() { dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -qx installed; }
+installed() { dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -x installed > /dev/null; }
 available() { installed "$1" || apt-cache policy "$1" 2>/dev/null | awk '$1=="Candidate:" && $2!="(none)" {ok=1} END {exit !ok}'; }
 # True when lslocks output (stdin) lists an APT/dpkg lock.
 apt_lock_listed() {
@@ -1367,11 +1378,11 @@ bbr_stage() {
     module_result bbr preserved 'existing TCP/qdisc policy'; return 0
   fi
   if ! modprobe tcp_bbr >/dev/null 2>&1 &&
-     ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+     ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -w bbr > /dev/null; then
     warn '当前内核不支持 BBR；不会更换内核。'
     module_result bbr unsupported 'kernel has no BBR'; return 0
   fi
-  if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+  if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -w bbr > /dev/null; then
     warn '加载模块后 BBR 仍不可用。'
     module_result bbr unsupported 'BBR unavailable after modprobe'; return 0
   fi
@@ -1451,7 +1462,7 @@ zram_vendor_default_only() {
   done
   if systemctl is-enabled zramswap.service >/dev/null 2>&1; then return 1; fi
   if awk '$1 !~ /^#/ && $3=="swap" {found=1} END{exit !found}' /etc/fstab 2>/dev/null; then return 1; fi
-  ! swapon --noheadings --show=NAME 2>/dev/null | grep -qv '^/dev/zram'
+  ! swapon --noheadings --show=NAME 2>/dev/null | grep -v '^/dev/zram' > /dev/null
 }
 
 # Ubuntu's cloud kernels leave zram out (it is in linux-modules-extra); every
@@ -1503,7 +1514,7 @@ zram_tune() {
   local pair key value current text='' existed=0
   local -a originals=() kept=()
   # A disk swap next to ZRAM would be slowed down by both values.
-  if swapon --noheadings --show=NAME 2>/dev/null | grep -qv '^/dev/zram'; then return 0; fi
+  if swapon --noheadings --show=NAME 2>/dev/null | grep -v '^/dev/zram' > /dev/null; then return 0; fi
   while IFS= read -r pair; do
     key="${pair%%=*}"; value="${pair#*=}"
     current="$(sysctl -n "$key" 2>/dev/null || true)"
@@ -1655,10 +1666,10 @@ zram_stage() {
   if swap_exists; then
     # The package default is replaced by this tool's own file when asked for
     # explicitly, or when it runs no swap at all (Ubuntu installs it unstarted).
-    if zram_vendor_default_only && { [[ "${ZRAM_CHOICE:-}" == 1 ]] || ! swapon --noheadings 2>/dev/null | grep -q .; }; then
+    if zram_vendor_default_only && { [[ "${ZRAM_CHOICE:-}" == 1 ]] || ! swapon --noheadings 2>/dev/null | grep . > /dev/null; }; then
       vendor=1
       echo '现在只有 systemd-zram-generator 软件包自带的默认 ZRAM 配置（约内存一半），改用本工具的配置。'
-    elif restore_file_ours zram_file && ! swapon --noheadings 2>/dev/null | grep -q .; then
+    elif restore_file_ours zram_file && ! swapon --noheadings 2>/dev/null | grep . > /dev/null; then
       echo '本工具的 ZRAM 配置还在，但 ZRAM 没有运行（可能上次启动失败）：重新启动它。'
       if zram_start; then zram_tune; module_result zram applied 'zram0 restarted'
       else warn 'ZRAM 仍然没有启动，请运行 systemctl status systemd-zram-setup@zram0 查看原因。'; module_result zram failed 'dev-zram0.swap did not start'; fi
@@ -3429,7 +3440,7 @@ fail2ban_stage() {
     fi
     warn 'Fail2ban 配置检查没通过，不启用服务。'; return 0
   fi
-  if ! systemctl enable fail2ban; then warn '无法设置 Fail2ban 开机启动。'; return 0; fi
+  if ! systemctl_quiet_sysv enable fail2ban; then warn '无法设置 Fail2ban 开机启动。'; return 0; fi
   if active fail2ban; then
     if ! systemctl restart fail2ban; then warn '无法重启 Fail2ban。'; return 0; fi
   else
@@ -3606,6 +3617,27 @@ docker_firewall_note() {
   echo '对策：只在本机使用的容器端口绑定到 127.0.0.1（例如 -p 127.0.0.1:8080:80）；需要对外的，在服务商安全组限制来源，或使用 DOCKER-USER 链（例如 ufw-docker）。'
 }
 
+# [FILE]: what to do when this machine forwards traffic (a WireGuard or
+# OpenVPN server: a wg/tun/tap interface, or ip_forward on) while UFW drops
+# forwarded packets (its default, DEFAULT_FORWARD_POLICY in FILE): clients
+# connect but reach nothing. Nothing when it does not apply; Docker alone
+# (which turns ip_forward on) brings its own forwarding rules.
+ufw_route_hint() {
+  local file="${1:-/etc/default/ufw}" policy vpn forward out why
+  policy="$(sed -n 's/^[[:space:]]*DEFAULT_FORWARD_POLICY[[:space:]]*=[[:space:]]*"\{0,1\}\([A-Za-z]*\)"\{0,1\}.*/\1/p' "$file" 2>/dev/null | tail -n 1)"
+  [[ "${policy^^}" != ACCEPT ]] || return 0
+  vpn="$(ip -o link show 2>/dev/null | awk -F': ' '{sub(/@.*/, "", $2); if ($2 ~ /^(wg|tun|tap)[A-Za-z0-9_.-]*$/) print $2}' | head -n 1 || true)"
+  forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
+  if [[ -z "$vpn" ]]; then
+    [[ "$forward" == 1 ]] || return 0
+    if docker_present; then return 0; fi
+  fi
+  out="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}' || true)"
+  if [[ -n "$vpn" ]]; then why="有 $vpn 接口"; else why='net.ipv4.ip_forward=1'; fi
+  printf '这台机器在转发流量（%s），UFW 默认丢弃转发的包：WireGuard、OpenVPN 这类的客户端能连上，却上不了网。需要时放行转发，例如 ufw route allow in on %s out on %s（换成你的接口名）。' \
+    "$why" "${vpn:-wg0}" "${out:-eth0}"
+}
+
 # Services reachable from outside right now that turning UFW on would block,
 # one "port/proto<TAB>program" per line (IPv4 and IPv6 may repeat: sort -u).
 # Left out: SSH, TCP 80/443 (the web-port question decides those), ports a
@@ -3685,7 +3717,7 @@ ssh_limit_exempt_one() {
 }
 
 host_has_global_ipv6() {
-  command -v ip >/dev/null && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
+  command -v ip >/dev/null && ip -6 addr show scope global 2>/dev/null | grep 'inet6' > /dev/null
 }
 
 # IP: the exemption rules this tool added for IP go again (only those it
@@ -3830,6 +3862,8 @@ firewall_stage() {
   if grep -Fxq 'Status: active' <<< "$state"; then
     ok 'UFW 已经开启：保留现有的 SSH 规则和默认策略。'
     docker_firewall_note
+    line="$(ufw_route_hint)"
+    if [[ -n "$line" ]]; then warn "$line"; fi
     if [[ -r /etc/default/ufw && "$(audit_ufw_ipv6 < /etc/default/ufw)" == no ]] && host_has_global_ipv6; then
       # Flipping IPV6 on a live firewall would drop IPv6 SSH until v6 rules exist.
       warn '本机有公网 IPv6 地址，但 UFW 设置了 IPV6=no：IPv6 入口不受防火墙保护。'
@@ -3951,6 +3985,8 @@ firewall_stage() {
       ufw_boot_enable
       FIREWALL_READY=1
       ufw status verbose
+      line="$(ufw_route_hint)"
+      if [[ -n "$line" ]]; then warn "$line"; fi
       module_result firewall applied "SSH ${SSH_PORTS[*]} ($ssh_verb)"
       return 0
     fi
@@ -4505,10 +4541,12 @@ ssh_harden_stage() {
   since="$(date +%s)"
   echo "请保持当前窗口不要关闭，新开一个终端，用密钥登录：ssh $user@服务器IP"
   if ((want_admin)); then echo "登录后在新窗口里运行一次：sudo true（输入 $user 的密码），确认 sudo 可用。"; fi
-  read -r -p '完成后回到这里按回车继续: ' answer || true
+  # Found on a real VPS: Enter pressed before the new window had logged in.
+  if ((want_admin)); then read -r -p '新窗口登录进去、运行完 sudo true 以后，再回到这里按回车: ' answer || true
+  else read -r -p '新窗口用密钥登录进去以后，再回到这里按回车: ' answer || true; fi
   if ssh_login_seen "$since" "$user" publickey; then
     ok "系统日志确认 $user 已用密钥登录成功。"
-  elif ! confirm_yes "系统日志里没有找到 $user 的密钥登录记录。你确定已经用密钥登录成功了吗？"; then
+  elif ! confirm_yes "系统日志里没有找到 $user 的密钥登录记录（新窗口还没登录进去的话，选 n，登录以后再重新运行）。你确定已经用密钥登录成功了吗？"; then
     ok '保留密码登录；SSH 设置没有改动。'; module_result ssh declined 'key login not confirmed'; return 0
   fi
   if ((want_admin)); then
@@ -7849,7 +7887,7 @@ restore_service_apply() {
   if [[ "$original" == absent ]]; then
     [[ "$current" != absent ]] || return 0
     systemctl stop "$unit" || return 1
-    case "${current%%:*}" in enabled|disabled) systemctl disable "$unit" || return 1 ;; static|indirect|generated) ;; *) return 1 ;; esac
+    case "${current%%:*}" in enabled|disabled) systemctl_quiet_sysv disable "$unit" || return 1 ;; static|indirect|generated) ;; *) return 1 ;; esac
     [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" == inactive ]]
     return "$?"
   fi
@@ -7857,8 +7895,8 @@ restore_service_apply() {
   [[ "$current" != absent ]] || return 1
   enabled="${original%%:*}"; running="${original##*:}"
   case "$enabled" in
-    enabled) systemctl enable "$unit" || return 1 ;;
-    disabled) systemctl disable "$unit" || return 1 ;;
+    enabled) systemctl_quiet_sysv enable "$unit" || return 1 ;;
+    disabled) systemctl_quiet_sysv disable "$unit" || return 1 ;;
     static|indirect|generated) [[ "${current%%:*}" == "$enabled" ]] || return 1 ;;
   esac
   if [[ "$running" == active ]]; then systemctl start "$unit" || return 1
@@ -8576,6 +8614,17 @@ restore_pick_group() {
   firewall_before="$(restore_value ufw_runtime 2>/dev/null || true)"
   restore_group_apply "$group"
   restore_firewall_warning "$firewall_before"
+  if [[ "$group" == ssh ]] && ((RESTORE_PARTIAL == 0)); then f2b_password_note; fi
+}
+
+# The SSH hardening undone on its own: password login works again while the
+# firewall stays on without Fail2ban, which the setup leaves out on a key-only
+# machine under 1 GiB (there was nothing to guess then).
+f2b_password_note() {
+  ufw_active || return 0
+  if active fail2ban || ssh_password_disabled; then return 0; fi
+  warn '密码登录又能用了，但 Fail2ban 没有运行（只允许密钥登录、内存不到 1 GiB 时，开荒按推荐不装它）：现在猜密码的程序没人挡。'
+  echo '建议开启：菜单 5 单项设置 → Fail2ban 防爆破 → 开启。'
 }
 
 restore_main() {
@@ -8706,7 +8755,12 @@ VERIFY_TEXT=''
 verify_module() {
   local module="$1" label="$2" check="$3" info result boot detail
   if ! info="$(module_expect "$module")"; then
-    verify_line na "$label" '没有开荒记录（还没运行过一键开荒或对应功能）'; return 0
+    # One-click setup never turns these on: "no setup record" would mislead.
+    case "$module" in
+      hostname|conntrack|ping|notify|quota|dockerlog|sshport) verify_line na "$label" '没有开启（一键开荒不管这一项，需要时在单项设置里开启）' ;;
+      *) verify_line na "$label" '没有开荒记录（还没运行过一键开荒或对应功能）' ;;
+    esac
+    return 0
   fi
   IFS=$'\t' read -r result boot detail <<< "$info"
   case "$result" in
@@ -8729,7 +8783,7 @@ verify_ssh_connection_cc() {
   read -r _ rport _ lport <<< "${SSH_CONNECTION:-}"
   [[ "$lport" =~ ^[0-9]+$ && "$rport" =~ ^[0-9]+$ ]] || return 1
   command -v ss >/dev/null || return 1
-  ss -tinH state established "( sport = :$lport and dport = :$rport )" 2>/dev/null | grep -qw bbr
+  ss -tinH state established "( sport = :$lport and dport = :$rport )" 2>/dev/null | grep -w bbr > /dev/null
 }
 
 check_keepalive() {
@@ -9282,8 +9336,17 @@ verify_checks() {
   verify_module firewall '防火墙' check_firewall
   verify_module fail2ban 'Fail2ban 防爆破' check_fail2ban
   if docker_present; then verify_line unknown 'Docker' '已安装：用 -p 发布的容器端口会绕过防火墙，请确认这些端口确实需要对外'; fi
+  verify_ufw_route
   verify_conntrack_usage
   verify_health
+}
+
+# The firewall on while this machine forwards traffic UFW drops (ufw_route_hint).
+verify_ufw_route() {
+  local hint
+  ufw_active || return 0
+  hint="$(ufw_route_hint)"
+  if [[ -n "$hint" ]]; then verify_line notice '转发' "${hint%。}"; fi
 }
 
 # The acceptance report, conclusion first: the counts and what needs a look,
@@ -9824,7 +9887,7 @@ item_status() {
     zram)
       value="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
       if [[ -n "$value" ]]; then echo "已开启，约 ${value} MiB"
-      elif swapon --noheadings 2>/dev/null | grep -q .; then echo '已有其他 Swap'
+      elif swapon --noheadings 2>/dev/null | grep . > /dev/null; then echo '已有其他 Swap'
       elif ! zram_module_available; then echo '内核不支持（没有 zram 模块）'
       else echo '未开启'; fi ;;
     journal)
@@ -10022,6 +10085,7 @@ item_turn_off() {
   if ((RESTORE_PARTIAL)); then warn '没有完全撤销，详情见上方提示。'
   else
     ok "已撤销本工具对「$(item_label "$key")」的修改。"
+    if [[ "$key" == ssh ]]; then f2b_password_note; fi
     # Without the policy the package only keeps a shutdown helper running.
     # Asked only when this tool installed it (Ubuntu ships it preinstalled).
     if [[ "$key" == updates ]] && restore_tool_package unattended-upgrades; then

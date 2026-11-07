@@ -116,6 +116,14 @@ direct="$(awk '$0 == "apt_run() {" {skip = 1} !skip {print NR ": " $0} skip && $
 source_of apt_run | grep -Fxq '  umask 022' || fail 'apt_run does not set umask 022'
 printf 'PASS: every apt-get that changes the system runs with umask 022.\n'
 
+# Under pipefail "cmd | grep -q" can fail although grep found the line: grep
+# stops at the first match, and a writer that still writes gets SIGPIPE (seen
+# with apt-config on Ubuntu 26.04). grep reads to the end instead
+# ("> /dev/null"), or reads a variable or a file.
+piped="$(grep -nE '(^|[^|])\|[[:space:]]*grep[[:space:]]+-[A-Za-z]*q' "$TEST_SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+[[ -z "$piped" ]] || fail "a pipe into grep -q (wrong under pipefail): $piped"
+printf 'PASS: no pipe into grep -q.\n'
+
 # Colours and state symbols come only from the interface block at the top, so
 # NO_COLOR, a log or a saved report, and VPS_ASCII=1 reach every line.
 # The login hook's text is left out by position: PAM runs it as a script of its

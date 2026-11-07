@@ -58,6 +58,27 @@ printf 'PASS: apt-get runs with umask 022 and the tool umask comes back.\n'
 )
 printf 'PASS: only missing packages go to APT (a dependency keeps its "automatic" mark).\n'
 
+# Enabling Fail2ban (the SSH port change does, twice) printed systemd's two
+# lines about its SysV script on a real Debian 13 VPS: they go, every other
+# message and the exit status stay.
+(
+  load_optimizer_functions systemctl_quiet_sysv
+  systemctl() {
+    printf '%s\n' 'Synchronizing state of fail2ban.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.' \
+      'Executing: /usr/lib/systemd/systemd-sysv-install enable fail2ban' \
+      'Created symlink /etc/systemd/system/multi-user.target.wants/fail2ban.service → /usr/lib/systemd/system/fail2ban.service.' >&2
+    return "$RC"
+  }
+  RC=0
+  systemctl_quiet_sysv enable fail2ban > "$TEST_ROOT/out" 2> "$TEST_ROOT/err" || fail 'a working enable reported as failed'
+  [[ "$(cat "$TEST_ROOT/err")" == 'Created symlink '* && "$(grep -c . "$TEST_ROOT/err")" == 1 && ! -s "$TEST_ROOT/out" ]] || fail "messages left: $(cat "$TEST_ROOT/err")"
+  RC=1
+  if systemctl_quiet_sysv enable fail2ban 2> /dev/null; then fail 'a failed enable reported as working'; fi
+  systemctl() { return 0; }
+  RC=0; [[ -z "$(systemctl_quiet_sysv enable x 2>&1)" ]] || fail 'something printed for a quiet systemctl'
+)
+printf 'PASS: the SysV lines of systemctl enable/disable are dropped, other messages and the result kept.\n'
+
 # Old kernels: the ones APT would autoremove, purged by name, never the running
 # one; other leftovers neither get removed nor block the cleanup (found on a real
 # Ubuntu 24.04 VPS: libfwupd2 left by an upgrade stopped every kernel cleanup).
