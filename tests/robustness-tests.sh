@@ -134,6 +134,7 @@ printf 'PASS: an empty package index is refreshed once before sudo is reported m
 eval "$(declare -f item_main | sed '/EUID/d')"
 validate_vm() { :; }; start_logging() { :; }; prepare_run_state() { :; }; stage_run() { :; }
 restore_prepare() { :; }; finish_run_state() { :; }
+run_latest_id() { :; }; run_state_mark_start() { :; }; run_state_changed() { return 0; }; run_state_discard() { :; }
 offer_reboot() { record offer; }
 item_menu() { record menu; UPGRADE_APPROVED="$U" KERNEL_UPDATE="$K"; }
 reset; UPGRADE_APPROVED=0 KERNEL_UPDATE=0 U=1 K=1
@@ -213,6 +214,52 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
   [[ -d "$STATE_ROOT/$RUN_ID" && -d "$BACKUP_ROOT/$RUN_ID" ]] || fail 'the current run was pruned'
   [[ -d "$STATE_ROOT/run-20250101T000000Z-100-First0" ]] || fail 'the first run was pruned'
 )
+# A menu session that only looked leaves no run record, backup or log: only 20
+# records are kept, and such sessions pushed out those of real changes. One
+# that changed anything keeps them. What changes by itself does not count.
+(
+  load_optimizer_functions run_latest_id run_state_mark_start run_state_changed run_state_discard
+  STATE_ROOT="$T/rs/state" BACKUP_ROOT="$T/rs/backups" LOG_DIR="$T/rs/state/logs"
+  RUN_CHANGE_ETC="$T/rs/etc" RUN_CHANGE_DPKG_LOG="$T/rs/dpkg.log"
+  current=run-20261107T000000Z-2-bbbbbb previous=run-20261101T000000Z-1-aaaaaa
+  session() {
+    rm -rf "$T/rs"
+    mkdir -p "$STATE_ROOT/$previous" "$STATE_ROOT/$current" "$BACKUP_ROOT/$current" "$LOG_DIR" "$RUN_CHANGE_ETC" "$STATE_ROOT/notify" "$STATE_ROOT/restore-v2/ssh_dropin"
+    : > "$RUN_CHANGE_ETC/hosts"; : > "$RUN_CHANGE_DPKG_LOG"; : > "$STATE_ROOT/logins"; : > "$STATE_ROOT/params"
+    printf '%s\n' "$previous" > "$STATE_ROOT/latest"
+    [[ "$(run_latest_id)" == "$previous" ]] || fail 'the latest run before the session'
+    printf '%s\n' "$current" > "$STATE_ROOT/latest"
+    RUN_STATE_DIR="$STATE_ROOT/$current" RUN_BACKUP_DIR="$BACKUP_ROOT/$current" RUN_LOG="$LOG_DIR/run-x.log" RUN_ID="$current"
+    : > "$RUN_LOG"
+    # Everything there before the session is older than its start.
+    find "$T/rs" -exec touch -d "@$(($(date +%s) - 10))" {} +
+    run_state_mark_start
+    later="@$(($(stat -c %Y "$RUN_STATE_DIR/.started") + 5))"
+  }
+  session
+  for f in "$STATE_ROOT/logins" "$STATE_ROOT/logins.lock" "$STATE_ROOT/notify/queue" "$RUN_LOG" "$RUN_STATE_DIR/stages.tsv" "$STATE_ROOT/latest"; do
+    touch -d "$later" "$f"
+  done
+  if run_state_changed; then fail 'a session that only looked counted as a change'; fi
+  run_state_discard "$previous" > /dev/null
+  [[ ! -e "$STATE_ROOT/$current" && ! -e "$BACKUP_ROOT/$current" && ! -e "$LOG_DIR/run-x.log" ]] || fail 'the record of a session that only looked stayed'
+  [[ "$(cat "$STATE_ROOT/latest")" == "$previous" && -d "$STATE_ROOT/$previous" && -z "$RUN_STATE_DIR" ]] || fail "latest after the session: $(cat "$STATE_ROOT/latest")"
+  for f in "$RUN_CHANGE_ETC/hosts" "$RUN_CHANGE_ETC/new.conf" "$RUN_CHANGE_DPKG_LOG" "$STATE_ROOT/params" "$STATE_ROOT/restore-v2/ssh_dropin/state" "$STATE_ROOT/modules-x"; do
+    session; touch -d "$later" "$f"
+    run_state_changed || fail "a change of ${f#"$T/rs/"} not seen"
+  done
+  # The mark is a second early: a change in the same tick of the clock counts.
+  session; touch "$STATE_ROOT/params"
+  run_state_changed || fail 'a change right after the mark not seen'
+)
+# Pruned when a run finishes: a session taken back must not have pushed one out.
+[[ "$(awk '/^prepare_run_state\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" != *run_records_prune* ]] || fail 'old records pruned when a run starts'
+[[ "$(awk '/^finish_run_state\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" == *run_records_prune* ]] || fail 'old records not pruned when a run finishes'
+for fn in item_main params_main; do
+  [[ "$(awk -v n="$fn" '$0 == n "() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT")" == *run_state_mark_start*'run_state_changed'*'run_state_discard'* ]] ||
+    fail "$fn does not take back the record of a session that changed nothing"
+done
+printf 'PASS: a menu session that only looked leaves no record, backup or log; a change of /etc, a package or the tool'"'"'s state keeps them.\n'
 printf 'PASS: old run records and backups are pruned to the first run plus the newest 20.\n'
 
 # The lock holder note in /run is removed by the process that holds the lock.

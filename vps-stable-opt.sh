@@ -2477,6 +2477,7 @@ params_import() {
 
 # vps params [show|export|import [FILE]]
 params_main() {
+  local previous
   [[ $EUID -eq 0 ]] || die '参数保存在 root 的目录里：请用 sudo vps params。'
   case "${MODE_ARGS[0]:-show}" in
     show) params_overview ;;
@@ -2484,11 +2485,13 @@ params_main() {
     import)
       validate_vm
       start_logging
+      previous="$(run_latest_id)"
       prepare_run_state
       stage_run backup backup_configs
       restore_prepare
+      run_state_mark_start
       params_import "${MODE_ARGS[1]:-}"
-      finish_run_state ;;
+      if run_state_changed; then finish_run_state; else run_state_discard "$previous"; fi ;;
     *) die '用法：vps params [show|export|import [文件]]' ;;
   esac
 }
@@ -5482,7 +5485,6 @@ prepare_run_state() {
   mv -fT -- "$temp" "$latest"
   ok "运行记录：$RUN_STATE_DIR"
   ok "配置备份目录：$RUN_BACKUP_DIR"
-  run_records_prune
 }
 
 # Every run adds a run record and a configuration backup. The first run (the
@@ -5638,11 +5640,61 @@ record_exit() {
   fi
 }
 
+# Old records are pruned at the end: a run whose record is taken back again
+# (run_state_discard) must not have pushed one out first.
 finish_run_state() {
   state_write finished_at "$(date -u +%FT%TZ)"
   state_write warning_count "${WARNINGS:-0}"
   state_write active_stage none
   state_write status completed
+  run_records_prune
+}
+
+# The run record that $STATE_ROOT/latest names now, or nothing.
+run_latest_id() {
+  local id
+  id="$(cat -- "$STATE_ROOT/latest" 2>/dev/null || true)"
+  if [[ "$id" =~ ^run-[0-9]{8}T[0-9]{6}Z-[0-9]+-[A-Za-z0-9]{6}$ ]]; then printf '%s\n' "$id"; fi
+  return 0
+}
+
+# From here on a menu session may change things (after its backup and the
+# rollback baseline). A second early: a change in the same tick of the clock
+# as the mark would not be newer than it.
+run_state_mark_start() {
+  local mark="$RUN_STATE_DIR/.started"
+  : > "$mark"
+  touch -d "@$(($(date +%s) - 1))" -- "$mark" 2>/dev/null || true
+}
+
+# True when something changed since run_state_mark_start: a file under /etc,
+# a package (dpkg's log), or this tool's own state. Its run records and logs,
+# the background check's files and the login record change by themselves.
+run_state_changed() {
+  local mark="$RUN_STATE_DIR/.started" etc="${RUN_CHANGE_ETC:-/etc}" dpkg_log="${RUN_CHANGE_DPKG_LOG:-/var/log/dpkg.log}"
+  [[ -f "$mark" ]] || return 0
+  if [[ -n "$(find "$etc" -xdev -newer "$mark" -print -quit 2>/dev/null)" ]]; then return 0; fi
+  if [[ -f "$dpkg_log" && "$dpkg_log" -nt "$mark" ]]; then return 0; fi
+  [[ -n "$(find "$STATE_ROOT" -mindepth 1 -xdev -newer "$mark" ! -path "$STATE_ROOT/run-*" ! -path "$LOG_DIR" ! -path "$LOG_DIR/*" \
+    ! -path "$STATE_ROOT/notify" ! -path "$STATE_ROOT/notify/*" ! -name 'logins*' ! -name latest ! -name '.latest.*' ! -name optimizer.lock \
+    -print -quit 2>/dev/null)" ]]
+}
+
+# PREVIOUS: a menu session only looked: its record, configuration backup and
+# log go again (only 20 records are kept, and such ones pushed out those of
+# real changes), and "latest" names PREVIOUS again.
+run_state_discard() {
+  local previous="$1" temp
+  rm -rf --one-file-system -- "$RUN_STATE_DIR" "$RUN_BACKUP_DIR"
+  if [[ -n "${RUN_LOG:-}" ]]; then rm -f -- "$RUN_LOG"; fi
+  if [[ -n "$previous" && -d "$STATE_ROOT/$previous" ]]; then
+    temp="$(mktemp "$STATE_ROOT/.latest.XXXXXX")" || return 0
+    if ! printf '%s\n' "$previous" > "$temp" || ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$STATE_ROOT/latest"; then rm -f -- "$temp"; fi
+  else
+    rm -f -- "$STATE_ROOT/latest"
+  fi
+  RUN_STATE_DIR='' RUN_BACKUP_DIR='' RUN_ID=''
+  ok '这次只是查看，没有改动：不留运行记录和配置备份。'
 }
 
 state_report() {
@@ -10075,14 +10127,17 @@ item_menu() {
 }
 
 item_main() {
+  local previous
   [[ $EUID -eq 0 ]] || die '单项设置需要 root：请用 sudo vps item。'
   validate_vm
   start_logging
+  previous="$(run_latest_id)"
   prepare_run_state
   stage_run backup backup_configs
   restore_prepare
+  run_state_mark_start
   item_menu
-  finish_run_state
+  if run_state_changed; then finish_run_state; else run_state_discard "$previous"; fi
   # Offer a reboot only for an upgrade made in this session; an older pending
   # reboot is just mentioned.
   if ((UPGRADE_APPROVED)) && { ((KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; }; then offer_reboot

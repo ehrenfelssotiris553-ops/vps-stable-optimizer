@@ -268,7 +268,18 @@ check_facts check
 endgroup
 
 group 'Single items: each switched off (back to how the system was) and on again'
+# Only looking at the menu leaves no run record or backup behind (only 20 are
+# kept, and such sessions used to push out those of real changes); the next
+# change keeps one.
+runs() { sudo find /var/lib/vps-stable-opt /var/backups/vps-stable-opt -maxdepth 1 -name 'run-*' | wc -l; }
+runs_before="$(runs)" latest_before="$(sudo cat /var/lib/vps-stable-opt/latest)"
+printf '%s\n' '请选择要修改的项目 ==> 0' > "$LOGS/item-look.rules"
+drive "$LOGS/item-look.rules" item-look sudo vps item || fail "looking at the single items exited with $?"
+has item-look '这次只是查看，没有改动'
+[[ "$(runs)" == "$runs_before" && "$(sudo cat /var/lib/vps-stable-opt/latest)" == "$latest_before" ]] ||
+  fail "a session that only looked left a record: $runs_before -> $(runs) records and backups, latest $(sudo cat /var/lib/vps-stable-opt/latest)"
 item_do item-bbr-off bbr 2
+[[ "$(sudo cat /var/lib/vps-stable-opt/latest)" != "$latest_before" ]] || fail 'a session that changed something left no record'
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "$before_cc" ]] || fail 'BBR off: congestion control not back'
 item_do item-bbr-on bbr 1
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == bbr ]] || fail 'BBR on: not bbr'
