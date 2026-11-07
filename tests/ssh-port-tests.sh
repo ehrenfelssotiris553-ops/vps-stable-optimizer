@@ -49,7 +49,8 @@ guard_arm() { record "guard $1"; }
 guard_confirm() { record confirm; ((CONFIRM)); }
 ssh_port_follow() { record "fail2ban follows $LISTEN"; }
 ssh_limit_exempt() { record exempt; }
-confirm_yes() { ((PROVIDER)); }
+confirm_yes() { case "$1" in *小于\ 1024*) record 'ask low port'; ((LOW_OK)) ;; *) ((PROVIDER)) ;; esac; }
+LOW_OK=1
 confirm_default_yes() { case "$1" in *注释掉*) record 'ask comment out'; ((COMMENT_OK)) ;; *) return 1 ;; esac; }
 backup_config_path() { :; }
 record_config_change() { :; }
@@ -105,10 +106,16 @@ ssh_detect() { SSH_PORTS=(22); }
 printf 'PASS: without a login on the new port everything goes back, to the previous change too.\n'
 
 # Refused before anything changes.
-for bad in 22 80 1023 70000 abc ''; do
+for bad in 22 0 70000 abc ''; do
   start; ssh_port_stage <<< "$bad" > /dev/null
   [[ ! -e "$SSH_PORT_DROPIN" && "$(grep -c '^ufw ' "$TEST_ROOT/trace")" == 0 ]] && grep -q '^result sshport declined' "$TEST_ROOT/trace" || fail "port <$bad> not refused"
 done
+# Below 1024 (where HTTP and HTTPS live): only after a yes.
+start; LOW_OK=0; ssh_port_stage <<< 80 > /dev/null
+[[ ! -e "$SSH_PORT_DROPIN" ]] && grep -Fxq 'ask low port' "$TEST_ROOT/trace" && grep -q '^result sshport declined port below 1024' "$TEST_ROOT/trace" ||
+  fail "a port below 1024 taken without a yes: $(cat "$TEST_ROOT/trace")"
+start; LOW_OK=1; ssh_port_stage <<< 993 > /dev/null
+[[ "$LISTEN" == '993 ' ]] && grep -q '^result sshport applied port 993' "$TEST_ROOT/trace" || fail "a port below 1024 refused after a yes: $(cat "$TEST_ROOT/trace")"
 start; printf 'LISTEN 0 128 0.0.0.0:2244 0.0.0.0:*\n' > "$TEST_ROOT/in-use"; ssh_port_stage <<< 2244 > /dev/null
 grep -q '^result sshport declined port in use' "$TEST_ROOT/trace" || fail 'a port in use accepted'
 start; PROVIDER=0; ssh_port_stage <<< 2244 > /dev/null

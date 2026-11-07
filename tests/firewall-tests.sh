@@ -21,6 +21,8 @@ module_result() { printf '%s %s\n' "$1" "$2" >> "$CASE_DIR/results"; }
 ssh_detect() { SSH_PORTS=(22); return 0; }
 ssh_password_disabled() { ((KEY_ONLY)); }
 docker_firewall_note() { :; }
+# The rule of a running firewall following the rate-limit switch (tested on its own below).
+ssh_rate_limit_sync() { record 'rate limit sync'; }
 # What ufw_route_hint says (tested on its own below); nothing unless a case sets it.
 ufw_route_hint() { printf '%s' "${ROUTE_HINT:-}"; }
 host_has_global_ipv6() { return 1; }
@@ -501,3 +503,45 @@ ROUTE_HINT=''
   VPN=wg0 FWD=1; [[ -z "$(ufw_route_hint "$D")" ]] || fail 'explained although UFW lets forwarded packets through'
 )
 printf 'PASS: forwarding (wg/tun/tap, or ip_forward without only Docker) that UFW drops is explained with the ufw route command.\n'
+
+# The SSH rate limit switched off (ssh_rate_limit=no): a new firewall lets SSH
+# in plainly although password login works; Fail2ban still guards it.
+PL="$TEST_ROOT/params-rate"; printf 'ssh_rate_limit=no\n' > "$PL"
+reset_case rate_limit_off
+printf 'CONNECTED\n' > "$CASE_DIR/input"
+PARAMS_FILE="$PL" firewall_stage < "$CASE_DIR/input" > /dev/null
+grep -Fxq 'ufw allow 22/tcp' "$CASE_DIR/rules" && ! grep -Fxq 'ufw limit 22/tcp' "$CASE_DIR/rules" || fail "rate limit off: $(cat "$CASE_DIR/rules")"
+# A firewall already on: the switch is followed for the rule this tool added
+# (UFW updates a port's rule in place; the record follows), not for others.
+(
+  load_optimizer_functions ssh_rate_limit_sync
+  R="$TEST_ROOT/rate-sync"; mkdir -p "$R"; RESTORE_ROOT="$R"
+  reset_case rate_limit_sync
+  ufw() {
+    record "ufw $*"
+    case "$*" in
+      'show added') printf 'Added user rules:\n'; cat "$CASE_DIR/rules" ;;
+      'limit 22/tcp'|'allow 22/tcp') { grep -v ' 22/tcp$' "$CASE_DIR/rules" || true; printf 'ufw %s\n' "$*"; } > "$CASE_DIR/rules.new"; mv "$CASE_DIR/rules.new" "$CASE_DIR/rules" ;;
+      *) fail "unexpected ufw $*" ;;
+    esac
+  }
+  restore_record_fw_rule() { printf '%s\n' "$1" >> "$R/fw_rules"; }
+  ssh_allowlist_decide() { record allowlist; }
+  ssh_limit_exempt() { record exempt; }
+  printf 'ufw limit 22/tcp\n' > "$CASE_DIR/rules"; printf 'ufw limit 22/tcp\n' > "$R/fw_rules"
+  PARAMS_FILE="$PL" ssh_rate_limit_sync
+  [[ "$(cat "$CASE_DIR/rules")" == 'ufw allow 22/tcp' && "$(cat "$R/fw_rules")" == 'ufw allow 22/tcp' ]] ||
+    fail "limit to allow: rule $(cat "$CASE_DIR/rules"), record $(cat "$R/fw_rules")"
+  printf 'ssh_rate_limit=yes\n' > "$PL"
+  PARAMS_FILE="$PL" ssh_rate_limit_sync
+  [[ "$(cat "$CASE_DIR/rules")" == 'ufw limit 22/tcp' && "$(cat "$R/fw_rules")" == 'ufw limit 22/tcp' ]] && grep -Fxq exempt "$CASE_DIR/calls" ||
+    fail "allow to limit: rule $(cat "$CASE_DIR/rules"), record $(cat "$R/fw_rules")"
+  # Key-only login: plain, whatever the switch says.
+  KEY_ONLY=1; PARAMS_FILE="$PL" ssh_rate_limit_sync
+  [[ "$(cat "$CASE_DIR/rules")" == 'ufw allow 22/tcp' ]] || fail 'key-only SSH still rate limited after the sync'
+  # A rule this tool did not add stays as it is.
+  KEY_ONLY=0; printf 'ufw allow 22/tcp\n' > "$CASE_DIR/rules"; : > "$R/fw_rules"
+  PARAMS_FILE="$PL" ssh_rate_limit_sync
+  [[ "$(cat "$CASE_DIR/rules")" == 'ufw allow 22/tcp' ]] || fail "someone else's SSH rule was changed"
+)
+printf 'PASS: the SSH rate limit follows its switch, for a new firewall and for the rule a running one got from this tool.\n'

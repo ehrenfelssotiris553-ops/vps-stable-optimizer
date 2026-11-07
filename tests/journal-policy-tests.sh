@@ -67,4 +67,14 @@ OURS=0; printf '[Journal]\nSystemMaxUse=500M\n' > "$JOURNAL_FILE"
 put_file() { [[ ! -e "$1" ]] || return 1; printf '%s\n' "$2" > "$1"; }
 journal_stage
 [[ "$(cat "$JOURNAL_FILE")" == $'[Journal]\nSystemMaxUse=500M' ]] || fail 'a file that is not this tool was rewritten'
+# A bigger system disk keeps the system's own limit, unless the parameter
+# says so (0: every disk).
+rm -f "$JOURNAL_FILE"; ROOT_GIB=30
+: > "$PARAMS_FILE"; journal_stage
+[[ ! -e "$JOURNAL_FILE" ]] || fail 'a 30 GiB disk got the limit by default'
+printf 'journal_auto_disk_gib=50\n' > "$PARAMS_FILE"; journal_stage
+[[ -e "$JOURNAL_FILE" ]] || fail 'a 30 GiB disk not limited up to 50 GiB'
+rm -f "$JOURNAL_FILE"; printf 'journal_auto_disk_gib=0\n' > "$PARAMS_FILE"; journal_stage
+[[ -e "$JOURNAL_FILE" ]] || fail 'not limited with 0 (every disk)'
+rm -f "$JOURNAL_FILE"; : > "$PARAMS_FILE"; ROOT_GIB=10
 printf 'PASS: the journal limit and retention follow the parameters; earlier 14-day files become 90 days.\n'

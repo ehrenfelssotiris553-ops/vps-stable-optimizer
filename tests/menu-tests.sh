@@ -97,6 +97,28 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
 )
 printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
 
+# The hints above the menu that the parameter leaves out are not shown.
+(
+  eval "$(declare -f menu | sed 's/\[\[ -t 0 \]\] || die/true || die/')"
+  # shellcheck disable=SC2034
+  SCRIPT_VERSION=9.9.9 OS=debian OS_VERSION=13 ROOT_GIB=20 STATE_ROOT="$TEST_ROOT/state" LOG_DIR="$TEST_ROOT/logs" COLUMNS=100
+  menu_reboot_hint() { echo 'VERIFY-HINT'; }
+  menu_pending_reboot_hint() { echo 'PENDING-REBOOT-HINT'; }
+  menu_login_alert() { echo 'LOGIN-HINT'; }
+  menu_quota_alert() { echo 'QUOTA-HINT'; }
+  setup_tmux_running() { return 1; }
+  systemctl() { return 1; }
+  printf 'menu_alerts=login quota\n' > "$PARAMS_FILE"
+  menu <<< 0 > "$TEST_ROOT/menu-out"
+  grep -Fq LOGIN-HINT "$TEST_ROOT/menu-out" && grep -Fq QUOTA-HINT "$TEST_ROOT/menu-out" || fail 'a hint asked for is missing'
+  if grep -Eq 'VERIFY-HINT|PENDING-REBOOT-HINT' "$TEST_ROOT/menu-out"; then fail 'a hint left out is shown'; fi
+  printf 'menu_alerts=none\n' > "$PARAMS_FILE"
+  menu <<< 0 > "$TEST_ROOT/menu-out"
+  if grep -Eq 'HINT' "$TEST_ROOT/menu-out"; then fail 'a hint shown with none asked for'; fi
+  : > "$PARAMS_FILE"
+)
+printf '%s\n' 'PASS: the menu shows only the hints the parameter asks for.'
+
 # Two columns on a wide terminal, aligned by display width (CJK counts two);
 # one column on a narrow one; every entry in both.
 (

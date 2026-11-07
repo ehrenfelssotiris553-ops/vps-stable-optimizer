@@ -65,6 +65,13 @@ reset; MEM_MIB=4096; swap_stage
 grep -q '^result swap skipped RAM >= 2GiB' "$TEST_ROOT/trace" || fail 'a disk swap made on its own with 4 GiB'
 reset; MEM_MIB=1024 OTHER_SWAP=1; swap_stage
 grep -q '^result swap skipped other swap present' "$TEST_ROOT/trace" || fail 'a disk swap made on its own next to another swap'
+# Below 8 GiB when the parameter says so.
+printf 'auto_swap_below_mib=8192\n' > "$PARAMS_FILE"
+reset; MEM_MIB=4096 OTHER_SWAP=0; swap_stage
+if grep -q '^result swap skipped RAM' "$TEST_ROOT/trace"; then fail 'no disk swap with 4 GiB although the limit is 8 GiB'; fi
+reset; MEM_MIB=8192; swap_stage
+grep -q '^result swap skipped RAM >= 8GiB' "$TEST_ROOT/trace" || fail "8 GiB not skipped: $(cat "$TEST_ROOT/trace")"
+: > "$PARAMS_FILE"; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"; MEM_MIB=1024
 OTHER_SWAP=0
 reset; VIRT=openvz; swap_stage
 grep -q '^result swap unsupported openvz' "$TEST_ROOT/trace" || fail 'a container got a swap file'
@@ -113,8 +120,13 @@ reset; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"; FREE=3600; swap_stage
 [[ "$(($(stat -c %s -- "$SWAP_FILE") / 1048576))" == 512 ]] || fail "not shrunk to keep 3 GB: $(stat -c %s -- "$SWAP_FILE")"
 reset; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"; FREE=3100; swap_stage
 [[ ! -e "$SWAP_FILE" ]] && grep -q '^result swap unsupported not enough disk space' "$TEST_ROOT/trace" || fail 'a swap made with less than 3 GB left'
+# swap_min_free_gb=1: 1 GB is enough here, the full size fits.
+printf 'swap_min_free_gb=1\n' > "$PARAMS_FILE"
+reset; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"; FREE=3600; swap_stage
+[[ "$(($(stat -c %s -- "$SWAP_FILE") / 1048576))" -gt 512 ]] || fail "shrunk although 1 GB was asked for: $(stat -c %s -- "$SWAP_FILE")"
+: > "$PARAMS_FILE"; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"
 FREE=20000
-printf 'PASS: at least 3 GB of the system disk stay free.\n'
+printf 'PASS: at least 3 GB of the system disk stay free (or what the parameter asks for).\n'
 
 # Someone else's /swapfile stays; this tool's own gets a new size.
 printf 'theirs\n' > "$SWAP_FILE"; cp "$SWAP_FILE" "$TEST_ROOT/theirs"
@@ -209,3 +221,22 @@ out="$(resources_line ssh ssh.service SSH x; resources_line ssh sshd.service SSH
 [[ "$(grep -c '^  SSH：内存 8 MiB，开机以来 CPU 2 秒。x$' <<< "$out")" == 1 && "$out" == *'Fail2ban：内存 8 MiB'* ]] || fail "resources: $out"
 unset -f systemctl
 printf 'PASS: the resource view lists a service under two names once.\n'
+
+# The memory values that suit ZRAM are parameters; this tool's own file with
+# other values is written again.
+(
+  load_optimizer_functions zram_tune zram_sysctl_pairs
+  F="$TEST_ROOT/zram-sysctl.conf"; ZRAM_SYSCTL_FILE="$F"; rm -f "$F"
+  swapon() { :; }
+  sysctl() { case "$1" in -n) case "$2" in vm.swappiness) echo 60 ;; vm.page-cluster) echo 3 ;; esac ;; *) printf 'sysctl %s\n' "$*" >> "$TEST_ROOT/zt" ;; esac; }
+  sysctl_key_configured() { return 1; }
+  put_file() { [[ ! -e "$1" ]] || [[ "$(cat "$1")" == "$2" ]] || return 1; printf '%s\n' "$2" > "$1"; }
+  restore_record_sysctl() { :; }
+  restore_file_ours() { [[ "$1" == zram_sysctl_file ]]; }
+  printf 'zram_swappiness=80\nzram_page_cluster=1\n' > "$PARAMS_FILE"
+  zram_tune > /dev/null
+  grep -Fxq 'vm.swappiness = 80' "$F" && grep -Fxq 'vm.page-cluster = 1' "$F" || fail "ZRAM values from the parameters: $(cat "$F")"
+  : > "$PARAMS_FILE"; zram_tune > /dev/null
+  grep -Fxq 'vm.swappiness = 100' "$F" && grep -Fxq 'vm.page-cluster = 0' "$F" || fail "this tool's file not written again: $(cat "$F")"
+)
+printf 'PASS: the ZRAM memory values follow their parameters.\n'

@@ -8,8 +8,10 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_ipv4_iface_values sysctl_config_files sysctl_key_configured sysctl_hardening_stage param_list param_recommended param_reason param_check param_caution param_read param_value param_mode param_store restore_sysctl_original tcp_buffer_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_values_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address f2b_optional ssh_effective_value port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
+load_optimizer_functions confirm kernel_cleanup auto_reboot_configure updates_stage sysctl_hardening_pairs sysctl_hardening_unset sysctl_ipv4_iface_values sysctl_config_files sysctl_key_configured sysctl_hardening_stage param_list param_recommended param_reason param_check param_caution param_read param_value param_mode param_store restore_sysctl_original tcp_buffer_stage hostname_resolves append_line_safely hosts_stage audit_ufw_ipv6 ufw_set_ipv6 f2b_jail_text f2b_jail_values_text f2b_jail_legacy_text f2b_jail_is_ours f2b_ignore_address f2b_optional ssh_effective_value port_source_valid timezone_resolve timezone_ask lock_holder_text log_rotate in_terminal_multiplexer admin_name_valid setup_questions reboot_time_normalize
 TEST_ROOT="$(mktemp -d)"
+# No originals recorded unless a case writes some.
+RESTORE_ROOT="$TEST_ROOT/restore"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 say() { :; }
@@ -309,6 +311,21 @@ unset -f sysctl_ipv6_iface_redirects
   out="$(sysctl_ipv6_iface_redirects "$P" | sort | tr '\n' ' ')"
   [[ "$out" == 'net.ipv6.conf.eth0.accept_redirects=1 net.ipv6.conf.veth-a1.accept_redirects=1 ' ]] || fail "interface list: $out"
 )
+# A key left out (sysctl_hardening_skip) is not written; left out later, it
+# goes back to its running value from before the tool.
+(
+  P="$TEST_ROOT/params-skip"; printf 'sysctl_hardening_skip=kernel.kptr_restrict\n' > "$P"; PARAMS_FILE="$P"
+  RESTORE_ROOT="$TEST_ROOT/restore-skip"; mkdir -p "$RESTORE_ROOT"
+  reset; rm -f "$SYSCTL_HARDENING_FILE"; SYSCTL_CHOICE=1 OURS=0
+  sysctl_hardening_stage
+  [[ -f "$SYSCTL_HARDENING_FILE" ]] && ! grep -Fq kptr_restrict "$SYSCTL_HARDENING_FILE" || fail "a key left out was written: $(cat "$SYSCTL_HARDENING_FILE" 2>&1)"
+  printf '# VPS Stable Optimizer v2.6: network hardening\nkernel.kptr_restrict = 2\n' > "$SYSCTL_HARDENING_FILE"
+  printf 'kernel.kptr_restrict=0\n' > "$RESTORE_ROOT/sysctl_runtime"
+  reset; OURS=1
+  sysctl_hardening_stage
+  ! grep -Fq kptr_restrict "$SYSCTL_HARDENING_FILE" && grep -Fxq 'sysctl -w kernel.kptr_restrict=0' "$TEST_ROOT/trace" ||
+    fail "a key left out later did not go back: $(cat "$TEST_ROOT/trace")"
+)
 printf 'PASS: sysctl hardening keeps foreign keys, skips absent keys, records originals and reaches every IPv6 interface.\n'
 
 # TCP buffer ceilings: sized by RAM, only ever raised, a key set elsewhere kept,
@@ -346,6 +363,19 @@ grep -q '^result tcp applied 16 MiB' "$TEST_ROOT/trace" || fail 'own buffer file
 reset; OURS=0
 tcp_buffer_stage
 grep -q '^result tcp preserved' "$TEST_ROOT/trace" || fail 'a buffer file that is not ours was not kept'
+# The two switches that come with the buffers follow tcp_extras.
+(
+  SYSVAL[net.ipv4.tcp_slow_start_after_idle]=1 SYSVAL[net.ipv4.tcp_mtu_probing]=0
+  printf 'tcp_extras=no\n' > "$PARAMS_FILE"
+  reset; rm -f "$TCP_BUFFER_FILE"; OURS=0 MEM_MIB=2048 CONFIGURED=none
+  tcp_buffer_stage
+  grep -Fq rmem_max "$TCP_BUFFER_FILE" && ! grep -Eq 'slow_start_after_idle|mtu_probing' "$TCP_BUFFER_FILE" || fail "tcp_extras=no: $(cat "$TCP_BUFFER_FILE")"
+  printf 'tcp_extras=yes\n' > "$PARAMS_FILE"
+  reset; rm -f "$TCP_BUFFER_FILE"
+  tcp_buffer_stage
+  grep -Fxq 'net.ipv4.tcp_slow_start_after_idle = 0' "$TCP_BUFFER_FILE" && grep -Fxq 'net.ipv4.tcp_mtu_probing = 1' "$TCP_BUFFER_FILE" || fail "tcp_extras=yes: $(cat "$TCP_BUFFER_FILE")"
+  : > "$PARAMS_FILE"; rm -f "$TCP_BUFFER_FILE"
+)
 # Not chosen (the recommended set): nothing written.
 reset; rm -f "$TCP_BUFFER_FILE"; TCP_BUFFER_CHOICE=0
 tcp_buffer_stage
@@ -688,8 +718,16 @@ printf 'PASS: a failed APT step stops with the next step to take.\n'
   grep -Fq '64 MiB' "$TEST_ROOT/tcp-question" || fail 'TCP buffer question does not name the ceiling for this RAM'
   grep -Fq '空闲后不重新慢启动' "$TEST_ROOT/tcp-question" || fail 'TCP question does not name the two switches'
   grep -Fq '需要你在场' "$TEST_ROOT/q-out" || fail 'user not told the end needs them'
+  # Steps left out of one-click setup (setup_skip) ask nothing.
+  load_optimizer_functions setup_skipped
+  printf 'setup_skip=sysctl tcp ssh firewall autoreboot\n' > "$TEST_ROOT/params-q"; PARAMS_FILE="$TEST_ROOT/params-q"
+  rm -f "$TEST_ROOT/tcp-question"; AUTO_UPDATES=1 ADMIN_NAME='' AUTO_REBOOT_TIME=''
+  setup_questions < "$TEST_ROOT/q-input" > "$TEST_ROOT/q-out"
+  [[ "$SYSCTL_CHOICE" == 0 && "$TCP_BUFFER_CHOICE" == 0 && "$SSH_CHOICE" == 0 && "$WEB_CHOICE" == 0 && "$F2B_CHOICE" == 0 ]] ||
+    fail "choices of steps left out: sysctl=$SYSCTL_CHOICE tcp=$TCP_BUFFER_CHOICE ssh=$SSH_CHOICE web=$WEB_CHOICE f2b=$F2B_CHOICE"
+  [[ ! -e "$TEST_ROOT/tcp-question" && -z "${AUTO_REBOOT_TIME:-}" ]] || fail 'a question of a step left out was asked'
 )
-printf 'PASS: setup questions are asked once and stored.\n'
+printf 'PASS: setup questions are asked once and stored; steps left out ask nothing.\n'
 
 # ZRAM on Ubuntu, found on a real Ubuntu 24.04 VPS: the cloud kernel has no zram
 # module, and its zram-generator package installs the default "[zram0]" right at

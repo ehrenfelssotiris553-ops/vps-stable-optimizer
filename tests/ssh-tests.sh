@@ -490,3 +490,45 @@ grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail "harden
 arm="$(grep '^arm ' "$CASE/trace")"
 if [[ "$arm" == *'-1): '* ]]; then fail "the hardening's guard would put the key login line back: $arm"; fi
 printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and put back by the guard, the rollback, or when it does not help; vps check names a line written back.\n'
+
+# The session limits are parameters. A key-only drop-in of this tool with the
+# old ones is written again under a guard timer, kept after a key login, put
+# back without one; the same text or a file that is not ours stays as it is.
+(
+  load_optimizer_functions ssh_dropin_refresh
+  P="$TEST_ROOT/ssh-params"; printf 'ssh_max_auth_tries=6\nssh_login_grace_seconds=45\nssh_x11_forwarding=yes\n' > "$P"
+  text="$(PARAMS_FILE="$P" ssh_dropin_text 1)"
+  for setting in 'MaxAuthTries 6' 'LoginGraceTime 45' 'X11Forwarding yes' 'PermitRootLogin no'; do
+    grep -Fxq "$setting" <<< "$text" || fail "drop-in with parameters lacks: $setting"
+  done
+  new_case refresh
+  STATE_ROOT="$CASE/state"; mkdir -p "$STATE_ROOT" "$(dirname "$SSH_DROPIN")"
+  ssh_dropin_text 1 > "$SSH_DROPIN"; cp "$SSH_DROPIN" "$CASE/old"
+  restore_file_ours() { [[ "$1" == ssh_dropin ]] && ((OURS)); }
+  module_expect() { printf 'applied\tboot-1\tkey-only user=alice root-ssh=off\n'; }
+  OURS=1 GUARD_OK=1
+  PARAMS_FILE="$P" ssh_dropin_refresh > "$CASE/out"
+  [[ "$(cat "$SSH_DROPIN")" == "$text" ]] || fail "new limits not written: $(cat "$SSH_DROPIN")"
+  grep -q "^arm vps-stable-ssh-revert-[0-9-]* /bin/sh -c cp -pf '$STATE_ROOT/ssh-dropin-previous' '$SSH_DROPIN'" "$CASE/trace" || fail "no guard: $(cat "$CASE/trace")"
+  grep -Fxq 'result ssh applied key-only user=alice root-ssh=off' "$CASE/trace" || fail "result after the refresh: $(cat "$CASE/trace")"
+  # No key login: the previous drop-in back, reloaded.
+  cp "$CASE/old" "$SSH_DROPIN"; : > "$CASE/trace"; GUARD_OK=0
+  PARAMS_FILE="$P" ssh_dropin_refresh > "$CASE/out"
+  cmp -s "$SSH_DROPIN" "$CASE/old" && grep -Fxq reload "$CASE/trace" || fail 'an unconfirmed refresh was kept'
+  if grep -q '^result ' "$CASE/trace"; then fail 'an unconfirmed refresh recorded as applied'; fi
+  # Nothing to do: the same limits, or not this tool's file.
+  : > "$CASE/trace"; ssh_dropin_refresh > "$CASE/out"
+  if grep -q '^arm ' "$CASE/trace"; then fail 'a guard for unchanged limits'; fi
+  OURS=0; : > "$CASE/trace"; PARAMS_FILE="$P" ssh_dropin_refresh > "$CASE/out"
+  cmp -s "$SSH_DROPIN" "$CASE/old" && ! grep -q '^arm ' "$CASE/trace" || fail "a drop-in that is not ours was changed"
+  # The guard timer: the confirmation time plus a minute.
+  load_optimizer_functions guard_arm
+  systemd-run() { printf '%s\n' "$*" > "$CASE/run"; }
+  active() { return 0; }
+  printf 'guard_seconds=300\n' > "$P"
+  PARAMS_FILE="$P" guard_arm unit-a /bin/true
+  grep -Fq -- '--on-active=360s' "$CASE/run" || fail "guard timer with 300 s: $(cat "$CASE/run")"
+  PARAMS_FILE=/nonexistent guard_arm unit-b /bin/true
+  grep -Fq -- '--on-active=240s' "$CASE/run" || fail "guard timer by default: $(cat "$CASE/run")"
+)
+printf 'PASS: the SSH session limits and the guard time are parameters; changed limits are applied under a guard.\n'

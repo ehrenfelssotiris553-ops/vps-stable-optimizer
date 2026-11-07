@@ -13,6 +13,8 @@ TEST_ROOT="$(mktemp -d)"
 # No sshd configuration here: nothing to name as winning over the tool's file.
 SSHD_CONFIG="$TEST_ROOT/sshd_config" SSH_DROPIN="$TEST_ROOT/sshd_config.d/01-vps-stable-keyonly.conf"
 PARAMS_FILE="$TEST_ROOT/params"
+# No BBR file of this tool: vps check expects the default queue fq.
+BBR_FILE="$TEST_ROOT/no-bbr.conf"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 die() { fail "$*"; }
@@ -72,7 +74,7 @@ grep -Fq 'SSH：没有开荒记录' <<< "$out" || fail 'unrecorded module not re
 out="$(verify_module hostname '主机名' check_pass | sed $'s/\033\\[[0-9;]*m//g')"
 [[ "$out" == *'主机名：没有开启（一键开荒不管这一项'* && "$out" != *开荒记录* ]] || fail "hostname without a record: $out"
 # The list of such items matches what one-click setup really runs.
-setup_stages="$(awk '/^main\(\) \{$/,/^\}$/' "$TEST_SCRIPT" | sed -n 's/^ *stage_run \([a-z_]*\) .*/\1/p' | sort -u | tr '\n' ' ')"
+setup_stages="$(awk '/^main\(\) \{$/,/^\}$/' "$TEST_SCRIPT" | sed -n 's/^ *\(stage\|setup\)_run \([a-z_]*\) .*/\2/p' | sort -u | tr '\n' ' ')"
 for module in hostname conntrack ping notify quota dockerlog sshport; do
   [[ " $setup_stages " != *" $module "* ]] || fail "$module is set up by one-click setup, yet called an item it never touches"
 done

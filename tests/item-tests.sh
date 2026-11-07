@@ -238,10 +238,27 @@ item_action upgrade < <(printf '2\n') > /dev/null
 item_action bbr < <(printf '1\n') > /dev/null
 item_action ports < /dev/null > /dev/null
 [[ "$(grep -v '^adopt\|^ufw off' "$TEST_ROOT/trace" | tr '\n' ' ')" == 'on firewall on bbr port menu ' ]] || fail "item dispatch: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+# The parameters of the items with more actions: the general settings (1
+# adjust, 2 reset, nothing else), SSH (3, 4), the firewall (4, 5; 3 stays its
+# rollback) and Fail2ban (4, 5; 3 stays the allowlist).
+(
+  param_adjust() { record "adjust $1"; }
+  param_reset() { record "reset $1"; }
+  item_turn_off() { record "off $1"; }
+  f2b_allowlist_menu() { record allowlist; }
+  reset
+  for pair in 'general 1' 'general 2' 'general 3' 'ssh 3' 'ssh 4' 'ssh 1' 'firewall 3' 'firewall 4' 'firewall 5' 'fail2ban 3' 'fail2ban 4' 'fail2ban 5'; do
+    item_action "${pair% *}" <<< "${pair#* }" > /dev/null
+  done
+  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'adjust general reset general adjust ssh reset ssh on ssh off firewall adjust firewall reset firewall allowlist adjust fail2ban reset fail2ban ' ]] ||
+    fail "parameter actions: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+)
+printf 'PASS: the general settings, SSH, the firewall and Fail2ban reach their parameters from the single-item menu.\n'
 reset; item_action() { record "action $1"; }
 printf '4\n0\n' | item_menu > /dev/null
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-[[ "$(item_keys | wc -l | tr -d ' ')" == 30 ]] || fail 'item count'
+# (31: the general settings, parameters only, came last in 2.9.)
+[[ "$(item_keys | wc -l | tr -d ' ')" == 31 ]] || fail 'item count'
 # New items are appended: the numbers the user knows stay the same.
 [[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
 [[ "$(item_keys | sed -n '20,30p' | tr '\n' ' ')" == 'hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog sshport ' ]] || fail 'new items are not appended in order'

@@ -96,6 +96,16 @@ now="$(date +%s)"
 hook root 192.0.2.2
 [[ "$(wc -l < "$REC")" == 20000 ]] && ! grep -q $'\t192.0.2.1\t' "$REC" || fail "record not limited: $(wc -l < "$REC") lines"
 printf 'PASS: the record keeps a year and at most 20000 lines.\n'
+# Other lengths, and no note, when the parameters say so.
+P="$TEST_ROOT/params-login"; printf 'login_keep_days=30\nlogin_keep_lines=1000\nlogin_note=no\nlogin_note_minutes=30\n' > "$P"
+PARAMS_FILE="$P" login_hook_text > "$TEST_ROOT/hook"
+{ printf '%s\troot\t192.0.2.1\tpassword\tssh\t0\n' "$((now - 40 * 86400))"; for ((i = 0; i < 1005; i++)); do printf '%s\troot\t192.0.2.2\tpublickey\tssh\t0\n' "$((now - 1000))"; done; } > "$REC"
+hook root 192.0.2.2
+[[ "$(wc -l < "$REC")" == 1000 ]] && ! grep -q $'\t192.0.2.1\t' "$REC" || fail "record with 30 days and 1000 lines: $(wc -l < "$REC") lines"
+[[ ! -s "$TEST_ROOT/note" ]] || fail "a note although switched off: $(cat "$TEST_ROOT/note")"
+grep -Fq 'cut=$((now - 1800))' "$TEST_ROOT/hook" && grep -Fq '最近 30 分钟还有' "$TEST_ROOT/hook" || fail 'the note window is not 30 minutes'
+login_hook_text > "$TEST_ROOT/hook"
+printf 'PASS: the record length and the note follow their parameters.\n'
 
 # The PAM profile: optional, the hook under a timeout.
 login_pam_text > "$TEST_ROOT/profile"
@@ -170,6 +180,11 @@ out="$(menu_login_alert)"
 [[ "$out" == *'陌生 IP 登录过：198.51.100.77（root，'* && "$out" != *198.51.100.66* && "$out" != *203.0.113.5* ]] || fail "menu alert: $out"
 printf 'ip 198.51.100.77\n' > "$STATE_ROOT/known"
 [[ -z "$(menu_login_alert)" ]] || fail 'an address marked as normal still alerted'
+: > "$STATE_ROOT/known"
+P="$TEST_ROOT/params-alert"; printf 'menu_alert_days=7\n' > "$P"
+out="$(PARAMS_FILE="$P" menu_login_alert)"
+[[ "$out" == *198.51.100.66* && "$out" == *198.51.100.77* ]] || fail "menu alert over 7 days: $out"
+printf 'ip 198.51.100.77\n' > "$STATE_ROOT/known"
 rm -f "$REC"; [[ -z "$(menu_login_alert)" ]] || fail 'an alert without a record'
 printf 'PASS: the menu shows first-time addresses of the last 3 days in red until marked as normal.\n'
 

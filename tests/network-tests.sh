@@ -90,6 +90,11 @@ VERIFY_NOTICE=0 VERIFY_PASS=0 VERIFY_ISSUES=()
 SYSVAL[net.netfilter.nf_conntrack_count]=50000
 out="$(verify_conntrack_usage; echo "notice=$VERIFY_NOTICE")"
 [[ "$out" == *'⚠ 注意  连接跟踪：用了 76%'* && "$out" == *notice=1 ]] || fail "a full table not noticed: $out"
+param_store conntrack_notice_percent 90
+VERIFY_NOTICE=0
+out="$(verify_conntrack_usage; echo "notice=$VERIFY_NOTICE")"
+[[ "$out" == *'✔ 正常  连接跟踪：用了 76%'* && "$out" == *notice=0 ]] || fail "76% noticed although 90 was asked for: $out"
+param_store conntrack_notice_percent ''
 SYSVAL[net.netfilter.nf_conntrack_count]=10
 [[ "$(verify_conntrack_usage)" == *'✔ 正常  连接跟踪：用了 0%'* ]] || fail 'usage not shown'
 unset 'SYSVAL[net.netfilter.nf_conntrack_max]'
@@ -168,6 +173,10 @@ check_keepalive '60 s'
 param_store ssh_keepalive_seconds 30
 reset; OURS=1; keepalive_stage
 grep -Fxq 'ClientAliveInterval 30' "$KEEPALIVE_FILE" || fail 'new interval not written'
+param_store ssh_keepalive_count 5
+reset; OURS=1; keepalive_stage
+grep -Fxq 'ClientAliveCountMax 5' "$KEEPALIVE_FILE" || fail "the number of unanswered checks not written: $(cat "$KEEPALIVE_FILE")"
+param_store ssh_keepalive_count ''
 # sshd refuses the configuration: taken back, no reload.
 rm -f "$KEEPALIVE_FILE"; SSHD_OK=0
 reset; keepalive_stage

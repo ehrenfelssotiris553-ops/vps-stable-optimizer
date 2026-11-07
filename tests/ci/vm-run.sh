@@ -679,6 +679,23 @@ vm_ops_sudo mv -f /root/provider.keep "$PROVIDER_CONF"
 vm_ops_sudo systemctl try-reload-or-restart ssh.service
 ssh_back 'the provider line commented out again'
 hardened 'with the provider line commented out again'
+# The session limits are parameters: 6 tries instead of 4 is written under a
+# guard and kept after a key login of ops; back to the recommendation the same way.
+index="$(item_index ssh)" || fail 'no single item ssh'
+for step in 'adjust 3 6' 'reset 4 4'; do
+  read -r name choice tries <<< "$step"
+  # ($VM_SSH_OPS and $ADMIN_PW are answer.exp's to expand.)
+  # shellcheck disable=SC2016
+  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" "请选择: ==> $choice" '新的值 ==> @seq 6 30 no' \
+    '等待确认（剩余 ==> !$VM_SSH_OPS true' '\[sudo[^]]*\] [Pp]assword ==> $ADMIN_PW' > "$LOGS/ssh-params-$name.rules"
+  VM_AS=$VM_OPS_HOST vm_drive "$LOGS/ssh-params-$name.rules" "ssh-params-$name" sudo vps item || fail "SSH parameters ($name) exited with $?"
+  has "ssh-params-$name" '新的 SSH 参数已保留'
+  ssh_back "the SSH parameters ($name)"
+  [[ "$(vm_ops_sudo sshd -T | awk '$1 == "maxauthtries" {print $2}')" == "$tries" ]] ||
+    fail "sshd does not use $tries tries after $name: $(vm_ops_sudo sshd -T | grep -i maxauthtries)"
+  vm_ops_sudo grep -Fxq "'MaxAuthTries $tries'" "$KEYONLY" || fail "the drop-in does not say $tries tries after $name"
+  hardened "after the SSH parameters ($name)"
+done
 endgroup
 
 group 'Full rollback and uninstall'

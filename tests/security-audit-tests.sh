@@ -46,6 +46,17 @@ reset_report; audit_logins > "$TEST_ROOT/out"
 if grep -Fq '198.51.100.66' "$TEST_ROOT/out"; then fail 'an address marked as normal was reported'; fi
 : > "$STATE_ROOT/known"
 printf 'PASS: the audit lists first-time addresses and console logins of the last 30 days, and counts failures.\n'
+# Another number of days (audit_days): a known address that logged in 40 days
+# ago is counted in the last 60.
+(
+  printf 'audit_days=60\n' > "$TEST_ROOT/params-audit"; PARAMS_FILE="$TEST_ROOT/params-audit"
+  reset_report; audit_logins > "$TEST_ROOT/out"
+  grep -Fq '谁登录过（最近 60 天）' "$TEST_ROOT/out" && grep -Fq '登录：2 个 IP 以前就登录过' "$TEST_ROOT/out" || fail "60 days: $(cat "$TEST_ROOT/out")"
+  printf 'audit_days=7\n' > "$PARAMS_FILE"
+  reset_report; audit_logins > "$TEST_ROOT/out"
+  grep -Fq 'IP 198.51.100.66：最近 7 天第一次出现' "$TEST_ROOT/out" || fail "7 days: $(cat "$TEST_ROOT/out")"
+)
+printf 'PASS: the audit covers the number of days the parameter asks for.\n'
 
 # 2. Accounts and keys: a second UID 0 and an empty password are suspect; a key
 # not marked as normal is listed, a marked one is not.

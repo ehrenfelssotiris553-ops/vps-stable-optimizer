@@ -177,6 +177,20 @@ command grep -q '^write -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_con
 command grep -qx 'result bbr applied' "$CALLS" || fail 'applied BBR result not recorded'
 command grep -qx 'net.core.default_qdisc = fq' "$BBR_FILE" || fail 'persistent fq line missing'
 command grep -qx 'net.ipv4.tcp_congestion_control = bbr' "$BBR_FILE" || fail 'persistent bbr line missing'
+# Another default queue (bbr_qdisc): this tool's own file is written again
+# and the running value follows; vps check expects that queue.
+(
+  restore_file_ours() { [[ "$1" == bbr_file ]]; }
+  printf 'bbr_qdisc=fq_codel\n' > "$TEST_ROOT/params"; PARAMS_FILE="$TEST_ROOT/params"
+  : > "$CALLS"; bbr_stage
+  command grep -qx 'net.core.default_qdisc = fq_codel' "$BBR_FILE" && command grep -q '^write -w net.core.default_qdisc=fq_codel net.ipv4.tcp_congestion_control=bbr$' "$CALLS" ||
+    fail "queue fq_codel: $(cat "$BBR_FILE") $(cat "$CALLS")"
+  load_optimizer_functions check_bbr verify_set
+  verify_ssh_connection_cc() { return 1; }
+  sysctl() { case "$2" in net.ipv4.tcp_congestion_control) echo bbr ;; net.core.default_qdisc) echo "$QD" ;; esac; }
+  QD=fq_codel; check_bbr; [[ "$VERIFY_STATUS" == pass ]] || fail "check with fq_codel asked for: $VERIFY_TEXT"
+  QD=fq; check_bbr; [[ "$VERIFY_STATUS" == fail ]] || fail 'fq passed although fq_codel was asked for'
+)
 : > "$CALLS"
 printf '%s\n' 'net/ipv4/tcp_congestion_control=cubic' > "$TEST_ROOT/input.conf"
 bbr_stage

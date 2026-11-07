@@ -230,6 +230,14 @@ printf 'MemTotal: 1000000 kB\nMemAvailable: 600000 kB\n' > "$F/proc/meminfo"
 sed -i '/^notify_cpu_percent=/d; /^notify_cpu_minutes=/d; /^notify_mem_percent=/d' "$PARAMS_FILE"
 printf 'PASS: only the notifications asked for are sent; the CPU and memory thresholds are parameters.\n'
 
+# The checks of what was done on the machine, every 10 minutes when asked.
+printf 'notify_events_minutes=10\n' >> "$PARAMS_FILE"
+past=$(($(date +%s) - 400)); printf '%s\n' "$past" > "$D/five"; : > "$T/sent"; run
+[[ "$(cat "$D/five")" == "$past" ]] || fail 'the checks ran after 400 s although every 10 minutes was asked for'
+sed -i '/^notify_events_minutes=/d' "$PARAMS_FILE"; run
+[[ "$(cat "$D/five")" != "$past" ]] || fail 'the checks did not run after 400 s by default (every 5 minutes)'
+printf 'PASS: the checks of what was done on the machine run at the interval asked for.\n'
+
 # The timer: every minute with TG, every 5 minutes for the traffic alert only,
 # gone with neither; quiet in the journal.
 put_file() { [[ ! -e "$1" ]] || [[ "$(cat "$1")" == "$2" ]] || return 1; mkdir -p -- "$(dirname -- "$1")"; printf '%s\n' "$2" > "$1"; }
@@ -243,7 +251,14 @@ grep -Fxq 'OnCalendar=*:0/1' "$CHECK_TIMER_FILE" && grep -Fxq 'LogLevelMax=notic
 grep -Fxq 'systemctl enable --now vps-stable-check.timer' "$TEST_ROOT/trace" && grep -Fxq 'adopt check_timer_file' "$TEST_ROOT/trace" || fail "timer not started or adopted: $(cat "$TEST_ROOT/trace")"
 # Limited in time; long enough for the acceptance check of the daily summary (60 s).
 grep -Fq "ExecStart=/usr/bin/timeout 110 /bin/bash $STATE_ROOT/notify-check" "$CHECK_SERVICE_FILE" || fail 'the check is not limited in time'
+# Other intervals when the parameters say so (this tool's timer is written again).
+printf 'check_minutes_tg=3\ncheck_minutes_quota=10\n' >> "$PARAMS_FILE"
+reset; check_reconcile
+grep -Fxq 'OnCalendar=*:0/3' "$CHECK_TIMER_FILE" || fail "timer with TG every 3 minutes: $(cat "$CHECK_TIMER_FILE")"
 mv "$STATE_ROOT/notify.conf" "$T/notify.conf.saved"
+reset; check_reconcile
+grep -Fxq 'OnCalendar=*:0/10' "$CHECK_TIMER_FILE" || fail "timer for traffic only every 10 minutes: $(cat "$CHECK_TIMER_FILE")"
+sed -i '/^check_minutes_tg=/d; /^check_minutes_quota=/d' "$PARAMS_FILE"
 reset; check_reconcile
 grep -Fxq 'OnCalendar=*:0/5' "$CHECK_TIMER_FILE" || fail "timer for traffic only: $(cat "$CHECK_TIMER_FILE")"
 rm -f "$STATE_ROOT/quota.conf"

@@ -12,6 +12,9 @@ unset SSH_CONNECTION SSH_CLIENT SSH_TTY SUDO_USER
 sshd_runtime_dir() { :; }
 # Straight to the (mocked) systemctl; extras-tests loads the real one to test it.
 systemctl_quiet_sysv() { systemctl "$@"; }
+# One-click setup leaves nothing out (setup_skip unset); entry-tests loads the
+# real one to test it.
+setup_skipped() { return 1; }
 # Straight to the (mocked) apt-get; extras-tests loads the real one to test it.
 apt_run() { apt-get "$@"; }
 # A step title through each test's own say(), as outside a setup; ui-tests
@@ -37,5 +40,10 @@ load_optimizer_functions() {
   done
 }
 # The TG notification names, which the parameter checks (loaded by many tests)
-# use; quiet when the script under test has none (an older one).
-load_optimizer_functions notify_event_names 2>/dev/null || true
+# use; quiet when the script under test has none (an older one). Likewise the other lists the parameter checks use, and the size text.
+load_optimizer_functions notify_event_names setup_skippable menu_alert_names menu_alert_on sysctl_hardening_all param_check_words mib_text names_only 2>/dev/null || true
+# The parameters: many functions read theirs. Without a PARAMS_FILE of the
+# test's own, every one is the recommended value; a test that sets one, or
+# mocks param_value, still does so after this.
+PARAMS_FILE="${PARAMS_FILE:-/nonexistent/vps-test-params}"
+load_optimizer_functions param_list param_kind param_recommended param_reason param_check param_caution param_read param_value param_mode 2>/dev/null || true

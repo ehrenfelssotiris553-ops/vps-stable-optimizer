@@ -57,9 +57,10 @@ printf 'PASS: parameters are stored strictly, follow the recommendation when aut
 : > "$PARAMS_FILE"; : > "$TEST_ROOT/applied"
 CONFIRM=n
 confirm_yes() { printf 'ASK %s\n' "$1"; [[ "$CONFIRM" == y ]]; }
-out="$(printf '\n' | param_adjust tcp)"
+# (tcp asks for two: the buffer cap, then the two switches that come with it.)
+out="$(printf '\n\n' | param_adjust tcp)"
 [[ "$out" == *'参数没有改动'* && ! -s "$TEST_ROOT/applied" ]] || fail "Enter changed something: $out"
-out="$(printf '%s\n' 500 abc 64 | param_adjust tcp)"
+out="$(printf '%s\n' 500 abc 64 '' | param_adjust tcp)"
 [[ "$out" == *'请输入 4 到 256 之间的整数'* ]] || fail 'out-of-range value not refused'
 [[ "$(param_value tcp_buffer_mib)" == 64 ]] || fail "adjusted value not kept: $(cat "$PARAMS_FILE")"
 grep -Fxq 'apply tcp' "$TEST_ROOT/applied" || fail 'an item that is on was not applied again'
@@ -73,7 +74,7 @@ printf 'auto\n' | param_adjust tcp > /dev/null
 [[ "$(param_mode tcp_buffer_mib)" == 自动 ]] || fail 'auto did not reset'
 # An item that is off keeps the value for when it is turned on.
 : > "$TEST_ROOT/applied"; MODULE='declined'
-out="$(printf '16\n' | param_adjust tcp)"
+out="$(printf '16\n\n' | param_adjust tcp)"
 [[ "$out" == *'开启时就会用新的参数'* && ! -s "$TEST_ROOT/applied" ]] || fail 'an item that is off was applied'
 MODULE='applied'
 param_reset tcp > /dev/null
@@ -85,7 +86,7 @@ item_status() { echo '已开启'; }
 item_turn_off() { :; }
 port_menu() { :; }
 [[ "$(printf '0\n' | item_action tcp)" == *'3. 调整参数   4. 恢复推荐值'* ]] || fail 'tcp item lacks adjust and reset'
-[[ "$(printf '0\n' | item_action bbr)" != *'调整参数'* ]] || fail 'an item without parameters offers to adjust'
+[[ "$(printf '0\n' | item_action trim)" != *'调整参数'* ]] || fail 'an item without parameters offers to adjust'
 param_store tcp_buffer_mib 48
 printf '4\n' | item_action tcp > /dev/null
 [[ "$(param_mode tcp_buffer_mib)" == 自动 ]] || fail '4 in the item menu did not reset'
@@ -150,3 +151,40 @@ grep -Fxq 'ui_ascii=1' "$PARAMS_FILE" || fail 'ASCII setting not saved'
 item_symbols > /dev/null
 if grep -q ui_ascii "$PARAMS_FILE"; then fail 'ASCII setting not removed'; fi
 printf 'PASS: the ASCII symbols setting is saved and removed from the single-item menu.\n'
+
+# The switches and numbers opened up in 2.9: each limit accepted, one past it
+# refused. Checked under LC_ALL=C, as this tool runs.
+for pair in 'guard_seconds 120' 'guard_seconds 900' 'setup_skip none' 'setup_skip bbr firewall' 'run_keep 5' 'run_keep 200' \
+    'audit_days 7' 'audit_days 365' 'menu_alerts all' 'menu_alerts none' 'menu_alerts verify reboot' 'menu_alert_days 1' 'menu_alert_days 30' \
+    'ssh_rate_limit yes' 'ssh_rate_limit no' 'ssh_max_auth_tries 2' 'ssh_max_auth_tries 10' 'ssh_login_grace_seconds 10' 'ssh_login_grace_seconds 120' \
+    'ssh_x11_forwarding yes' 'ssh_x11_forwarding no' 'sysctl_hardening_skip none' 'sysctl_hardening_skip kernel.kptr_restrict' \
+    'bbr_qdisc fq' 'bbr_qdisc fq_codel' 'bbr_qdisc cake' 'zram_swappiness 1' 'zram_swappiness 200' 'zram_page_cluster 0' 'zram_page_cluster 3' \
+    'auto_swap_below_mib 512' 'auto_swap_below_mib 16384' 'swap_min_free_gb 1' 'swap_min_free_gb 50' 'tcp_extras yes' 'tcp_extras no' \
+    'journal_auto_disk_gib 0' 'journal_auto_disk_gib 4096' 'ssh_keepalive_count 1' 'ssh_keepalive_count 10' 'f2b_optional_below_mib 0' \
+    'f2b_optional_below_mib 65536' 'conntrack_notice_percent 30' 'conntrack_notice_percent 95' 'login_keep_days 30' 'login_keep_days 1825' \
+    'login_keep_lines 1000' 'login_keep_lines 100000' 'login_note yes' 'login_note no' 'login_note_minutes 1' 'login_note_minutes 120' \
+    'check_minutes_tg 1' 'check_minutes_tg 30' 'check_minutes_quota 1' 'check_minutes_quota 60' 'notify_events_minutes 1' 'notify_events_minutes 60'; do
+  LC_ALL=C param_check "${pair%% *}" "${pair#* }" > /dev/null || fail "rejected: $pair"
+done
+for pair in 'guard_seconds 119' 'guard_seconds 901' 'setup_skip apt_index' 'setup_skip bbr bbr2' 'run_keep 4' 'run_keep 201' 'audit_days 6' \
+    'audit_days 366' 'menu_alerts some' 'menu_alerts none login' 'menu_alert_days 0' 'menu_alert_days 31' 'ssh_rate_limit maybe' 'ssh_max_auth_tries 1' \
+    'ssh_max_auth_tries 11' 'ssh_login_grace_seconds 9' 'ssh_login_grace_seconds 121' 'ssh_x11_forwarding 1' 'sysctl_hardening_skip net.ipv4.ip_forward' \
+    'bbr_qdisc pfifo_fast' 'zram_swappiness 0' 'zram_swappiness 201' 'zram_page_cluster 4' 'auto_swap_below_mib 511' 'auto_swap_below_mib 16385' \
+    'swap_min_free_gb 0' 'swap_min_free_gb 51' 'tcp_extras on' 'journal_auto_disk_gib 4097' 'ssh_keepalive_count 0' 'ssh_keepalive_count 11' \
+    'f2b_optional_below_mib 65537' 'conntrack_notice_percent 29' 'conntrack_notice_percent 96' 'login_keep_days 29' 'login_keep_days 1826' \
+    'login_keep_lines 999' 'login_keep_lines 100001' 'login_note 1' 'login_note_minutes 0' 'login_note_minutes 121' 'check_minutes_tg 0' \
+    'check_minutes_tg 31' 'check_minutes_quota 0' 'check_minutes_quota 61' 'notify_events_minutes 0' 'notify_events_minutes 61'; do
+  if LC_ALL=C param_check "${pair%% *}" "${pair#* }" > /dev/null; then fail "accepted: $pair"; fi
+done
+# Every name of the name lists, one by one and all together (found here: under
+# LC_ALL=C the descriptions in brackets were cut off only for some names).
+notify_names='boot login console account sudo oom package key port autostart cpu disk memory reboot service traffic'
+[[ "$(LC_ALL=C notify_event_names | LC_ALL=C names_only)" == "$notify_names" ]] || fail "notification names: $(LC_ALL=C notify_event_names | LC_ALL=C names_only)"
+[[ "$(LC_ALL=C menu_alert_names | LC_ALL=C names_only)" == 'verify reboot login quota' ]] || fail "menu alert names: $(LC_ALL=C menu_alert_names | LC_ALL=C names_only)"
+for name in $notify_names; do LC_ALL=C param_check notify_events "$name" > /dev/null || fail "notification name rejected: $name"; done
+LC_ALL=C param_check notify_events "$notify_names" > /dev/null || fail 'all notification names together rejected'
+for name in verify reboot login quota; do LC_ALL=C param_check menu_alerts "$name" > /dev/null || fail "menu alert name rejected: $name"; done
+for name in $(setup_skippable); do LC_ALL=C param_check setup_skip "$name" > /dev/null || fail "setup step rejected: $name"; done
+LC_ALL=C param_check setup_skip "$(setup_skippable | tr '\n' ' ')" > /dev/null || fail 'all setup steps together rejected'
+for name in $(sysctl_hardening_all | sed 's/=.*//'); do LC_ALL=C param_check sysctl_hardening_skip "$name" > /dev/null || fail "hardening key rejected: $name"; done
+printf 'PASS: every switch and number opened up in 2.9 keeps to its limits; every name of the name lists is accepted under LC_ALL=C.\n'

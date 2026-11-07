@@ -17,7 +17,7 @@ load_function() {
   eval "$definition"
 }
 for name in journal_policy_paths sysctl_config_files trim_support decision_line decision_file_state decision_journal_state decision_report \
-    param_value param_read param_recommended param_check journal_config_text; do load_function "$name"; done
+    param_value param_read param_recommended param_check journal_config_text mib_text; do load_function "$name"; done
 SWAP_FILE=/swapfile PARAMS_FILE=/nonexistent/params
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -26,7 +26,6 @@ say() { printf '%s\n' "$*"; }
 WARNINGS=0
 warn() { WARNINGS=$((WARNINGS+1)); printf '%s\n' "$*"; }
 JOURNAL_FILE="$TEST_ROOT/managed-journal.conf"
-JOURNAL_LIMIT_GB=20
 BBR_FILE="$TEST_ROOT/bbr.conf"
 MODULE_FILE="$TEST_ROOT/module.conf"
 F2B_FILE="$TEST_ROOT/99-vps-stable-sshd.local"
@@ -99,6 +98,7 @@ put_file() { fail 'read-only report changed configuration'; }
 # Avoid inspecting actual /etc journal files in report cases.
 decision_journal_state() { printf '%s\n' "${JOURNAL_STATE:-missing}"; }
 assert_contains() { grep -Fq -- "$1" "$TEST_ROOT/report" || fail "missing report text: $1"; }
+restore_file_ours() { [[ "$1" == bbr_file ]] && ((${BBR_OURS:-0})); }
 assert_absent() { if grep -Fq -- "$1" "$TEST_ROOT/report"; then fail "unexpected report text: $1"; fi; }
 
 BBR_ELSEWHERE=1 BBR_AVAILABLE='reno cubic bbr'
@@ -194,3 +194,17 @@ assert_contains '目标日志配置已有不同内容'
 assert_contains '当前软件索引未确认组件可用'
 assert_contains '保留已有 chrony'
 printf 'PASS: read-only decisions, current preflight inputs, conservative preservation and no mutation commands.\n'
+
+# Another default queue asked for (bbr_qdisc): the plan names it; this tool's
+# own file with the old queue is written again, someone else's is kept.
+(
+  printf 'bbr_qdisc=fq_codel\n' > "$TEST_ROOT/params"; PARAMS_FILE="$TEST_ROOT/params"
+  BBR_AVAILABLE='reno cubic bbr' BBR_CURRENT=cubic RULES_SAFE=1 JOURNAL_STATE=missing
+  printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$BBR_FILE"
+  BBR_OURS=1; decision_report 0 0 > "$TEST_ROOT/report"
+  assert_contains '设置 BBR 和默认 fq_codel 队列'
+  BBR_OURS=0; decision_report 0 0 > "$TEST_ROOT/report"
+  assert_contains '本工具使用的配置路径已有不同内容'
+  rm -f "$BBR_FILE"
+)
+printf "PASS: the plan follows the default queue asked for and rewrites only this tool's own BBR file.\n"

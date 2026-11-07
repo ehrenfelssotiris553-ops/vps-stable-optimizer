@@ -100,7 +100,8 @@ while IFS= read -r key; do
   if [[ "$key" != ports ]]; then grep -Eq "^    $key\)" <<< "$on" || fail "item $key cannot be turned on"; fi
   case "$key" in
     # One-off actions, the port menu, and packages (offered for removal instead).
-    upgrade|kernel|ports|tools|vnstat) ;;
+    # (and the general settings, which are parameters only).
+    upgrade|kernel|ports|tools|vnstat|general) ;;
     *) [[ " ${RB_GROUPS[*]} " == *" $key "* ]] || fail "item $key has no rollback group to undo it" ;;
   esac
 done < <(item_keys)
@@ -168,3 +169,81 @@ printf 'PASS: colours and state symbols come only from the interface block.\n'
   done < <(param_list)
 )
 printf 'PASS: every parameter belongs to a single item, and its recommendation is allowed and explained.\n'
+
+# Every step of one-click setup that decides by itself or asks can be left out
+# (setup_skip), and the list of those names is exactly those steps.
+block="$(source_of main | awk '/UI_STEPS=15/ {on = 1} on {print} /stage_run verification/ {exit}')"
+runs="$(sed -n 's/^ *setup_run \([a-z0-9_]*\) .*/\1/p' <<< "$block" | sort -u | tr '\n' ' ')"
+[[ "$runs" == "$(setup_skippable | sort -u | tr '\n' ' ')" ]] || fail "setup steps that can be left out ($runs) and setup_skippable differ"
+others="$(sed -n 's/^ *stage_run \([a-z0-9_]*\) .*/\1/p' <<< "$block" | sort -u | tr '\n' ' ')"
+[[ "$others" == 'apt_index apt_upgrade questions verification ' ]] || fail "setup steps that cannot be left out: $others"
+printf 'PASS: every step of one-click setup can be left out by the parameter.\n'
+
+# No new fixed numbers in what this tool writes to the system (user rule,
+# 2026-11-07: every number that is a choice can be adjusted). Each number in
+# these functions is listed here with its reason; anything else must come from
+# a parameter (param_list). A new number fails here until it is one or is
+# listed with a reason.
+declare -A FIXED_NUMBERS=(
+  # swap-priority: ZRAM is used before any disk swap (an order, not a choice).
+  [zram_config_text]='100'
+  # Priority: the disk swap after ZRAM (100).
+  [swap_unit_text]='10'
+  # The runtime journal: half the limit, at least 16 MiB (follows journal_max).
+  [journal_config_text]='2 16'
+  # The hardened value of each key; each key can be left out (sysctl_hardening_skip).
+  [sysctl_hardening_all]='0 1 2'
+  # PAM priority 0; the hook under a 3 s timeout so it can never hold up a login.
+  [login_pam_text]='0 3'
+  # [ -t 1 ]: only on a terminal.
+  [login_profile_text]='1'
+  # Field numbers and exit codes, umask 077 and mode 755, the red colour (31,
+  # escape 033), seconds per minute and day, C.UTF-8, the sshd lines of the last
+  # 600 s (50 at most) matched within 120 s, the last 300 records compared, and
+  # the cut lengths of names (32), addresses (64) and lines (20).
+  [login_hook_text]='0 1 2 3 4 5 7 8 9 20 31 32 033 50 60 64 077 120 300 600 755 86400'
+  # Positional ${2}; minutes and days in seconds.
+  [f2b_jail_text]='2 60 86400'
+  # Positional ${7}; localhost (127.0.0.1/8, ::1) is never banned.
+  [f2b_jail_values_text]='1 7 8 127'
+  # Minutes and hours.
+  [f2b_policy_text]='0 60'
+  # Bans are remembered at least a week, longer with a longer longest ban (f2b_maxtime_days).
+  [f2b_db_text]='86400 604800'
+  # Fail2ban's default port, replaced by each jail's own.
+  [f2b_action_text]='22'
+  # Positional $1 and the root switch (0/1); the limits are parameters.
+  [ssh_dropin_text]='0 1'
+  # Nice=10 (in the background); 110 s: room for the daily summary's acceptance check (60 s).
+  [check_service_text]='10 110'
+  # *:0/N (N is check_minutes_*); AccuracySec=5s.
+  [check_timer_text]='0 5'
+  [zram_sysctl_pairs]='' [ping_ufw_text]='' [f2b_bootstrap_text]='' [ssh_port_text]='' [dockerlog_text]=''
+)
+for fn in "${!FIXED_NUMBERS[@]}"; do
+  body="$(source_of "$fn" | grep -v '^[[:space:]]*#')"
+  [[ -n "$body" ]] || fail "$fn not found"
+  for n in $(grep -oE '(^|[^A-Za-z0-9_.$@])[0-9]+' <<< "$body" | grep -oE '[0-9]+' | sort -u); do
+    [[ " ${FIXED_NUMBERS[$fn]} " == *" $n "* ]] || fail "$fn writes the fixed number $n: make it a parameter (param_list) or list it in consistency-tests with its reason"
+  done
+done
+printf 'PASS: what this tool writes to the system has no fixed number without a reason.\n'
+
+# The check script's fallbacks when a parameter is missing are the
+# recommended values: a second copy of a number must not drift.
+fallbacks="$(source_of notify_check_text | grep -oE "(num|param) [a-z_]+ ('[^']*'|[^ )\"']+)\)" |
+  sed -E "s/^(num|param) ([a-z_]+) '?([^')]*)'?\)$/\2\t\3/")"
+[[ "$(grep -c . <<< "$fallbacks")" -ge 10 ]] || fail "check script fallbacks not found: $fallbacks"
+while IFS=$'\t' read -r name def; do
+  want="$(param_recommended "$name")"
+  [[ "$def" == "$want" ]] || fail "the check script falls back to $def for $name, the recommended value is $want"
+done <<< "$fallbacks"
+printf 'PASS: the check script falls back to the recommended value of each parameter.\n'
+
+# Every parameter is in the README's table, by the name the menu shows.
+README_FILE="$(dirname -- "$TEST_SCRIPT")/README.md"
+[[ -r "$README_FILE" ]] || README_FILE="$HERE/../README.md"
+while IFS=$'\t' read -r name _item label _unit; do
+  grep -Fq "| $label |" "$README_FILE" || fail "parameter $name ($label) is not in the README's table"
+done < <(param_list)
+printf 'PASS: every parameter is in the README, by the name the menu shows.\n'

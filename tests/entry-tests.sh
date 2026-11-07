@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions main
+load_optimizer_functions main setup_run
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -139,3 +139,21 @@ order="$(awk '/^stage / {print $2}' "$CASE_DIR/calls" | tr '\n' ' ')"
 [[ "$order" == 'backup ssh verification ' ]] || fail "ssh mode ran unrelated stages: $order"
 
 printf '%s\n' 'PASS: actual main gates read-only modes, confirmation, preflight, backup failure, stage order and reboot offer.'
+
+# Steps one-click setup leaves out (setup_skip): recorded as skipped, not run.
+(
+  load_optimizer_functions setup_run setup_skipped
+  T="$(mktemp -d)"; P="$T/params"; printf 'setup_skip=bbr firewall\n' > "$P"; PARAMS_FILE="$P"
+  stage_run() { printf 'stage %s\n' "$*" >> "$T/trace"; }
+  module_result() { printf 'result %s\n' "$*" >> "$T/trace"; }
+  state_event() { printf 'event %s\n' "$*" >> "$T/trace"; }
+  ok() { :; }
+  item_label() { printf '%s\n' "$1"; }
+  setup_run bbr bbr_stage; setup_run zram zram_stage; setup_run firewall firewall_stage
+  [[ "$(cat "$T/trace")" == $'event bbr skipped 0\nresult bbr skipped setup_skip\nstage zram zram_stage\nevent firewall skipped 0\nresult firewall skipped setup_skip' ]] ||
+    { printf 'FAIL: skipped steps: %s\n' "$(cat "$T/trace")" >&2; exit 1; }
+  printf 'setup_skip=none\n' > "$P"; : > "$T/trace"; setup_run bbr bbr_stage
+  [[ "$(cat "$T/trace")" == 'stage bbr bbr_stage' ]] || { printf 'FAIL: nothing skipped: %s\n' "$(cat "$T/trace")" >&2; exit 1; }
+  rm -rf "$T"
+)
+printf 'PASS: one-click setup leaves out the steps the parameter names, recorded as skipped.\n'

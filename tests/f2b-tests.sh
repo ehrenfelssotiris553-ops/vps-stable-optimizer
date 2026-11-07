@@ -265,6 +265,12 @@ f2b_optional 1 && fail 'optional with 4 GiB'
 MEM_MIB=512; f2b_optional 1 || fail 'not optional below 1 GiB when the hardening makes the login key-only'
 PASSWORD_LOGIN=yes; if f2b_optional 0; then fail 'optional with password login'; fi
 PASSWORD_LOGIN=no; f2b_optional 0 || fail 'not optional with key-only login below 1 GiB'
+# Another limit (f2b_optional_below_mib), 0: never optional.
+printf 'f2b_optional_below_mib=8192\n' > "$PARAMS_FILE"; MEM_MIB=4096
+f2b_optional 0 || fail 'not optional below 8 GiB when asked for'
+printf 'f2b_optional_below_mib=0\n' > "$PARAMS_FILE"; MEM_MIB=256
+if f2b_optional 0; then fail 'optional although 0 was asked for'; fi
+: > "$PARAMS_FILE"
 MEM_MIB=4096 PASSWORD_LOGIN=yes
 passed 'Fail2ban is optional only with key-only login below 1 GiB'
 

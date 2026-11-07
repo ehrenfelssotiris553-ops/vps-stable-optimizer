@@ -203,6 +203,17 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
   [[ -d "$STATE_ROOT/restore-v2" && -d "$BACKUP_ROOT/not-a-run" ]] || fail 'something other than run records was removed'
   grep -Fq '已清理 4 次' "$T/log" || fail 'pruning not reported'
 )
+# Another number kept (run_keep): the first run and the newest 5.
+(
+  STATE_ROOT="$T/prune5/state" BACKUP_ROOT="$T/prune5/backups"
+  mkdir -p "$STATE_ROOT" "$BACKUP_ROOT"
+  for i in $(seq -w 1 10); do mkdir -p "$STATE_ROOT/run-202610${i}T000000Z-1-abcdef"; done
+  printf 'run_keep=5\n' > "$T/params-keep"; PARAMS_FILE="$T/params-keep"
+  run_records_prune
+  [[ "$(find "$STATE_ROOT" -maxdepth 1 -name 'run-*' | grep -c .)" == 6 ]] || fail "not pruned to the first plus the newest 5: $(ls "$STATE_ROOT")"
+  [[ -d "$STATE_ROOT/run-20261001T000000Z-1-abcdef" && -d "$STATE_ROOT/run-20261006T000000Z-1-abcdef" && ! -e "$STATE_ROOT/run-20261005T000000Z-1-abcdef" ]] ||
+    fail "the wrong runs kept: $(ls "$STATE_ROOT")"
+)
 # Wrong clocks can leave names that sort after the current run: it stays anyway.
 (
   STATE_ROOT="$T/prune2/state" BACKUP_ROOT="$T/prune2/backups"
