@@ -686,8 +686,9 @@ sudo bash "$CI/snapshot.sh" > "$LOGS/snapshot-after.txt"
 sudo bash "$CI/upgrade-info.sh" "$snapshot_since" > "$LOGS/upgrade-info.txt"
 rc=0
 # The previous release recorded no package states, so this version only
-# removes (never purges) what that one installed.
-purged=(--purged)
+# removes (never purges) what that one installed; and it handed packages that
+# were there already to apt-get install, which marks them installed by hand.
+purged=(--purged --marks)
 if [[ "$mode" == upgrade ]]; then purged=(); fi
 python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt" --upgrades "$LOGS/upgrade-info.txt" \
   "${purged[@]}" > "$LOGS/snapdiff.log" || rc=$?

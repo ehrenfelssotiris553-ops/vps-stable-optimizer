@@ -380,12 +380,17 @@ apt_progress() {
 # apt waits for the package lock itself (DPkg::Lock::Timeout, 15 minutes): an
 # automatic update can take its lock right after apt_wait_idle looked, and on a
 # small or long-unpatched machine it often runs for more than a few minutes.
+# PACKAGE...: the missing ones installed, and recorded so that rollback can
+# offer to remove them. One that is there already never goes to APT: "apt-get
+# install" would mark a package that came as a dependency as installed by
+# hand, which no rollback can tell apart afterwards.
 install_pkgs() {
   local pkg new=() rc=0
   for pkg in "$@"; do installed "$pkg" || new+=("$pkg"); done
+  ((${#new[@]})) || return 0
   apt_wait_idle
-  apt_run -y -q -o DPkg::Lock::Timeout=900 install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" || rc=$?
-  if declare -F restore_record_packages >/dev/null && ((${#new[@]})); then
+  apt_run -y -q -o DPkg::Lock::Timeout=900 install --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${new[@]}" || rc=$?
+  if declare -F restore_record_packages >/dev/null; then
     restore_record_packages "${new[@]}" || warn '无法记录本次新装的软件包；回退时不会提供卸载它们的选项。'
   fi
   return "$rc"

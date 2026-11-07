@@ -655,7 +655,7 @@ vm "bash -s '$snapshot_since'" < "$CI/upgrade-info.sh" > "$LOGS/upgrade-info.txt
 rc=0
 # ops, the admin made by the SSH hardening, stays by design (with its key).
 python3 "$CI/snapdiff.py" "$LOGS/snapshot-before.txt" "$LOGS/snapshot-after.txt" --upgrades "$LOGS/upgrade-info.txt" \
-  --allow-user ops --purged > "$LOGS/snapdiff.log" || rc=$?
+  --allow-user ops --purged --marks > "$LOGS/snapdiff.log" || rc=$?
 cat "$LOGS/snapdiff.log"
 if ((rc)); then
   { cat "$LOGS/listchanges-steps.txt"

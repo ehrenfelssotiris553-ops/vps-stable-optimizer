@@ -38,6 +38,26 @@ reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 )
 printf 'PASS: apt-get runs with umask 022 and the tool umask comes back.\n'
 
+# A package that is there already never goes to APT: "apt-get install" would
+# mark one that came as a dependency as installed by hand ("set to manually
+# installed"), and no rollback could tell it apart afterwards.
+(
+  load_optimizer_functions install_pkgs
+  installed() { [[ " curl tmux " == *" $1 "* ]]; }
+  apt_wait_idle() { :; }
+  apt_run() { record "apt $*"; }
+  restore_record_packages() { record "recorded $*"; }
+  reset
+  install_pkgs curl vim tmux htop
+  line="$(grep '^apt ' "$TEST_ROOT/trace")"
+  [[ "$line" == *' install '*' vim htop' && "$line" != *curl* && "$line" != *tmux* ]] || fail "packages handed to APT: $line"
+  grep -Fxq 'recorded vim htop' "$TEST_ROOT/trace" || fail "recorded: $(cat "$TEST_ROOT/trace")"
+  reset
+  install_pkgs curl tmux || fail 'nothing to install counted as a failure'
+  [[ ! -s "$TEST_ROOT/trace" ]] || fail "APT ran for packages that are all there: $(cat "$TEST_ROOT/trace")"
+)
+printf 'PASS: only missing packages go to APT (a dependency keeps its "automatic" mark).\n'
+
 # Old kernels: the ones APT would autoremove, purged by name, never the running
 # one; other leftovers neither get removed nor block the cleanup (found on a real
 # Ubuntu 24.04 VPS: libfwupd2 left by an upgrade stopped every kernel cleanup).

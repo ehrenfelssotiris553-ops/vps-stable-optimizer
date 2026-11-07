@@ -11,8 +11,12 @@ Configuration that removed packages keep ("rc" state, as with apt remove) is
 listed as a warning: it is not the tool's own file, but it is left behind.
 With --purged (the tool recorded the packages' state before its first run, so
 it purges what it installed) any such configuration is a difference instead.
+With --marks (this version of the tool did everything in between) a package
+there before and after must keep its "automatic" mark: before 2.9 the tool
+handed packages that were there already to "apt-get install", which marks a
+dependency as installed by hand.
 
-Usage: snapdiff.py BEFORE AFTER [--upgrades FILE] [--allow-user NAME]... [--purged]
+Usage: snapdiff.py BEFORE AFTER [--upgrades FILE] [--allow-user NAME]... [--purged] [--marks]
 """
 import argparse
 import re
@@ -126,6 +130,7 @@ def main():
     ap.add_argument('--upgrades')
     ap.add_argument('--allow-user', action='append', default=[])
     ap.add_argument('--purged', action='store_true')
+    ap.add_argument('--marks', action='store_true')
     args = ap.parse_args()
     a, b = load(args.before), load(args.after)
     up = load(args.upgrades) if args.upgrades else {}
@@ -180,6 +185,12 @@ def main():
             unexplained.append(f'package installed: {name}')
     for name in sorted(pa - pb):
         (explained if name in up_pkgs or KERNEL_PKG.match(name) else unexplained).append(f'package removed: {name}')
+    if args.marks:
+        auto_a = set(a.get('autopkg', []))
+        for name in sorted((pa & pb) & (auto_a ^ auto_b)):
+            was = 'automatic' if name in auto_a else 'manual'
+            now = 'automatic' if name in auto_b else 'manual'
+            unexplained.append(f'package mark changed: {name} ({was} before, {now} after)')
     rc_new = sorted(set(b.get('pkgconf', [])) - set(a.get('pkgconf', [])))
     rc_files = set(b.get('rcfile', []))
     if rc_new and args.purged:
