@@ -35,5 +35,5 @@ for p in $pkgs; do
   if [[ "$p" == @system-upgrade ]]; then echo 'systemupgrade yes'; continue; fi
   printf 'upgradepkg %s\n' "$p"
   { dpkg -L "$p" 2>/dev/null || true; } |
-    awk -F/ '/^\/etc\// {print "upgradefile " $0} /\/systemd\/system\/[^\/]+\.(service|timer|socket|path|target|mount)$/ {print "upgradeunit " $NF}'
+    awk -F/ '/^\/(etc|usr\/share\/pam-configs)\// {print "upgradefile " $0} /\/systemd\/system\/[^\/]+\.(service|timer|socket|path|target|mount)$/ {print "upgradeunit " $NF}'
 done | sort -u

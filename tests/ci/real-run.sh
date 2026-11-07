@@ -99,6 +99,16 @@ snapshot_since="$(date '+%F %T')"
 # shellcheck disable=SC2024
 sudo bash "$CI/snapshot.sh" > "$LOGS/snapshot-before.txt"
 
+group 'answer.exp: a question no rule knows fails within seconds'
+# Not only [y/N]: a number menu or a free answer missing from a rules file
+# used to wait out the whole time limit (25 to 50 minutes) before failing.
+printf '%s\n' '不会出现的问题 ==> x' > "$LOGS/unknown-question.rules"
+rc=0 asked_at=$SECONDS
+# shellcheck disable=SC2016
+ANSWER_IDLE=5 drive "$LOGS/unknown-question.rules" unknown-question bash -c 'read -r -p "请选择: " answer; echo "answered $answer"' || rc=$?
+((rc == 3 && SECONDS - asked_at < 60)) || fail "answer.exp on a question no rule knows: exit $rc after $((SECONDS - asked_at)) s"
+endgroup
+
 if [[ "$mode" == upgrade ]]; then
   group 'Install the previous release'
   previous="$(previous_release "$version")" || fail 'no previous release on origin/main'

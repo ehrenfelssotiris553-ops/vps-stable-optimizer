@@ -4,7 +4,9 @@ after the full rollback and uninstall, and fails on any difference it cannot
 explain. Explained are:
 - what loading kernel modules leaves (new sysctl keys, more congestion
   control algorithms available);
-- package upgrades, which a rollback keeps by design (upgrade-info.sh);
+- package upgrades, which a rollback keeps by design (upgrade-info.sh); a
+  file under /etc a system upgrade removed only when it belonged to an
+  upgraded package (the "owner" lines of the snapshot before);
 - system users that packages create, and users named with --allow-user;
 - volatile kernel counters.
 Configuration that removed packages keep ("rc" state, as with apt remove) is
@@ -230,6 +232,10 @@ def main():
 
     # Files, links and directories under /etc.
     fa, fb = files(a), files(b)
+    owners = {}
+    for rest in a.get('owner', []):
+        path, _, pkg = rest.rpartition(' ')
+        owners.setdefault(path, set()).add(pkg)
     dangling = set(b.get('dangling', [])) - set(a.get('dangling', []))
     rc_dirs = {p.rsplit('/', i)[0] for p in rc_files for i in range(1, p.count('/'))}
     # Directories of upgraded packages, but never the shared drop-in ones the
@@ -243,8 +249,8 @@ def main():
             explained.append(f'{what}: {path} (kept by package scripts during upgrades)')
             continue
         if (system_upgrade and what == 'file removed' and 'vps-stable' not in path
-                and path.rsplit('/', 1)[0] not in SHARED_DIRS):
-            explained.append(f'{what}: {path} (dropped by the system upgrade)')
+                and path.rsplit('/', 1)[0] not in SHARED_DIRS and owners.get(path, set()) & up_pkgs):
+            explained.append(f'{what}: {path} (dropped by the system upgrade of {" ".join(sorted(owners[path] & up_pkgs))})')
             continue
         if up_pkgs and 'vps-stable' not in path and (path in TRIGGERED or path.rsplit('/', 1)[0] in up_dirs):
             explained.append(f'{what}: {path} (package upgrades)')
@@ -345,7 +351,8 @@ def main():
         warnings.append("UFW's empty chains (they filter nothing) stay until a reboot: " + ' '.join(inert))
     for kind, label in (('local', 'tool path'), ('cron', 'root crontab'), ('nft', 'nft rule'),
                         ('iptables-save', 'iptables rule'), ('ip6tables-save', 'ip6tables rule'),
-                        ('swap', 'swap'), ('vpsunit', 'tool unit'), ('ufwrule', 'stored UFW rule')):
+                        ('swap', 'swap'), ('vpsunit', 'tool unit'), ('ufwrule', 'stored UFW rule'),
+                        ('active', 'unit state'), ('swapfile', 'swap file')):
         sa_k, sb_k = set(a.get(kind, [])), set(b.get(kind, []))
         unexplained += [f'{label} left: {x}' for x in sorted(sb_k - sa_k)]
         unexplained += [f'{label} gone: {x}' for x in sorted(sa_k - sb_k)]

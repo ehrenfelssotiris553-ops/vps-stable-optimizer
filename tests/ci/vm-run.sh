@@ -386,17 +386,30 @@ if grep -q '192.0.2.50' "$LOGS/ufw-allow.log"; then fail 'the exemption of the r
 grep -Fxq 'ufw allow from 10.0.2.2 to any port 22 proto tcp' "$LOGS/ufw-allow.log" || fail 'the remaining address lost its exemption'
 endgroup
 
-group 'From outside: the firewall really blocks, opens and closes a port'
+group 'From outside: the firewall really blocks, opens and closes a port, over IPv4 and IPv6'
 vm 'nohup python3 -m http.server 8080 >/dev/null 2>&1 </dev/null &'
 web() { curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:8080/ || true; }
+# IPv6 from a network namespace on the VM: its packets come in on an interface
+# of their own and go through UFW's ip6tables rules like any from outside
+# (QEMU's user network forwards IPv4 only).
+vm 'ip netns add ci6 && ip link add ci6-host type veth peer name ci6-peer && ip link set ci6-peer netns ci6 &&
+  ip addr add fd00:6::1/64 dev ci6-host nodad && ip link set ci6-host up &&
+  ip -n ci6 link set lo up && ip -n ci6 addr add fd00:6::2/64 dev ci6-peer nodad && ip -n ci6 link set ci6-peer up' ||
+  fail 'no network namespace for the IPv6 check'
+# shellcheck disable=SC2016
+web6() { vm 'ip netns exec ci6 curl -6 -s -o /dev/null -m 5 -w "%{http_code}" "http://[fd00:6::1]:8080/"' || true; }
 sleep 2
 [[ -n "$(vm 'ss -H -lnt "( sport = :8080 )"')" ]] || fail 'the test web server on 8080 did not start'
+[[ "$(vm 'grep -E "^IPV6=" /etc/default/ufw')" == 'IPV6=yes' ]] || fail 'UFW does not guard IPv6 here'
 [[ "$(web)" != 200 ]] || fail 'port 8080 answered before it was opened'
+[[ "$(web6)" != 200 ]] || fail 'port 8080 answered over IPv6 before it was opened'
 vm_drive port.rules port-open vps port open 8080 tcp || fail "port open exited with $?"
 [[ "$(web)" == 200 ]] || fail 'port 8080 does not answer after vps port open'
+[[ "$(web6)" == 200 ]] || fail 'port 8080 does not answer over IPv6 after vps port open'
 vm_drive port.rules port-close vps port close 8080 tcp || fail "port close exited with $?"
 [[ "$(web)" != 200 ]] || fail 'port 8080 still answers after vps port close'
-vm 'pkill -f "http.server 8080"' || true
+[[ "$(web6)" != 200 ]] || fail 'port 8080 still answers over IPv6 after vps port close'
+vm 'pkill -f "http.server 8080"; ip netns del ci6' || true
 endgroup
 
 group 'From outside: a stranger guessing passwords is banned for real, then unbanned'
@@ -484,6 +497,36 @@ passed check-after-reboot '主机名'
 passed check-after-reboot '禁止 ping'
 [[ "$(vm 'sysctl -n net.ipv4.icmp_echo_ignore_all')" == 1 ]] || fail 'ping answered again after the reboot'
 probe journal-probe-after-reboot
+endgroup
+
+group 'Single items only the menu has: system upgrade, old kernels, time sync, host name resolution, Fail2ban parameters'
+# Each from the tool's own list; the answers are those of a user taking the
+# recommendation. After the reboot an old image runs a newer kernel, so its
+# old one can go.
+for key in upgrade kernel ntp hosts; do
+  index="$(item_index "$key")" || fail "no single item $key"
+  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '升级这 [0-9]+ 个软件包吗？ ==> y' '确认删除这些旧内核吗？ ==> y' '现在重启吗？ ==> n' > "$WORK/item-$key.rules"
+  vm_drive "$WORK/item-$key.rules" "item-$key" vps item || fail "single item $key exited with $?"
+done
+grep -Eq '系统软件(已经是最新的|已升级)' "$LOGS/item-upgrade.log" || fail 'the system upgrade item did not finish'
+vm 'apt-get -s upgrade --with-new-pkgs | grep -c "^Inst " || true' > "$LOGS/upgrade-left.txt"
+[[ "$(cat "$LOGS/upgrade-left.txt")" == 0 ]] || fail "packages still to upgrade after the item: $(cat "$LOGS/upgrade-left.txt")"
+grep -Eq '没有需要清理的旧内核|已清理 [0-9]+ 个旧内核包|保留旧内核' "$LOGS/item-kernel.log" || fail 'the old kernel item did not finish'
+# shellcheck disable=SC2016
+vm 'ls /boot/vmlinuz-* | grep -c "$(uname -r)"' > /dev/null || fail 'the running kernel is gone'
+[[ "$(vm 'timedatectl show -p NTP --value')" == yes ]] || fail 'time synchronization not on after the item'
+# shellcheck disable=SC2016
+vm 'getent hosts "$(hostname)"' > /dev/null || fail 'the host name does not resolve after the item'
+# Fail2ban: 3 tries instead of 5, then back to the recommendation; the running
+# jail follows both times.
+index="$(item_index fail2ban)" || fail 'no single item fail2ban'
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 4' '新的值 ==> @seq 3 auto' > "$WORK/f2b-params.rules"
+vm_drive "$WORK/f2b-params.rules" f2b-params vps item || fail "Fail2ban parameters exited with $?"
+[[ "$(vm 'fail2ban-client get sshd maxretry')" == 3 ]] || fail "the running jail does not use 3 tries: $(vm 'fail2ban-client get sshd maxretry')"
+vm "grep -Fxq 'maxretry = 3' /etc/fail2ban/jail.d/99-vps-stable-sshd.local" || fail 'the jail file does not say 3 tries'
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 5' > "$WORK/f2b-reset.rules"
+vm_drive "$WORK/f2b-reset.rules" f2b-reset vps item || fail "Fail2ban parameters reset exited with $?"
+[[ "$(vm 'fail2ban-client get sshd maxretry')" == 5 ]] || fail "the running jail is not back at 5 tries: $(vm 'fail2ban-client get sshd maxretry')"
 endgroup
 
 if ((!old)); then
