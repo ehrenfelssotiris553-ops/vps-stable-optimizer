@@ -109,6 +109,9 @@ ANSWER_IDLE=5 drive "$LOGS/unknown-question.rules" unknown-question bash -c 'rea
 ((rc == 3 && SECONDS - asked_at < 60)) || fail "answer.exp on a question no rule knows: exit $rc after $((SECONDS - asked_at)) s"
 endgroup
 
+# How Fail2ban bans: the nftables sets of this version, or (upgraded, until
+# Fail2ban is turned on again) the UFW rules of the previous release.
+F2B_BANS=nft
 if [[ "$mode" == upgrade ]]; then
   group 'Install the previous release'
   previous="$(previous_release "$version")" || fail 'no previous release on origin/main'
@@ -203,7 +206,7 @@ check_all() {
 # release (F2B_BANS=ufw: upgraded, Fail2ban not turned on again yet) the
 # switch to the nftables sets is offered and the live test finds a UFW rule;
 # otherwise the check passes and the live test finds the address in the set.
-F2B_BANS=nft
+# (F2B_BANS is set before the install; this is defined after it.)
 f2b_checked() {
   if [[ "$F2B_BANS" == ufw ]]; then
     grep -Eq '^⚠ 可更新[[:space:]]+Fail2ban 防爆破：封禁还是旧版的做法' "$LOGS/$1.log" || fail "$1: the switch to the nftables sets is not offered"
