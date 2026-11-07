@@ -60,6 +60,8 @@ SSH_DROPIN=/etc/ssh/sshd_config.d/01-vps-stable-keyonly.conf
 SSH_PORT_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-port.conf
 # Only written when a provider image ships "PubkeyAuthentication no".
 SSH_PUBKEY_DROPIN=/etc/ssh/sshd_config.d/00-vps-stable-pubkey.conf
+# sshd's main configuration: read from the top, every Include where it stands.
+SSHD_CONFIG=/etc/ssh/sshd_config
 # Tells cloud-init to keep a hostname set with vps (it sets the provider's at boot).
 CLOUD_HOSTNAME_FILE=/etc/cloud/cloud.cfg.d/99-vps-stable-hostname.cfg
 # cloud-init's data for this machine (the provider's first-boot configuration).
@@ -3973,6 +3975,246 @@ ssh_dropin_text() {
   printf '%s\n' 'MaxAuthTries 4' 'LoginGraceTime 30' 'X11Forwarding no'
 }
 
+# TEXT: the first value of an sshd_config line ("Key value", "Key=value",
+# "Key = \"value\"", a "# comment" after it), in lower case.
+sshd_line_value() {
+  local text="$1" key value=''
+  key="${text%%[[:space:]=]*}"
+  text="${text:${#key}}"
+  text="${text#"${text%%[![:space:]]*}"}"
+  text="${text#=}"
+  read -r value _ <<< "$text" || true
+  [[ "$value" != '#'* ]] || value=''
+  value="${value//\"/}"
+  printf '%s\n' "${value,,}"
+}
+
+# The settings sshd reads, in its order: the main file from the top, every
+# Include expanded where it stands (its files in name order, a relative path
+# under /etc/ssh), at most 16 levels deep. One line per setting:
+# FILE<TAB>LINE<TAB>MATCH<TAB>TEXT, MATCH 1 inside a Match block (which ends
+# at the next Match or with the file it is in, as in OpenSSH's servconf.c).
+sshd_config_walk() {
+  local file="${1:-$SSHD_CONFIG}" depth="${2:-0}" match="${3:-0}" n=0 line key arg found
+  ((depth <= 16)) || return 0
+  [[ -f "$file" && -r "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "$line" && "$line" != '#'* ]] || continue
+    printf '%s\t%s\t%s\t%s\n' "$file" "$n" "$match" "$line"
+    key="${line%%[[:space:]=]*}"
+    case "${key,,}" in
+      match) match=1 ;;
+      include)
+        while IFS= read -r arg; do
+          while IFS= read -r found; do
+            [[ -n "$found" ]] || continue
+            sshd_config_walk "$found" $((depth + 1)) "$match"
+          done < <({ compgen -G "$arg" || true; } | LC_ALL=C sort)
+        done < <(sshd_include_args "$line") ;;
+    esac
+  done < "$file"
+}
+
+# TEXT (an Include line): its patterns, one per line, a relative one under
+# the directory of the main file (/etc/ssh).
+sshd_include_args() {
+  local text="$1" key arg
+  local -a args=()
+  key="${text%%[[:space:]=]*}"
+  text="${text:${#key}}"; text="${text#"${text%%[![:space:]]*}"}"; text="${text#=}"
+  read -r -a args <<< "$text" || true
+  for arg in "${args[@]}"; do
+    [[ "$arg" != '#'* ]] || break
+    arg="${arg//\"/}"
+    [[ "$arg" == /* ]] || arg="${SSHD_CONFIG%/*}/$arg"
+    printf '%s\n' "$arg"
+  done
+}
+
+# FILE: sshd reads FILE, or would once it exists (an Include it reads names it).
+sshd_reads() {
+  local file text key arg
+  while IFS=$'\t' read -r file _ _ text; do
+    if [[ "$file" == "$1" ]]; then return 0; fi
+    key="${text%%[[:space:]=]*}"
+    [[ "${key,,}" == include ]] || continue
+    while IFS= read -r arg; do
+      # shellcheck disable=SC2053
+      if [[ "$1" == $arg ]]; then return 0; fi
+    done < <(sshd_include_args "$text")
+  done < <(sshd_config_walk)
+  return 1
+}
+
+# KEY WANT OWN: the lines that keep sshd from using WANT for KEY (both lower
+# case), as FILE<TAB>LINE<TAB>MATCH<TAB>TEXT. sshd keeps the first value it
+# reads: outside Match blocks the lines before OWN (this tool's drop-in) count
+# when the first of them says something else; inside Match blocks every line
+# that says something else counts (it wins for the connections it matches).
+# ChallengeResponseAuthentication is the old name of KbdInteractiveAuthentication.
+sshd_setting_overrides() {
+  local key="$1" want="$2" own="$3" file n match text k v first='' reached=0
+  local -a early=() inside=()
+  while IFS=$'\t' read -r file n match text; do
+    if [[ "$file" == "$own" ]]; then reached=1; continue; fi
+    k="${text%%[[:space:]=]*}"; k="${k,,}"
+    [[ "$k" != challengeresponseauthentication ]] || k=kbdinteractiveauthentication
+    [[ "$k" == "$key" ]] || continue
+    v="$(sshd_line_value "$text")"
+    if ((match)); then
+      [[ "$v" == "$want" ]] || inside+=("$file"$'\t'"$n"$'\t'1$'\t'"$text")
+    elif ((reached == 0)); then
+      [[ -n "$first" ]] || first="$v"
+      [[ "$v" == "$want" ]] || early+=("$file"$'\t'"$n"$'\t'0$'\t'"$text")
+    fi
+  done < <(sshd_config_walk)
+  if [[ -n "$first" && "$first" != "$want" ]]; then printf '%s\n' "${early[@]}"; fi
+  if ((${#inside[@]})); then printf '%s\n' "${inside[@]}"; fi
+}
+
+# OWN: the Port lines outside OWN (sshd listens on every one it reads), as
+# FILE<TAB>LINE<TAB>0<TAB>TEXT.
+sshd_port_lines() {
+  local file n match text k
+  while IFS=$'\t' read -r file n match text; do
+    [[ "$file" != "$1" ]] || continue
+    k="${text%%[[:space:]=]*}"
+    if [[ "${k,,}" == port ]] && ((match == 0)); then printf '%s\t%s\t0\t%s\n' "$file" "$n" "$text"; fi
+  done < <(sshd_config_walk)
+}
+
+# LINES (from sshd_setting_overrides or sshd_port_lines), one per line for the
+# user: "  FILE 第 N 行：TEXT".
+sshd_lines_show() {
+  local file n match text
+  while IFS=$'\t' read -r file n match text; do
+    [[ -n "$file" ]] || continue
+    printf '  %s 第 %s 行：%s' "$file" "$n" "$(audit_clean_text <<< "$text" | cut -c1-120)"
+    if ((match)); then printf '（在 Match 块里，对符合条件的连接生效）'; fi
+    printf '\n'
+  done <<< "$1"
+}
+
+# A line this tool commented out starts with "#vps-stable-off(GROUP,TAG): ",
+# the original line following unchanged; GROUP is the rollback group (ssh or
+# sshport) and TAG the change that did it. sed puts it back.
+# GROUP TAG LINES: comments out LINES (as above) after a backup, the files
+# recorded for rollback first. Only plain files with plain names are changed;
+# anything else fails before any file is.
+sshd_lines_off() {
+  local group="$1" tag="$2" file n temp
+  local -a files=() script=()
+  mapfile -t files < <(awk -F'\t' '$1 != "" {print $1}' <<< "$3" | LC_ALL=C sort -u)
+  ((${#files[@]})) || return 1
+  for file in "${files[@]}"; do
+    if [[ ! "$file" =~ ^/[A-Za-z0-9._/@+-]+$ || ! -f "$file" || -L "$file" ]]; then
+      warn "$file 不是普通文件，或者名字里有特殊字符：不改它。"; return 1
+    fi
+  done
+  for file in "${files[@]}"; do
+    script=()
+    while IFS=$'\t' read -r _ n _; do script+=(-e "${n}s/^/#vps-stable-off($group,$tag): /"); done < <(awk -F'\t' -v f="$file" '$1 == f' <<< "$3")
+    backup_config_path "$file"
+    restore_record_sshd_file "$group" "$file" || { warn "无法记录 $file，撤销时就放不回去了：不改它。"; return 1; }
+    temp="$(mktemp "${file%/*}/.vps-stable.XXXXXX")" || return 1
+    # The copy keeps the file's mode and owner; sed keeps a missing last newline.
+    if ! cp -p -- "$file" "$temp" || ! sed "${script[@]}" -- "$file" > "$temp" || ! mv -fT -- "$temp" "$file"; then
+      rm -f -- "$temp"; warn "没能改 $file。"; return 1
+    fi
+    record_config_change "$file" commented-out || true
+  done
+}
+
+# GROUP TAG FILE...: the lines commented out for GROUP put back, only those of
+# the change TAG when TAG is not empty.
+sshd_lines_on() {
+  local group="$1" tag="${2:-[0-9-]*}" file temp rc=0
+  shift 2
+  for file in "$@"; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    grep -q "^#vps-stable-off($group,$tag): " -- "$file" || continue
+    temp="$(mktemp "${file%/*}/.vps-stable.XXXXXX")" || { rc=1; continue; }
+    if ! cp -p -- "$file" "$temp" || ! sed -e "s/^#vps-stable-off($group,$tag): //" -- "$file" > "$temp" || ! mv -fT -- "$temp" "$file"; then
+      rm -f -- "$temp"; warn "没能把 $file 里注释掉的行放回去。"; rc=1
+    fi
+  done
+  return "$rc"
+}
+
+# GROUP TAG FILE...: the same as sshd_lines_on, as a shell command for a guard
+# timer (the names are plain: sshd_lines_off allows no other).
+sshd_lines_on_cmd() {
+  local group="$1" tag="$2" file
+  shift 2
+  for file in "$@"; do printf "; sed -i 's/^#vps-stable-off(%s,%s): //' '%s'" "$group" "$tag" "$file"; done
+}
+
+# GROUP [TAG]: the recorded files that still have lines commented out for
+# GROUP (by the change TAG only, when given).
+sshd_off_files() {
+  local record="$RESTORE_ROOT/sshd_lines_off" group file tag="${2:-[0-9-]*}"
+  restore_data_safe "$record" || return 0
+  while IFS=$'\t' read -r group file; do
+    [[ "$group" == "$1" && -f "$file" && ! -L "$file" ]] || continue
+    if grep -q "^#vps-stable-off($1,$tag): " -- "$file"; then printf '%s\n' "$file"; fi
+  done < "$record"
+}
+
+# USER WANT_ADMIN: the settings of the key-only drop-in that sshd does not use
+# now (for USER, and for root when root login is to be turned off).
+ssh_hardening_overridden() {
+  local effective
+  effective="$(ssh_effective "$1")" || effective=''
+  [[ "$(ssh_effective_value "$effective" passwordauthentication)" == no ]] || echo PasswordAuthentication
+  [[ "$(ssh_effective_value "$effective" kbdinteractiveauthentication)" == no ]] || echo KbdInteractiveAuthentication
+  if (($2)) && [[ "$(ssh_effective_value "$(ssh_effective root)" permitrootlogin)" != no ]]; then echo PermitRootLogin; fi
+  return 0
+}
+
+# GROUP TAG OWN LABEL KEY=WANT...: settings of this tool's drop-in OWN that an
+# earlier line wins over (a provider's image often has its own): where they
+# are, and on a yes they are commented out (the rollback of GROUP, and the
+# guard when the change is not confirmed, put them back). True when the lines
+# are commented out and sshd accepts the result; the caller checks again what
+# sshd uses now.
+ssh_overrides_offer() {
+  local group="$1" tag="$2" own="$3" label="$4" pair hits='' found
+  local -a files=()
+  shift 4
+  if ! sshd_reads "$own"; then
+    warn "sshd 根本没有读取 $own：$SSHD_CONFIG 里没有 Include /etc/ssh/sshd_config.d/*.conf 这一行（较老的镜像会这样）。在 $SSHD_CONFIG 开头加上这一行，再重新运行。"
+    return 1
+  fi
+  for pair in "$@"; do
+    found="$(sshd_setting_overrides "${pair%%=*}" "${pair#*=}" "$own")"
+    if [[ -n "$found" ]]; then hits+="$found"$'\n'; fi
+  done
+  hits="$(sort -u <<< "$hits" | grep . || true)"
+  if [[ -z "$hits" ]]; then
+    warn "${label}没有生效，但没找到是哪一行在起作用：用 sshd -T 查看 sshd 实际用的设置。"
+    return 1
+  fi
+  warn "${label}没有生效：sshd 只用它第一次读到的值，下面这些行比本工具的设置先读到（多半是服务商镜像自带的）："
+  sshd_lines_show "$hits"
+  echo '可以把这几行注释掉：行首加上 #vps-stable-off 标记，原来的内容一个字不改；撤销时原样放回，没确认登录也会自动放回。'
+  if ! confirm_default_yes '要我把这几行注释掉吗？'; then
+    echo '没有改它们：要自己处理的话，注释掉上面这几行，再重新运行。'
+    return 1
+  fi
+  sshd_lines_off "$group" "$tag" "$hits" || return 1
+  sshd_runtime_dir
+  if ! sshd -t; then
+    mapfile -t files < <(cut -f1 <<< "$hits" | sort -u)
+    sshd_lines_on "$group" "$tag" "${files[@]}" || true
+    warn 'sshd -t 不接受注释后的配置，已经放回去了。'
+    return 1
+  fi
+  ok "已注释掉 $(grep -c . <<< "$hits") 行（撤销时放回）。"
+}
+
 ssh_pubkey_valid() {
   local key="$1" temp rc=0
   [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\ [A-Za-z0-9+/]+={0,3}(\ [^[:cntrl:]]*)?$ ]] || return 1
@@ -4115,7 +4357,8 @@ ssh_console_guard() {
 # reads before the main file turns key login on; password login is untouched,
 # so this step cannot lock anyone out and needs no guard timer.
 ssh_enable_pubkey() {
-  local user="$1" effective
+  local user="$1" effective tag
+  local -a files=()
   put_file "$SSH_PUBKEY_DROPIN" $'# VPS Stable Optimizer v2.6: allow SSH public key login\nPubkeyAuthentication yes' || return 1
   sshd_runtime_dir
   if ! sshd -t; then
@@ -4123,8 +4366,22 @@ ssh_enable_pubkey() {
   fi
   effective="$(ssh_effective "$user")" || effective=''
   if [[ "$(ssh_effective_value "$effective" pubkeyauthentication)" != yes ]]; then
+    # Lines commented out here stay with the drop-in: only the rollback of the
+    # SSH group puts them back (this step adds a way in, it cannot lock out).
+    # Its own mark: the hardening's guard, in the same second, leaves it alone.
+    tag="$(date +%s)-$$-1"
+    if ssh_overrides_offer ssh "$tag" "$SSH_PUBKEY_DROPIN" '开启公钥登录的设置' pubkeyauthentication=yes; then
+      effective="$(ssh_effective "$user")" || effective=''
+      if [[ "$(ssh_effective_value "$effective" pubkeyauthentication)" != yes ]]; then
+        mapfile -t files < <(sshd_off_files ssh "$tag")
+        sshd_lines_on ssh "$tag" "${files[@]}" || true
+        warn '注释掉以后公钥登录仍然没有生效，已经放回去了；用 sshd -T 查看 sshd 实际用的设置。'
+      fi
+    fi
+  fi
+  if [[ "$(ssh_effective_value "$effective" pubkeyauthentication)" != yes ]]; then
     rm -f -- "$SSH_PUBKEY_DROPIN"
-    warn '开启公钥登录的设置被更早读取的配置覆盖，没有生效，已撤销（请检查 /etc/ssh/sshd_config 开头是否有 Include /etc/ssh/sshd_config.d/*.conf）。'
+    warn '公钥登录没有开启，开启它的配置已删除。'
     return 1
   fi
   if ! ssh_reload; then warn 'sshd 重新加载失败；公钥登录还没有生效。'; return 1; fi
@@ -4133,8 +4390,8 @@ ssh_enable_pubkey() {
 
 ssh_harden_stage() {
   step 13 'SSH 登录加固（可选）'
-  local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail
-  local -a overridden=()
+  local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail tag
+  local -a overridden=() pairs=() off_files=()
   if [[ -z "${SSH_CHOICE:-}" ]]; then
     if [[ "$MODE" == ssh ]] || confirm_yes '加固 SSH 登录（只允许密钥登录，可选新建管理员并禁止 root 直接登录）吗？（推荐）'; then SSH_CHOICE=1; else SSH_CHOICE=0; fi
   fi
@@ -4260,18 +4517,31 @@ ssh_harden_stage() {
   if ! sshd -t; then
     rm -f -- "$SSH_DROPIN"; warn 'sshd -t 不接受新配置，已删除。'; module_result ssh failed 'sshd -t failed'; return 0
   fi
-  effective="$(ssh_effective "$user")" || effective=''
-  [[ "$(ssh_effective_value "$effective" passwordauthentication)" == no ]] || overridden+=(PasswordAuthentication)
-  [[ "$(ssh_effective_value "$effective" kbdinteractiveauthentication)" == no ]] || overridden+=(KbdInteractiveAuthentication)
-  if ((want_admin)) && [[ "$(ssh_effective_value "$(ssh_effective root)" permitrootlogin)" != no ]]; then overridden+=(PermitRootLogin); fi
+  # The change's name: the guard timer's, and the mark of lines it comments out.
+  tag="$(date +%s)-$$"
+  mapfile -t overridden < <(ssh_hardening_overridden "$user" "$want_admin")
+  if ((${#overridden[@]})); then
+    pairs=()
+    for key in "${overridden[@]}"; do pairs+=("${key,,}=no"); done
+    if ssh_overrides_offer ssh "$tag" "$SSH_DROPIN" "只允许密钥登录的设置（${overridden[*]}）" "${pairs[@]}"; then
+      mapfile -t off_files < <(sshd_off_files ssh "$tag")
+      mapfile -t overridden < <(ssh_hardening_overridden "$user" "$want_admin")
+      if ((${#overridden[@]})); then
+        sshd_lines_on ssh "$tag" "${off_files[@]}" || true
+        off_files=()
+        warn '注释掉以后仍然没有生效，已经放回去了；用 sshd -T 查看 sshd 实际用的设置。'
+      fi
+    fi
+  fi
   if ((${#overridden[@]})); then
     rm -f -- "$SSH_DROPIN"
-    warn "这些设置被更早的配置覆盖，没有生效：${overridden[*]}（检查 /etc/ssh/sshd_config 和编号更小的 sshd_config.d 文件）。已撤销。"
+    warn "这些设置没有生效：${overridden[*]}。本工具的配置已删除，SSH 登录设置保持原样。"
     module_result ssh preserved 'earlier sshd setting wins'; return 0
   fi
-  unit="vps-stable-ssh-revert-$(date +%s)-$$"
-  guard_arm "$unit" /bin/sh -c "rm -f -- '$SSH_DROPIN'; systemctl try-reload-or-restart ssh.service" || {
-    rm -f -- "$SSH_DROPIN"; warn '无法启用 SSH 自动撤销计时器；没有做任何修改。'; module_result ssh failed 'guard not armed'; return 0
+  unit="vps-stable-ssh-revert-$tag"
+  guard_arm "$unit" /bin/sh -c "rm -f -- '$SSH_DROPIN'$(sshd_lines_on_cmd ssh "$tag" "${off_files[@]}"); systemctl try-reload-or-restart ssh.service" || {
+    rm -f -- "$SSH_DROPIN"; sshd_lines_on ssh "$tag" "${off_files[@]}" || true
+    warn '无法启用 SSH 自动撤销计时器；没有做任何修改。'; module_result ssh failed 'guard not armed'; return 0
   }
   deadline=$((SECONDS + 180))
   if ! ssh_reload; then warn 'sshd 重新加载失败；自动撤销计时器保持启用。'; module_result ssh failed 'sshd reload failed'; return 0; fi
@@ -4287,6 +4557,9 @@ ssh_harden_stage() {
       detail="key-only user=$user"
       if ((want_admin)); then detail+=' root-ssh=off'; fi
       ok '新的 SSH 登录设置已保留，自动撤销计时器已取消。'
+      if ((${#off_files[@]})); then
+        echo "注释掉的行保持注释（${off_files[*]}）。服务商要是重启后把它们写回来，vps check 会指出来，再运行一次 SSH 加固就行。"
+      fi
       module_result ssh applied "$detail"
       return 0
     fi
@@ -4294,6 +4567,7 @@ ssh_harden_stage() {
   fi
   warn '这次没有确认成功：正在恢复原来的 SSH 设置；可以稍后重试。'
   rm -f -- "$SSH_DROPIN"
+  sshd_lines_on ssh "$tag" "${off_files[@]}" || true
   # The guard reloads sshd again when it fires: keep it unless this reload worked.
   if ssh_reload; then systemctl stop "$unit.timer" 2>/dev/null || true
   else warn 'sshd 重新加载失败：自动撤销计时器保留，到期时会再重新加载一次。'; fi
@@ -4309,12 +4583,12 @@ ssh_port_text() {
   printf 'Port %s\n' "$@"
 }
 
-# Where a port is set apart from this tool's file (sshd_config, another
-# drop-in, an override of ssh.socket); nothing when nowhere.
+# An override of ssh.socket that sets a port of its own (systemd listens
+# there whatever sshd says); nothing when there is none. Port lines in sshd's
+# own files are sshd_port_lines'.
 ssh_port_elsewhere() {
   local found
-  found="$(grep -REin --exclude="${SSH_PORT_DROPIN##*/}" '^[[:space:]]*Port[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null | head -n 1 || true)"
-  [[ -n "$found" ]] || found="$(grep -Rls '^[[:space:]]*ListenStream' /etc/systemd/system/ssh.socket.d 2>/dev/null | head -n 1 || true)"
+  found="$(grep -Rls '^[[:space:]]*ListenStream' /etc/systemd/system/ssh.socket.d 2>/dev/null | head -n 1 || true)"
   printf '%s' "$found"
 }
 
@@ -4330,11 +4604,13 @@ ssh_port_established() {
   [[ -n "$(ss -Htn state established "( sport = :$1 )" 2>/dev/null)" ]]
 }
 
-# The setting before this change, back (the timer does the same if this run dies).
+# TAG FILE...: the setting before this change back, with the Port lines it
+# commented out (the timer does the same if this run dies).
 ssh_port_restore_previous() {
   if [[ -s "$STATE_ROOT/sshport-previous" ]]; then cp -f -- "$STATE_ROOT/sshport-previous" "$SSH_PORT_DROPIN"
   else rm -f -- "$SSH_PORT_DROPIN"; fi
   chmod 644 -- "$SSH_PORT_DROPIN" 2>/dev/null || true
+  if (($# > 1)); then sshd_lines_on sshport "$@" || true; fi
 }
 
 # Fail2ban watches the ports sshd listens on now (its own jail only).
@@ -4365,7 +4641,8 @@ ssh_port_fw_close() {
 
 ssh_port_stage() {
   say '修改 SSH 端口'
-  local old new verb=allow previous='' unit deadline where fw=0
+  local old new verb=allow previous='' unit deadline where fw=0 port_lines tag
+  local -a off_files=()
   if [[ "${SSHPORT_CHOICE:-}" != 1 ]]; then module_result sshport declined 'not requested'; return 0; fi
   if ! ssh_detect || ((${#SSH_PORTS[@]} != 1)); then
     warn '没能确认 SSH 正在监听的唯一端口（没在运行，或者同时监听了几个），不改。'; module_result sshport skipped 'SSH port not clear'; return 0
@@ -4373,8 +4650,23 @@ ssh_port_stage() {
   old="${SSH_PORTS[0]}"
   where="$(ssh_port_elsewhere)"
   if [[ -n "$where" ]]; then
-    warn "SSH 端口在别处设置了（$(audit_clean_text <<< "$where" | cut -c1-120)）：本工具不改那里。要改的话先把那一行注释掉。"
+    warn "ssh.socket 的端口在 $(audit_clean_text <<< "$where" | cut -c1-120) 里另外设置了：本工具不改那里。要改的话先删掉那个文件里的 ListenStream。"
     module_result sshport preserved 'port set elsewhere'; return 0
+  fi
+  # A Port line elsewhere (provider images write "Port 22" into sshd_config):
+  # sshd listens on every one, so the old port could never close.
+  port_lines="$(sshd_port_lines "$SSH_PORT_DROPIN")"
+  if [[ -n "$port_lines" ]]; then
+    warn 'SSH 端口在别的配置里写明了：sshd 会在每一行 Port 上都监听，不改的话旧端口关不掉。'
+    sshd_lines_show "$port_lines"
+    if ! sshd_reads "$SSH_PORT_DROPIN"; then
+      warn "sshd 不读取 $SSH_PORT_DROPIN（$SSHD_CONFIG 里没有 Include /etc/ssh/sshd_config.d/*.conf），本工具没法改端口。"
+      module_result sshport preserved 'port set elsewhere'; return 0
+    fi
+    echo '可以把这几行注释掉：行首加上 #vps-stable-off 标记，原来的内容一个字不改；改端口期间旧端口照样开着，撤销时原样放回，没确认登录也会自动放回。'
+    if ! confirm_default_yes '要我把这几行注释掉吗？'; then
+      ok '没有改：要自己处理的话，注释掉上面这几行再来。'; module_result sshport preserved 'port set elsewhere'; return 0
+    fi
   fi
   if guard_leftovers; then module_result sshport skipped 'earlier protection timer pending'; return 0; fi
   echo "现在的 SSH 端口：$old。换端口挡不住真正的攻击者，但能少掉绝大多数自动扫描（日志清净，Fail2ban 也轻松）。"
@@ -4401,21 +4693,30 @@ ssh_port_stage() {
   fi
   # The port to go back to (kept from the first change on).
   if [[ ! -s "$RESTORE_ROOT/sshport" ]]; then printf 'port=%s\nverb=%s\n' "$old" "$verb" > "$RESTORE_ROOT/sshport"; chmod 600 -- "$RESTORE_ROOT/sshport"; fi
-  # 2. sshd on both ports, under a timer that puts the old setting back.
+  # 2. sshd on both ports, under a timer that puts the old setting back; the
+  # Port lines elsewhere commented out (the old port stays in this tool's file).
+  tag="$(date +%s)-$$"
+  if [[ -n "$port_lines" ]]; then
+    if ! sshd_lines_off sshport "$tag" "$port_lines"; then
+      if ((fw)); then ssh_port_fw_close "$new" || true; fi
+      warn '没能注释掉别处的 Port 行，什么都没改。'; module_result sshport failed 'port lines not commented out'; return 0
+    fi
+    mapfile -t off_files < <(sshd_off_files sshport "$tag")
+  fi
   rm -f -- "$SSH_PORT_DROPIN"
   if ! put_file "$SSH_PORT_DROPIN" "$(ssh_port_text "$old" "$new")" || ! { sshd_runtime_dir; sshd -t; }; then
-    ssh_port_restore_previous; if ((fw)); then ssh_port_fw_close "$new" || true; fi
+    ssh_port_restore_previous "$tag" "${off_files[@]}"; if ((fw)); then ssh_port_fw_close "$new" || true; fi
     warn 'sshd 不接受新的端口设置，已撤回。'; module_result sshport failed 'sshd -t failed'; return 0
   fi
-  unit="vps-stable-ssh-revert-$(date +%s)-$$"
-  if ! guard_arm "$unit" /bin/sh -c "if [ -s '$STATE_ROOT/sshport-previous' ]; then cp -f '$STATE_ROOT/sshport-previous' '$SSH_PORT_DROPIN'; else rm -f '$SSH_PORT_DROPIN'; fi; if systemctl is-active -q ssh.socket; then systemctl daemon-reload; systemctl restart ssh.socket; else systemctl try-reload-or-restart ssh.service; fi"; then
-    ssh_port_restore_previous; if ((fw)); then ssh_port_fw_close "$new" || true; fi
+  unit="vps-stable-ssh-revert-$tag"
+  if ! guard_arm "$unit" /bin/sh -c "if [ -s '$STATE_ROOT/sshport-previous' ]; then cp -f '$STATE_ROOT/sshport-previous' '$SSH_PORT_DROPIN'; else rm -f '$SSH_PORT_DROPIN'; fi$(sshd_lines_on_cmd sshport "$tag" "${off_files[@]}"); if systemctl is-active -q ssh.socket; then systemctl daemon-reload; systemctl restart ssh.socket; else systemctl try-reload-or-restart ssh.service; fi"; then
+    ssh_port_restore_previous "$tag" "${off_files[@]}"; if ((fw)); then ssh_port_fw_close "$new" || true; fi
     warn '无法启用自动撤销计时器；什么都没改。'; module_result sshport failed 'guard not armed'; return 0
   fi
   deadline=$((SECONDS + 180))
   ssh_port_reload || true
   if ! port_listening "$new" || ! port_listening "$old"; then
-    ssh_port_restore_previous; ssh_port_reload || true
+    ssh_port_restore_previous "$tag" "${off_files[@]}"; ssh_port_reload || true
     if ((fw)); then ssh_port_fw_close "$new" || true; fi
     systemctl stop "$unit.timer" 2>/dev/null || true
     warn "SSH 没能同时在 $old 和 $new 上监听，已恢复原样。"; module_result sshport failed 'not listening'; return 0
@@ -4441,7 +4742,7 @@ ssh_port_stage() {
     module_result sshport failed 'old port not closed'; return 0
   fi
   warn '这次没有确认：正在恢复原来的 SSH 端口。'
-  ssh_port_restore_previous
+  ssh_port_restore_previous "$tag" "${off_files[@]}"
   if ssh_port_reload; then systemctl stop "$unit.timer" 2>/dev/null || true
   else warn 'SSH 重新加载失败：自动撤销计时器保留，到期时会再试一次。'; fi
   if ((fw)); then ssh_port_fw_close "$new" || true; fi
@@ -4452,7 +4753,9 @@ ssh_port_stage() {
 # Rollback only widens access: the port SSH goes back to is let in first.
 restore_sshport_group() {
   local port verb
-  restore_needed sshport_dropin || return 0
+  local -a files=()
+  mapfile -t files < <(sshd_off_files sshport)
+  restore_needed sshport_dropin || ((${#files[@]})) || return 0
   port="$(sed -n 's/^port=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)" verb="$(sed -n 's/^verb=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)"
   if [[ "$port" =~ ^[0-9]{1,5}$ ]] && ufw_active; then
     # What is let in again here is this tool's own (the change took its rules
@@ -4464,6 +4767,8 @@ restore_sshport_group() {
     if [[ "$verb" == limit ]]; then RESTORE_READY=1 ssh_limit_exempt; fi
   fi
   restore_resource sshport_dropin
+  # The Port lines this tool commented out, back as they were.
+  if ((${#files[@]})) && ! sshd_lines_on sshport '' "${files[@]}"; then RESTORE_PARTIAL=1; fi
   if ! ssh_port_reload; then warn 'SSH 重新加载失败：重启 SSH 后才回到原来的端口。'; RESTORE_PARTIAL=1; fi
   ssh_port_follow
   if [[ "$port" =~ ^[0-9]+$ ]]; then ok "SSH 回到端口 $port（新端口的防火墙规则在撤销防火墙时一起删掉）。"; fi
@@ -7420,6 +7725,17 @@ restore_record_hosts_line() {
   printf '%s\n' "$line" >> "$file" && chmod 600 -- "$file"
 }
 
+# GROUP FILE: FILE has lines this tool commented out for the rollback group
+# GROUP (sshd_lines_off); the group's rollback puts them back.
+restore_record_sshd_file() {
+  local line="$1"$'\t'"$2" file="$RESTORE_ROOT/sshd_lines_off"
+  [[ "$RESTORE_READY" == 1 ]] || return 0
+  [[ "$1" =~ ^(ssh|sshport)$ && "$2" =~ ^/[A-Za-z0-9._/@+-]+$ ]] || return 1
+  [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
+  if [[ -f "$file" ]] && grep -Fxq -- "$line" "$file"; then return 0; fi
+  printf '%s\n' "$line" >> "$file" && chmod 600 -- "$file"
+}
+
 restore_hosts_line_present() {
   local record="$RESTORE_ROOT/${1:-hosts_line}" file
   file="$(restore_path hosts_file)" || return 1
@@ -7737,11 +8053,15 @@ restore_firewall_group() {
 # off) go back to their original state, then sshd reloads once.
 restore_ssh_group() {
   local id pending=0 failed=0
+  local -a files=()
   for id in ssh_dropin ssh_pubkey_dropin; do
     if restore_needed "$id"; then pending=1; fi
     # "applied" with the drop-in already gone: an earlier sshd reload failed.
     if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then pending=1; fi
   done
+  # Lines of other files commented out for the hardening (a provider's).
+  mapfile -t files < <(sshd_off_files ssh)
+  if ((${#files[@]})); then pending=1; fi
   ((pending)) || return 0
   if restore_needed ssh_pubkey_dropin; then
     warn 'SSH 公钥登录会恢复成原来的关闭状态，之后只能用密码登录；请确认你记得密码。'
@@ -7752,6 +8072,7 @@ restore_ssh_group() {
     # Still "applied" means this restore failed; "clean" was never changed.
     if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then failed=1; fi
   done
+  if ((${#files[@]})) && ! sshd_lines_on ssh '' "${files[@]}"; then failed=1; RESTORE_PARTIAL=1; fi
   ((failed == 0)) || return 0
   if ssh_reload; then ok '已恢复 SSH 原来的登录设置；已导入的公钥保留。'
   else
@@ -8079,6 +8400,7 @@ restore_group_pending() {
     ping) [[ -s "$RESTORE_ROOT/ping_sysctl_runtime" ]] && return 0 ;;
     zram) [[ -s "$RESTORE_ROOT/zram_sysctl_runtime" ]] && return 0 ;;
     hostname) [[ -s "$RESTORE_ROOT/hostname_hosts_line" ]] && return 0 ;;
+    ssh|sshport) [[ -n "$(sshd_off_files "$group")" ]] && return 0 ;;
   esac
   return 1
 }
@@ -8363,10 +8685,23 @@ check_keepalive() {
 }
 
 check_sshport() {
-  local ports p rules
+  local ports p rules stray='' file n port_lines text
   ports="$(sed -n 's/^Port //p' "$SSH_PORT_DROPIN" 2>/dev/null | tr '\n' ' ')"
   [[ -n "${ports// /}" ]] || { verify_set fail "$SSH_PORT_DROPIN 不见了：SSH 回到了默认端口"; return 0; }
   for p in $ports; do port_listening "$p" || { verify_set fail "SSH 没有在端口 $p 上监听"; return 0; }; done
+  # A Port line elsewhere (written back by a provider at boot): the old port open again.
+  port_lines="$(sshd_port_lines "$SSH_PORT_DROPIN")"
+  if [[ -n "$port_lines" ]]; then
+    IFS=$'\t' read -r file n _ <<< "$port_lines"
+    while IFS=$'\t' read -r _ _ _ text; do
+      p="$(sshd_line_value "$text")"
+      if [[ " $ports $stray " != *" $p "* ]] && port_listening "$p"; then stray+="$p "; fi
+    done <<< "$port_lines"
+    if [[ -n "$stray" ]]; then
+      verify_set fail "SSH 还在端口 ${stray% } 上监听：$file 第 $n 行写了 Port（多半是服务商重启时写回的）。在撤销里撤销「SSH 端口」，再重新改一次，会问你要不要把它注释掉"
+      return 0
+    fi
+  fi
   if ufw_active; then
     rules="$(ufw show added 2>/dev/null || true)"
     for p in $ports; do grep -Eq "^ufw (allow|limit) $p/tcp$" <<< "$rules" || { verify_set fail "防火墙没有放行 SSH 端口 $p"; return 0; }; done
@@ -8576,12 +8911,29 @@ check_timezone() {
   else verify_set fail "当前时区 ${current:-未知}，预期 $1"; fi
 }
 
+# KEY WANT OWN: " FILE 第 N 行" for the first line that keeps sshd from WANT
+# (written back by a provider at boot, say); nothing when none is found.
+check_ssh_override() {
+  local lines file n
+  lines="$(sshd_setting_overrides "$1" "$2" "$3" 2>/dev/null || true)"
+  [[ -n "$lines" ]] || return 0
+  IFS=$'\t' read -r file n _ <<< "$lines"
+  printf '：%s 第 %s 行比本工具的设置先生效（多半是服务商重启时写回的）' "$file" "$n"
+}
+
 check_ssh() {
-  local root_value
-  if ! ssh_password_disabled; then verify_set fail '当前生效的 SSH 配置仍允许密码登录'; return 0; fi
+  local root_value where
+  if ! ssh_password_disabled; then
+    where="$(check_ssh_override passwordauthentication no "$SSH_DROPIN")"
+    [[ -n "$where" ]] || where="$(check_ssh_override kbdinteractiveauthentication no "$SSH_DROPIN")"
+    if [[ -n "$where" ]]; then where+='。再运行一次 SSH 加固（菜单 10），会问你要不要把它注释掉'; fi
+    verify_set fail "当前生效的 SSH 配置仍允许密码登录$where"; return 0
+  fi
   if [[ "$1" == *root-ssh=off* ]]; then
     root_value="$(ssh_effective_value "$(ssh_effective root || true)" permitrootlogin)"
-    if [[ "$root_value" != no ]]; then verify_set fail "密码登录已关闭，但 root 仍可直接 SSH 登录（PermitRootLogin=${root_value:-未知}）"; return 0; fi
+    if [[ "$root_value" != no ]]; then
+      verify_set fail "密码登录已关闭，但 root 仍可直接 SSH 登录（PermitRootLogin=${root_value:-未知}）$(check_ssh_override permitrootlogin no "$SSH_DROPIN")"; return 0
+    fi
     local who="${1#*user=}"
     verify_set pass "只允许密钥登录，root 不能直接 SSH 登录（管理员：${who%% *}）"
   else

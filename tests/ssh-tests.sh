@@ -6,7 +6,10 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey guard_since ssh_harden_stage
+load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey guard_since ssh_harden_stage \
+  sshd_line_value sshd_config_walk sshd_include_args sshd_reads sshd_setting_overrides sshd_lines_show sshd_lines_off sshd_lines_on \
+  sshd_lines_on_cmd sshd_off_files ssh_overrides_offer ssh_hardening_overridden restore_record_sshd_file audit_clean_text \
+  restore_ssh_group check_ssh check_ssh_override verify_set
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -117,10 +120,14 @@ confirm() {
   case "$2" in KEYOK) ((KEYOK)) ;; SUDOOK) ((SUDOOK)) ;; NOCONSOLE) ((NOCONSOLE)) ;; *) fail "unexpected confirmation $2" ;; esac
 }
 confirm_default_yes() {
-  case "$1" in *公钥登录*) record 'ask pubkey'; ((ENABLE_PUBKEY)) ;; *) fail "unexpected Y/n question: $1" ;; esac
+  case "$1" in
+    *公钥登录*) record 'ask pubkey'; ((ENABLE_PUBKEY)) ;;
+    *注释掉*) record 'ask comment out'; ((COMMENT_OK)) ;;
+    *) fail "unexpected Y/n question: $1" ;;
+  esac
 }
 guard_leftovers() { return 1; }
-guard_arm() { record "arm $1"; }
+guard_arm() { record "arm $*"; }
 guard_confirm() { ((GUARD_OK)); }
 ssh_reload() { record reload; }
 systemctl() { record "systemctl $*"; }
@@ -168,6 +175,20 @@ sshd() {
       if ((ALREADY_OFF)) || [[ -f "$SSH_DROPIN" && "$DROPIN_WINS" == 1 ]]; then pa=no; fi
       # Provider image with "PubkeyAuthentication no"; our 00- drop-in can win.
       if ((PUBKEY_OFF)); then pub=no; if [[ -f "$SSH_PUBKEY_DROPIN" ]] && ((PUBKEY_WINS)); then pub=yes; fi; fi
+      # The provider's layout of a real Debian 13 VPS, read the way sshd reads
+      # it (written out here, not worked out): its included file, its 00-
+      # drop-in, this tool's 00-/01- ones, cloud-init's 50-; the first value wins.
+      if ((PROVIDER)); then
+        pa=yes pub=yes
+        local f v found_pa='' found_pub=''
+        for f in "$CASE/ppflight-login.conf" "$CASE/sshd_config.d/00-ppflight-cloud.conf" "$SSH_PUBKEY_DROPIN" "$SSH_DROPIN" "$CASE/sshd_config.d/50-cloud-init.conf"; do
+          v="$(awk 'tolower($1) == "passwordauthentication" {print tolower($2); exit}' "$f" 2>/dev/null || true)"
+          if [[ -z "$found_pa" && -n "$v" ]]; then found_pa="$v"; fi
+          v="$(awk 'tolower($1) == "pubkeyauthentication" {print tolower($2); exit}' "$f" 2>/dev/null || true)"
+          if [[ -z "$found_pub" && -n "$v" ]]; then found_pub="$v"; fi
+        done
+        pa="${found_pa:-yes}" pub="${found_pub:-yes}"
+      fi
       if [[ -f "$SSH_DROPIN" && "$ROOT_WINS" == 1 ]] && grep -Fxq 'PermitRootLogin no' "$SSH_DROPIN"; then root=no; fi
       if [[ "$spec" != user=root,* ]]; then root=yes; [[ -f "$SSH_DROPIN" ]] && grep -Fxq 'PermitRootLogin no' "$SSH_DROPIN" && ((ROOT_WINS)) && root=no; fi
       printf 'passwordauthentication %s\nkbdinteractiveauthentication %s\npermitrootlogin %s\npubkeyauthentication %s\nauthenticationmethods any\nauthorizedkeysfile %s\n' "$pa" "$pa" "$root" "$pub" "$AKF" ;;
@@ -189,7 +210,9 @@ new_case() {
   MODE=ssh SUDO_USER=alice LOGIN=alice TARGET=alice SSH_CONNECTION='203.0.113.9 50000 192.0.2.1 22'
   SSH_CHOICE='' ADMIN_CHOICE=0 ADMIN_NAME=''
   ADD_MORE=0 KEYOK=0 SUDOOK=0 NOCONSOLE=0 SET_PW=0 GUARD_OK=1 SEEN=1 SUDO_SEEN=1 HOME_SAFE=1
-  ALREADY_OFF=0 DROPIN_WINS=1 ROOT_WINS=1 SSHD_T_RC=0
+  ALREADY_OFF=0 DROPIN_WINS=1 ROOT_WINS=1 SSHD_T_RC=0 PROVIDER=0 COMMENT_OK=1
+  SSHD_CONFIG="$CASE/sshd_config" RESTORE_ROOT="$CASE/restore" RESTORE_READY=1
+  mkdir -p "$RESTORE_ROOT"
   AKF='.ssh/authorized_keys .ssh/authorized_keys2'
   printf '\n%s\n\n' "$KEY" > "$CASE/input"
 }
@@ -365,3 +388,105 @@ ssh_harden_stage < "$CASE/input" > "$CASE/out"
 grep -q '^result ssh failed' "$CASE/trace" || fail 'ineffective key login drop-in not reported'
 if grep -Fxq reload "$CASE/trace"; then fail 'sshd reloaded for an ineffective setting'; fi
 printf 'PASS: SSH hardening: admin account, root login, console guard, key import as the account, evidence, timeout revert and key login turned on first.\n'
+
+# ---- A provider's setting read before this tool's ----------------------------
+# The layout of a real Debian 13 VPS (2026-11-03): sshd_config includes the
+# provider's file on its first line, and the provider's 00- drop-in sorts
+# before this tool's 01- one; cloud-init's 50- comes after it and does not win.
+restore_data_safe() { [[ -f "$1" && ! -L "$1" ]]; }
+provider_case() {
+  new_case "$1"
+  PROVIDER=1
+  mkdir -p "$CASE/sshd_config.d"
+  printf '%s\n' "Include $CASE/ppflight-login.conf" "Include $CASE/sshd_config.d/*.conf" > "$SSHD_CONFIG"
+  printf '%s\n' 'PasswordAuthentication yes' > "$CASE/ppflight-login.conf"
+  printf '%s\n' '# provider' 'PasswordAuthentication yes' > "$CASE/sshd_config.d/00-ppflight-cloud.conf"
+  printf '%s\n' 'PasswordAuthentication yes' > "$CASE/sshd_config.d/50-cloud-init.conf"
+  mkdir -p "$CASE/before"
+  cp -p "$CASE/ppflight-login.conf" "$CASE/sshd_config.d/00-ppflight-cloud.conf" "$CASE/sshd_config.d/50-cloud-init.conf" "$CASE/before/"
+}
+same_as_before() {
+  local f
+  for f in ppflight-login.conf 00-ppflight-cloud.conf 50-cloud-init.conf; do
+    if [[ -f "$CASE/$f" ]]; then cmp -s "$CASE/$f" "$CASE/before/$f" || return 1
+    else cmp -s "$CASE/sshd_config.d/$f" "$CASE/before/$f" || return 1; fi
+  done
+}
+
+provider_case provider_wins
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+grep -Fxq 'ask comment out' "$CASE/trace" || fail 'commenting out the provider lines was not offered'
+grep -q 'ppflight-login.conf 第 1 行：PasswordAuthentication yes' "$CASE/out" && grep -q '00-ppflight-cloud.conf 第 2 行：PasswordAuthentication yes' "$CASE/out" ||
+  fail "the winning lines were not shown: $(cat "$CASE/out")"
+if grep -q '50-cloud-init.conf' "$CASE/out"; then fail 'a line read after this tool'"'"'s file was shown as winning'; fi
+tag="$(sed -n 's/^#vps-stable-off(ssh,\([0-9-]*\)): PasswordAuthentication yes$/\1/p' "$CASE/ppflight-login.conf")"
+[[ -n "$tag" ]] || fail "provider file not commented out: $(cat "$CASE/ppflight-login.conf")"
+[[ "$(sed -n 2p "$CASE/sshd_config.d/00-ppflight-cloud.conf")" == "#vps-stable-off(ssh,$tag): PasswordAuthentication yes" ]] || fail 'provider drop-in not commented out'
+cmp -s "$CASE/sshd_config.d/50-cloud-init.conf" "$CASE/before/50-cloud-init.conf" || fail 'cloud-init'"'"'s file, read later, was changed'
+arm="$(grep '^arm ' "$CASE/trace")"
+[[ "$arm" == "arm vps-stable-ssh-revert-$tag /bin/sh -c rm -f -- '$SSH_DROPIN'; sed -i 's/^#vps-stable-off(ssh,$tag): //' "* ]] || fail "guard does not put the lines back: $arm"
+[[ "$arm" == *"'$CASE/ppflight-login.conf'"* && "$arm" == *"'$CASE/sshd_config.d/00-ppflight-cloud.conf'"* ]] || fail "guard misses a file: $arm"
+grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail "hardening not applied: $(cat "$CASE/trace")"
+grep -q '注释掉的行保持注释' "$CASE/out" || fail 'what stays commented out was not said'
+# Rollback: the provider's lines back byte for byte, sshd reloaded.
+restore_needed() { return 1; }
+restore_read() { return 1; }
+restore_resource() { record "resource $1"; rm -f -- "$SSH_DROPIN"; }
+restore_mark() { :; }
+: > "$CASE/trace"; RESTORE_PARTIAL=0
+restore_ssh_group
+same_as_before || fail 'rollback did not put the provider'"'"'s lines back byte for byte'
+grep -Fxq reload "$CASE/trace" && ((RESTORE_PARTIAL == 0)) || fail "rollback: $(cat "$CASE/trace")"
+: > "$CASE/trace"; restore_ssh_group
+if grep -Fxq reload "$CASE/trace"; then fail 'a second rollback still found something to undo'; fi
+unset -f restore_needed restore_read restore_resource restore_mark
+
+# vps check after the provider wrote its line back at boot.
+provider_case written_back
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+sed -i 's/^#vps-stable-off(ssh,[0-9-]*): //' "$CASE/sshd_config.d/00-ppflight-cloud.conf"
+ssh_password_disabled() { [[ "$(sshd -T | awk '$1 == "passwordauthentication" {print $2}')" == no ]]; }
+check_ssh 'key-only user=alice'
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'00-ppflight-cloud.conf 第 2 行'*'服务商'*'SSH 加固'* ]] || fail "check after a write-back: $VERIFY_STATUS $VERIFY_TEXT"
+sed -i '2s/^/#vps-stable-off(ssh,1-1): /' "$CASE/sshd_config.d/00-ppflight-cloud.conf"
+check_ssh 'key-only user=alice'
+[[ "$VERIFY_STATUS" == pass ]] || fail "check with the lines commented out: $VERIFY_TEXT"
+unset -f ssh_password_disabled
+
+provider_case provider_declined
+COMMENT_OK=0
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+same_as_before && [[ ! -e "$SSH_DROPIN" ]] || fail 'something changed although commenting out was declined'
+grep -q '^result ssh preserved earlier sshd setting wins' "$CASE/trace" || fail 'declined: not reported as kept'
+if grep -q '^arm ' "$CASE/trace"; then fail 'guard armed although nothing changed'; fi
+
+provider_case provider_unconfirmed
+GUARD_OK=0
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+same_as_before && [[ ! -e "$SSH_DROPIN" ]] || fail 'an unconfirmed change left provider lines commented out'
+grep -q '^result ssh failed second login not confirmed' "$CASE/trace" || fail 'unconfirmed: not reported'
+
+# Commented out, yet sshd still keeps password login on (a line this tool
+# cannot see): everything goes back.
+provider_case still_overridden
+printf 'PasswordAuthentication yes\n' > "$CASE/sshd_config.d/00-aaa-hidden.conf"
+cp -p "$CASE/sshd_config.d/00-aaa-hidden.conf" "$CASE/before/"
+sshd_reads() { return 0; }
+sshd_setting_overrides() { printf '%s\t2\t0\tPasswordAuthentication yes\n' "$CASE/sshd_config.d/00-ppflight-cloud.conf"; }
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+same_as_before && [[ ! -e "$SSH_DROPIN" ]] || fail 'lines left commented out although it did not help'
+grep -q '^result ssh preserved' "$CASE/trace" || fail 'still overridden: not reported'
+load_optimizer_functions sshd_reads sshd_setting_overrides
+
+# Key login turned off by the provider's 00- drop-in, which sorts before this
+# tool's 00-vps-stable-pubkey.conf: commented out (it stays: key login only
+# adds a way in), then the hardening goes on with its own change.
+provider_case pubkey_provider
+printf '%s\n' '# provider' 'PasswordAuthentication yes' 'PubkeyAuthentication no' > "$CASE/sshd_config.d/00-ppflight-cloud.conf"
+cp -p "$CASE/sshd_config.d/00-ppflight-cloud.conf" "$CASE/before/"
+ssh_harden_stage < "$CASE/input" > "$CASE/out"
+grep -q '^#vps-stable-off(ssh,[0-9]*-[0-9]*-1): PubkeyAuthentication no$' "$CASE/sshd_config.d/00-ppflight-cloud.conf" || fail "key login line: $(cat "$CASE/sshd_config.d/00-ppflight-cloud.conf")"
+grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail "hardening after key login: $(cat "$CASE/trace")"
+arm="$(grep '^arm ' "$CASE/trace")"
+if [[ "$arm" == *'-1): '* ]]; then fail "the hardening's guard would put the key login line back: $arm"; fi
+printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and put back by the guard, the rollback, or when it does not help; vps check names a line written back.\n'

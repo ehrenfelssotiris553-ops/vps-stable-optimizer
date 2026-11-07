@@ -156,6 +156,14 @@ group 'Boot and install'
 wait_ssh
 # shellcheck disable=SC2016
 vm 'cloud-init status --wait >/dev/null 2>&1 || true; . /etc/os-release; echo "$PRETTY_NAME"; free -m | sed -n 2p'
+# A provider's own SSH settings, read before this tool's files (a real Debian
+# 13 VPS had them, 2026-11-03): the hardening and the port change must name
+# these lines and comment them out on a yes, and every way back (the guard
+# timer, the single item, the full rollback) must put them back byte for byte
+# (the snapshot below has the file).
+PROVIDER_CONF=/etc/ssh/sshd_config.d/00-aaa-provider.conf
+vm "printf '%s\\n' '# A provider image (CI): read before the tool' 'PasswordAuthentication yes' 'Port 22' > $PROVIDER_CONF"
+provider_line() { vm "grep -qx '$1' $PROVIDER_CONF" 2>/dev/null || vm_ops_sudo grep -qx "'$1'" "$PROVIDER_CONF"; }
 # The whole picture before anything is installed, compared at the very end.
 snapshot_since="$(vm "date '+%F %T'")"
 vm 'bash -s' < "$CI/snapshot.sh" > "$LOGS/snapshot-before.txt"
@@ -514,10 +522,11 @@ group 'SSH port: 22 to 2244 from outside (the old port closed only after a login
 # few seconds on the new port ($VM_SSH_NEW is expanded by the shell answer.exp starts).
 index="$(item_index sshport)" || fail 'no single item sshport'
 # shellcheck disable=SC2016
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
   '等待确认（剩余 ==> !$VM_SSH_NEW sleep 10' > "$LOGS/sshport-on.rules"
 vm_drive "$LOGS/sshport-on.rules" sshport-on vps item || fail "the port change exited with $?"
 has sshport-on 'SSH 端口已改成 2244'
+has sshport-on '00-aaa-provider.conf 第 3 行：Port 22'
 ssh "${VM_NEW_OPTS[@]}" "$VM_HOST" true || fail 'no login on the new port 2244'
 if ssh "${VM_OPTS[@]}" -o ConnectTimeout=5 "$VM_HOST" true 2>/dev/null; then fail 'the old port 22 still lets logins in'; fi
 ssh "${VM_NEW_OPTS[@]}" "$VM_HOST" 'cat /etc/ssh/sshd_config.d/00-vps-stable-port.conf; ufw show added; fail2ban-client get sshd actions >/dev/null && grep "^port" /etc/fail2ban/jail.d/99-vps-stable-sshd.local' > "$LOGS/sshport-state.txt" 2>&1 || true
@@ -531,12 +540,14 @@ printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 2'
 drive "$LOGS/sshport-off.rules" sshport-off ssh "${VM_NEW_OPTS[@]}" -tt "$VM_HOST" 'TERM=xterm vps item' || fail "putting the port back exited with $?"
 vm true || fail 'no login on port 22 after putting the port back'
 if ssh "${VM_NEW_OPTS[@]}" -o ConnectTimeout=5 "$VM_HOST" true 2>/dev/null; then fail 'port 2244 still lets logins in after putting the port back'; fi
+provider_line 'Port 22' || fail "putting the port back did not put the provider's Port line back: $(vm "cat $PROVIDER_CONF")"
 endgroup
 group 'SSH hardening: a connection dropped mid-way puts the old settings back'
 vm_drive ssh-drop.rules ssh-drop vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (dropped) exited with $rc"; }
 has ssh-drop '系统日志确认 ops 已用密钥登录成功'
 has ssh-drop 'ops 当前已有 0 个公钥'
 has ssh-drop '已关闭 SSH 密码登录'
+has ssh-drop '00-aaa-provider.conf 第 2 行：PasswordAuthentication yes'
 # The guard timer (240 s) undoes it; ops logs in with the key all along.
 drop_at=$SECONDS undone=0
 for ((i = 0; i < 120; i++)); do
@@ -564,6 +575,7 @@ if ! vm true 2>/dev/null; then
   fail 'root cannot log in again after the undo'
 fi
 [[ "$(ssh_methods root)" == *password* ]] || fail "password login not back after the undo: $(ssh_methods root)"
+provider_line 'PasswordAuthentication yes' || fail "the guard timer did not put the provider's line back: $(vm "cat $PROVIDER_CONF")"
 endgroup
 
 group 'SSH hardening: key-only login, admin ops with sudo, no root login'
@@ -571,6 +583,8 @@ vm_drive ssh-apply.rules ssh-apply vps ssh || { rc=$?; sudo_journal; fail "ssh h
 has ssh-apply '已在系统日志里看到新窗口登录成功，自动确认'
 has ssh-apply '新的 SSH 登录设置已保留'
 has ssh-apply 'ops 当前已有 1 个公钥'
+has ssh-apply '00-aaa-provider.conf 第 2 行：PasswordAuthentication yes'
+has ssh-apply '注释掉的行保持注释'
 hardened() {
   if vm true 2>/dev/null; then fail "$1: root can still log in over SSH"; fi
   [[ "$(ssh_methods ops)" == publickey ]] || fail "$1: sshd still offers $(ssh_methods ops)"
@@ -583,6 +597,17 @@ wait_ssh vm_ops
 hardened 'after a reboot'
 VM_AS=$VM_OPS_HOST check_all check-hardened sudo
 passed check-hardened 'SSH 登录加固'
+# The provider writes its line back (some do at every boot): password login
+# is on again, and vps check says which line of which file did it.
+vm_ops_sudo cp -p "$PROVIDER_CONF" /root/provider.keep
+vm_ops_sudo sed -i "'s/^#vps-stable-off(ssh,[0-9-]*): //'" "$PROVIDER_CONF"
+vm_ops_sudo systemctl try-reload-or-restart ssh.service
+vm_ops_sudo vps check > "$LOGS/check-written-back.log" 2>&1 || true
+grep -q '当前生效的 SSH 配置仍允许密码登录：.*00-aaa-provider.conf 第 2 行' "$LOGS/check-written-back.log" ||
+  fail "vps check did not name the line written back: $(grep -m1 'SSH 登录加固' "$LOGS/check-written-back.log" || true)"
+vm_ops_sudo mv -f /root/provider.keep "$PROVIDER_CONF"
+vm_ops_sudo systemctl try-reload-or-restart ssh.service
+hardened 'with the provider line commented out again'
 endgroup
 
 group 'Full rollback and uninstall'
@@ -593,7 +618,7 @@ group 'Full rollback and uninstall'
 index="$(item_index sshport)" || fail 'no single item sshport'
 # ($ADMIN_PW is answer.exp's to expand.)
 # shellcheck disable=SC2016
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
   "等待确认（剩余 ==> !ssh ${VM_NEW_OPTS[*]} $VM_OPS_HOST sleep 10" '\[sudo[^]]*\] [Pp]assword ==> $ADMIN_PW' > "$LOGS/sshport-again.rules"
 VM_AS=$VM_OPS_HOST vm_drive "$LOGS/sshport-again.rules" sshport-again sudo vps item || fail "the second port change exited with $?"
 has sshport-again 'SSH 端口已改成 2244'
@@ -603,6 +628,8 @@ has rollback '撤销完成'
 grep -Eq '已删除本工具添加的规则：ufw (allow|limit) 22/tcp' "$LOGS/rollback.log" || fail 'the full rollback left the rule it let port 22 in with again'
 has rollback '已恢复 SSH 原来的登录设置'
 vm true || fail 'root cannot log in after the rollback'
+[[ "$(vm "cat $PROVIDER_CONF")" == $'# A provider image (CI): read before the tool\nPasswordAuthentication yes\nPort 22' ]] ||
+  fail "the full rollback did not put the provider's lines back: $(vm "cat $PROVIDER_CONF")"
 lc_mark 'after the rollback (packages removed)'
 [[ "$(ssh_methods root)" == *password* ]] || fail "password login not restored by the rollback: $(ssh_methods root)"
 # shellcheck disable=SC2016

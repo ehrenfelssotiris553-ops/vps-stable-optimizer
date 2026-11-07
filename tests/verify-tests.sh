@@ -7,8 +7,11 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions state_path_safe state_secure_dir module_result module_expect module_result_label verify_line verify_module verify_health_units param_value param_read param_recommended param_check param_mode verify_set verify_ssh_connection_cc check_bbr check_timezone check_ssh ssh_effective_value check_sysctl sysctl_file_mismatch verify_reboot_state upgrade_has_kernel boot_kernels verify_kernel \
-  trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health audit_clean_text f2b_jail_text f2b_jail_values_text
+  trim_support check_trim check_fail2ban check_firewall check_journal audit_ufw_ipv6 ufw_ssh_access port_item_covers verify_main verify_health audit_clean_text f2b_jail_text f2b_jail_values_text \
+  check_ssh_override sshd_setting_overrides sshd_config_walk sshd_include_args sshd_line_value
 TEST_ROOT="$(mktemp -d)"
+# No sshd configuration here: nothing to name as winning over the tool's file.
+SSHD_CONFIG="$TEST_ROOT/sshd_config" SSH_DROPIN="$TEST_ROOT/sshd_config.d/01-vps-stable-keyonly.conf"
 PARAMS_FILE="$TEST_ROOT/params"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }

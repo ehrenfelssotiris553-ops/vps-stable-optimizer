@@ -33,11 +33,17 @@ jobs:
         image: ['debian:12', 'debian:13', 'ubuntu:22.04', 'ubuntu:24.04', 'ubuntu:26.04']
     container: ${{ matrix.image }}
     steps:
+      # openssh-server is never started: sshd-config-tests compares the
+      # tool's reading of sshd's files with `sshd -T` of each release. Its
+      # sshd is moved off PATH, so the other tests keep their mocks.
       - name: Tools the tests use
         run: |
           apt-get update -q
           DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
-            ca-certificates git openssh-client procps iproute2 util-linux
+            ca-certificates git openssh-client openssh-server procps iproute2 util-linux
+          mkdir -p /opt/vps-test && mv /usr/sbin/sshd /opt/vps-test/sshd
       - uses: actions/checkout@v5
       - name: All isolated tests (root)
+        env:
+          VPS_TEST_SSHD: /opt/vps-test/sshd
         run: bash tests/ci/report.sh 'isolated tests ${{ matrix.image }}' bash tests/run-all.sh
