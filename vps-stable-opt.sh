@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v2.9.0 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v3.0.0 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
 umask 077
 
-SCRIPT_VERSION=2.9.0
+SCRIPT_VERSION=3.0.0
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 # Inside the root-only state directory: Ubuntu's /var/log is group-writable
@@ -122,7 +122,7 @@ case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V2.9.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+VPS 机器管家 V3.0.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps report     机器体检（只读）：性能、资源、磁盘、服务和系统状况一份看完，要留意的排在最前
   vps clean      磁盘清理：先列出能清掉多少，你选了才清
