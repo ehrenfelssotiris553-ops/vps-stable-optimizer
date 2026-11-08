@@ -3009,6 +3009,8 @@ params_import() {
   done
   ok '参数已导入。'
   for line in "${items[@]}"; do
+    # Read at every backup; there is nothing to set up again (only the time).
+    if [[ "$line" == databackup ]]; then param_apply databackup; continue; fi
     if param_live "$line"; then
       if param_item_on "$line"; then ok "「$(item_label "$line")」下次检查时就会用新的参数。"; fi
       continue

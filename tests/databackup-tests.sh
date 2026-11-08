@@ -408,6 +408,21 @@ if grep -Fq adopt "$CALLS"; then fail 'adopted inside its own stage, which recor
 RESTORE_STAGE=''
 printf 'PASS: the schedule follows the parameter, also to and from manual.\n'
 
+# Imported parameters reach the schedule; nothing is asked or set up again
+# (found by the real run: the import went through the whole setup of the item).
+(
+  load_optimizer_functions params_import param_info param_store param_apply param_live param_item_on
+  item_turn_on() { printf 'set up again %s\n' "$1" >> "$CALLS"; }
+  reset
+  : > "$BACKUP_SERVICE_FILE"
+  printf 'backup_time=06:45\n' > "$TEST_ROOT/import"
+  params_import "$TEST_ROOT/import" > "$TEST_ROOT/out" 2>&1 || fail "import: $(cat "$TEST_ROOT/out")"
+  grep -Fxq 'OnCalendar=*-*-* 06:45:00' "$BACKUP_TIMER_FILE" || fail "imported time not in the timer: $(cat "$TEST_ROOT/out")"
+  if grep -Fq 'set up again' "$CALLS"; then fail 'an import of a backup parameter set the whole item up again'; fi
+  rm -f -- "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"
+)
+printf 'PASS: imported backup parameters reach the schedule without setting anything up again.\n'
+
 # 8. The check, the menu's line, the status.
 verify_set() { VERDICT="$1 $2"; }
 check() { VERDICT=''; check_databackup; }

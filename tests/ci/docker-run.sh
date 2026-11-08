@@ -162,21 +162,39 @@ passed check-dockerfw 'Docker 端口受防火墙管'
 lacks check-dockerfw '绕过防火墙'
 endgroup
 
-group 'Data backup to S3-compatible storage (a local MinIO)'
-sudo docker run -d --name minio -p 127.0.0.1:9000:9000 -e MINIO_ROOT_USER=ciaccesskey -e MINIO_ROOT_PASSWORD=cisecretvalue123 minio/minio:RELEASE.2024-01-16T16-07-38Z server /data > /dev/null
-for ((i = 0; i < 30; i++)); do if curl -sf -m 2 http://127.0.0.1:9000/minio/health/live > /dev/null; then break; fi; sleep 2; done
+group 'Data backup to S3-compatible storage (a stand-in on this machine)'
+s3_store="$(mktemp -d)"
+python3 "$CI/fake-s3.py" "$s3_store" ciaccesskey 9000 > "$LOGS/fake-s3.log" 2>&1 &
+s3_pid=$!
+for ((i = 0; i < 20; i++)); do if curl -s -m 2 -o /dev/null http://127.0.0.1:9000/; then break; fi; sleep 1; done
 sudo mkdir -p /srv/ci-s3
 echo 'object storage payload' | sudo tee /srv/ci-s3/file.txt > /dev/null
 printf 'backup_paths=/srv/ci-s3\nbackup_drill_days=1\n' > "$LOGS/backup-params.txt"
 drive params.rules backup-params sudo vps params import "$LOGS/backup-params.txt" || fail "params import exited with $?"
 backup_index="$(item_index databackup)" || fail 'no single item databackup'
+# ACCESS-KEY: the answers for this storage.
+s3_answers() {
+  printf '%s\n' '备份目标 \[1-4 ==> 2' '对象存储的地址 ==> http://127.0.0.1:9000' '存储桶的名字 ==> ci-bucket' '桶里的目录 ==> vps/one' '区域 ==> us-east-1' "Access Key ==> $1" 'Secret Key ==> cisecretvalue123'
+}
+# A key the storage does not know: said so, and nothing is switched on.
 { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> 1\n' "$backup_index"
-  printf '%s\n' '备份目标 \[1-4 ==> 2' '对象存储的地址 ==> http://127.0.0.1:9000' '存储桶的名字 ==> ci-bucket' '桶里的目录 ==> vps/one' '区域 ==> us-east-1' 'Access Key ==> ciaccesskey' 'Secret Key ==> cisecretvalue123' '备份密码（输入时不显示 ==>' '已经把这个密码存到 ==> y'
+  s3_answers wrongaccesskey
+  printf '%s\n' '备份密码（输入时不显示 ==>' '已经把这个密码存到 ==> y'
+  cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3-bad.rules"
+drive "$LOGS/backup-s3-bad.rules" backup-s3-bad sudo vps item || fail "data backup with a wrong key exited with $?"
+has backup-s3-bad '没能在备份目标上建好仓库'
+lacks backup-s3-bad '数据备份已开启'
+if sudo test -e /etc/systemd/system/vps-stable-backup.timer; then fail 'a backup that never worked was scheduled'; fi
+# The right key: backed up, encrypted, and restored from there.
+{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> 1\n' "$backup_index"
+  printf '%s\n' '沿用上次的备份目标吗 ==> n'
+  s3_answers ciaccesskey
   cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3.rules"
 drive "$LOGS/backup-s3.rules" backup-s3 sudo vps item || fail "data backup to S3 exited with $?"
 has backup-s3 '数据备份已开启'
 has backup-s3 '恢复演练通过'
-sudo docker exec minio ls /data/ci-bucket/vps/one | grep -Fx config > /dev/null || fail 'nothing arrived in the bucket'
+[[ -f "$s3_store/ci-bucket/vps/one/config" ]] || fail "nothing arrived in the bucket: $(find "$s3_store" | head -n 20)"
+if grep -rqF 'object storage payload' "$s3_store"; then fail 'the backup is not encrypted in the bucket'; fi
 lacks backup-s3 'cisecretvalue123'
 if sudo grep -rlF --exclude=conf -- cisecretvalue123 /var/lib/vps-stable-opt /var/backups/vps-stable-opt | grep .; then fail 'the storage secret is in a log or backup of the tool'; fi
 [[ "$(sudo stat -c %a /var/lib/vps-stable-opt/databackup/conf)" == 600 ]] || fail 'the settings with the storage secret are readable by others'
@@ -187,8 +205,8 @@ drive "$LOGS/backup-s3-restore.rules" backup-s3-restore sudo vps item || fail "r
 target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | head -n 1)"
 [[ "$(sudo cat "$target/srv/ci-s3/file.txt")" == 'object storage payload' ]] || fail 'not restored from the bucket'
 sudo rm -rf -- "$target" /srv/ci-s3
-sudo docker rm -f minio > /dev/null
-sudo docker rmi minio/minio:RELEASE.2024-01-16T16-07-38Z > /dev/null
+kill "$s3_pid"
+rm -rf -- "$s3_store"
 endgroup
 
 group 'Rollback and uninstall'
