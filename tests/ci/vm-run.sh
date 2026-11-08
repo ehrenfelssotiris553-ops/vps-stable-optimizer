@@ -591,6 +591,26 @@ if ((!old)); then
   # dpkg included.
   # shellcheck disable=SC2016
   vm 'pgid="$(ps -o pgid= -p "$(pgrep -o -f "vps-stable-opt.sh setup")" | tr -d " ")"; [ -n "$pgid" ] && kill -INT -- "-$pgid"'
+  # It has to end, not hang: once, on a 512 MiB VM, it was still there 50 minutes
+  # later holding the lock, and nothing showed why. The allowance covers apt
+  # finishing a package; past it, what the processes wait for is kept.
+  ctrl_c_deadline=$((SECONDS + 900))
+  while vm 'pgrep -f "^/bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh setup" > /dev/null' 2>/dev/null; do
+    if ((SECONDS > ctrl_c_deadline)); then
+      # shellcheck disable=SC2016
+      vm 'for p in $(pgrep -f "^/bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh setup" | head -n 2); do
+          echo "== $p wchan: $(cat "/proc/$p/wchan")"; head -n 6 "/proc/$p/stack" 2>&1
+          grep -E "^(State|SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):" "/proc/$p/status"; ls -l "/proc/$p/fd" 2>&1 | cut -c40-
+        done' > "$LOGS/ctrl-c-hang.log" 2>&1 || true
+      vm 'ps -eo pid,ppid,pgid,stat,wchan:24,etimes,args --forest | grep -v "\[" | tail -n 28 | cut -c1-170
+        tail -n 8 /var/lib/vps-stable-opt/run-*/stages.tsv' > "$LOGS/ctrl-c-ps.log" 2>&1 || true
+      notice 'the setup did not end after Ctrl+C: what it waits for' "$LOGS/ctrl-c-hang.log"
+      notice 'the setup did not end after Ctrl+C: processes and stages' "$LOGS/ctrl-c-ps.log"
+      kill "$drive_pid" 2>/dev/null || true
+      fail 'the setup did not end within 15 minutes of Ctrl+C (see the notice)'
+    fi
+    sleep 2
+  done
   if wait "$drive_pid"; then fail 'the interrupted setup ended as if nothing happened'; fi
   if vm 'dpkg --audit | grep -q .'; then
     # dpkg was cut off: the tool has to stop and say how to repair it.
