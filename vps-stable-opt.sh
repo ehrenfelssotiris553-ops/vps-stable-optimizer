@@ -2339,7 +2339,7 @@ param_reason() {
     notify_disk_percent) echo '用到 90% 提醒：还来得及清理；再晚满了会出各种奇怪的错误。' ;;
     notify_mem_percent) echo '可用内存低于总内存的 5% 时提醒：再少就可能有进程被杀。回到这个数加 10 以上才算恢复，免得来回提醒。' ;;
     notify_cpu_percent) echo '90%：跑任务时短时间吃满很正常，持续吃满才值得看一眼。降到这个数减 20 以下才算恢复，免得来回提醒。' ;;
-    notify_cpu_minutes) echo '10 分钟：吃满这么久才提醒（按「装软件、加公钥这类变化多久查一次」的间隔看，默认每 5 分钟一次，往上取整）。' ;;
+    notify_cpu_minutes) echo '10 分钟：吃满这么久才提醒（按两次检查之间的分钟数往上取整：默认每 5 分钟一次；「开了 TG 时多久检查一次」更长时按它）。' ;;
     notify_sudo_args) echo 'no：只说运行了哪个程序。整条命令里可能有密码，发到 Telegram 就收不回来了。' ;;
     notify_services) echo 'none：不盯任何服务。写上你自己的服务名（例如 xray nginx，用空格隔开），它们停了、恢复了都会提醒。' ;;
     quota_alerts) echo '用到 80%、90%、100% 各提醒一次：有时间换套餐或者省着用。数字以服务商面板为准。' ;;
@@ -6658,9 +6658,13 @@ if [ "$tg" = 1 ]; then
   fi
 fi
 
-# Every 5 minutes: what was done on the machine and how it is.
+# Every 5 minutes (or as asked): what was done on the machine and how it is.
 five="$(cat "$dir/five" 2>/dev/null || echo 0)"
 ev_min="$(num notify_events_minutes 5)"
+# How far apart these checks really are: the timer may run less often.
+ev_every="$ev_min"; tg_min="$(num check_minutes_tg 1)"
+[ "$tg_min" -le "$ev_every" ] || ev_every="$tg_min"
+[ "$ev_every" -ge 1 ] || ev_every=1
 if [ "$tg" = 1 ] && [ $((now - five)) -ge $((ev_min * 60 - 10)) ]; then
   printf '%s\n' "$now" > "$dir/five"
   journal_new events -t useradd -t passwd -t chpasswd -t sudo -t kernel -t sshd -t sshd-session > "$dir/events"
@@ -6698,17 +6702,17 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge $((ev_min * 60 - 10)) ]; then
     find /etc/systemd/system -maxdepth 2 \( -name '*.service' -o -name '*.timer' \) ! -name 'vps-stable-*' -printf '%p\n'
     find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron/crontabs -maxdepth 1 -type f -printf '%p\n'; }
   new_lines autostart autostart | head -n 10 | while read -r p; do queue autostart "新加了开机自启或定时任务：$(printf '%s' "$p" | clean 120)"; done
-  # The CPU busy for a while (that many checks in a row, one every 5 minutes).
+  # The CPU busy for a while (that many checks in a row, EV_EVERY minutes apart).
   set -- $(awk '$1 == "cpu" {print $2 + $3 + $4 + $6 + $7 + $8 + $9, $5}' /proc/stat)
   busy="$1" idle="$2"
-  cpu_pct="$(num notify_cpu_percent 90)" cpu_runs=$((($(num notify_cpu_minutes 10) + ev_min - 1) / ev_min))
+  cpu_pct="$(num notify_cpu_percent 90)" cpu_runs=$((($(num notify_cpu_minutes 10) + ev_every - 1) / ev_every))
   if read -r b0 i0 2>/dev/null < "$dir/cpu" && [ $((busy + idle - b0 - i0)) -gt 0 ]; then
     pct=$(((busy - b0) * 100 / (busy + idle - b0 - i0)))
     hot="$(cat "$dir/cpu-hot" 2>/dev/null || echo 0)"
     if [ "$pct" -ge "$cpu_pct" ]; then hot=$((hot + 1)); elif [ "$pct" -lt $((cpu_pct - 20)) ]; then hot=0; fi
     printf '%s\n' "$hot" > "$dir/cpu-hot"
     if once cpu [ "$hot" -ge "$cpu_runs" ]; then
-      queue cpu "CPU 已经连续 $((cpu_runs * ev_min)) 分钟以上占用 ${cpu_pct}% 以上（现在 ${pct}%）。最忙的进程：$(ps -eo comm=,pid= --sort=-pcpu | head -n 1 | clean 40)"
+      queue cpu "CPU 已经连续 $((cpu_runs * ev_every)) 分钟以上占用 ${cpu_pct}% 以上（现在 ${pct}%）。最忙的进程：$(ps -eo comm=,pid= --sort=-pcpu | head -n 1 | clean 40)"
     fi
   fi
   printf '%s %s\n' "$busy" "$idle" > "$dir/cpu"
@@ -9549,13 +9553,16 @@ check_timer_ok() {
   fi
 }
 
+# The check runs every check_minutes_tg minutes: missing for that long and 9
+# minutes more (10 minutes with the default 1) it has stopped.
 check_notify() {
-  local last waiting
+  local last waiting every
   [[ -s "$STATE_ROOT/notify.conf" ]] || { verify_set fail 'TG 的设置不见了'; return 0; }
   check_timer_ok || return 0
   last="$(cat -- "$STATE_ROOT/notify/last-run" 2>/dev/null || echo 0)"
   waiting="$(grep -c . "$STATE_ROOT/notify/queue" 2>/dev/null || true)"
-  if (($(date +%s) - last > 600)); then verify_set fail "检查已经超过 10 分钟没跑了（上次：$(audit_when "$last")）"
+  every="$(param_value check_minutes_tg)"
+  if (($(date +%s) - last > (every + 9) * 60)); then verify_set fail "检查已经超过 $((every + 9)) 分钟没跑了（应该每 $every 分钟一次；上次：$(audit_when "$last")）"
   elif ((${waiting:-0} > 20)); then verify_set fail "有 ${waiting} 条消息发不出去：检查网络，或者 Token 是不是被作废了"
   else verify_set pass "每 $(param_value check_minutes_tg) 分钟检查一次，上次在 $(audit_when "$last")$(if ((${waiting:-0})); then echo "，${waiting} 条等着发"; fi)"; fi
 }

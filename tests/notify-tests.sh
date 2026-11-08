@@ -228,7 +228,14 @@ printf 'MemTotal: 1000000 kB\nMemAvailable: 400000 kB\n' > "$F/proc/meminfo"; rm
 sent | grep -Fq '内存快不够了：只剩 40% 可用' || fail "memory threshold: $(sent)"
 printf 'MemTotal: 1000000 kB\nMemAvailable: 600000 kB\n' > "$F/proc/meminfo"
 sed -i '/^notify_cpu_percent=/d; /^notify_cpu_minutes=/d; /^notify_mem_percent=/d' "$PARAMS_FILE"
-printf 'PASS: only the notifications asked for are sent; the CPU and memory thresholds are parameters.\n'
+# The timer every 30 minutes, rarer than these checks' 5: one busy check (a
+# 30-minute average) already covers the 10 minutes asked for, and says 30.
+printf 'notify_cpu_percent=50\ncheck_minutes_tg=30\n' >> "$PARAMS_FILE"
+printf 'cpu 100 0 100 800 0 0 0 0 0 0\n' > "$F/proc/stat"; rm -f "$D/five" "$D/cpu" "$D/cpu-hot" "$D/flag-cpu"; run
+printf 'cpu 700 0 100 1200 0 0 0 0 0 0\n' > "$F/proc/stat"; rm -f "$D/five"; : > "$T/sent"; run
+sent | grep -Fq 'CPU 已经连续 30 分钟以上占用 50% 以上（现在 60%）' || fail "CPU with the timer every 30 minutes: $(sent)"
+sed -i '/^notify_cpu_percent=/d; /^check_minutes_tg=/d' "$PARAMS_FILE"
+printf 'PASS: only the notifications asked for are sent; the CPU and memory thresholds are parameters, the CPU minutes counted as the checks really run.\n'
 
 # The checks of what was done on the machine, every 10 minutes when asked.
 printf 'notify_events_minutes=10\n' >> "$PARAMS_FILE"
@@ -251,6 +258,18 @@ grep -Fxq 'OnCalendar=*:0/1' "$CHECK_TIMER_FILE" && grep -Fxq 'LogLevelMax=notic
 grep -Fxq 'systemctl enable --now vps-stable-check.timer' "$TEST_ROOT/trace" && grep -Fxq 'adopt check_timer_file' "$TEST_ROOT/trace" || fail "timer not started or adopted: $(cat "$TEST_ROOT/trace")"
 # Limited in time; long enough for the acceptance check of the daily summary (60 s).
 grep -Fq "ExecStart=/usr/bin/timeout 110 /bin/bash $STATE_ROOT/notify-check" "$CHECK_SERVICE_FILE" || fail 'the check is not limited in time'
+# vps check: the check has stopped when it missed its interval and 9 minutes
+# more (10 minutes every minute; 39 every 30 minutes).
+: > "$D/queue"
+printf '%s\n' "$(($(date +%s) - 300))" > "$D/last-run"; check_notify
+[[ "$VERIFY_STATUS" == pass ]] || fail "a check 5 minutes ago: $VERIFY_STATUS $VERIFY_TEXT"
+printf '%s\n' "$(($(date +%s) - 1200))" > "$D/last-run"; check_notify
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'超过 10 分钟没跑了'* ]] || fail "a check 20 minutes ago, every minute: $VERIFY_STATUS $VERIFY_TEXT"
+printf 'check_minutes_tg=30\n' >> "$PARAMS_FILE"; check_notify
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'每 30 分钟检查一次'* ]] || fail "a check 20 minutes ago, every 30 minutes: $VERIFY_STATUS $VERIFY_TEXT"
+printf '%s\n' "$(($(date +%s) - 2400))" > "$D/last-run"; check_notify
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'超过 39 分钟没跑了'* ]] || fail "a check 40 minutes ago, every 30 minutes: $VERIFY_STATUS $VERIFY_TEXT"
+sed -i '/^check_minutes_tg=/d' "$PARAMS_FILE"
 # Other intervals when the parameters say so (this tool's timer is written again).
 printf 'check_minutes_tg=3\ncheck_minutes_quota=10\n' >> "$PARAMS_FILE"
 reset; check_reconcile
