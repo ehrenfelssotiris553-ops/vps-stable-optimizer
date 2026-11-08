@@ -17,6 +17,8 @@ load_audit_function() {
 for audit_name in audit_clean_text audit_bounded_lines audit_sshd_values audit_uid0_names audit_passwd_state audit_listener_rows audit_ufw_ipv6 audit_mem_values audit_disk_risks audit_journal_counts audit_accounts audit_authorized_keys audit_network docker_present docker_firewall_note security_audit audit_journal_health health_report; do
   load_audit_function "$audit_name"
 done
+# The switch for published Docker ports is off here.
+dockerfw_on() { return 1; }
 PASS=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 passed() { PASS=$((PASS+1)); printf 'PASS: %s\n' "$*"; }

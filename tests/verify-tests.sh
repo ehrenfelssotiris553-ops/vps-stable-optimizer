@@ -76,11 +76,11 @@ out="$(verify_module hostname '主机名' check_pass | sed $'s/\033\\[[0-9;]*m//
 [[ "$out" == *'主机名：没有开启（一键开荒不管这一项'* && "$out" != *开荒记录* ]] || fail "hostname without a record: $out"
 # The list of such items matches what one-click setup really runs.
 setup_stages="$(awk '/^main\(\) \{$/,/^\}$/' "$TEST_SCRIPT" | sed -n 's/^ *\(stage\|setup\)_run \([a-z_]*\) .*/\2/p' | sort -u | tr '\n' ' ')"
-for module in hostname conntrack ping notify quota dockerlog sshport; do
+for module in hostname conntrack ping notify quota dockerlog sshport dockerfw databackup; do
   [[ " $setup_stages " != *" $module "* ]] || fail "$module is set up by one-click setup, yet called an item it never touches"
 done
 for module in $(awk '/^verify_checks\(\) \{$/,/^\}$/' "$TEST_SCRIPT" | sed -n "s/^ *verify_module \([a-z_]*\) .*/\1/p"); do
-  case "$module" in hostname|conntrack|ping|notify|quota|dockerlog|sshport|upgrade|tools|traffic) continue ;; esac
+  case "$module" in hostname|conntrack|ping|notify|quota|dockerlog|sshport|dockerfw|databackup|upgrade|tools|traffic) continue ;; esac
   [[ " $setup_stages " == *" $module "* ]] || fail "$module is not set up by one-click setup: add it to the items verify_module calls not part of it"
 done
 verify_module bbr 'BBR' check_pass > /dev/null

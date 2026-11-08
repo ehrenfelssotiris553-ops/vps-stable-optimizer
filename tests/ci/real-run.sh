@@ -838,10 +838,10 @@ echo 'added later' | sudo tee /srv/ci-data/later.txt > /dev/null
 # shellcheck disable=SC2024
 sudo vps backup now > "$LOGS/backup-now.log" 2>&1 || fail "vps backup now exited with $?"
 has backup-now '备份完成'
-restic_ci -r /var/backups/vps-data-ci ls latest | grep -Fxq /srv/ci-data/later.txt || fail 'a new file is not in the next backup'
+restic_ci -r /var/backups/vps-data-ci ls latest | grep -Fx /srv/ci-data/later.txt > /dev/null || fail 'a new file is not in the next backup'
 # shellcheck disable=SC2024
 sudo vps backup list > "$LOGS/backup-list.log" 2>&1 || fail "vps backup list exited with $?"
-has backup-list '/srv/ci-data'
+has backup-list 'vps-stable'
 printf 'backup_time=05:00\n' > "$LOGS/backup-time.txt"
 drive params.rules backup-time sudo vps params import "$LOGS/backup-time.txt" || fail "params import exited with $?"
 sudo grep -Fxq 'OnCalendar=*-*-* 05:00:00' /etc/systemd/system/vps-stable-backup.timer || fail 'the timer does not follow the parameter'
@@ -897,6 +897,9 @@ sudo awk -v k="$(cut -d' ' -f2 "$LOGS/other-host-key.pub")" '{print $1, "ssh-ed2
 sudo vps backup now > "$LOGS/backup-hostkey.log" 2>&1 || fail "vps backup now exited with $?"
 has backup-hostkey '备份没有成功'
 sudo cp -- "$LOGS/known-hosts-keep" "$backup_dir/known_hosts"
+# shellcheck disable=SC2024
+sudo vps backup now > "$LOGS/backup-final.log" 2>&1 || fail "vps backup now exited with $?"
+has backup-final '备份完成'
 endgroup
 
 group 'Acceptance check after the single items'

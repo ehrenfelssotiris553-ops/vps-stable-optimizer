@@ -45,6 +45,9 @@ load_optimizer_functions notify_event_names setup_skippable menu_alert_names men
 # Which Fail2ban ban action is in place (the check, the plan, the firewall
 # pause and the resources read it); none unless a test writes the file.
 load_optimizer_functions f2b_action_text f2b_action_legacy_text f2b_action_kind 2>/dev/null || true
+# The switch for published Docker ports is off, unless a test says otherwise;
+# dockerfw-tests loads the real one.
+dockerfw_on() { return 1; }
 # The rollback tables, which every restore_* lookup reads.
 load_optimizer_functions restore_table restore_group_table 2>/dev/null || true
 F2B_ACTION_FILE="${F2B_ACTION_FILE:-/nonexistent/vps-test-f2b-action}"

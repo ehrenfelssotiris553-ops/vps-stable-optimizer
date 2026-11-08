@@ -98,7 +98,7 @@ from_outside() { [[ "$(sudo ip netns exec ci-outside curl -s -m 3 --interface "$
 # SOURCE: up to some seconds, for the path unit to have followed UFW.
 opens() { local i; for ((i = 0; i < 12; i++)); do if from_outside "${1:-198.18.0.2}"; then return 0; fi; sleep 1; done; return 1; }
 closes() { local i; for ((i = 0; i < 12; i++)); do if ! from_outside "${1:-198.18.0.2}"; then return 0; fi; sleep 1; done; return 1; }
-in_set() { sudo nft list set inet vps-stable-docker open_tcp 2>/dev/null | grep -Eq "[ ,{]$1[ ,}]"; }
+in_set() { sudo nft list set inet vps-stable-docker open_tcp 2>/dev/null | grep -E "[ ,{]$1[ ,}]" > /dev/null; }
 table_there() { sudo nft list table inet vps-stable-docker > /dev/null 2>&1; }
 opens || fail 'the baseline is wrong: the published port should answer from outside, past the firewall'
 dockerfw_index="$(item_index dockerfw)" || fail 'no single item dockerfw'
@@ -132,11 +132,12 @@ opens 198.18.0.2 || fail 'allowed for one source, closed for it'
 closes 198.18.0.3 || fail 'allowed for one source, open for another'
 sudo ufw delete allow from 198.18.0.2 to any port 8081 proto tcp > /dev/null
 closes || fail 'source rule taken out, still open'
-# Several commands in a row: the last ones are not lost.
-sudo ufw allow 18082/tcp > /dev/null; sudo ufw allow 18083/tcp > /dev/null; sudo ufw allow 18084/tcp > /dev/null
-for ((i = 0; i < 15; i++)); do if in_set 18082 && in_set 18083 && in_set 18084; then break; fi; sleep 1; done
-if ! { in_set 18082 && in_set 18083 && in_set 18084; }; then fail "rules added in a row went missing: $(sudo nft list set inet vps-stable-docker open_tcp)"; fi
-for port in 18082 18083 18084; do sudo ufw delete allow "$port/tcp" > /dev/null; done
+# Several commands in a row: the last ones are not lost. (Not neighbours: nft
+# shows those as one range.)
+sudo ufw allow 18082/tcp > /dev/null; sudo ufw allow 18092/tcp > /dev/null; sudo ufw allow 18102/tcp > /dev/null
+for ((i = 0; i < 15; i++)); do if in_set 18082 && in_set 18092 && in_set 18102; then break; fi; sleep 1; done
+if ! { in_set 18082 && in_set 18092 && in_set 18102; }; then fail "rules added in a row went missing: $(sudo nft list set inet vps-stable-docker open_tcp)"; fi
+for port in 18082 18092 18102; do sudo ufw delete allow "$port/tcp" > /dev/null; done
 # Docker restarted: still held back. The firewall paused: nothing is.
 sudo systemctl restart docker
 sudo docker start web > /dev/null
@@ -153,7 +154,7 @@ if table_there; then fail 'the rules stayed after switching off'; fi
 opens || fail 'still closed after switching off'
 # On again, keeping the running port open: the check passes, the rollback below takes the rule back.
 dockerfw_item dockerfw-on-again 1 '继续让外面访问这些端口吗 ==> y' '从外面打开你的网站 ==> CONNECTED'
-sudo ufw show added | grep -Fxq 'ufw allow 8081/tcp' || fail 'the running port was not added to the firewall'
+sudo ufw show added | grep -Fx 'ufw allow 8081/tcp' > /dev/null || fail 'the running port was not added to the firewall'
 opens || fail 'kept open as asked, closed from outside'
 rc=0; drive check.rules check-dockerfw sudo vps check || rc=$?
 [[ "$rc" == 0 || "$rc" == 3 ]] || fail "check exited with $rc"
@@ -175,7 +176,7 @@ backup_index="$(item_index databackup)" || fail 'no single item databackup'
 drive "$LOGS/backup-s3.rules" backup-s3 sudo vps item || fail "data backup to S3 exited with $?"
 has backup-s3 '数据备份已开启'
 has backup-s3 '恢复演练通过'
-sudo docker exec minio ls /data/ci-bucket/vps/one | grep -Fxq config || fail 'nothing arrived in the bucket'
+sudo docker exec minio ls /data/ci-bucket/vps/one | grep -Fx config > /dev/null || fail 'nothing arrived in the bucket'
 lacks backup-s3 'cisecretvalue123'
 if sudo grep -rlF --exclude=conf -- cisecretvalue123 /var/lib/vps-stable-opt /var/backups/vps-stable-opt | grep .; then fail 'the storage secret is in a log or backup of the tool'; fi
 [[ "$(sudo stat -c %a /var/lib/vps-stable-opt/databackup/conf)" == 600 ]] || fail 'the settings with the storage secret are readable by others'
