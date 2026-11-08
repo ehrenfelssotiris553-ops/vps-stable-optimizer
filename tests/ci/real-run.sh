@@ -138,7 +138,8 @@ if [[ "$mode" == upgrade ]]; then
   cmp -s /usr/local/bin/vps <(awk '/^cat > "\$TMP_DIR\/launcher" <</ {f = 1; next} f && /^EOF$/ {exit} f' "$ROOT/install.sh") ||
     fail "the launcher of $old_version was not replaced: $(cat /usr/local/bin/vps)"
   # Its Fail2ban bans stay UFW rules until Fail2ban is turned on again.
-  F2B_BANS=ufw
+  # Up to 2.8 each ban was a UFW rule; from 2.9 on an element of the nftables sets.
+  if ! grep -Fq 'table inet vps-stable-f2b' "$LOGS/old-vps-stable-opt.sh"; then F2B_BANS=ufw; fi
   endgroup
 else
   group 'Install from the checkout'
