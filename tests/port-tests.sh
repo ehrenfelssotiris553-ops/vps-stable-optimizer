@@ -116,7 +116,14 @@ port_open 3306 tcp 203.0.113.5 > "$TEST_ROOT/out"
 reset
 DOCKER=1
 port_open 8080 tcp '' > "$TEST_ROOT/out"
-grep -Fq 'Docker' "$TEST_ROOT/out" || fail 'Docker bypass note missing'
+grep -Fq '绕过 UFW' "$TEST_ROOT/out" || fail 'Docker bypass note missing'
+# With the switch on those ports do follow these rules.
+reset
+dockerfw_on() { return 0; }
+port_open 8080 tcp '' > "$TEST_ROOT/out"
+if grep -Fq '绕过' "$TEST_ROOT/out"; then fail 'says container ports bypass the firewall with the switch on'; fi
+grep -Fq '也按这里的规则放行' "$TEST_ROOT/out" || fail 'no word on what counts with the switch on'
+dockerfw_on() { return 1; }
 DOCKER=0
 
 reset

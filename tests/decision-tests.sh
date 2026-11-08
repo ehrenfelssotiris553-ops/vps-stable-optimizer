@@ -120,6 +120,20 @@ ROOT_FS=btrfs
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '系统盘是 btrfs：本工具只在 ext4、xfs 上建硬盘 Swap。'
 ROOT_FS=ext4
+# The plan says what the parameters say, not the recommended values.
+printf 'swap_min_free_gb=7\njournal_auto_disk_gib=15\n' > "$TEST_ROOT/params"; PARAMS_FILE="$TEST_ROOT/params"
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '系统盘至少留 7 GB'
+assert_contains '系统盘不大于 15GiB'
+printf 'auto_swap_below_mib=512\n' > "$TEST_ROOT/params"
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_absent '用不了 ZRAM'
+ZRAM_MODULE=1
+printf 'zram_percent=33\nzram_algorithm=lz4\n' > "$TEST_ROOT/params"
+decision_report 0 0 > "$TEST_ROOT/report"
+assert_contains '约内存 33% 大小的 ZRAM（lz4 压缩'
+ZRAM_MODULE=0
+PARAMS_FILE=/nonexistent/params
 # Found on a real VPS: a machine already set up still showed Fail2ban as
 # "准备调整". This tool's jail in place and running is kept as it is.
 assert_contains '配置 SSH 防爆破'

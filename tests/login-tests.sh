@@ -178,6 +178,7 @@ printf '%s\troot\t198.51.100.66\tpassword\tssh\t1\n%s\troot\t198.51.100.77\tpass
 : > "$STATE_ROOT/known"
 out="$(menu_login_alert)"
 [[ "$out" == *'陌生 IP 登录过：198.51.100.77（root，'* && "$out" != *198.51.100.66* && "$out" != *203.0.113.5* ]] || fail "menu alert: $out"
+[[ "$out" == *'菜单 6 安全排查'* ]] || fail "the alert points to the wrong menu entry: $out"
 printf 'ip 198.51.100.77\n' > "$STATE_ROOT/known"
 [[ -z "$(menu_login_alert)" ]] || fail 'an address marked as normal still alerted'
 : > "$STATE_ROOT/known"

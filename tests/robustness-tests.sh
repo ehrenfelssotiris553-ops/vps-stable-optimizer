@@ -143,6 +143,15 @@ item_main > /dev/null
 reset; U=0 K=0
 item_main > /dev/null
 if grep -Fxq offer "$T/trace"; then fail 'reboot offered although nothing was upgraded in this session'; fi
+# A change of the SSH port whose session was lost is finished first (a real VPS
+# kept the firewall rule for the new port); nothing pending, nothing happens.
+STATE_ROOT="$T"; printf 'new=1\n' > "$T/sshport-pending"
+stage_run() { record "stage $*"; }
+reset; U=0 K=0; item_main > /dev/null
+grep -Fxq 'stage sshport ssh_port_settle' "$T/trace" || fail "the unconfirmed port change not finished: $(tr '\n' ' ' < "$T/trace")"
+rm -f "$T/sshport-pending"; reset; item_main > /dev/null
+if grep -q ssh_port_settle "$T/trace"; then fail 'settled with nothing pending'; fi
+stage_run() { :; }; unset STATE_ROOT
 printf 'PASS: single-item menu offers a reboot only after its own upgrade.\n'
 
 # Menu 11 / vps reboot: says why a reboot is (not) needed, refuses while an SSH
@@ -235,7 +244,8 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
   current=run-20261107T000000Z-2-bbbbbb previous=run-20261101T000000Z-1-aaaaaa
   session() {
     rm -rf "$T/rs"
-    mkdir -p "$STATE_ROOT/$previous" "$STATE_ROOT/$current" "$BACKUP_ROOT/$current" "$LOG_DIR" "$RUN_CHANGE_ETC" "$STATE_ROOT/notify" "$STATE_ROOT/restore-v2/ssh_dropin"
+    mkdir -p "$STATE_ROOT/$previous" "$STATE_ROOT/$current" "$BACKUP_ROOT/$current" "$LOG_DIR" "$RUN_CHANGE_ETC" "$STATE_ROOT/notify" "$STATE_ROOT/restore-v2/ssh_dropin" "$STATE_ROOT/databackup/cache"
+    : > "$STATE_ROOT/databackup/conf"; : > "$STATE_ROOT/databackup/cache/x"
     : > "$RUN_CHANGE_ETC/hosts"; : > "$RUN_CHANGE_DPKG_LOG"; : > "$STATE_ROOT/logins"; : > "$STATE_ROOT/params"
     printf '%s\n' "$previous" > "$STATE_ROOT/latest"
     [[ "$(run_latest_id)" == "$previous" ]] || fail 'the latest run before the session'
@@ -251,14 +261,15 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
   # (verified_boot: a vps check right before the session, as on the CI, where
   # it fell inside the second the mark goes back and kept the record.)
   for f in "$STATE_ROOT/logins" "$STATE_ROOT/logins.lock" "$STATE_ROOT/notify/queue" "$RUN_LOG" "$RUN_STATE_DIR/stages.tsv" "$STATE_ROOT/latest" \
-      "$STATE_ROOT/optimizer.lock" "$STATE_ROOT/verified_boot"; do
+      "$STATE_ROOT/optimizer.lock" "$STATE_ROOT/verified_boot" "$STATE_ROOT/databackup/cache/x" "$STATE_ROOT/databackup/last" \
+      "$STATE_ROOT/databackup/last.log" "$STATE_ROOT/databackup/lock" "$STATE_ROOT/databackup/drill.log" "$STATE_ROOT/databackup"; do
     touch -d "$later" "$f"
   done
   if run_state_changed; then fail 'a session that only looked counted as a change'; fi
   run_state_discard "$previous" > /dev/null
   [[ ! -e "$STATE_ROOT/$current" && ! -e "$BACKUP_ROOT/$current" && ! -e "$LOG_DIR/run-x.log" ]] || fail 'the record of a session that only looked stayed'
   [[ "$(cat "$STATE_ROOT/latest")" == "$previous" && -d "$STATE_ROOT/$previous" && -z "$RUN_STATE_DIR" ]] || fail "latest after the session: $(cat "$STATE_ROOT/latest")"
-  for f in "$RUN_CHANGE_ETC/hosts" "$RUN_CHANGE_ETC/new.conf" "$RUN_CHANGE_DPKG_LOG" "$STATE_ROOT/params" "$STATE_ROOT/restore-v2/ssh_dropin/state" "$STATE_ROOT/modules-x"; do
+  for f in "$RUN_CHANGE_ETC/hosts" "$RUN_CHANGE_ETC/new.conf" "$RUN_CHANGE_DPKG_LOG" "$STATE_ROOT/params" "$STATE_ROOT/restore-v2/ssh_dropin/state" "$STATE_ROOT/modules-x" "$STATE_ROOT/databackup/conf"; do
     session; touch -d "$later" "$f"
     run_state_changed || fail "a change of ${f#"$T/rs/"} not seen"
   done

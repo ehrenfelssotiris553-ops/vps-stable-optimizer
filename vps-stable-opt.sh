@@ -148,7 +148,7 @@ VPS 机器管家 V3.1.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
   vps params     参数总览（现在的值、推荐值和理由）；vps params export 导出，vps params import [文件] 导入
   vps bans       查看 Fail2ban 封禁记录，可以解封某个 IP
   vps reboot     重启服务器（先说明是否需要重启；防失联确认或软件安装没结束时不重启）
-  vps firewall   设置防火墙与 SSH 防爆破（需已有 UFW）
+  vps firewall   设置防火墙与 SSH 防爆破（没装 UFW 会先装上）
   vps ssh        SSH 登录加固（只允许密钥登录，可选新建管理员并禁止 root 直接登录）
   vps records    查看操作记录和配置备份
   vps rollback   撤销本工具做过的设置（全部或只撤销某一项），可选卸载新装的软件包
@@ -1170,7 +1170,7 @@ apt_upgrade_stage() {
     module_result upgrade declined 'system upgrade not requested'
     ok '按你的选择，没有升级系统软件。'
   fi
-  for pkg in ufw iproute2 procps util-linux; do
+  for pkg in iproute2 procps util-linux $(if ! setup_skipped firewall; then echo ufw; fi); do
     if available "$pkg"; then packages+=("$pkg"); else warn "找不到软件包：$pkg"; fi
   done
   if (( AUTO_UPDATES )); then
@@ -2916,7 +2916,9 @@ param_apply() {
     general) ok '已保存：下次用到时就按新的参数。'; return 0 ;;
     # Read at every run; only the time is in a unit.
     databackup)
-      if databackup_on; then databackup_units_write; fi
+      if databackup_on && ! databackup_units_write; then
+        warn '定时任务没能按新的参数更新（定时文件可能被手动改过）：备份内容按新参数，时间还是原来的。'; return 0
+      fi
       ok '已保存：下次备份就按新的参数。'; return 0 ;;
     # Key-only login with other session limits: under a guard, like the hardening.
     ssh) stage_run ssh ssh_dropin_refresh; return 0 ;;
@@ -3427,7 +3429,7 @@ menu_login_alert() {
   while IFS=$'\t' read -r when user ip; do
     [[ -n "$ip" ]] || continue
     if [[ -f "$STATE_ROOT/known" ]] && grep -Fxq "ip $ip" "$STATE_ROOT/known"; then continue; fi
-    printf '%s%s 陌生 IP 登录过：%s（%s，%s）。不是你的话马上处理；是你自己就在 7 安全排查里标记为正常。%s\n' \
+    printf '%s%s 陌生 IP 登录过：%s（%s，%s）。不是你的话马上处理；是你自己就在菜单 6 安全排查里标记为正常。%s\n' \
       "${C_FAIL-}" "${SYM_WARN-⚠}" "$ip" "$user" "$(date -d "@$when" '+%m-%d %H:%M' 2>/dev/null || echo '?')" "${C_RESET-}"
   done < <(login_recent 2000 | awk -F'\t' -v cut=$((now - $(param_value menu_alert_days 2>/dev/null || echo 3) * 86400)) '$1 >= cut && $6 == 1 {print $1 "\t" $2 "\t" $3}' | tail -n 3)
 }
@@ -4546,7 +4548,10 @@ dockerfw_stage() {
   why="$(dockerfw_unsupported)"
   if [[ -n "$why" ]]; then warn "$why"; module_result dockerfw unsupported 'not available here'; return 0; fi
   if guard_leftovers; then module_result dockerfw skipped 'earlier protection timer pending'; return 0; fi
-  if ! command -v nft >/dev/null && ! install_pkgs nftables; then warn 'nftables 没能安装，这一项没有开启。'; module_result dockerfw failed 'nftables missing'; return 0; fi
+  if ! command -v nft >/dev/null; then
+    apt_index_ready || true
+    if ! install_pkgs nftables; then warn 'nftables 没能安装，这一项没有开启。'; module_result dockerfw failed 'nftables missing'; return 0; fi
+  fi
   command -v nft >/dev/null || { warn '找不到 nft 命令，这一项没有开启。'; module_result dockerfw failed 'nft missing'; return 0; }
   while IFS=$'\t' read -r line name; do
     [[ -n "$line" ]] || continue
@@ -4865,6 +4870,10 @@ ufw_sysctl_keys() {
 firewall_stage() {
   step 14 '防火墙（需要新 SSH 窗口确认）'
   FIREWALL_READY=0
+  # vps firewall on a machine that never ran the setup: what it needs comes first.
+  if ! command -v ufw >/dev/null && [[ "$MODE" == firewall ]]; then
+    if apt_index_ready && available ufw; then install_pkgs ufw || warn 'UFW 没能安装。'; fi
+  fi
   command -v ufw >/dev/null || { warn '还没有安装 ufw，请先运行一键开荒。'; module_result firewall skipped 'ufw missing'; return 0; }
   local state rules p ip unit deadline since ssh_verb=limit web=0 line key value
   local -a listeners=() extra=()
@@ -5346,13 +5355,6 @@ ssh_effective_value() {
   awk -v key="$2" 'tolower($1) == key {sub(/^[^ ]+ /, ""); print; exit}' <<< "$1"
 }
 
-# sudo's success record "USER : TTY=... ; USER=root ; COMMAND=/usr/bin/true",
-# written as root. Failed attempts put text before TTY= ("3 incorrect password
-# attempts", "user NOT in sudoers") and a line from `logger -t sudo` by a local
-# user is not written as root: neither counts.
-# sudo logs under the real UID of the account that ran it, so lines from that
-# account (or root) count; a line another local user writes with
-# `logger -t sudo` carries that user's UID and is ignored.
 # CHECK ARGS...: true as soon as a look in the journal finds it. The journal can
 # be a moment behind what just happened (seen on a 512 MiB machine: sudo had run,
 # the check right after it found nothing and asked "are you sure").
@@ -5365,6 +5367,13 @@ journal_settle() {
   "$@"
 }
 
+# sudo's success record "USER : TTY=... ; USER=root ; COMMAND=/usr/bin/true",
+# written as root. Failed attempts put text before TTY= ("3 incorrect password
+# attempts", "user NOT in sudoers") and a line from `logger -t sudo` by a local
+# user is not written as root: neither counts.
+# sudo logs under the real UID of the account that ran it, so lines from that
+# account (or root) count; a line another local user writes with
+# `logger -t sudo` carries that user's UID and is ignored.
 ssh_sudo_seen() {
   local user="$1" since="$2" uid
   command -v journalctl >/dev/null || return 1
@@ -5890,8 +5899,10 @@ ssh_port_stage() {
     warn 'sshd 不接受新的端口设置，已撤回。'; module_result sshport failed 'sshd -t failed'; return 0
   fi
   unit="vps-stable-ssh-revert-$tag"
+  printf 'new=%s\nold=%s\ntag=%s\nunit=%s\nfw=%s\n' "$new" "$old" "$tag" "$unit" "$fw" > "$STATE_ROOT/sshport-pending"
   if ! guard_arm "$unit" /bin/sh -c "if [ -s '$STATE_ROOT/sshport-previous' ]; then cp -f '$STATE_ROOT/sshport-previous' '$SSH_PORT_DROPIN'; else rm -f '$SSH_PORT_DROPIN'; fi$(sshd_lines_on_cmd sshport "$tag" "${off_files[@]}"); if systemctl is-active -q ssh.socket; then systemctl daemon-reload; systemctl restart ssh.socket; else systemctl try-reload-or-restart ssh.service; fi"; then
     ssh_port_restore_previous "$tag" "${off_files[@]}"; if ((fw)); then ssh_port_fw_close "$new" || true; fi
+    rm -f -- "$STATE_ROOT/sshport-pending"
     warn '无法启用自动撤销计时器；什么都没改。'; module_result sshport failed 'guard not armed'; return 0
   fi
   deadline=$((SECONDS + $(param_value guard_seconds)))
@@ -5900,6 +5911,7 @@ ssh_port_stage() {
     ssh_port_restore_previous "$tag" "${off_files[@]}"; ssh_port_reload || true
     if ((fw)); then ssh_port_fw_close "$new" || true; fi
     systemctl stop "$unit.timer" 2>/dev/null || true
+    rm -f -- "$STATE_ROOT/sshport-pending"
     warn "SSH 没能同时在 $old 和 $new 上监听，已恢复原样。"; module_result sshport failed 'not listening'; return 0
   fi
   ssh_port_follow
@@ -5909,6 +5921,7 @@ ssh_port_stage() {
   ssh -p $new 账户名@服务器IP
 新端口上一有登录，这里几秒内就会自动确认；没有自动确认时回到这个窗口输入 CONNECTED。$(param_value guard_seconds) 秒内没有确认就恢复原样。"
   if guard_confirm "$unit" "$deadline" ssh_port_login_seen "$new" "$since"; then
+    rm -f -- "$STATE_ROOT/sshport-pending"
     # 3. Only the new port: sshd, then this tool's rules for the old one.
     rm -f -- "$SSH_PORT_DROPIN"
     if put_file "$SSH_PORT_DROPIN" "$(ssh_port_text "$new")" && sshd -t && ssh_port_reload && port_listening "$new"; then
@@ -5931,7 +5944,33 @@ ssh_port_stage() {
   else warn 'SSH 重新加载失败：自动撤销计时器保留，到期时会再试一次。'; fi
   if ((fw)); then ssh_port_fw_close "$new" || true; fi
   ssh_port_follow
+  rm -f -- "$STATE_ROOT/sshport-pending"
   module_result sshport failed 'new port not confirmed; reverted'
+}
+
+# A change whose session ended before the confirmation (a lost connection, a
+# reboot): the timer only puts sshd back, so a real VPS kept UFW's rule for the
+# new port and Fail2ban on both ports. The next run does the rest and says so.
+# A reboot before the timer fired leaves both ports in the file: back too.
+ssh_port_settle() {
+  local file="$STATE_ROOT/sshport-pending" new old tag unit fw
+  local -a off_files=()
+  [[ -s "$file" && ! -L "$file" ]] || return 0
+  new="$(sed -n 's/^new=//p' "$file")" old="$(sed -n 's/^old=//p' "$file")" tag="$(sed -n 's/^tag=//p' "$file")"
+  unit="$(sed -n 's/^unit=//p' "$file")" fw="$(sed -n 's/^fw=//p' "$file")"
+  if [[ ! "$new" =~ ^[0-9]{1,5}$ || ! "$old" =~ ^[0-9]{1,5}$ || ! "$tag" =~ ^[0-9]+-[0-9]+$ || "$unit" != "vps-stable-ssh-revert-$tag" ]]; then
+    rm -f -- "$file"; return 0
+  fi
+  if active "$unit.timer"; then return 0; fi
+  if [[ -f "$SSH_PORT_DROPIN" ]] && grep -qx "Port $new" "$SSH_PORT_DROPIN"; then
+    mapfile -t off_files < <(sshd_off_files sshport "$tag")
+    ssh_port_restore_previous "$tag" "${off_files[@]}"
+    ssh_port_reload || true
+  fi
+  if [[ "$fw" == 1 ]]; then ssh_port_fw_close "$new" || true; fi
+  ssh_port_follow
+  rm -f -- "$file"
+  warn "上次改 SSH 端口没有等到确认（连接断了或者重启了）：SSH 已回到原来的端口 $old，这次多出来的防火墙规则也删掉了。"
 }
 
 # Rollback only widens access: the port SSH goes back to is let in first.
@@ -5939,6 +5978,7 @@ restore_sshport_group() {
   local port verb p new_ports
   local -a files=()
   mapfile -t files < <(sshd_off_files sshport)
+  rm -f -- "$STATE_ROOT/sshport-pending"
   restore_needed sshport_dropin || ((${#files[@]})) || return 0
   port="$(sed -n 's/^port=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)" verb="$(sed -n 's/^verb=//p' "$RESTORE_ROOT/sshport" 2>/dev/null || true)"
   if [[ "$port" =~ ^[0-9]{1,5}$ ]] && ufw_active; then
@@ -6883,7 +6923,8 @@ run_state_changed() {
   if [[ -f "$dpkg_log" && "$dpkg_log" -nt "$mark" ]]; then return 0; fi
   [[ -n "$(find "$STATE_ROOT" -mindepth 1 -xdev -newer "$mark" ! -path "$STATE_ROOT/run-*" ! -path "$LOG_DIR" ! -path "$LOG_DIR/*" \
     ! -path "$STATE_ROOT/notify" ! -path "$STATE_ROOT/notify/*" ! -name 'logins*' ! -name latest ! -name '.latest.*' ! -name optimizer.lock \
-    ! -name verified_boot -print -quit 2>/dev/null)" ]]
+    ! -name verified_boot ! -path "$STATE_ROOT/databackup" ! -path "$STATE_ROOT/databackup/cache*" ! -path "$STATE_ROOT/databackup/last*" \
+    ! -path "$STATE_ROOT/databackup/drill*" ! -path "$STATE_ROOT/databackup/lock" -print -quit 2>/dev/null)" ]]
 }
 
 # PREVIOUS: a menu session only looked: its record, configuration backup and
@@ -7393,6 +7434,8 @@ databackup_finish() {
 databackup_drill() {
   local d="$STATE_ROOT/databackup" tmp list line good=1
   local -a sample=() includes=()
+  # Left by a drill that was cut off (it holds restored files): not for long.
+  find /var/tmp -maxdepth 1 -type d -name 'vps-backup-drill.*' -mmin +120 -exec rm -rf --one-file-system -- {} + 2>/dev/null || true
   databackup_restic check > "$d/drill.log" 2>&1 || return 1
   list="$(databackup_restic ls --long latest 2>> "$d/drill.log")" || return 1
   mapfile -t sample < <(awk 'NF == 7 && $1 ~ /^-/ && $4 + 0 > 0 && $4 + 0 <= 1048576 && $7 !~ /[][*?\\]/ {print $4 "\t" $7}' <<< "$list" | shuf -n 10 || true)
@@ -7427,7 +7470,8 @@ databackup_run() {
   done
   ((${#paths[@]})) || { databackup_finish fail '要备份的目录都不存在'; return 1; }
   read -r -a excludes <<< "$(param_value backup_exclude)"
-  args=(--one-file-system --exclude-caches --tag vps-stable --exclude "$d")
+  # What a restore brought back (/root/vps-restore-*) is a copy of the backups.
+  args=(--one-file-system --exclude-caches --tag vps-stable --exclude "$d" --exclude '/root/vps-restore-*')
   if [[ "${excludes[0]:-none}" != none ]]; then
     for p in "${excludes[@]}"; do args+=(--exclude "$p"); done
   fi
@@ -7547,7 +7591,10 @@ databackup_ask_s3() {
 
 databackup_ask_rclone() {
   local target
-  if ! command -v rclone >/dev/null; then install_pkgs rclone || { warn '没能安装 rclone。'; return 1; }; fi
+  if ! command -v rclone >/dev/null; then
+    apt_index_ready || true
+    install_pkgs rclone || { warn '没能安装 rclone。'; return 1; }
+  fi
   if [[ -z "$(rclone listremotes 2>/dev/null || true)" ]]; then
     warn '还没有配置网盘：先运行 rclone config 配好，再回到这里。'; return 1
   fi
@@ -7898,10 +7945,10 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge $((ev_min * 60 - 10)) ]; then
       done
     done; }
   new_lines keys keys | while read -r a fp c; do queue key "加了公钥：账户 $(printf '%s' "$a" | clean 32)，$fp（$(printf '%s' "$c" | clean 60)）"; done
-  ports() { ss -H -tulpn | awk '$5 !~ /^(127\.|\[::1\]|::1)/ {n = split($5, a, ":"); match($0, /\("[^"]*"/); p = substr($0, RSTART + 2, RLENGTH - 3); print a[n] "/" $1 (p != "" ? "（" p "）" : "")}'; }
+  ports() { ss -H -tulpn | awk '$5 !~ /^(127\.|\[::1\]|::1)/ {n = split($5, a, ":"); match($0, /\("[^"]*"/); p = substr($0, RSTART + 2, RLENGTH - 3); if ($1 == "udp" && p ~ /^(systemd-timesyn|dhclient|dhcpcd|chronyd)/) next; print a[n] "/" $1 (p != "" ? "（" p "）" : "")}'; }
   new_lines ports ports | while read -r p; do queue port "新开了端口：$(printf '%s' "$p" | clean 60)"; done
   autostart() {
-    find /etc/systemd/system -maxdepth 2 \( -name '*.service' -o -name '*.timer' \) ! -name 'vps-stable-*' -printf '%p\n'
+    find /etc/systemd/system -maxdepth 2 \( -name '*.service' -o -name '*.timer' \) ! -name 'vps-stable-*' -printf '%p\n' | LC_ALL=C sort | awk -F/ '!seen[$NF]++'
     find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron/crontabs -maxdepth 1 -type f -printf '%p\n'; }
   new_lines autostart autostart | head -n 10 | while read -r p; do queue autostart "新加了开机自启或定时任务：$(printf '%s' "$p" | clean 120)"; done
   # The CPU busy for a while (that many checks in a row, EV_EVERY minutes apart).
@@ -8068,6 +8115,31 @@ check_reconcile() {
   fi
 }
 
+# TG or the traffic alert undone from `vps rollback`, which is no run (put_file
+# has no backups to go by there): the timer goes with the last of them, or
+# follows the one still on. With both on, a real VPS reported a partial rollback.
+check_after_rollback() {
+  local interval text now temp
+  if [[ ! -s "$STATE_ROOT/notify.conf" && ! -s "$STATE_ROOT/quota.conf" ]]; then check_remove; return 0; fi
+  [[ -f "$CHECK_TIMER_FILE" && ! -L "$CHECK_TIMER_FILE" ]] || return 0
+  interval="$(param_value check_minutes_quota)"
+  [[ ! -s "$STATE_ROOT/notify.conf" ]] || interval="$(param_value check_minutes_tg)"
+  text="$(check_timer_text "$interval")"
+  now="$(cat -- "$CHECK_TIMER_FILE")"
+  [[ "$now" != "$text" ]] || return 0
+  case "$now" in
+    "$(check_timer_text "$(param_value check_minutes_tg)")"|"$(check_timer_text "$(param_value check_minutes_quota)")") ;;
+    *) warn "$CHECK_TIMER_FILE 被改过，保持不变。"; return 0 ;;
+  esac
+  temp="$(mktemp "$CHECK_TIMER_FILE.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' "$text" > "$temp" || ! chmod 644 -- "$temp" || ! mv -fT -- "$temp" "$CHECK_TIMER_FILE"; then
+    rm -f -- "$temp"; return 1
+  fi
+  systemctl daemon-reload || true
+  systemctl restart vps-stable-check.timer >/dev/null 2>&1 || warn '检查定时任务没能按新的间隔启动。'
+  RESTORE_READY=1 restore_adopt check_timer_file || true
+}
+
 check_remove() {
   local file id
   if [[ "$(systemctl is-enabled vps-stable-check.timer 2>/dev/null || true)" == enabled ]] || systemctl is-active -q vps-stable-check.timer 2>/dev/null; then
@@ -8182,7 +8254,7 @@ menu_quota_alert() {
   low="$(param_value quota_alerts 2>/dev/null | tr ' ' '\n' | sort -n | head -n 1)"
   ((used * 100 >= quota * ${low:-80})) || return 0
   printf '%s%s 这个周期的流量已用 %s GB，是额度 %s GB 的 %s%%（数字以服务商面板为准）。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" \
-    "$((used / 1000))" "$((quota / 1000))" "$((used * 100 / quota))" "${C_RESET-}"
+    "$(awk -v m="$used" 'BEGIN {if (m < 10000) printf "%.1f", m / 1000; else printf "%d", m / 1000}')" "$((quota / 1000))" "$((used * 100 / quota))" "${C_RESET-}"
 }
 
 # Docker's default keeps every line a container writes: a size per log file
@@ -8950,14 +9022,14 @@ decision_report() {
   elif ! zram_module_available; then
     decision_line '保留现状' '内存缓冲（ZRAM）' '这个内核没有 zram 模块（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里），不配置 ZRAM。'
   elif available systemd-zram-generator; then
-    decision_line '准备调整' '内存缓冲（ZRAM）' "内存低于 $(mib_text "$(param_value auto_swap_below_mib)")，未发现 Swap/ZRAM；计划配置约内存一半大小的 ZRAM（zstd 压缩，并配好适合 ZRAM 的 swappiness 和 page-cluster），不创建硬盘 Swap。"
+    decision_line '准备调整' '内存缓冲（ZRAM）' "内存低于 $(mib_text "$(param_value auto_swap_below_mib)")，未发现 Swap/ZRAM；计划配置约内存$(if (($(param_value zram_percent) == 50)); then echo 一半; else echo " $(param_value zram_percent)% "; fi)大小的 ZRAM（$(param_value zram_algorithm) 压缩，并配好适合 ZRAM 的 swappiness 和 page-cluster），不创建硬盘 Swap。"
   else
     decision_line '准备调整' '内存缓冲（ZRAM）' "内存低于 $(mib_text "$(param_value auto_swap_below_mib)")，未发现 Swap/ZRAM；当前软件索引未确认组件可用，更新索引后再检查，不可用就跳过。"
   fi
   # Without ZRAM a small machine gets a disk swap instead.
-  if [[ "${MEM_MIB:-}" =~ ^[0-9]+$ ]] && ((MEM_MIB < 2048)) && ! swap_exists && ! zram_module_available; then
+  if [[ "${MEM_MIB:-}" =~ ^[0-9]+$ ]] && ((MEM_MIB < $(param_value auto_swap_below_mib))) && ! swap_exists && ! zram_module_available; then
     case "$ROOT_FS" in
-      ext4|xfs) decision_line '准备调整' '硬盘 Swap' "用不了 ZRAM：建约 $(param_value swap_mib) MiB 的硬盘 Swap（$SWAP_FILE），系统盘至少留 3 GB。" ;;
+      ext4|xfs) decision_line '准备调整' '硬盘 Swap' "用不了 ZRAM：建约 $(param_value swap_mib) MiB 的硬盘 Swap（$SWAP_FILE），系统盘至少留 $(param_value swap_min_free_gb) GB。" ;;
       *) decision_line '保留现状' '硬盘 Swap' "用不了 ZRAM，系统盘是 $ROOT_FS：本工具只在 ext4、xfs 上建硬盘 Swap。" ;;
     esac
   fi
@@ -8992,7 +9064,7 @@ decision_report() {
       match) decision_line '保留现状' '日志空间' '本工具的日志容量和保留时间限制已经存在。' ;;
       conflict) decision_line '保留现状' '日志空间' '目标日志配置已有不同内容，不会覆盖。' ;;
       unknown) decision_line '需要先处理' '日志空间' '已有日志配置无法读取，计划未确认，需人工检查。' ;;
-      *) decision_line '准备调整' '日志空间' "系统盘不大于 20GiB，计划限制日志：持久日志 $(param_value journal_max_mb)MiB、保留 $(param_value journal_days) 天。" ;;
+      *) decision_line '准备调整' '日志空间' "$(if (($(param_value journal_auto_disk_gib) > 0)); then echo "系统盘不大于 $(param_value journal_auto_disk_gib)GiB"; else echo '按参数不管系统盘多大都限制'; fi)，计划限制日志：持久日志 $(param_value journal_max_mb)MiB、保留 $(param_value journal_days) 天。" ;;
     esac
   fi
 
@@ -9613,7 +9685,7 @@ restore_record_fw_rule() {
   # A port rule, or the SSH rate-limit exemption of one allowlisted address.
   if [[ "$rule" =~ ^ufw\ allow\ from\ ([0-9A-Fa-f:.]+)\ to\ any\ port\ [0-9]{1,5}\ proto\ tcp$ ]]; then
     port_source_valid "${BASH_REMATCH[1]}" || return 1
-  elif [[ ! "$rule" =~ ^ufw\ (allow|limit)\ [0-9]{1,5}/(tcp|udp)$ ]]; then
+  elif [[ ! "$rule" =~ ^ufw\ (allow|limit)\ [0-9]{1,5}(:[0-9]{1,5})?/(tcp|udp)$ ]]; then
     return 1
   fi
   [[ ! -L "$file" && ( ! -e "$file" || ( -f "$file" && -O "$file" ) ) ]] || return 1
@@ -9938,6 +10010,9 @@ restore_at_origin() {
   fp="$(restore_fingerprint "$id")" || return 1
   origin="$(restore_read "$id" origin_fp 2>/dev/null)" || return 1
   [[ "$fp" == "$origin" ]] && return 0
+  # UFW gone (the package removal of an earlier rollback): no switch left to put
+  # back. A real VPS reported a partial rollback the next time.
+  if [[ "$id" == ufw_ipv6 && "$fp" == value:absent ]]; then return 0; fi
   [[ "$origin" == value:absent ]] || return 1
   # Not installed before: installed but switched off is equivalent (packages stay).
   case "$id" in
@@ -10044,8 +10119,8 @@ restore_fw_rules_apply() {
     if [[ "$rule" =~ ^ufw\ allow\ from\ ([0-9A-Fa-f:.]+)\ to\ any\ port\ ([0-9]{1,5})\ proto\ tcp$ ]]; then
       verb=allow; src="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; proto=tcp
       spec=(allow from "$src" to any port "$port" proto tcp)
-    elif [[ "$rule" =~ ^ufw\ (allow|limit)\ ([0-9]{1,5})/(tcp|udp)$ ]]; then
-      verb="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; proto="${BASH_REMATCH[3]}"
+    elif [[ "$rule" =~ ^ufw\ (allow|limit)\ ([0-9]{1,5}(:[0-9]{1,5})?)/(tcp|udp)$ ]]; then
+      verb="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; proto="${BASH_REMATCH[4]}"
       spec=("$verb" "$port/$proto")
     else
       warn "忽略格式异常的规则记录：$rule"; RESTORE_PARTIAL=1; continue
@@ -10485,6 +10560,7 @@ restore_group_pending() {
   done < <(restore_group_ids "$group")
   case "$group" in
     firewall) [[ -s "$RESTORE_ROOT/fw_rules" ]] && return 0 ;;
+    dockerfw) [[ -s "$RESTORE_ROOT/dockerfw_rules" ]] && return 0 ;;
     sysctl) [[ -s "$RESTORE_ROOT/sysctl_runtime" ]] && return 0 ;;
     tcp) [[ -s "$RESTORE_ROOT/tcp_sysctl_runtime" ]] && return 0 ;;
     conntrack) [[ -s "$RESTORE_ROOT/conntrack_sysctl_runtime" ]] && return 0 ;;
@@ -10522,7 +10598,8 @@ restore_group_apply() {
       if [[ "$(restore_read conntrack_file state 2>/dev/null || true)" != applied ]]; then restore_sysctl_runtime conntrack_sysctl_runtime; fi ;;
     notify|quota)
       restore_resource "${group}_conf"
-      check_reconcile || RESTORE_PARTIAL=1 ;;
+      if [[ "${RESTORE_READY:-0}" == 1 ]]; then check_reconcile || RESTORE_PARTIAL=1
+      else check_after_rollback || RESTORE_PARTIAL=1; fi ;;
     check)
       check_remove
       while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids check) ;;
@@ -10982,11 +11059,20 @@ check_zram() {
   else verify_set pass "/dev/zram0 已启用，约 ${size} MiB${algorithm:+，压缩算法 $algorithm}"; fi
 }
 
+# The time servers do not answer (a real VPS: every poll timed out, its
+# provider drops UDP 123).
+ntp_unreachable() {
+  local log
+  log="$(journalctl -u systemd-timesyncd -n 20 --no-pager -o cat 2>/dev/null || true)"
+  [[ "$log" == *'Timed out waiting for reply'* ]]
+}
+
 check_ntp() {
   local up
   if ntp_synced; then verify_set pass '系统时间已同步'; return 0; fi
   up="$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 9999)"
   if ((up < 180)); then verify_set unknown '刚开机不久，时间同步可能还在进行，过几分钟再查'
+  elif ntp_unreachable; then verify_set fail '时间没有同步：连不上任何时间服务器（日志里都是超时），多半是服务商挡了 UDP 123，不是本工具的设置造成的。可以问服务商放行 UDP 123，否则系统时间会慢慢走偏'
   else verify_set fail '时间尚未同步，请检查时间同步服务'; fi
 }
 
@@ -11651,7 +11737,10 @@ port_open() {
   for item in "${items[@]}"; do for proto in "${protos[@]}"; do port_listen_note "$item" "$proto"; done; done
   if ! ufw_active; then warn '防火墙当前没有开启：规则会保存，但要等防火墙开启后才生效。'; fi
   echo '提醒：服务商的安全组（云防火墙）也要放行同样的端口，否则外网仍然连不上。'
-  if docker_present; then echo '注意：Docker 用 -p 发布的容器端口不受这里的规则控制（会绕过 UFW）。'; fi
+  if docker_present; then
+    if dockerfw_on; then echo 'Docker：容器端口也按这里的规则放行，写外面看到的端口（-p 8080:80 就放行 8080）。'
+    else echo '注意：Docker 用 -p 发布的容器端口不受这里的规则控制（会绕过 UFW）；要让它们受防火墙管，打开单项设置里的「Docker 端口受防火墙管」。'; fi
+  fi
   risky="$(port_risky_names "${items[@]}")"
   if [[ -n "$risky" && -z "$src" ]]; then
     warn "这些端口通常不应该对整个公网开放：$risky"
@@ -11912,6 +12001,7 @@ item_state() {
 
 # KEY STATUS: the mark in front of a status in the list.
 item_mark() {
+  case "$2" in *失败*|*暂时不起作用*) printf '%s%s%s ' "${C_WARN-}" "${SYM_WARN-⚠}" "${C_RESET-}"; return 0 ;; esac
   case "$(item_state "$1" "$2")" in
     on) printf '%s%s%s ' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}" ;;
     off) printf '%s%s%s ' "${C_DIM-}" "${SYM_SKIP-○}" "${C_RESET-}" ;;
@@ -12169,7 +12259,7 @@ item_turn_on() {
     dockerfw) DOCKERFW_CHOICE=1
       stage_run dockerfw dockerfw_stage ;;
     databackup) DATABACKUP_CHOICE=1
-      apt_index_ready || return 0
+      if ! installed restic; then apt_index_ready || return 0; fi
       stage_run databackup databackup_stage ;;
     # Only parameters: nothing to turn on.
     general) param_adjust general ;;
@@ -12197,6 +12287,8 @@ item_turn_off() {
   else
     ok "已撤销本工具对「$(item_label "$key")」的修改。"
     if [[ "$key" == ssh ]]; then f2b_password_note; fi
+    # The disk swap had taken ZRAM's values away; alone again, it gets them back.
+    if [[ "$key" == swap ]] && restore_file_ours zram_file && zram_swap_active; then stage_run zram zram_tune; fi
     # Without the policy the package only keeps a shutdown helper running.
     # Asked only when this tool installed it (Ubuntu ships it preinstalled).
     if [[ "$key" == updates ]] && restore_tool_package unattended-upgrades; then
@@ -12351,6 +12443,7 @@ item_main() {
   stage_run backup backup_configs
   restore_prepare
   run_state_mark_start
+  if [[ -s "${STATE_ROOT:-}/sshport-pending" ]]; then stage_run sshport ssh_port_settle; fi
   if [[ -n "${MODE_ARGS[0]:-}" ]]; then
     grep -Fxq -- "${MODE_ARGS[0]}" <<< "$(item_keys)" || die "没有这一项：${MODE_ARGS[0]}。"
     item_action "${MODE_ARGS[0]}"
@@ -12375,7 +12468,7 @@ reboot_reason() {
   else echo '目前没有需要重启才能生效的更新，不重启也可以。'; fi
 }
 
-# Menu 8 / vps reboot. Refuses while an SSH protection timer is pending (a
+# Menu r / vps reboot. Refuses while an SSH protection timer is pending (a
 # reboot would drop the timer and keep an unconfirmed change) or APT is busy.
 reboot_main() {
   [[ $EUID -eq 0 ]] || die '重启需要 root：请用 sudo vps reboot。'
@@ -12610,6 +12703,7 @@ main() {
   prepare_run_state
   stage_run backup backup_configs
   restore_prepare
+  if [[ -s "${STATE_ROOT:-}/sshport-pending" ]]; then stage_run sshport ssh_port_settle; fi
   if [[ "$MODE" == ssh ]]; then
     stage_run ssh ssh_harden_stage
   elif [[ "$MODE" == firewall ]]; then

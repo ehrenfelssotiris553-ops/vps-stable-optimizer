@@ -683,6 +683,21 @@ printf 'PASS: the setup offers tmux first, installs it when missing, keeps the S
 )
 printf 'PASS: a failed APT step stops with the next step to take.\n'
 
+# A setup that leaves the firewall out does not install it.
+(
+  load_optimizer_functions apt_upgrade_stage
+  UPGRADE_APPROVED=0 KERNEL_UPDATE=0 UPGRADE_COUNT=0 AUTO_UPDATES=0 NEED_TIMESYNCD=0 INSTALL_TOOLS=0 VNSTAT_CHOICE=0 KERNEL_CLEAN_CHOICE=0
+  available() { return 0; }
+  install_pkgs() { printf '%s\n' "$*" > "$TEST_ROOT/packages"; }
+  setup_skipped() { [[ "$1" == firewall ]]; }
+  apt_upgrade_stage > /dev/null
+  if [[ " $(cat "$TEST_ROOT/packages") " == *' ufw '* ]]; then fail "UFW installed although the firewall is left out: $(cat "$TEST_ROOT/packages")"; fi
+  setup_skipped() { return 1; }
+  apt_upgrade_stage > /dev/null
+  [[ " $(cat "$TEST_ROOT/packages") " == *' ufw '* ]] || fail "UFW not installed for the firewall: $(cat "$TEST_ROOT/packages")"
+)
+printf 'PASS: UFW is installed only when the setup will use it.\n'
+
 # Setup questions are all asked up front and stored.
 (
   confirm_yes() {
@@ -791,3 +806,40 @@ printf 'PASS: setup questions are asked once and stored; steps left out ask noth
   if zram_file_packaged; then fail 'an edited ZRAM config counted as the package default'; fi
 )
 printf 'PASS: ZRAM is skipped without a zram module and replaces only an unchanged packaged default.\n'
+
+# vps check on a machine whose time servers do not answer says why (a real VPS:
+# every poll timed out); right after a boot it is still too early to tell.
+(
+  load_optimizer_functions check_ntp ntp_unreachable verify_set
+  SYNCED=0 UP=9999 LOG='Timed out waiting for reply from 209.58.185.100:123 (3.debian.pool.ntp.org).'
+  ntp_synced() { ((SYNCED)); }
+  journalctl() { printf '%s\n' "$LOG"; }
+  awk() { if [[ "$*" == *'/proc/uptime'* ]]; then echo "$UP"; else command awk "$@"; fi; }
+  check_ntp
+  [[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'UDP 123'* ]] || fail "blocked time servers not explained: $VERIFY_TEXT"
+  LOG='Contacted time server 1.2.3.4:123'; check_ntp
+  [[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" != *'UDP 123'* ]] || fail "UDP 123 blamed without timeouts: $VERIFY_TEXT"
+  LOG='Timed out waiting for reply'; UP=30; check_ntp
+  [[ "$VERIFY_STATUS" == unknown ]] || fail "right after a boot: $VERIFY_STATUS"
+  UP=9999 SYNCED=1; check_ntp
+  [[ "$VERIFY_STATUS" == pass ]] || fail "synchronized: $VERIFY_STATUS"
+)
+printf 'PASS: vps check says when the time servers do not answer.\n'
+
+# UFW gone (the package removal of an earlier rollback): its IPv6 switch is
+# nothing to put back (a real VPS: the next rollback reported a partial one).
+# A switch still there, and any other setting, are still put back.
+(
+  load_optimizer_functions restore_at_origin restore_needed
+  R="$(mktemp -d)"; RESTORE_ROOT="$R"; mkdir -p "$R/ufw_ipv6" "$R/hosts_file" "$R/other"
+  FP=value:absent ORIGIN=value:yes
+  restore_fingerprint() { echo "$FP"; }
+  restore_read() { echo "$ORIGIN"; }
+  restore_value() { echo absent; }
+  if restore_needed ufw_ipv6; then fail 'the IPv6 switch of a UFW that is gone counted as pending'; fi
+  FP=value:no; restore_needed ufw_ipv6 || fail 'a changed IPv6 switch not put back'
+  FP=value:absent; restore_needed other || fail 'another setting that is gone counted as back'
+  FP=value:yes; if restore_needed ufw_ipv6; then fail 'a switch at its origin counted as pending'; fi
+  rm -rf -- "$R"
+)
+printf 'PASS: a rollback after the package removal has no IPv6 switch of UFW left to put back.\n'

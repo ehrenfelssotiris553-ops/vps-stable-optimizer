@@ -140,6 +140,13 @@ run_case ssh_only ssh 1 0 0
 order="$(awk '/^stage / {print $2}' "$CASE_DIR/calls" | tr '\n' ' ')"
 [[ "$order" == 'backup ssh verification ' ]] || fail "ssh mode ran unrelated stages: $order"
 
+# A change of the SSH port whose session was lost is finished before the rest.
+STATE_ROOT="$(mktemp -d)"; printf 'new=1\n' > "$STATE_ROOT/sshport-pending"
+run_case ssh_port_pending ssh 1 0 0
+order="$(awk '/^stage / {print $2 ":" $3}' "$CASE_DIR/calls" | tr '\n' ' ')"
+[[ "$order" == 'backup:backup_configs sshport:ssh_port_settle ssh:ssh_harden_stage '* ]] || fail "the unconfirmed port change not finished first: $order"
+rm -rf -- "$STATE_ROOT"; unset STATE_ROOT
+
 printf '%s\n' 'PASS: actual main gates read-only modes, confirmation, preflight, backup failure, stage order and reboot offer.'
 
 # Steps one-click setup leaves out (setup_skip): recorded as skipped, not run.

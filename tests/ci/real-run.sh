@@ -936,6 +936,20 @@ if [[ -s "$LOGS/root-only.txt" ]]; then notice "files under /etc only root can r
 endgroup
 fi
 
+# TG next to the traffic alert, as they are used: one timer for both, so the
+# rollback has it follow one and go with the other (a real VPS reported a
+# partial rollback with both on).
+group 'TG and the traffic alert both on before the rollback'
+python3 "$CI/fake-tg.py" "$LOGS/tg-sent-2.log" 8443 > "$LOGS/fake-tg-2.out" 2>&1 < /dev/null &
+tg_pid=$!
+for _ in $(seq 1 50); do if (exec 3<>/dev/tcp/127.0.0.1/8443) 2>/dev/null; then break; fi; sleep 0.2; done
+index="$(item_index notify)" || fail 'no single item notify'
+{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq 1\n' "$index"; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/item-notify-on-2.rules"
+drive "$LOGS/item-notify-on-2.rules" item-notify-on-2 sudo VPS_TG_API=http://127.0.0.1:8443 vps item || fail "TG on again exited with $?"
+if ! sudo test -s /var/lib/vps-stable-opt/notify.conf || ! sudo test -s /var/lib/vps-stable-opt/quota.conf; then fail 'TG and the traffic alert are not both on'; fi
+grep -Fxq 'OnCalendar=*:0/1' /etc/systemd/system/vps-stable-check.timer || fail "the timer with TG: $(cat /etc/systemd/system/vps-stable-check.timer)"
+kill "$tg_pid" 2>/dev/null || true
+
 group 'Full rollback with package removal'
 drive rollback.rules rollback sudo vps rollback || fail "rollback exited with $?"
 has rollback '撤销完成'

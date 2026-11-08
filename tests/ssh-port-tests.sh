@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions ssh_port_text ssh_port_reload ssh_port_login_seen ssh_port_restore_previous ssh_port_fw_close ssh_port_stage \
+load_optimizer_functions ssh_port_settle ssh_port_text ssh_port_reload ssh_port_login_seen ssh_port_restore_previous ssh_port_fw_close ssh_port_stage \
   restore_sshport_group check_sshport ufw_rule restore_record_fw_rule port_source_valid verify_set audit_clean_text \
   sshd_line_value sshd_config_walk sshd_include_args sshd_reads sshd_port_lines sshd_lines_show sshd_lines_off sshd_lines_on \
   sshd_lines_on_cmd sshd_off_files restore_record_sshd_file ipv4_private ipv4_behind_nat
@@ -302,6 +302,44 @@ check_sshport ''
 [[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'端口 22 上监听'*'sshd_config 第 2 行'* ]] || fail "check after a write-back: $VERIFY_STATUS $VERIFY_TEXT"
 plain_config
 printf 'PASS: a Port line elsewhere is commented out on a yes, put back by rollback, by the guard and when not confirmed; vps check sees one written back.\n'
+
+# The session ended before the confirmation (a real VPS, connection lost): the
+# timer only puts sshd back. The next run removes this tool's rule for the new
+# port and has Fail2ban follow, and says so; not while the timer still counts.
+TIMER_ON=0
+active() { [[ "$1" == *.timer ]] && ((TIMER_ON)); }
+pending() { printf 'new=2244\nold=22\ntag=1-2\nunit=vps-stable-ssh-revert-1-2\nfw=1\n' > "$STATE_ROOT/sshport-pending"; }
+leftover() { printf 'ufw limit 2244/tcp\n' >> "$TEST_ROOT/ufw"; printf 'ufw limit 2244/tcp\n' >> "$RESTORE_ROOT/fw_rules"; }
+start; pending; leftover; TIMER_ON=1
+ssh_port_settle
+grep -q 2244 "$TEST_ROOT/ufw" && [[ -s "$STATE_ROOT/sshport-pending" && ! -s "$TEST_ROOT/log" ]] || fail 'settled while the timer still counts'
+TIMER_ON=0; ssh_port_settle
+if grep -q 2244 "$TEST_ROOT/ufw" "$RESTORE_ROOT/fw_rules"; then fail "the rule for the new port stayed: $(cat "$TEST_ROOT/ufw")"; fi
+[[ ! -e "$STATE_ROOT/sshport-pending" ]] || fail 'the record of the change stayed'
+grep -q '^fail2ban follows' "$TEST_ROOT/trace" || fail 'Fail2ban kept the new port'
+grep -q '上次改 SSH 端口没有等到确认.*原来的端口 22' "$TEST_ROOT/log" || fail "not said: $(cat "$TEST_ROOT/log")"
+# A rule this tool did not add stays.
+start; pending; printf 'ufw allow 2244/tcp\n' >> "$TEST_ROOT/ufw"
+ssh_port_settle
+grep -Fxq 'ufw allow 2244/tcp' "$TEST_ROOT/ufw" || fail "someone else's rule went"
+# Rebooted before the timer fired (it does not survive that): both ports still
+# in the file, so sshd goes back too.
+start; pending; leftover; printf '# x\nPort 22\nPort 2244\n' > "$SSH_PORT_DROPIN"; LISTEN='22 2244 '; : > "$STATE_ROOT/sshport-previous"
+ssh_port_settle
+[[ ! -e "$SSH_PORT_DROPIN" && "${LISTEN// /}" == 22 ]] || fail "after a reboot, both ports stayed: $LISTEN"
+# Nothing pending (or a damaged record): nothing happens.
+start; rm -f "$STATE_ROOT/sshport-pending"; ssh_port_settle; [[ ! -s "$TEST_ROOT/trace" ]] || fail 'settled with nothing pending'
+start; printf 'new=x; rm -rf /\n' > "$STATE_ROOT/sshport-pending"; ssh_port_settle
+[[ ! -s "$TEST_ROOT/trace" && ! -e "$STATE_ROOT/sshport-pending" ]] || fail 'a damaged record was used'
+# The record exists exactly while the confirmation is awaited.
+guard_confirm() { if [[ -s "$STATE_ROOT/sshport-pending" ]]; then record 'pending while waiting'; fi; record confirm; ((CONFIRM)); }
+start; ssh_port_stage <<< 2244 > /dev/null
+grep -Fxq 'pending while waiting' "$TEST_ROOT/trace" && [[ ! -e "$STATE_ROOT/sshport-pending" ]] || fail 'record around a confirmed change'
+start; CONFIRM=0; ssh_port_stage <<< 2244 > /dev/null
+grep -Fxq 'pending while waiting' "$TEST_ROOT/trace" && [[ ! -e "$STATE_ROOT/sshport-pending" ]] || fail 'record around an unconfirmed change'
+guard_confirm() { record confirm; ((CONFIRM)); }
+unset -f active
+printf 'PASS: a change whose session was lost is finished by the next run (the firewall rule goes, Fail2ban follows, it is said).\n'
 
 # vps check: sshd listens on the ports of the file, the firewall lets them in.
 printf 'Port 2244\n' > "$SSH_PORT_DROPIN"; LISTEN='2244 '; printf 'ufw limit 2244/tcp\n' > "$TEST_ROOT/ufw"

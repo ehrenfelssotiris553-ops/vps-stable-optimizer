@@ -543,3 +543,21 @@ grep -Fxq 'ufw allow 22/tcp' "$CASE_DIR/rules" && ! grep -Fxq 'ufw limit 22/tcp'
   [[ "$(cat "$CASE_DIR/rules")" == 'ufw allow 22/tcp' ]] || fail "someone else's SSH rule was changed"
 )
 printf 'PASS: the SSH rate limit follows its switch, for a new firewall and for the rule a running one got from this tool.\n'
+
+# vps firewall (menu 5 -> 1) on a machine that never ran the setup installs UFW
+# itself instead of sending the user to the setup; elsewhere nothing changes.
+(
+  command() { if [[ "$*" == '-v ufw' ]]; then return 1; fi; builtin command "$@"; }
+  apt_index_ready() { echo index; }
+  available() { return 0; }
+  install_pkgs() { echo "install $*"; }
+  CASE_DIR="$(mktemp -d)"
+  MODE=firewall
+  out="$(firewall_stage < /dev/null 2>&1)"
+  [[ "$out" == *index*'install ufw'* ]] || fail "vps firewall did not install UFW: $out"
+  MODE=setup
+  out="$(firewall_stage < /dev/null 2>&1)"
+  if [[ "$out" == *'install ufw'* ]]; then fail 'UFW installed outside vps firewall'; fi
+  rm -rf -- "$CASE_DIR"
+)
+printf 'PASS: vps firewall installs UFW itself on a machine that never ran the setup.\n'

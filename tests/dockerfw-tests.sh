@@ -275,6 +275,51 @@ ufw allow 6081/tcp"
 )
 printf 'PASS: the stage keeps running ports open when asked, has a way back before the rules load, and undoes all of it unconfirmed.\n'
 
+# nftables comes from a fresh package index (the switch may be the first
+# thing done on a machine whose index is old).
+(
+  command() { if [[ "$*" == '-v nft' ]]; then return 1; fi; builtin command "$@"; }
+  apt_index_ready() { record index; }
+  DOCKERFW_CHOICE=1
+  : > "$CALLS"
+  dockerfw_stage > /dev/null 2>&1 || true
+  [[ "$(grep -n '^index$' "$CALLS" | cut -d: -f1)" -lt "$(grep -n '^install nftables$' "$CALLS" | cut -d: -f1)" ]] || fail "nftables installed without a fresh index: $(cat "$CALLS")"
+)
+# A range of ports is recorded like one port, and goes again with the rollback.
+(
+  load_optimizer_functions restore_record_fw_rule restore_data_safe state_path_safe port_source_valid restore_fw_rules_apply ssh_candidates
+  RESTORE_READY=1
+  ssh_candidates() { echo 22; }
+  rm -f -- "$RESTORE_ROOT/fw_rules"
+  restore_record_fw_rule 'ufw allow 7000:7010/tcp' || fail 'a range of ports could not be recorded'
+  grep -Fxq 'ufw allow 7000:7010/tcp' "$RESTORE_ROOT/fw_rules" || fail 'range not in the record'
+  if restore_record_fw_rule 'ufw allow 7000:x/tcp'; then fail 'nonsense accepted as a range'; fi
+  ufw() {
+    case "$1 ${2:-}" in
+      'show added') echo 'ufw allow 7000:7010/tcp' ;;
+      'status '*) echo 'Status: inactive' ;;
+      '--force delete') record "ufw $*" ;;
+    esac
+  }
+  RESTORE_PARTIAL=0
+  : > "$CALLS"
+  restore_fw_rules_apply > /dev/null
+  called 'ufw --force delete allow 7000:7010/tcp' || fail "range not deleted by the rollback: $(cat "$CALLS")"
+  ((RESTORE_PARTIAL == 0)) || fail 'a range reported as not undone'
+)
+# Rules added for the switch still count when its units are already gone.
+(
+  load_optimizer_functions restore_group_pending restore_needed restore_at_origin restore_read restore_data_safe state_path_safe sshd_off_files
+  restore_needed() { return 1; }
+  restore_read() { echo clean; }
+  rm -f -- "$RESTORE_ROOT/dockerfw_rules"
+  if restore_group_pending dockerfw; then fail 'pending with nothing to undo'; fi
+  printf 'ufw allow 6081/tcp\n' > "$RESTORE_ROOT/dockerfw_rules"
+  restore_group_pending dockerfw || fail 'rules added for the switch not pending'
+  rm -f -- "$RESTORE_ROOT/dockerfw_rules"
+)
+printf 'PASS: nftables comes from a fresh index, and ranges of ports are recorded and undone.\n'
+
 # 7. What the check says, and the note in the acceptance check.
 verify_set() { VERDICT="$1 $2"; }
 : > "$DOCKER_FW_PATH_FILE"

@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove restore_path tg_call notify_stage \
+load_optimizer_functions check_after_rollback notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove restore_path tg_call notify_stage \
   quota_status menu_quota_alert dockerlog_text dockerlog_merge check_dockerlog check_notify check_quota check_timer_ok verify_set audit_when audit_clean_text \
   param_list param_kind param_recommended param_check param_read param_value param_caution
 TEST_ROOT="$(mktemp -d)"
@@ -130,6 +130,16 @@ printf '%s.3 host sudo[3]: ops : TTY=pts/0 ; PWD=/root ; USER=root ; COMMAND=/us
 : > "$T/sent"; run
 sent | grep -Fq 'sudo：ops 运行了 /usr/bin/apt install x' || fail "full sudo command: $(sent)"
 sed -i '/^notify_sudo_args=/d' "$PARAMS_FILE"; : > "$T/journal"
+# Clients with a random UDP source port are no new ports (a real VPS reported
+# systemd-timesyncd's after its polls); a UDP service still is. One unit
+# enabled is one message, not one for the file and one for the link.
+rm -f "$D/five"
+printf 'udp UNCONN 0 0 0.0.0.0:57683 0.0.0.0:* users:(("systemd-timesyn",pid=3,fd=9))\nudp UNCONN 0 0 0.0.0.0:68 0.0.0.0:* users:(("dhclient",pid=5,fd=6))\nudp UNCONN 0 0 0.0.0.0:51820 0.0.0.0:* users:(("wg-daemon",pid=4,fd=3))\n' >> "$T/ss"
+mkdir -p "$F/systemd/multi-user.target.wants"; printf '[Service]\n' > "$F/systemd/web2.service"; printf '[Service]\n' > "$F/systemd/multi-user.target.wants/web2.service"
+: > "$T/sent"; run
+sent | grep -Fq '新开了端口：51820/udp（wg-daemon）' || fail "a UDP service not reported: $(sent)"
+if sent | grep -Eq 'systemd-timesyn|dhclient'; then fail "a client's source port reported: $(sent)"; fi
+[[ "$(sent | grep -c 'web2.service')" == 1 ]] || fail "one unit, not one message: $(sent)"
 printf 'PASS: accounts, passwords, sudo without its arguments, packages, keys, ports and autostart are sent; failures only counted.\n'
 
 # Told once: a full disk, until it is well below the line again; a reboot.
@@ -453,3 +463,45 @@ for bad in 'notify_services x;y' 'quota_alerts 0' 'quota_alerts 101' 'notify_sum
 done
 [[ -n "$(param_caution notify_sudo_args yes)" ]] || fail 'whole sudo commands not explained'
 printf 'PASS: the notification, traffic and Docker parameters are checked.\n'
+
+# The menu's traffic line: 830 MB of a 1 GB quota is not "0 GB" (a real VPS).
+load_optimizer_functions menu_quota_alert quota_status
+SYM_WARN='!' C_WARN='' C_RESET=''
+mkdir -p "$STATE_ROOT/notify"
+printf 'quota_mb=1000\n' > "$STATE_ROOT/quota.conf"; printf '830\n' > "$STATE_ROOT/notify/traffic-used"
+line="$(menu_quota_alert)"; [[ "$line" == *'已用 0.8 GB，是额度 1 GB 的 83%'* ]] || fail "small numbers: $line"
+printf 'quota_mb=2000000\n' > "$STATE_ROOT/quota.conf"; printf '1900000\n' > "$STATE_ROOT/notify/traffic-used"
+line="$(menu_quota_alert)"; [[ "$line" == *'已用 1900 GB，是额度 2000 GB 的 95%'* ]] || fail "large numbers: $line"
+printf 'quota_mb=1000\n' > "$STATE_ROOT/quota.conf"; printf '100\n' > "$STATE_ROOT/notify/traffic-used"
+[[ -z "$(menu_quota_alert)" ]] || fail 'shown below the lowest alert'
+printf 'PASS: the traffic line in the menu shows what was used, also below 1 GB.\n'
+
+# `vps rollback` is no run, so put_file has no backups to go by there: with TG
+# and the traffic alert both on, a real VPS reported a partial rollback. The
+# timer follows the one still on, directly; goes with the last; someone's stays.
+put_file() { record "put_file $1"; return 1; }
+systemctl() { record "systemctl $*"; }
+restore_adopt() { record "adopt $1 ready=$RESTORE_READY"; }
+param_timer() { check_timer_text "$(param_value "$1")"; }
+RESTORE_READY=0
+: > "$STATE_ROOT/quota.conf"; printf 'quota_mb=1000\n' > "$STATE_ROOT/quota.conf"; rm -f "$STATE_ROOT/notify.conf"
+param_timer check_minutes_tg > "$CHECK_TIMER_FILE"
+reset; check_after_rollback
+[[ "$(cat "$CHECK_TIMER_FILE")" == "$(param_timer check_minutes_quota)" ]] || fail "TG undone, the timer did not follow the traffic alert: $(cat "$CHECK_TIMER_FILE")"
+if grep -q '^put_file' "$TEST_ROOT/trace"; then fail 'put_file used outside a run'; fi
+grep -Fq 'systemctl restart vps-stable-check.timer' "$TEST_ROOT/trace" || fail "the timer was not restarted: $(cat "$TEST_ROOT/trace")"
+grep -Fxq 'adopt check_timer_file ready=1' "$TEST_ROOT/trace" || fail "the new timer not adopted: $(cat "$TEST_ROOT/trace")"
+[[ "$RESTORE_READY" == 0 ]] || fail 'RESTORE_READY stayed changed'
+# Already right (the traffic alert undone, TG still on): nothing to do.
+printf 'x\n' > "$STATE_ROOT/notify.conf"; rm -f "$STATE_ROOT/quota.conf"; param_timer check_minutes_tg > "$CHECK_TIMER_FILE"
+reset; check_after_rollback
+if grep -Fq 'restart' "$TEST_ROOT/trace"; then fail "restarted without a change: $(cat "$TEST_ROOT/trace")"; fi
+# Changed by someone: it stays, said, and is no failure.
+printf '[Timer]\nOnCalendar=hourly\n' > "$CHECK_TIMER_FILE"
+reset; check_after_rollback || fail 'a changed timer counted as a failed rollback'
+grep -q 'OnCalendar=hourly' "$CHECK_TIMER_FILE" && grep -q '被改过' "$TEST_ROOT/log" || fail 'a changed timer was replaced'
+# The last one undone: the timer goes.
+rm -f "$STATE_ROOT/notify.conf" "$STATE_ROOT/quota.conf"; param_timer check_minutes_quota > "$CHECK_TIMER_FILE"
+reset; check_after_rollback
+[[ ! -e "$CHECK_TIMER_FILE" ]] || fail 'the timer stayed after the last one was undone'
+printf 'PASS: vps rollback handles TG and the traffic alert together: the timer follows the one still on and goes with the last.\n'

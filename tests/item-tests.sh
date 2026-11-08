@@ -134,6 +134,7 @@ restore_hostname_group() { record 'group hostname'; }
 restore_swap_group() { record 'group swap'; }
 restore_sshport_group() { record 'group sshport'; }
 check_reconcile() { record 'check reconcile'; }
+check_after_rollback() { record 'check after rollback'; }
 check_remove() { record 'check remove'; }
 # No Docker running here (the Docker log group only warns when it runs).
 active() { return 1; }
@@ -164,6 +165,15 @@ restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
 [[ ! -s "$TEST_ROOT/trace" ]] || fail 'invalid pick changed something'
 printf 'PASS: rollback groups keep the safe order and per-item rollback touches one group.\n'
 
+# TG or the traffic alert undone: inside a run the timer is written the usual
+# way; `vps rollback` is no run and goes the direct way.
+saved_ready="${RESTORE_READY:-0}"
+RESTORE_READY=1; reset; restore_group_apply notify
+grep -Fxq 'check reconcile' "$TEST_ROOT/trace" && ! grep -Fxq 'check after rollback' "$TEST_ROOT/trace" || fail "inside a run: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+RESTORE_READY=0; reset; restore_group_apply quota
+grep -Fxq 'check after rollback' "$TEST_ROOT/trace" && ! grep -Fxq 'check reconcile' "$TEST_ROOT/trace" || fail "vps rollback: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+RESTORE_READY="$saved_ready"
+
 # Single-item menu: off undoes only this tool's change; firewall pause; dispatch.
 reset; STATE=()
 item_turn_off bbr
@@ -172,6 +182,24 @@ grep -Fq '本工具没有改过' "$TEST_ROOT/log" || fail 'untouched item not ex
 reset; STATE=([bbr_file]=applied)
 item_turn_off bbr
 grep -Fxq 'resource bbr_file' "$TEST_ROOT/trace" || fail 'item off did not undo the tool change'
+# Undoing the disk swap: this tool's ZRAM, alone again, gets its values back (a
+# real VPS stayed on swappiness 60 / page-cluster 3). A ZRAM not of this tool
+# is left alone, and so is every other item.
+ZRAM_OURS=1 ZRAM_ON=1
+restore_file_ours() { [[ "$1" == zram_file ]] && ((ZRAM_OURS)); }
+zram_swap_active() { ((ZRAM_ON)); }
+real_stage_run="$(declare -f stage_run || true)"
+stage_run() { record "stage $*"; }
+reset; STATE=([swap_unit]=applied); item_turn_off swap
+grep -Fxq 'stage zram zram_tune' "$TEST_ROOT/trace" || fail "ZRAM values not back after the disk swap went: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+ZRAM_OURS=0; reset; STATE=([swap_unit]=applied); item_turn_off swap
+if grep -q zram_tune "$TEST_ROOT/trace"; then fail 'a ZRAM of someone else was tuned'; fi
+ZRAM_OURS=1 ZRAM_ON=0; reset; STATE=([swap_unit]=applied); item_turn_off swap
+if grep -q zram_tune "$TEST_ROOT/trace"; then fail 'tuned without a ZRAM running'; fi
+ZRAM_ON=1; reset; STATE=([bbr_file]=applied); item_turn_off bbr
+if grep -q zram_tune "$TEST_ROOT/trace"; then fail 'another item tuned ZRAM'; fi
+unset -f restore_file_ours zram_swap_active stage_run
+if [[ -n "$real_stage_run" ]]; then eval "$real_stage_run"; fi
 if grep -q '^result ' "$TEST_ROOT/trace"; then fail 'a group still pending was recorded as undone'; fi
 # Once undone, vps check must report the item as undone, not as broken.
 module_result() { record "result $1 $2"; }

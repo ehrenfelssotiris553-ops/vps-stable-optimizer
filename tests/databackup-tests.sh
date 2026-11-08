@@ -105,7 +105,7 @@ param backup_exclude "/root/.cache *.tmp"
 param backup_limit_mbps 10
 (cd "$TEST_ROOT/data" && databackup_run > /dev/null) || fail 'a run that worked failed'
 line="$(calls_of backup)"
-for want in '--one-file-system' '--exclude-caches' '--tag|vps-stable' "--exclude|$D" '--exclude|/root/.cache' '--exclude|*.tmp' "--exclude|$TEST_ROOT/repo" '--limit-upload|1220' "|$TEST_ROOT/data"; do
+for want in '--one-file-system' '--exclude-caches' '--tag|vps-stable' "--exclude|$D" '--exclude|/root/vps-restore-*' '--exclude|/root/.cache' '--exclude|*.tmp' "--exclude|$TEST_ROOT/repo" '--limit-upload|1220' "|$TEST_ROOT/data"; do
   [[ "$line" == *"$want"* ]] || fail "backup without $want: $line"
 done
 if [[ "$line" == *'--exclude|a.tmp'* ]]; then fail 'exclude rule expanded by the shell'; fi
@@ -212,6 +212,18 @@ param backup_drill_days 0
 databackup_run > /dev/null
 [[ -z "$(calls_of check)" ]] || fail 'drill although set to never'
 printf 'PASS: the drill really restores a sample and fails when what comes back is wrong.\n'
+
+# A drill cut off leaves restored files behind: the next one clears them.
+if [[ -d /var/tmp && -w /var/tmp ]]; then
+  mkdir -p /var/tmp/vps-backup-drill.staletest /var/tmp/vps-backup-drill.freshtest
+  touch -d '3 hours ago' /var/tmp/vps-backup-drill.staletest
+  reset
+  param backup_drill_days 30
+  (shuf() { cat; }; databackup_run > /dev/null) || fail 'drill with an old directory there'
+  [[ ! -e /var/tmp/vps-backup-drill.staletest ]] || fail 'a drill directory left hours ago stayed'
+  [[ -d /var/tmp/vps-backup-drill.freshtest ]] || fail 'the directory of a drill still running was removed'
+  rm -rf /var/tmp/vps-backup-drill.staletest /var/tmp/vps-backup-drill.freshtest
+fi
 
 # What is told, and to whom.
 notify_run() { reset; mkdir -p -- "$STATE_ROOT/notify"; printf 'chat=1\n' > "$STATE_ROOT/notify.conf"; for pair in "$@"; do param "${pair%%=*}" "${pair#*=}"; done; }
@@ -421,7 +433,38 @@ printf 'PASS: the schedule follows the parameter, also to and from manual.\n'
   if grep -Fq 'set up again' "$CALLS"; then fail 'an import of a backup parameter set the whole item up again'; fi
   rm -f -- "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"
 )
+# A timer file edited by hand: said so, and the run goes on (it used to end in
+# the error trap).
+(
+  load_optimizer_functions param_apply
+  reset
+  : > "$BACKUP_SERVICE_FILE"
+  databackup_units_write() { return 1; }
+  out="$(param_apply databackup 2>&1)" || fail "param_apply stopped: $out"
+  [[ "$out" == *定时任务没能按新的参数更新* ]] || fail "not said: $out"
+  rm -f -- "$BACKUP_SERVICE_FILE"
+)
 printf 'PASS: imported backup parameters reach the schedule without setting anything up again.\n'
+# Turned on again with restic there: no package index needed. The list marks a
+# backup that failed differently from one that works.
+(
+  load_optimizer_functions item_turn_on item_mark item_state
+  apt_index_ready() { printf 'index\n' >> "$CALLS"; return 1; }
+  stage_run() { printf 'stage %s\n' "$1" >> "$CALLS"; }
+  : > "$CALLS"
+  installed() { [[ "$1" == restic ]]; }
+  item_turn_on databackup
+  [[ "$(cat "$CALLS")" == 'stage databackup' ]] || fail "with restic there: $(cat "$CALLS")"
+  : > "$CALLS"
+  installed() { return 1; }
+  item_turn_on databackup
+  [[ "$(cat "$CALLS")" == 'index' ]] || fail "without restic: $(cat "$CALLS")"
+  SYM_OK=OK SYM_WARN=WARN SYM_SKIP=SKIP
+  [[ "$(item_mark databackup '已开启，上次备份失败（11-08 03:30）')" == 'WARN ' ]] || fail "failed backup marked: $(item_mark databackup '已开启，上次备份失败')"
+  [[ "$(item_mark databackup '已开启，上次备份 11-08 03:30')" == 'OK ' ]] || fail 'working backup marked wrongly'
+  [[ "$(item_mark dockerfw '已开启，但防火墙没开，暂时不起作用')" == 'WARN ' ]] || fail 'a switch that does nothing marked as working'
+)
+printf 'PASS: turning the backup on again needs no package index; a failure is marked as one.\n'
 
 # 8. The check, the menu's line, the status.
 verify_set() { VERDICT="$1 $2"; }
