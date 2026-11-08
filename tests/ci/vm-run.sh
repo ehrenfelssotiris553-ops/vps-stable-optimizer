@@ -597,7 +597,7 @@ group 'SSH port: 22 to 2244 from outside (the old port closed only after a login
 # few seconds on the new port ($VM_SSH_NEW is expanded by the shell answer.exp starts).
 index="$(item_index sshport)" || fail 'no single item sshport'
 # shellcheck disable=SC2016
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '仍然要改 SSH 端口吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
   '等待确认（剩余 ==> !$VM_SSH_NEW sleep 10' > "$LOGS/sshport-on.rules"
 vm_drive "$LOGS/sshport-on.rules" sshport-on vps item || fail "the port change exited with $?"
 has sshport-on 'SSH 端口已改成 2244'
@@ -721,7 +721,7 @@ group 'Full rollback and uninstall'
 index="$(item_index sshport)" || fail 'no single item sshport'
 # ($ADMIN_PW is answer.exp's to expand.)
 # shellcheck disable=SC2016
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '仍然要改 SSH 端口吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
   "等待确认（剩余 ==> !ssh ${VM_NEW_OPTS[*]} $VM_OPS_HOST sleep 10" '\[sudo[^]]*\] [Pp]assword ==> $ADMIN_PW' > "$LOGS/sshport-again.rules"
 VM_AS=$VM_OPS_HOST vm_drive "$LOGS/sshport-again.rules" sshport-again sudo vps item || fail "the second port change exited with $?"
 has sshport-again 'SSH 端口已改成 2244'

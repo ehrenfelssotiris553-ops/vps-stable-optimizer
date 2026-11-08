@@ -12,7 +12,7 @@ source "$HERE/test-common.sh"
 load_optimizer_functions ssh_port_text ssh_port_reload ssh_port_established ssh_port_restore_previous ssh_port_fw_close ssh_port_stage \
   restore_sshport_group check_sshport ufw_rule restore_record_fw_rule port_source_valid verify_set audit_clean_text \
   sshd_line_value sshd_config_walk sshd_include_args sshd_reads sshd_port_lines sshd_lines_show sshd_lines_off sshd_lines_on \
-  sshd_lines_on_cmd sshd_off_files restore_record_sshd_file
+  sshd_lines_on_cmd sshd_off_files restore_record_sshd_file ipv4_private ipv4_behind_nat
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -64,8 +64,15 @@ guard_arm() { record "guard $1"; }
 guard_confirm() { record confirm; ((CONFIRM)); }
 ssh_port_follow() { record "fail2ban follows $LISTEN"; }
 ssh_limit_exempt() { record exempt; }
-confirm_yes() { case "$1" in *小于\ 1024*) record 'ask low port'; ((LOW_OK)) ;; *) ((PROVIDER)) ;; esac; }
+confirm_yes() { case "$1" in *小于\ 1024*) record 'ask low port'; ((LOW_OK)) ;; *端口转发*) record 'ask nat'; ((NAT_OK)) ;; *) ((PROVIDER)) ;; esac; }
 LOW_OK=1
+# The machine's IPv4 addresses (`ip -4 -o addr show scope global`): a public
+# one unless a case says otherwise.
+ip() {
+  [[ "$*" == '-4 -o addr show scope global' ]] || return 1
+  local a
+  for a in $IPV4_ADDRS; do printf '2: eth0    inet %s brd 0.0.0.0 scope global eth0\       valid_lft forever\n' "$a"; done
+}
 confirm_default_yes() { case "$1" in *注释掉*) record 'ask comment out'; ((COMMENT_OK)) ;; *) return 1 ;; esac; }
 backup_config_path() { :; }
 record_config_change() { :; }
@@ -89,6 +96,7 @@ start() {
   printf 'ufw limit 22/tcp\nufw allow from 203.0.113.9 to any port 22 proto tcp\n' > "$RESTORE_ROOT/fw_rules"
   rm -f "$SSH_PORT_DROPIN" "$RESTORE_ROOT/sshport"
   LISTEN=22 SSHD_OK=1 RELOAD_OK=1 CONFIRM=1 PROVIDER=1 SSHPORT_CHOICE=1 COMMENT_OK=1 REEXEC_SLEEPS=0 PENDING=''
+  IPV4_ADDRS='198.51.100.5/24' NAT_OK=1
 }
 
 # Confirmed: the new port let in first, both ports while waiting, then only the
@@ -111,6 +119,28 @@ ssh_port_stage <<< 2244 > /dev/null
 [[ "$(cat "$SSH_PORT_DROPIN")" == $'# VPS Stable Optimizer v2.8: SSH port\nPort 2244' ]] && grep -q '^result sshport applied port 2244' "$TEST_ROOT/trace" ||
   fail "a slow reload taken for a failure: $(cat "$SSH_PORT_DROPIN"); $(grep '^result' "$TEST_ROOT/trace")"
 printf 'PASS: a confirmed change lets the new port in first, waits on both, then closes the old port everywhere (also when sshd listens a moment after a reload).\n'
+
+# No public IPv4 (a NAT VPS forwards one outside port to 22 inside; seen on a
+# real one: confirmed over IPv6, the change cut IPv4 off): said before the new
+# port is asked for, and a no changes nothing. Confirmed anyway, the
+# forwarding is mentioned again at the end.
+for a in 10.0.0.1 172.16.0.1 172.31.255.255 192.168.1.1 100.64.0.1 100.127.255.255; do ipv4_private "$a" || fail "$a not private"; done
+for a in 8.8.8.8 172.15.0.1 172.32.0.1 192.169.0.1 100.63.255.255 100.128.0.1 11.0.0.1 abc; do if ipv4_private "$a"; then fail "$a taken for private"; fi; done
+start; IPV4_ADDRS='100.64.18.27/24' NAT_OK=0
+ssh_port_stage <<< 2244 > "$TEST_ROOT/out"
+[[ ! -e "$SSH_PORT_DROPIN" && "$(grep -c '^ufw ' "$TEST_ROOT/trace")" == 0 ]] && grep -Fxq 'ask nat' "$TEST_ROOT/trace" && grep -q '^result sshport declined NAT IPv4' "$TEST_ROOT/trace" ||
+  fail "behind NAT, a no changed something: $(cat "$TEST_ROOT/trace")"
+grep -q 'IPv4 是内网地址（100.64.18.27）' "$TEST_ROOT/log" && grep -q '只转发到内部的 22' "$TEST_ROOT/out" || fail "the forwarding not explained: $(cat "$TEST_ROOT/log" "$TEST_ROOT/out")"
+start; IPV4_ADDRS='10.0.2.15/24'
+ssh_port_stage <<< 2244 > /dev/null
+grep -q '^result sshport applied port 2244' "$TEST_ROOT/trace" && grep -q '把转发改到 2244' "$TEST_ROOT/log" || fail "behind NAT, confirmed: $(cat "$TEST_ROOT/trace" "$TEST_ROOT/log")"
+# A public address, also next to a private one, or no IPv4 at all: not asked.
+for addrs in '198.51.100.5/24' '10.0.0.5/8 198.51.100.5/24' ''; do
+  start; IPV4_ADDRS="$addrs"; ssh_port_stage <<< 2244 > /dev/null
+  if grep -Fxq 'ask nat' "$TEST_ROOT/trace" || grep -q '内网地址' "$TEST_ROOT/log"; then fail "asked about NAT with <$addrs>"; fi
+  grep -q '^result sshport applied port 2244' "$TEST_ROOT/trace" || fail "not changed with <$addrs>: $(grep '^result' "$TEST_ROOT/trace")"
+done
+printf 'PASS: without a public IPv4 the port forwarding of a NAT VPS is explained and asked about first.\n'
 
 # Not confirmed: everything as it was, the timer stopped.
 start; CONFIRM=0

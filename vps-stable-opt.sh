@@ -5311,9 +5311,32 @@ ssh_port_fw_close() {
   return "$left"
 }
 
+# ADDRESS (IPv4): private (10/8, 172.16/12, 192.168/16) or shared by a
+# provider's NAT (100.64/10).
+ipv4_private() {
+  local a b
+  IFS=. read -r a b _ _ <<< "$1"
+  [[ "$a" =~ ^[0-9]{1,3}$ && "$b" =~ ^[0-9]{1,3}$ ]] || return 1
+  ((a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127)))
+}
+
+# The first IPv4 address of this machine when it has no public one: reached
+# from outside through the provider's forwarding. Nothing otherwise (a public
+# address, or no IPv4 at all).
+ipv4_behind_nat() {
+  local addr first=''
+  while IFS= read -r addr; do
+    addr="${addr%%/*}"
+    [[ -n "$addr" ]] || continue
+    ipv4_private "$addr" || return 0
+    [[ -n "$first" ]] || first="$addr"
+  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' || true)
+  [[ -z "$first" ]] || printf '%s\n' "$first"
+}
+
 ssh_port_stage() {
   say '修改 SSH 端口'
-  local old new verb=allow previous='' unit deadline where fw=0 port_lines tag
+  local old new verb=allow previous='' unit deadline where fw=0 port_lines tag nat
   local -a off_files=()
   if [[ "${SSHPORT_CHOICE:-}" != 1 ]]; then module_result sshport declined 'not requested'; return 0; fi
   if ! ssh_detect || ((${#SSH_PORTS[@]} != 1)); then
@@ -5341,6 +5364,17 @@ ssh_port_stage() {
     fi
   fi
   if guard_leftovers; then module_result sshport skipped 'earlier protection timer pending'; return 0; fi
+  # No public IPv4: a NAT VPS forwards one outside port (often above 20000)
+  # to port 22 inside, and that forwarding ends with the change; confirmed
+  # over IPv6 the change goes through and IPv4 is lost (seen on a real NAT
+  # VPS). Big clouds (AWS, Azure) forward the whole address and are fine.
+  nat="$(ipv4_behind_nat)"
+  if [[ -n "$nat" ]]; then
+    warn "这台机器的 IPv4 是内网地址（$nat）：从外面要经过服务商的转发才能连进来。"
+    echo "像 AWS、Azure、阿里云这类整个 IP 都转发的云服务器，改端口没问题（安全组放行新端口就行）。"
+    echo "按端口转发的 NAT 机器（服务商给你一个外部端口，常在 20000 以上）只转发到内部的 $old：改了端口，IPv4 就连不上了，除非服务商面板能把转发改到新端口；有独享 IPv6 的话，IPv6 不受影响。"
+    if ! confirm_yes '弄清了端口转发的情况，仍然要改 SSH 端口吗？'; then ok '已取消。'; module_result sshport declined 'NAT IPv4'; return 0; fi
+  fi
   echo "现在的 SSH 端口：$old。换端口挡不住真正的攻击者，但能少掉绝大多数自动扫描（日志清净，Fail2ban 也轻松）。"
   read -r -p '新的端口（1–65535，建议 1024 以上，直接回车取消）: ' new || new=''
   if [[ -z "$new" ]]; then ok '已取消。'; module_result sshport declined 'cancelled'; return 0; fi
@@ -5409,6 +5443,7 @@ ssh_port_stage() {
       fi
       ssh_port_follow
       ok "SSH 端口已改成 $new。以后登录用 ssh -p $new；记得到服务商的安全组里把旧端口 $old 关掉。"
+      if [[ -n "$nat" ]]; then warn "IPv4 是内网地址（$nat）：按端口转发的话，到服务商面板里把转发改到 $new，IPv4 才能再连上。"; fi
       module_result sshport applied "port $new"
       return 0
     fi
