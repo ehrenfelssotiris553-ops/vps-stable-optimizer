@@ -3558,12 +3558,15 @@ f2b_policy_text() {
 
 # Fail2ban keeps bans in its database for a day by default: an address banned
 # again later starts over at the first ban time. Kept for the longest ban, at
-# least a week.
+# least a week. allowipv6: Fail2ban 1.0 (Debian 12) ships fail2ban.conf with it
+# commented out and warns about it at every fail2ban-client command (seen on a
+# real Debian 12 VPS, also in this tool's output); auto is its default.
 f2b_db_text() {
   local age=604800 max
   max=$(($(param_value f2b_maxtime_days) * 86400))
   ((max <= age)) || age="$max"
-  printf '%s\n' '# VPS Stable Optimizer v2.8: how long bans are remembered ("banned again" doubles)' '[DEFAULT]' "dbpurgeage = $age"
+  printf '%s\n' '# VPS Stable Optimizer v2.8: how long bans are remembered ("banned again" doubles)' '[DEFAULT]' "dbpurgeage = $age" \
+    'allowipv6 = auto'
 }
 
 # Writes (or writes again, after a parameter change) this tool's file; a
@@ -9311,7 +9314,8 @@ restore_firewall_warning() {
 restore_all_groups() {
   local group firewall_before RESTORE_ALL=1
   firewall_before="$(restore_value ufw_runtime 2>/dev/null || true)"
-  # Fail2ban first (its bans live in UFW), then the firewall itself.
+  # Fail2ban first (the bans of its UFW action up to v2.8 live in UFW), then
+  # the firewall itself.
   while IFS= read -r group; do restore_group_apply "$group"; done < <(restore_groups)
   restore_packages_offer
   restore_zram_settle

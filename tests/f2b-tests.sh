@@ -161,6 +161,9 @@ grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail 'applied Fail2ban resul
 # Bans are remembered for a week (Fail2ban's own default is a day), or a
 # "banned again" after that would start over at an hour.
 grep -Fxq 'dbpurgeage = 604800' "$F2B_DB_FILE" && grep -Fxq '[DEFAULT]' "$F2B_DB_FILE" || fail "ban history: $(cat "$F2B_DB_FILE" 2>&1)"
+# Fail2ban 1.0 (Debian 12) ships fail2ban.conf with allowipv6 commented out and
+# warns about it at every fail2ban-client command (seen on a real VPS).
+grep -Fxq 'allowipv6 = auto' "$F2B_DB_FILE" || fail "allowipv6 not set: Fail2ban 1.0 warns at every command: $(cat "$F2B_DB_FILE")"
 passed 'first install is guarded, port-specific and tested before service start'
 
 : > "$CASE_DIR/events"
