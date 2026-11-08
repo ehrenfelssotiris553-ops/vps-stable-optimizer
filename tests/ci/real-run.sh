@@ -870,7 +870,7 @@ has backup-repaired '备份完成'
 echo 'changed since' | sudo tee /srv/ci-data/sub/keep.txt > /dev/null
 backup_item backup-restore 5 '回车返回: ==> 3' '恢复哪一次 ==>' '恢复哪个文件或目录 ==> /srv/ci-data/sub/keep.txt' '恢复到 /root/vps-restore ==> y'
 has backup-restore '已恢复到 /root/vps-restore-'
-target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | head -n 1)"
+target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | awk 'NR == 1')"
 [[ "$(sudo cat "$target/srv/ci-data/sub/keep.txt")" == 'precious data' ]] || fail "restored: $(sudo cat "$target/srv/ci-data/sub/keep.txt")"
 [[ "$(sudo cat /srv/ci-data/sub/keep.txt)" == 'changed since' ]] || fail 'the restore touched the file in place'
 sudo rm -rf -- "$target"
@@ -878,7 +878,7 @@ sudo rm -rf -- "$target"
 # Another machine: this one, as a user of its own over SFTP. The old password
 # stays; the key that logs in is added at the moment the tool asks for it.
 sudo useradd -m -s /bin/bash cibackup
-sftp_port="$(sudo sshd -T | awk '$1 == "port" {print $2; exit}')"
+sftp_port="$(sudo sshd -T | awk '$1 == "port" && !seen {print $2; seen = 1}')"
 printf 'install -d -o cibackup -g cibackup -m 700 /home/cibackup/.ssh\ninstall -o cibackup -g cibackup -m 600 %s/id_ed25519.pub /home/cibackup/.ssh/authorized_keys\n' "$backup_dir" > "$LOGS/backup-add-key.sh"
 backup_item backup-sftp 1 '沿用上次的备份目标吗 ==> n' '备份目标 \[1-4 ==> 1' '对方的地址 ==> 127.0.0.1' "对方的 SSH 端口 ==> $sftp_port" '对方的账户名 ==> cibackup' '对方保存备份的目录 ==> backups/ci' '指纹对得上吗 ==> y' "加好了按回车 ==> !!sudo bash $LOGS/backup-add-key.sh"
 has backup-sftp '数据备份已开启'
@@ -891,12 +891,12 @@ sudo vps backup now > "$LOGS/backup-sftp-now.log" 2>&1 || fail "vps backup now e
 has backup-sftp-now '恢复演练通过'
 # A host key that changed: refused, not accepted.
 ssh-keygen -q -t ed25519 -N '' -f "$LOGS/other-host-key"
-sudo cp -- "$backup_dir/known_hosts" "$LOGS/known-hosts-keep"
-sudo awk -v k="$(cut -d' ' -f2 "$LOGS/other-host-key.pub")" '{print $1, "ssh-ed25519", k}' "$LOGS/known-hosts-keep" | sort -u | sudo tee "$backup_dir/known_hosts" > /dev/null
+sudo cp -- "$backup_dir/known_hosts" "$backup_dir/known_hosts.keep"
+sudo awk -v k="$(cut -d' ' -f2 "$LOGS/other-host-key.pub")" '{print $1, "ssh-ed25519", k}' "$backup_dir/known_hosts.keep" | sort -u | sudo tee "$backup_dir/known_hosts" > /dev/null
 # shellcheck disable=SC2024
 sudo vps backup now > "$LOGS/backup-hostkey.log" 2>&1 || fail "vps backup now exited with $?"
 has backup-hostkey '备份没有成功'
-sudo cp -- "$LOGS/known-hosts-keep" "$backup_dir/known_hosts"
+sudo mv -- "$backup_dir/known_hosts.keep" "$backup_dir/known_hosts"
 # shellcheck disable=SC2024
 sudo vps backup now > "$LOGS/backup-final.log" 2>&1 || fail "vps backup now exited with $?"
 has backup-final '备份完成'

@@ -61,6 +61,23 @@ if ssh_sudo_seen alice 1; then fail 'a different command, a failed attempt or a 
 SUDO_LINE='alice : TTY=pts/1 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/true'
 ssh_sudo_seen alice 1 || fail 'sudo true in the journal was missed'
 if ssh_sudo_seen nobody-here 1; then fail 'sudo counted for an unknown account'; fi
+# The journal a moment behind: looked at again before anyone is asked.
+(
+  load_optimizer_functions journal_settle
+  sleep() { :; }
+  looks="$(mktemp)"
+  found_third() { printf 'x' >> "$looks"; (($(wc -c < "$looks") >= 3)); }
+  journal_settle found_third || fail 'a record that arrives a moment later was missed'
+  [[ "$(wc -c < "$looks" | tr -d ' ')" == 3 ]] || fail "journal looked at $(wc -c < "$looks") times, should stop at the third"
+  : > "$looks"
+  never() { printf 'x' >> "$looks"; return 1; }
+  if journal_settle never; then fail 'nothing in the journal counted as found'; fi
+  (($(wc -c < "$looks") <= 6)) || fail 'keeps looking'
+  rm -f -- "$looks"
+  for name in ssh_login_seen ssh_sudo_seen; do
+    grep -Eq "journal_settle $name " "$TEST_SCRIPT" || fail "$name is looked up only once before asking"
+  done
+)
 unset -f getent
 # The privilege separation directory sshd -t needs: created when missing (as
 # ssh.service does), an existing directory or link left alone.

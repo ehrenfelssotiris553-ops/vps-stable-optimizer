@@ -202,7 +202,7 @@ if sudo grep -rlF --exclude=conf -- cisecretvalue123 /var/lib/vps-stable-opt /va
   printf '%s\n' '回车返回: ==> 3' '恢复哪一次 ==>' '恢复哪个文件或目录 ==>' '恢复到 /root/vps-restore ==> y'
   cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3-restore.rules"
 drive "$LOGS/backup-s3-restore.rules" backup-s3-restore sudo vps item || fail "restore from S3 exited with $?"
-target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | head -n 1)"
+target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | awk 'NR == 1')"
 [[ "$(sudo cat "$target/srv/ci-s3/file.txt")" == 'object storage payload' ]] || fail 'not restored from the bucket'
 sudo rm -rf -- "$target" /srv/ci-s3
 kill "$s3_pid"

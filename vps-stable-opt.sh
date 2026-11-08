@@ -5353,6 +5353,18 @@ ssh_effective_value() {
 # sudo logs under the real UID of the account that ran it, so lines from that
 # account (or root) count; a line another local user writes with
 # `logger -t sudo` carries that user's UID and is ignored.
+# CHECK ARGS...: true as soon as a look in the journal finds it. The journal can
+# be a moment behind what just happened (seen on a 512 MiB machine: sudo had run,
+# the check right after it found nothing and asked "are you sure").
+journal_settle() {
+  local i
+  for ((i = 0; i < 4; i++)); do
+    if "$@"; then return 0; fi
+    sleep 1
+  done
+  "$@"
+}
+
 ssh_sudo_seen() {
   local user="$1" since="$2" uid
   command -v journalctl >/dev/null || return 1
@@ -5604,13 +5616,13 @@ ssh_harden_stage() {
   # Found on a real VPS: Enter pressed before the new window had logged in.
   if ((want_admin)); then read -r -p '新窗口登录进去、运行完 sudo true 以后，再回到这里按回车: ' answer || true
   else read -r -p '新窗口用密钥登录进去以后，再回到这里按回车: ' answer || true; fi
-  if ssh_login_seen "$since" "$user" publickey; then
+  if journal_settle ssh_login_seen "$since" "$user" publickey; then
     ok "系统日志确认 $user 已用密钥登录成功。"
   elif ! confirm_yes "系统日志里没有找到 $user 的密钥登录记录（新窗口还没登录进去的话，选 n，登录以后再重新运行）。你确定已经用密钥登录成功了吗？"; then
     ok '保留密码登录；SSH 设置没有改动。'; module_result ssh declined 'key login not confirmed'; return 0
   fi
   if ((want_admin)); then
-    if ssh_sudo_seen "$user" "$since"; then
+    if journal_settle ssh_sudo_seen "$user" "$since"; then
       ok "系统日志确认 $user 可以使用 sudo。"
     elif ! confirm_yes "系统日志里没有找到 $user 执行 sudo 的记录。你确定 sudo 可用吗？"; then
       warn '没有确认 sudo 可用：这次不禁止 root 直接登录，只关闭密码登录。'
