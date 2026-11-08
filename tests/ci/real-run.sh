@@ -575,12 +575,25 @@ if ! grep -Fq 'TG 通知已开启' "$LOGS/tg-sent.log" || ! grep -Fxq 'chat=4242
 systemctl is-active -q vps-stable-check.timer || fail 'the check timer is not running'
 grep -Fxq 'OnCalendar=*:0/1' /etc/systemd/system/vps-stable-check.timer || fail 'the check does not run every minute with TG'
 check_started="$(date '+%F %T')"
-sudo systemctl start vps-stable-check.service
+# A run of the check of its own, after what was just done: systemctl start
+# joins a run the timer started a moment before instead of starting one (on an
+# arm runner the run in progress had read the login record before the hook
+# wrote to it: the hook's sudo reached TG, the login did not). So wait until
+# none is running first; one the timer starts after that sees it all.
+check_run() {
+  local i
+  for ((i = 0; i < 120; i++)); do
+    [[ "$(systemctl show -p ActiveState --value vps-stable-check.service)" == activating ]] || break
+    sleep 1
+  done
+  sudo systemctl start vps-stable-check.service
+}
+check_run
 sudo rm -f /var/lib/vps-stable-opt/notify/five
 sudo true
 sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PAM_TYPE=open_session PAM_SERVICE=sshd PAM_USER=runner PAM_RHOST=192.0.2.8 PAM_TTY=/dev/pts/9 \
   /usr/bin/timeout 3 /bin/bash /var/lib/vps-stable-opt/login-hook || fail "the login hook exited with $?"
-sudo systemctl start vps-stable-check.service
+check_run
 cat "$LOGS/tg-sent.log"
 grep -Fq 'sudo：runner 运行了 /usr/bin/true' "$LOGS/tg-sent.log" || fail 'a sudo did not reach TG'
 grep -Fq '登录：runner 来自 192.0.2.8' "$LOGS/tg-sent.log" || fail 'a login did not reach TG'
@@ -588,7 +601,7 @@ grep -Fq '登录：runner 来自 192.0.2.8' "$LOGS/tg-sent.log" || fail 'a login
 # conclusion every day: the service runs vps check for real, within its time.
 sudo sh -c "printf 'notify_summary_time=00:00\nnotify_summary_check=always\n' >> /var/lib/vps-stable-opt/params; printf '1999-01-01\n' > /var/lib/vps-stable-opt/notify/summary-date"
 summary_at=$SECONDS
-sudo systemctl start vps-stable-check.service
+check_run
 printf 'The check with the daily summary took %s s.\n' "$((SECONDS - summary_at))"
 cat "$LOGS/tg-sent.log"
 grep -Fq '每日汇总（过去 24 小时）' "$LOGS/tg-sent.log" || fail 'no daily summary reached TG'
