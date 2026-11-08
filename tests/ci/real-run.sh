@@ -934,7 +934,6 @@ sudo ls /var/lib/vps-stable-opt/logs | grep '^audit-' > /dev/null || fail 'no sa
 sudo find /etc -xdev -type f -newer "$run_marker" ! -perm -o=r -printf '%m %u:%g %p\n' 2>/dev/null | sort > "$LOGS/root-only.txt" || true
 if [[ -s "$LOGS/root-only.txt" ]]; then notice "files under /etc only root can read, written during the run ($mode, $(uname -m))" "$LOGS/root-only.txt"; fi
 endgroup
-fi
 
 # TG next to the traffic alert, as they are used: one timer for both, so the
 # rollback has it follow one and go with the other (a real VPS reported a
@@ -949,6 +948,8 @@ drive "$LOGS/item-notify-on-2.rules" item-notify-on-2 sudo VPS_TG_API=http://127
 if ! sudo test -s /var/lib/vps-stable-opt/notify.conf || ! sudo test -s /var/lib/vps-stable-opt/quota.conf; then fail 'TG and the traffic alert are not both on'; fi
 grep -Fxq 'OnCalendar=*:0/1' /etc/systemd/system/vps-stable-check.timer || fail "the timer with TG: $(cat /etc/systemd/system/vps-stable-check.timer)"
 kill "$tg_pid" 2>/dev/null || true
+endgroup
+fi
 
 group 'Full rollback with package removal'
 drive rollback.rules rollback sudo vps rollback || fail "rollback exited with $?"
