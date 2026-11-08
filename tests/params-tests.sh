@@ -11,6 +11,7 @@ source "$HERE/test-common.sh"
 load_optimizer_functions param_list param_kind param_recommended param_reason param_check param_caution param_read param_value param_mode \
   param_store param_names param_info param_item_on param_adjust param_reset param_apply param_live params_overview params_export params_import \
   item_action item_symbols check_tcp verify_set verify_line
+load_optimizer_functions item_actions item_state
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -57,10 +58,10 @@ printf 'PASS: parameters are stored strictly, follow the recommendation when aut
 : > "$PARAMS_FILE"; : > "$TEST_ROOT/applied"
 CONFIRM=n
 confirm_yes() { printf 'ASK %s\n' "$1"; [[ "$CONFIRM" == y ]]; }
-# (tcp asks for two: the buffer cap, then the two switches that come with it.)
-out="$(printf '\n\n' | param_adjust tcp)"
+# (tcp asks for three: the buffer cap, the two switches, the limit of what waits to be sent.)
+out="$(printf '\n\n\n' | param_adjust tcp)"
 [[ "$out" == *'参数没有改动'* && ! -s "$TEST_ROOT/applied" ]] || fail "Enter changed something: $out"
-out="$(printf '%s\n' 500 abc 64 '' | param_adjust tcp)"
+out="$(printf '%s\n' 500 abc 64 '' '' | param_adjust tcp)"
 [[ "$out" == *'请输入 4 到 256 之间的整数'* ]] || fail 'out-of-range value not refused'
 [[ "$(param_value tcp_buffer_mib)" == 64 ]] || fail "adjusted value not kept: $(cat "$PARAMS_FILE")"
 grep -Fxq 'apply tcp' "$TEST_ROOT/applied" || fail 'an item that is on was not applied again'
@@ -74,7 +75,7 @@ printf 'auto\n' | param_adjust tcp > /dev/null
 [[ "$(param_mode tcp_buffer_mib)" == 自动 ]] || fail 'auto did not reset'
 # An item that is off keeps the value for when it is turned on.
 : > "$TEST_ROOT/applied"; MODULE='declined'
-out="$(printf '16\n\n' | param_adjust tcp)"
+out="$(printf '16\n\n\n' | param_adjust tcp)"
 [[ "$out" == *'开启时就会用新的参数'* && ! -s "$TEST_ROOT/applied" ]] || fail 'an item that is off was applied'
 MODULE='applied'
 param_reset tcp > /dev/null
@@ -188,3 +189,20 @@ for name in $(setup_skippable); do LC_ALL=C param_check setup_skip "$name" > /de
 LC_ALL=C param_check setup_skip "$(setup_skippable | tr '\n' ' ')" > /dev/null || fail 'all setup steps together rejected'
 for name in $(sysctl_hardening_all | sed 's/=.*//'); do LC_ALL=C param_check sysctl_hardening_skip "$name" > /dev/null || fail "hardening key rejected: $name"; done
 printf 'PASS: every switch and number opened up in 2.9 keeps to its limits; every name of the name lists is accepted under LC_ALL=C.\n'
+
+# Fail2ban's mode: the default leaves the jail as it was, the aggressive one
+# is a line of its own and the jail is still recognised as this tool's.
+(
+  load_optimizer_functions f2b_jail_text f2b_jail_values_text f2b_jail_legacy_text f2b_jail_is_ours
+  : > "$PARAMS_FILE"
+  plain="$(f2b_jail_text 22)"
+  if grep -q '^mode' <<< "$plain"; then fail "a mode line by default: $plain"; fi
+  f2b_jail_is_ours "$plain" 22 || fail 'the default jail is not recognised'
+  printf 'f2b_mode=aggressive\n' > "$PARAMS_FILE"
+  aggressive="$(f2b_jail_text 22 198.51.100.7)"
+  grep -Fxq 'mode = aggressive' <<< "$aggressive" || fail "no mode line: $aggressive"
+  f2b_jail_is_ours "$aggressive" 22 || fail "a jail with a mode is not recognised as this tool's"
+  [[ -n "$(param_caution f2b_mode aggressive)" && -z "$(param_caution f2b_mode normal)" ]] || fail 'the mode has no warning'
+  if param_check f2b_mode strange > /dev/null; then fail 'an unknown mode was accepted'; fi
+)
+printf 'PASS: the Fail2ban mode is a parameter and leaves the default jail as it was.\n'

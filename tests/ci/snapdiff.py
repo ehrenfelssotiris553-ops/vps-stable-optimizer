@@ -36,8 +36,8 @@ CC_KEYS = ('net.ipv4.tcp_available_congestion_control', 'net.ipv4.tcp_allowed_co
            'net.ipv4.tcp_available_ulp')
 # What the tool itself sets: compared even across a kernel change.
 TOOL_KEYS = re.compile(r'^(net\.ipv[46]\.conf\.|net\.ipv4\.(tcp_congestion_control|tcp_syncookies|icmp_)'
-                       r'|net\.ipv4\.tcp_(slow_start_after_idle|mtu_probing)$|net\.ipv6\.icmp\.'
-                       r'|net\.netfilter\.nf_conntrack_tcp_timeout_established$'
+                       r'|net\.ipv4\.tcp_(slow_start_after_idle|mtu_probing|notsent_lowat)$|net\.ipv6\.icmp\.'
+                       r'|net\.netfilter\.nf_conntrack_(tcp_timeout_established|buckets)$'
                        r'|net\.core\.(default_qdisc|rmem_max|wmem_max)|vm\.(swappiness|page-cluster)'
                        r'|kernel\.(kptr_restrict|dmesg_restrict))')
 # Defaults the kernel works out from the free memory at boot: after a reboot

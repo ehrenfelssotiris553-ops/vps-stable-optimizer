@@ -90,3 +90,8 @@ update_main > /dev/null
 grep -Fq '连不上 GitHub' "$TEST_ROOT/log" || fail 'download failure not explained'
 if grep -q '^ask\|^install' "$TEST_ROOT/log"; then fail 'continued after a failed download'; fi
 printf 'PASS: update offers only a newer, hash-consistent release and installs it only after yes.\n'
+
+# Updates come from the branch that moves only after a release passed its
+# checks on GitHub; those checks reach the new version through the variable.
+grep -Eq '^UPDATE_BASE_URL="\$\{VPS_UPDATE_URL:-https://raw\.githubusercontent\.com/[^/]+/[^/]+/stable\}"$' "$TEST_SCRIPT" || fail 'vps update does not follow the stable branch'
+printf 'PASS: vps update follows the stable branch.\n'

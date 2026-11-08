@@ -6,7 +6,7 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width display_name_get menu_login_alert login_recent menu_quota_alert quota_status
+load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width ui_bar display_name_get menu_login_alert login_recent menu_quota_alert quota_status menu_stale_check_hint
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 # No display name stored (the header shows the hostname).
@@ -67,7 +67,7 @@ set -e
 [[ ! -e "$CHILD_ARGS" && ! -e "$CHILD_MARKER" ]] || fail 'invalid action reached a child or continued past die'
 printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
 
-# The menu numbers, grouped by how often each item is used (update last).
+# The menu: numbers for what is used most, letters for the rest.
 (
   eval "$(declare -f menu | sed 's/\[\[ -t 0 \]\] || die/true || die/')"
   # shellcheck disable=SC2034
@@ -76,26 +76,55 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
   menu_pending_reboot_hint() { echo 'PENDING-REBOOT-HINT'; }
   setup_tmux_running() { return 0; }
   systemctl() { return 1; }
-  menu_action() { printf '%s\n' "$2" >> "$TEST_ROOT/menu-actions"; }
+  menu_action() { printf '%s\n' "${*:2}" >> "$TEST_ROOT/menu-actions"; }
   : > "$TEST_ROOT/menu-actions"
-  # 1 opens the read-only checks: 1 the plan, 2 performance, 3 resources.
-  # 7 opens the security audit (1) and the login record (2).
-  { printf '1\n1\n\n'; for n in $(seq 2 14) 15; do if ((n == 7)); then printf '7\n1\n\n'; else printf '%s\n\n' "$n"; fi; done
-    printf '1\n2\n\n1\n3\n\n1\n\n7\n2\n\n7\n\n'; } > "$TEST_ROOT/menu-input"
-  printf '0\n' >> "$TEST_ROOT/menu-input"
+  # 5, 6 and z open a choice of their own; Enter there goes back to the menu.
+  {
+    printf '1\n\n2\n\n3\n\n4\n\n'
+    printf '5\n1\n\n5\n2\n\n5\n3\n\n5\n4\n\n5\n\n'
+    printf '6\n1\n\n6\n2\n\n6\n\n'
+    printf '7\n\n8\n\nr\n\nl\n\nz\n1\n\nz\n2\n\nz\n\nu\n\n9\n'
+    printf '0\n'
+  } > "$TEST_ROOT/menu-input"
   menu < "$TEST_ROOT/menu-input" > "$TEST_ROOT/menu-out"
-  expected='plan setup check port item bans audit reboot firewall ssh records rollback uninstall update perf resources logins '
-  [[ "$(tr '\n' ' ' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' ' ' < "$TEST_ROOT/menu-actions")"
-  if grep -Fq '还在开发中' "$TEST_ROOT/menu-out"; then fail '7 still says the security audit is to come'; fi
-  grep -Fq '无效选项，请输入 0 至 14 或 h' "$TEST_ROOT/menu-out" || fail 'number 15 not rejected'
-  grep -Fq '14. 检查更新' "$TEST_ROOT/menu-out" || fail 'update is not the last item'
+  expected='report|setup|check|item|firewall|ssh|item sshport|bans|audit|logins|port|clean|reboot|records|rollback|uninstall|update|'
+  [[ "$(tr '\n' '|' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' '|' < "$TEST_ROOT/menu-actions")"
+  grep -Fq '无效选项，请输入 1 至 8，或 r、l、z、u、h，0 退出' "$TEST_ROOT/menu-out" || fail 'number 9 not rejected'
   grep -Fq '3. 开荒验收' "$TEST_ROOT/menu-out" || fail 'acceptance check does not follow setup'
   grep -Fq '第一次用：先选 1 体检' "$TEST_ROOT/menu-out" || fail 'no first-time hint before any setup'
   # Banners: an update waiting for a reboot, and a setup still running in tmux.
   grep -Fq 'PENDING-REBOOT-HINT' "$TEST_ROOT/menu-out" || fail 'pending reboot not shown in the menu'
   grep -Fq '一键开荒正在 tmux 里运行' "$TEST_ROOT/menu-out" || fail 'setup running in tmux not shown in the menu'
 )
-printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
+printf '%s\n' 'PASS: menu numbers and letters reach what they say.'
+
+# The first lines tell how the machine stands: the marks are plain ASCII.
+(
+  [[ "$(ui_bar 0)" == '[..........]' && "$(ui_bar 41)" == '[####......]' && "$(ui_bar 100)" == '[##########]' ]] || fail "bars: $(ui_bar 0) $(ui_bar 41) $(ui_bar 100)"
+  # shellcheck disable=SC2034
+  SCRIPT_VERSION=9.9.9 OS=debian OS_VERSION=13 ROOT_GIB=20 STATE_ROOT="$TEST_ROOT/state" LOG_DIR="$TEST_ROOT/logs"
+  systemctl() { return 1; }
+  wide="$(menu_header 100)" narrow="$(menu_header 50)"
+  grep -Fq '内存 ' <<< "$wide" && grep -Fq '负载 ' <<< "$wide" || fail "no load on the header: $wide"
+  [[ "$(grep -c '内存 .*硬盘 ' <<< "$wide")" == 1 && "$(grep -c '内存 .*硬盘 ' <<< "$narrow" || true)" == 0 ]] || fail "not one line when wide, several when narrow: $narrow"
+  mkdir -p "$STATE_ROOT/notify"; printf 'quota_mb=1000000\n' > "$STATE_ROOT/quota.conf"; printf '312000\n' > "$STATE_ROOT/notify/traffic-used"
+  grep -Fq '流量 312/1000 GB' <<< "$(menu_header 100)" || fail "traffic not on the header: $(menu_header 100)"
+  rm -rf "$STATE_ROOT"
+)
+printf '%s\n' 'PASS: the header shows memory, disk, load and traffic, on one line only when it fits.'
+
+# A check script an earlier version wrote is pointed out, and only then.
+(
+  STATE_ROOT="$TEST_ROOT/state-stale"; mkdir -p "$STATE_ROOT"
+  SYM_WARN='⚠' C_WARN='' C_RESET=''
+  notify_check_text() { echo current; }
+  [[ -z "$(menu_stale_check_hint)" ]] || fail 'hint without a check script'
+  echo current > "$STATE_ROOT/notify-check"
+  [[ -z "$(menu_stale_check_hint)" ]] || fail 'hint although the script is current'
+  echo older > "$STATE_ROOT/notify-check"
+  [[ "$(menu_stale_check_hint)" == *'检查脚本还是旧版本'* ]] || fail 'an older script not pointed out'
+)
+printf '%s\n' 'PASS: the menu points out a check script from an earlier version.'
 
 # The hints above the menu that the parameter leaves out are not shown.
 (
@@ -119,29 +148,28 @@ printf '%s\n' 'PASS: menu numbers follow the grouped order, with update last.'
 )
 printf '%s\n' 'PASS: the menu shows only the hints the parameter asks for.'
 
-# Two columns on a wide terminal, aligned by display width (CJK counts two);
-# one column on a narrow one; every entry in both.
+# Up to three columns, aligned by display width (CJK counts two); one on a
+# phone; every entry in each.
 (
-  wide="$(menu_render 100)" narrow="$(menu_render 44)"
-  for f in "$wide" "$narrow"; do
-    grep -Eq '^  h\. 使用说明 +0\. 退出$' <<< "$f" || fail "no help and exit line: $f"
-  done
-  for n in $(seq 1 14); do
+  wide="$(menu_render 100)" narrow="$(menu_render 30)"
+  for n in $(seq 1 8); do
     grep -Eq "(^| )$n\. " <<< "$wide" || fail "entry $n missing from the wide menu"
     grep -Eq "^ *$n\. " <<< "$narrow" || fail "entry $n missing from the narrow menu"
   done
-  grep -Eq '^  1\. 体检.* 4\. 端口管理$' <<< "$wide" || fail "groups not side by side: $wide"
-  grep -Fxq '  4. 端口管理' <<< "$narrow" || fail "narrow menu not one column: $narrow"
-  # The right column lines up: in every row with two entries, the right
-  # entry's dot (the 4th column of its cell) is at the same display column.
-  two='[0-9]\. .* [0-9]{1,2}\. ' upto='^(.* [0-9]{1,2})\. '
-  starts="$(while IFS= read -r line; do
-    [[ "$line" =~ $two && "$line" =~ $upto ]] || continue
-    ui_width "${BASH_REMATCH[1]}"; done <<< "$wide" | sort -u)"
-  [[ -n "$starts" && "$(wc -l <<< "$starts")" == 1 ]] || fail "right column not aligned: dots at $(tr '\n' ' ' <<< "$starts")"
+  for k in r l z u h 0; do
+    grep -Eq "(^| )$k\. " <<< "$wide" || fail "entry $k missing from the wide menu"
+    grep -Eq "(^| )$k\. " <<< "$narrow" || fail "entry $k missing from the narrow menu"
+  done
+  grep -Eq '^  1\. .*  2\. .*  3\. ' <<< "$wide" || fail "not three columns: $wide"
+  grep -Fxq '  4. 单项设置' <<< "$narrow" || fail "narrow menu not one column: $narrow"
+  # The columns line up: the last entry of each full row starts at one column.
+  last='^(.*[[:space:]])[0-9]\.[[:space:]]'
+  starts="$(head -n 2 <<< "$wide" | while IFS= read -r line; do [[ "$line" =~ $last ]] && ui_width "${BASH_REMATCH[1]}"; done | sort -u)"
+  [[ -n "$starts" && "$(wc -l <<< "$starts")" == 1 ]] || fail "columns not aligned: $(tr '\n' ' ' <<< "$starts")"
   if grep -q ' $' <<< "$wide"; then fail 'trailing spaces in the wide menu'; fi
+  if grep -q ' $' <<< "$narrow"; then fail 'trailing spaces in the narrow menu'; fi
 )
-printf '%s\n' 'PASS: the menu is two aligned columns when wide and one when narrow.'
+printf '%s\n' 'PASS: the menu is aligned columns when wide and one when narrow.'
 
 # After an update the new version's menu opens (exec), unless it does not parse.
 grep -A4 'if \[\[ "$action" == update && "$(sha256sum' "$TEST_SCRIPT" | grep -Fq 'exec /bin/bash -- "$self" menu' ||
@@ -161,7 +189,7 @@ printf '%s\n' 'PASS: after an update the new version of the menu opens.'
   printf '100.00 50.00\n' > "$TEST_ROOT/up-short"
   printf '0.00 0.00\n' > "$TEST_ROOT/up-zero"
   out="$(menu_pending_reboot_hint "$B" "$TEST_ROOT/no-flag" "$TEST_ROOT/up-short")"
-  [[ "$out" == *'新内核 6.1.0-11-amd64 已经装好，重启后才会用上：方便时选 8 重启。'* ]] || fail "new kernel not announced: $out"
+  [[ "$out" == *'新内核 6.1.0-11-amd64 已经装好，重启后才会用上：方便时选 r 重启。'* ]] || fail "new kernel not announced: $out"
   [[ -z "$(menu_pending_reboot_hint "$B" "$TEST_ROOT/no-flag" "$TEST_ROOT/up-zero")" ]] || fail 'a kernel present at boot was announced'
   touch -d '3 days ago' "$TEST_ROOT/flag"
   out="$(menu_pending_reboot_hint "$B" "$TEST_ROOT/flag" "$TEST_ROOT/up-zero")"

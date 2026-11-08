@@ -368,7 +368,7 @@ endgroup
 group 'Allowlist management: one more address, then removed again'
 index="$(item_index fail2ban)" || fail 'no single item fail2ban'
 allow_rules() {
-  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 3' "a 添加，d 删除，0 返回 ==> @seq $1 0" \
+  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 5' "a 添加，d 删除，0 返回 ==> @seq $1 0" \
     '要加的 IP 或网段 ==> 192.0.2.50' '要删除第几个？ ==> 2' > "$WORK/allow-$1.rules"
 }
 allow_rules a
@@ -477,9 +477,9 @@ endgroup
 
 group 'Rename the machine; the display name in Chinese'
 old_name="$(vm hostname)"
-# The single item from the tool's own list: 2 renames, then 1 sets the display name.
+# The single item from the tool's own list: 1 renames, then 5 sets the display name.
 index="$(item_index hostname)" || fail 'no single item hostname'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index $index 0" '请选择: ==> @seq 2 1' \
+printf '%s\n' "请选择要修改的项目 ==> @seq $index $index 0" '请选择: ==> @seq 1 5' \
   '新的主机名（直接回车取消） ==> vps-ci-renamed' '把主机名从 ==> y' '新的显示名 ==> 测试机-一号' > "$WORK/rename.rules"
 vm_drive "$WORK/rename.rules" rename vps item || fail "rename exited with $?"
 [[ "$(vm hostname)" == vps-ci-renamed ]] || fail "hostname after the rename: $(vm hostname)"
@@ -545,11 +545,11 @@ vm 'getent hosts "$(hostname)"' > /dev/null || fail 'the host name does not reso
 # Fail2ban: 3 tries instead of 5, then back to the recommendation; the running
 # jail follows both times.
 index="$(item_index fail2ban)" || fail 'no single item fail2ban'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 4' '新的值 ==> @seq 3 auto' > "$WORK/f2b-params.rules"
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 3' '新的值 ==> @seq 3 auto' > "$WORK/f2b-params.rules"
 vm_drive "$WORK/f2b-params.rules" f2b-params vps item || fail "Fail2ban parameters exited with $?"
 [[ "$(vm 'fail2ban-client get sshd maxretry')" == 3 ]] || fail "the running jail does not use 3 tries: $(vm 'fail2ban-client get sshd maxretry')"
 vm "grep -Fxq 'maxretry = 3' /etc/fail2ban/jail.d/99-vps-stable-sshd.local" || fail 'the jail file does not say 3 tries'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 5' > "$WORK/f2b-reset.rules"
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 4' > "$WORK/f2b-reset.rules"
 vm_drive "$WORK/f2b-reset.rules" f2b-reset vps item || fail "Fail2ban parameters reset exited with $?"
 [[ "$(vm 'fail2ban-client get sshd maxretry')" == 5 ]] || fail "the running jail is not back at 5 tries: $(vm 'fail2ban-client get sshd maxretry')"
 endgroup

@@ -189,12 +189,10 @@ foreign_f2b_config() { record 'unexpected Fail2ban setup after firewall refusal'
 reset_case f2b_readiness_gate
 printf '1\n' > "$CASE_DIR/ufw-active"
 FIREWALL_READY=0
-# The function must defend itself if called after a refused firewall. Overall
-# entry-point sequencing is checked separately by entry-tests.sh.
+# Since 2.9 the bans are Fail2ban's own nftables set: an unconfirmed firewall
+# does not stop it (it goes on to read the existing configuration).
 fail2ban_stage
-if grep -q '^unexpected Fail2ban setup' "$CASE_DIR/calls"; then
-  fail 'Fail2ban setup continued while firewall stage was not ready'
-fi
+grep -q '^unexpected Fail2ban setup' "$CASE_DIR/calls" || fail 'Fail2ban waited for a firewall it does not use'
 
 reset_case confirmed
 printf 'CONNECTED\n' > "$CASE_DIR/input"

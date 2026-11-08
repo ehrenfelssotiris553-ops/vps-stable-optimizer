@@ -70,7 +70,7 @@ endgroup
 
 group 'The firewall paused and on again: Docker keeps its FORWARD policy, the container keeps working'
 index="$(item_index firewall)" || fail 'no single item firewall'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 2' '临时关闭防火墙吗？ ==> y' > "$LOGS/fw-pause.rules"
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 5' '临时关闭防火墙吗？ ==> y' > "$LOGS/fw-pause.rules"
 drive "$LOGS/fw-pause.rules" fw-pause sudo vps item || fail "pausing the firewall exited with $?"
 if sudo ufw status 2>/dev/null | grep -Fx 'Status: active' > /dev/null; then fail 'the firewall is still on after the pause'; fi
 [[ "$(forward)" == "$before_forward" ]] || fail "pausing the firewall left FORWARD at '$(forward)', Docker had '$before_forward'"

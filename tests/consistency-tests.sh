@@ -200,8 +200,9 @@ declare -A FIXED_NUMBERS=(
   # Field numbers and exit codes, umask 077 and mode 755, the red colour (31,
   # escape 033), seconds per minute and day, C.UTF-8, the sshd lines of the last
   # 600 s (50 at most) matched within 120 s, the last 300 records compared, and
-  # the cut lengths of names (32), addresses (64) and lines (20).
-  [login_hook_text]='0 1 2 3 4 5 7 8 9 20 31 32 033 50 60 64 077 120 300 600 755 86400'
+  # the cut lengths of names (32), addresses (64) and lines (20); 6: the number
+  # of the security audit in the menu, as a text to the user.
+  [login_hook_text]='0 1 2 3 4 5 6 7 8 9 20 31 32 033 50 60 64 077 120 300 600 755 86400'
   # Positional ${2}; minutes and days in seconds.
   [f2b_jail_text]='2 60 86400'
   # Positional ${7}; localhost (127.0.0.1/8, ::1) is never banned.

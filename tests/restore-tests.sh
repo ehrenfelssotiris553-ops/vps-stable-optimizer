@@ -522,14 +522,22 @@ value_baseline() {
   installed() { [[ "$1" == systemd-zram-generator ]]; }
   systemctl() {
     case "$*" in
-      daemon-reload) ;;
+      daemon-reload) printf 'reload\n' >> "$TRACE" ;;
       'reset-failed systemd-zram-setup@zram0.service dev-zram0.swap') printf 'reset-failed\n' >> "$TRACE" ;;
+      'mask --runtime dev-zram0.swap systemd-zram-setup@zram0.service') printf 'mask\n' >> "$TRACE" ;;
+      'unmask --runtime dev-zram0.swap systemd-zram-setup@zram0.service') printf 'unmask\n' >> "$TRACE" ;;
       *) die "unexpected systemctl $*" ;;
     esac
   }
   restore_packages_offer() { printf 'offer %s\n' "$*" >> "$TRACE"; }
   warn() { printf 'WARN %s\n' "$*" >> "$TRACE"; }
+  restore_tool_package() { [[ "$1" == systemd-zram-generator ]]; }
   restore_zram_group
+  # Held off before systemd reads the package's default, until the package is
+  # dealt with: on a small machine a ZRAM started meanwhile cannot be taken away.
+  [[ "$(grep -nE '^(mask|reload)$' "$TRACE" | head -n 2 | cut -d: -f2 | tr '\n' ' ')" == 'mask reload ' ]] || die "the package default not held off before the reload: $(tr '\n' ' ' < "$TRACE")"
+  ZRAM_HELD_OFF=1 restore_zram_settle > /dev/null
+  grep -Fxq unmask "$TRACE" || die 'ZRAM left masked after the rollback'
   [[ ! -e "$ZRAM_FILE" ]] || die 'ZRAM configuration not removed'
   grep -q '^WARN systemd-zram-generator' "$TRACE" || die 'package default turning ZRAM back on not explained'
   grep -Fxq 'offer systemd-zram-generator' "$TRACE" || die 'removal of the package not offered'

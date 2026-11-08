@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions ssh_port_text ssh_port_reload ssh_port_established ssh_port_restore_previous ssh_port_fw_close ssh_port_stage \
+load_optimizer_functions ssh_port_text ssh_port_reload ssh_port_login_seen ssh_port_restore_previous ssh_port_fw_close ssh_port_stage \
   restore_sshport_group check_sshport ufw_rule restore_record_fw_rule port_source_valid verify_set audit_clean_text \
   sshd_line_value sshd_config_walk sshd_include_args sshd_reads sshd_port_lines sshd_lines_show sshd_lines_off sshd_lines_on \
   sshd_lines_on_cmd sshd_off_files restore_record_sshd_file ipv4_private ipv4_behind_nat
@@ -62,6 +62,7 @@ sshd_runtime_dir() { :; }
 guard_leftovers() { return 1; }
 guard_arm() { record "guard $1"; }
 guard_confirm() { record confirm; ((CONFIRM)); }
+guard_since() { echo 1; }
 ssh_port_follow() { record "fail2ban follows $LISTEN"; }
 ssh_limit_exempt() { record exempt; }
 confirm_yes() { case "$1" in *小于\ 1024*) record 'ask low port'; ((LOW_OK)) ;; *端口转发*) record 'ask nat'; ((NAT_OK)) ;; *) ((PROVIDER)) ;; esac; }
@@ -222,7 +223,43 @@ grep -Fxq 'ufw limit 22/tcp' "$TEST_ROOT/ufw" || fail "someone else's rule for t
 restore_sshport_group
 RESTORE_READY=1
 if grep -Fxq 'ufw limit 22/tcp' "$RESTORE_ROOT/fw_rules"; then fail "someone else's rule for the old port recorded as this tool's"; fi
-printf 'PASS: rollback lets the original port in (allowlisted addresses unlimited again) before SSH goes back to it, by a rule of its own.\n'
+# Once SSH is back on the old port the new port's rule goes as well (it used to
+# stay until the whole firewall was undone); not while SSH is not back yet.
+start; ssh_port_stage <<< 2244 > /dev/null
+restore_needed() { return 0; }
+restore_resource() { record "resource $1"; rm -f "$SSH_PORT_DROPIN"; }
+restore_sshport_group
+if grep -q 2244 "$TEST_ROOT/ufw"; then fail "the new port is still let in after going back: $(cat "$TEST_ROOT/ufw")"; fi
+if grep -q 2244 "$RESTORE_ROOT/fw_rules"; then fail "the new port's rule is still recorded: $(cat "$RESTORE_ROOT/fw_rules")"; fi
+start; ssh_port_stage <<< 2244 > /dev/null
+RELOAD_OK=0; RESTORE_PARTIAL=0
+restore_sshport_group
+grep -Fxq 'ufw limit 2244/tcp' "$TEST_ROOT/ufw" || fail "the new port was closed although SSH is not back on the old one: $(cat "$TEST_ROOT/ufw")"
+RELOAD_OK=1
+unset -f restore_needed restore_resource
+printf 'PASS: rollback lets the original port in (allowlisted addresses unlimited again) before SSH goes back to it, by a rule of its own, and closes the new port after.\n'
+
+# The confirmation of a new port is a login on it, not any connection to it: a
+# scanner connects without logging in. Peers as ss prints them, sshd's own lines.
+(
+  SS_OUT=''; JOURNAL=''
+  ss() { [[ "$*" == '-Htn state established ( sport = :2244 )' ]] || fail "unexpected ss $*"; printf '%s' "$SS_OUT"; }
+  journalctl() { [[ "$*" == *'--since @100 _UID=0 -t sshd -t sshd-session'* ]] || fail "unexpected journalctl $*"; printf '%s' "$JOURNAL"; }
+  SS_OUT=$'0 0 198.51.100.5:2244 203.0.113.50:40001\n'
+  if ssh_port_login_seen 2244 100; then fail 'a connection without a login confirmed the port'; fi
+  JOURNAL=$'Accepted publickey for root from 203.0.113.9 port 50000 ssh2: ED25519 SHA256:x\n'
+  if ssh_port_login_seen 2244 100; then fail 'a login from another connection (the old port) confirmed the port'; fi
+  JOURNAL=$'Accepted publickey for root from 203.0.113.50 port 40001 ssh2: ED25519 SHA256:x\n'
+  ssh_port_login_seen 2244 100 || fail 'a login on the new port was not seen'
+  SS_OUT=$'0 0 [::ffff:198.51.100.5]:2244 [::ffff:203.0.113.50]:40001\n'
+  ssh_port_login_seen 2244 100 || fail 'a login on a dual-stack socket (ssh.socket) was not seen'
+  SS_OUT=$'0 0 [2001:db8::1]:2244 [2001:db8::2]:40001\n'
+  JOURNAL=$'Accepted publickey for root from 2001:db8::2 port 40001 ssh2: ED25519 SHA256:x\n'
+  ssh_port_login_seen 2244 100 || fail 'a login over IPv6 was not seen'
+  SS_OUT=''
+  if ssh_port_login_seen 2244 100; then fail 'confirmed with nobody connected'; fi
+)
+printf 'PASS: only a login on the new port confirms it, not a connection to it.\n'
 
 # A provider image with "Port 22" in sshd_config (a real Debian 13 VPS): on a
 # yes it is commented out, the old port stays open through this tool's own

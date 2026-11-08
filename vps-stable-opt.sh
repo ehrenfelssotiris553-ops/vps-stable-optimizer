@@ -118,13 +118,15 @@ CHECK_TIMER_FILE=/etc/systemd/system/vps-stable-check.timer
 DOCKER_DAEMON_FILE=/etc/docker/daemon.json
 NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE='' SSHPORT_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report|clean|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|report|clean|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
 VPS 机器管家 V2.9.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
-  vps plan       给机器做体检（只检查）
+  vps report     机器体检（只读）：性能、资源、磁盘、服务和系统状况一份看完，要留意的排在最前
+  vps clean      磁盘清理：先列出能清掉多少，你选了才清
+  vps plan       开荒前的完整计划（只检查）
   vps perf       性能体检（只读）：CPU 是否被抢、内存和硬盘压力、换页、网络重传、连接跟踪
   vps resources  资源占用一览（只读）：常驻服务各占多少内存和 CPU、能不能关、封禁规则多少
   vps audit      安全排查（只读）：谁登录过、账户和公钥、装过什么、正在运行什么、开机自启和定时任务、系统文件
@@ -135,7 +137,7 @@ VPS 机器管家 V2.9.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
                    vps port open 8080 | 443-600 | 8080,9000-9100 [tcp|udp|both] [from IP]
                    vps port close 8080 [tcp|udp|both]
                    vps port list
-  vps item       单项设置：逐项开启或关闭某一项，不用重跑整个开荒；能调的项目可以调整参数
+  vps item       单项设置：逐项开启或关闭某一项，不用重跑整个开荒；能调的项目可以调整参数（vps item tcp 直接打开这一项）
   vps params     参数总览（现在的值、推荐值和理由）；vps params export 导出，vps params import [文件] 导入
   vps bans       查看 Fail2ban 封禁记录，可以解封某个 IP
   vps reboot     重启服务器（先说明是否需要重启；防失联确认或软件安装没结束时不重启）
@@ -217,6 +219,12 @@ on_error() {
   local code="$1" line="$2"
   trap - ERR
   if declare -F restore_capture_failure >/dev/null; then restore_capture_failure || true; fi
+  # A step of one-click setup that runs on its own (stage_run_isolated): only
+  # that step ends, the setup goes on.
+  if [[ "${STAGE_ISOLATED:-0}" == 1 ]]; then
+    printf '%s%s 出错：第 %s 行，退出码 %s；这一步先跳过，后面的步骤继续。%s\n' "${C_FAIL-}" "${SYM_FAIL-✖}" "$line" "$code" "${C_RESET-}" >&2
+    exit "$code"
+  fi
   if declare -F record_failure >/dev/null; then record_failure "$line" "$code" || true; fi
   printf '%s%s 出错：第 %s 行，退出码 %s；请查看运行记录，不要盲目重跑。%s\n' "${C_FAIL-}" "${SYM_FAIL-✖}" "$line" "$code" "${C_RESET-}" >&2
   exit "$code"
@@ -671,7 +679,7 @@ details_report() {
 plan() {
   say '给机器做体检（只检查，不修改）'
   printf '系统：%s | 内核：%s | 虚拟化：%s | 内存：%s MiB | 系统盘：%s GiB\n' "$PRETTY_NAME" "$(uname -r)" "$VIRT" "$MEM_MIB" "$ROOT_GIB"
-  # Menus 8 and 9 change one thing only: the full setup plan would mislead there.
+  # These two change one thing only: the full setup plan would mislead there.
   case "$MODE" in
     ssh) echo '这次只做 SSH 登录加固：先体检，再按提示一步步确认。' ;;
     firewall) echo '这次只设置防火墙和 SSH 防爆破：先体检，再按提示一步步确认。' ;;
@@ -982,7 +990,7 @@ setup_questions() {
   fi
   if ! setup_skipped firewall && confirm_yes '防火墙同时放行网站端口 TCP 80、443 吗？（只做代理或跳板可以不开，以后可用端口管理再放行）'; then WEB_CHOICE=1; else WEB_CHOICE=0; fi
   F2B_CHOICE=1
-  if setup_skipped fail2ban || setup_skipped firewall; then F2B_CHOICE=0
+  if setup_skipped fail2ban; then F2B_CHOICE=0
   elif f2b_optional "$SSH_CHOICE"; then
     if [[ "${RECOMMENDED:-0}" == 1 ]]; then
       F2B_CHOICE=0
@@ -2112,6 +2120,7 @@ param_list() {
     f2b_bantime_min fail2ban 'Fail2ban 首次封禁时长' 分钟 \
     f2b_increment fail2ban 'Fail2ban 再犯加倍' '' \
     f2b_maxtime_days fail2ban 'Fail2ban 最长封禁时长' 天 \
+    f2b_mode fail2ban 'Fail2ban 识别模式' '' \
     notify_summary notify 'TG 每日汇总' '' \
     notify_summary_time notify 'TG 每日汇总的时间' '' \
     notify_summary_check notify '每日汇总附上验收结论' '' \
@@ -2142,6 +2151,7 @@ param_list() {
     auto_swap_below_mib zram '内存小于多少时开荒自动配 ZRAM（或硬盘 Swap）' MiB \
     swap_min_free_gb swap '建了硬盘 Swap 后系统盘至少还剩' GB \
     tcp_extras tcp '空闲后不慢启动、自动探测 MTU' '' \
+    tcp_notsent_kib tcp '还没发出去的数据最多排队多少' KiB \
     journal_auto_disk_gib journal '系统盘多大以内开荒自动限制日志' GiB \
     ssh_keepalive_count keepalive 'SSH 保活几次没回应才断开' 次 \
     f2b_optional_below_mib fail2ban '只用密钥登录时，内存小于多少开荒不装 Fail2ban' MiB \
@@ -2152,7 +2162,9 @@ param_list() {
     login_note_minutes login '登录提醒列出最近几分钟的其他登录' 分钟 \
     check_minutes_tg notify '开了 TG 时多久检查一次' 分钟 \
     notify_events_minutes notify '装软件、加公钥这类变化多久查一次' 分钟 \
-    check_minutes_quota quota '只开流量提醒时多久检查一次' 分钟
+    check_minutes_quota quota '只开流量提醒时多久检查一次' 分钟 \
+    clean_log_days general '磁盘清理时删多少天以前的旧日志' 天 \
+    clean_journal_keep_mib general '磁盘清理后系统日志至少留多少' MiB
 }
 
 # MIB as people say it: "2GiB" for whole GiB, else "1536 MiB".
@@ -2171,6 +2183,40 @@ setup_skipped() {
   [[ " $(param_value setup_skip) " == *" $1 "* ]]
 }
 
+# Steps nothing after them depends on (ntp is not one: the upgrade reads what
+# it found). One that stops on an unexpected error is recorded as failed and
+# the setup goes on: the SSH hardening, the firewall and Fail2ban come last and
+# must not be lost to the error of a small step.
+setup_step_independent() {
+  case "$1" in zram|swap|bbr|sysctl|tcp|journal|trim|updates|autoreboot|timezone|hosts|keepalive|ipv4|login) return 0 ;; esac
+  return 1
+}
+
+# STAGE FUNCTION...: runs like stage_run, in a subshell of its own, with errexit on. Must
+# not be called from a condition (if, ||, &&), where Bash ignores errexit even
+# in a subshell. What the stage sets stays in the subshell (none of these sets
+# anything read later) but for the count of warnings.
+stage_run_isolated() {
+  local stage="$1" rc=0 count
+  count="$(mktemp)" || die '无法创建临时文件。'
+  set +e
+  ( set -e; STAGE_ISOLATED=1; stage_run "$@"; printf '%s\n' "$WARNINGS" > "$count" )
+  rc=$?
+  set -e
+  if ((rc == 0)); then
+    WARNINGS="$(cat -- "$count")"
+    rm -f -- "$count"
+    return 0
+  fi
+  rm -f -- "$count"
+  # Ctrl+C or a lost connection ends the whole run, as everywhere else.
+  if ((rc >= 128)); then exit "$rc"; fi
+  state_write active_stage none || true
+  state_event "$stage" failed "$rc" || true
+  module_result "$stage" failed "unexpected error, exit $rc"
+  warn "「$(item_label "$stage")」这一步没有做完（退出码 $rc），详情见运行日志；其余步骤继续。以后可以在单项设置里单独重做这一项。"
+}
+
 # NAME FUNCTION...: a step of one-click setup, unless the parameter leaves it
 # out (then it is recorded as skipped, which vps check reports as such).
 setup_run() {
@@ -2180,7 +2226,7 @@ setup_run() {
     module_result "$1" skipped 'setup_skip'
     return 0
   fi
-  stage_run "$@"
+  if setup_step_independent "$1"; then stage_run_isolated "$@"; else stage_run "$@"; fi
 }
 
 # The alerts at the top of the menu that can be switched (menu_alerts).
@@ -2223,7 +2269,7 @@ notify_event_names() {
 # NAME: "int" (a whole number) or "word" (one of a few names).
 param_kind() {
   case "$1" in
-    zram_algorithm|apt_upgrade_time|tools_list|f2b_increment|notify_summary|notify_summary_time|notify_summary_check|notify_events|notify_sudo_args|notify_services|quota_alerts) echo word ;;
+    zram_algorithm|apt_upgrade_time|tools_list|f2b_increment|f2b_mode|notify_summary|notify_summary_time|notify_summary_check|notify_events|notify_sudo_args|notify_services|quota_alerts) echo word ;;
     setup_skip|menu_alerts|ssh_rate_limit|ssh_x11_forwarding|sysctl_hardening_skip|bbr_qdisc|zram_swappiness|zram_page_cluster|tcp_extras|login_note) echo word ;;
     *) echo int ;;
   esac
@@ -2262,6 +2308,7 @@ param_recommended() {
     f2b_bantime_min) echo 60 ;;
     f2b_increment) echo yes ;;
     f2b_maxtime_days) echo 7 ;;
+    f2b_mode) echo normal ;;
     notify_summary) echo yes ;;
     notify_summary_time) echo 09:00 ;;
     notify_summary_check) echo issues ;;
@@ -2295,6 +2342,9 @@ param_recommended() {
     ssh_keepalive_count) echo 3 ;;
     f2b_optional_below_mib) echo 1024 ;;
     conntrack_notice_percent) echo 70 ;;
+    tcp_notsent_kib) echo 128 ;;
+    clean_log_days) echo 30 ;;
+    clean_journal_keep_mib) echo 50 ;;
     login_keep_days) echo 365 ;;
     login_keep_lines) echo 20000 ;;
     login_note_minutes) echo 10 ;;
@@ -2362,6 +2412,10 @@ param_reason() {
     auto_swap_below_mib) echo '2048 MiB：内存小于 2 GiB 的机器常会用到 Swap，开荒时没有 Swap 就自动配 ZRAM（内核没有 zram 模块时配硬盘 Swap）；更大的机器开荒时问你。' ;;
     swap_min_free_gb) echo '3 GB：系统升级、日志、临时文件都要地方；建 Swap 后剩得不够，Swap 会自动缩小。' ;;
     tcp_extras) echo 'yes：连接空闲一会儿后不重新慢启动（跑代理时网速不会忽快忽慢），大包被路上的设备丢掉时自动找到能走的大小。' ;;
+    tcp_notsent_kib) echo '128：程序写得比线路发得快时，多出来的数据留在程序里，不堆在内核的发送队列里，延迟低、省内存；路上正在传的数据不受限，速度不变。0 表示不设置（内核默认不限）。' ;;
+    clean_log_days) echo '30：一个月以前的旧日志一般用不上了；wtmp、btmp 这类登录记录不删。' ;;
+    clean_journal_keep_mib) echo '50：清理以后系统日志至少还留这么多，最旧的先删；出了问题还能往回查。' ;;
+    f2b_mode) echo 'normal：只算明确的失败，比如输错密码。aggressive：没试密码就断开的扫描也算，只允许密钥登录时才封得到扫描者。OpenSSH 9.8 起（Debian 13 等）sshd 自己会惩罚这类连接，一般不用开。' ;;
     journal_auto_disk_gib) echo '20 GiB：小硬盘的系统日志可能长到几个 GiB，开荒时自动限制；更大的硬盘保持系统默认（最多占 10%、最多 4 GiB）。0 表示不管多大都限制。' ;;
     ssh_keepalive_count) echo '3 次：连续 3 次没回应（约 3 分钟）才当成断了，网络短暂抖一下不会断开 SSH。' ;;
     f2b_optional_below_mib) echo '1024 MiB：只允许密钥登录时猜密码猜不中，内存小于 1 GiB 的机器开荒时按推荐不装 Fail2ban，省约 30 MB 内存。0 表示总是装。' ;;
@@ -2432,6 +2486,9 @@ param_check() {
     f2b_maxtime_days)
       if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 1 && 10#$2 <= 365)); then return 0; fi
       echo '请输入 1 到 365 之间的整数（天）。' ;;
+    f2b_mode)
+      case "$2" in normal|aggressive) return 0 ;; esac
+      echo '请输入 normal 或 aggressive。' ;;
     notify_summary)
       case "$2" in yes|no) return 0 ;; esac
       echo '请输入 yes（每天发汇总）或 no（不发）。' ;;
@@ -2549,6 +2606,15 @@ param_check() {
     ssh_rate_limit|ssh_x11_forwarding|tcp_extras|login_note)
       case "$2" in yes|no) return 0 ;; esac
       echo '请输入 yes 或 no。' ;;
+    tcp_notsent_kib)
+      if [[ "$2" =~ ^[0-9]{1,5}$ ]] && { ((10#$2 == 0)) || ((10#$2 >= 16 && 10#$2 <= 16384)); }; then return 0; fi
+      echo '请输入 0（不设置）或 16 到 16384 之间的整数（单位 KiB）。' ;;
+    clean_log_days)
+      if [[ "$2" =~ ^[0-9]{1,4}$ ]] && ((10#$2 >= 1 && 10#$2 <= 3650)); then return 0; fi
+      echo '请输入 1 到 3650 之间的整数（天）。' ;;
+    clean_journal_keep_mib)
+      if [[ "$2" =~ ^[0-9]{1,4}$ ]] && ((10#$2 >= 16 && 10#$2 <= 4096)); then return 0; fi
+      echo '请输入 16 到 4096 之间的整数（单位 MiB）。' ;;
     bbr_qdisc)
       case "$2" in fq|fq_codel|cake) return 0 ;; esac
       echo '请输入 fq、fq_codel 或 cake。' ;;
@@ -2618,7 +2684,7 @@ param_caution() {
       if ((10#$2 < 150)); then echo '比较短：来不及新开窗口登录的话，改动会被自动撤销（安全，但要重做）。'
       elif ((10#$2 > 600)); then echo '比较长：万一把自己锁在外面，要多等一会儿才会自动恢复。'; fi ;;
     setup_skip)
-      if [[ " $2 " == *' firewall '* ]]; then echo '跳过防火墙：一键开荒后所有在监听的端口都直接暴露在公网，Fail2ban 也不会装。'; fi ;;
+      if [[ " $2 " == *' firewall '* ]]; then echo '跳过防火墙：一键开荒后所有在监听的端口都直接暴露在公网（Fail2ban 照常工作，它不靠防火墙）。'; fi ;;
     ssh_rate_limit)
       if [[ "$2" == no ]]; then echo '不限速：还允许密码登录时，猜密码只靠 Fail2ban 挡（它要等输错几次才封）。'; fi ;;
     ssh_max_auth_tries)
@@ -2642,6 +2708,12 @@ param_caution() {
       if ((10#$2 < 2)); then echo '不到 2 GB：系统升级时可能没地方放软件包。'; fi ;;
     tcp_extras)
       if [[ "$2" == no ]]; then echo '关掉：连接空闲后重新慢启动，跨洲代理时网速会忽快忽慢。'; fi ;;
+    tcp_notsent_kib)
+      if ((10#$2 != 0 && 10#$2 < 64)); then echo '比较小：带宽很高时程序要写得非常勤，CPU 弱的机器速度可能上不去。'; fi ;;
+    clean_log_days)
+      if ((10#$2 < 7)); then echo '不到一周：刚出的问题可能查不到日志了。'; fi ;;
+    f2b_mode)
+      if [[ "$2" == aggressive ]]; then echo '没试密码就断开的连接也算失败：你自己的客户端带着很多把钥匙、或者网络抖动时也可能被封，先把自己的 IP 加进白名单。'; fi ;;
     journal_auto_disk_gib)
       if ((10#$2 == 0)); then echo '0：大硬盘也按日志上限限制，日志保存不了那么多。'; fi ;;
     ssh_keepalive_count)
@@ -3130,7 +3202,7 @@ if [ -n "$others" ]; then
   done
 fi
 if [ "$new" = 1 ]; then
-  printf '\033[31m这是第一次从 %s 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 7 安全排查。是你自己就不用管，下次不再标红。\033[0m\n' "$from"
+  printf '\033[31m这是第一次从 %s 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 6 安全排查。是你自己就不用管，下次不再标红。\033[0m\n' "$from"
 fi
 } > "$note"
 chown -- "$user" "$note" 2>/dev/null || rm -f "$note"
@@ -3188,7 +3260,7 @@ login_stage() {
   fi
   if login_pam_enabled; then
     login_known_seed || warn '没能把你现在的 IP 记成认识的：下次登录时它会标成第一次出现。'
-    ok '登录记录和提醒已开启：下次登录起每次记一行（vps 选 7 安全排查里能看到），登录时显示上次登录。'
+    ok '登录记录和提醒已开启：下次登录起每次记一行（vps 选 6 安全排查里能看到），登录时显示上次登录。'
     module_result login applied 'pam_exec in common-session'
   else
     warn "$PAM_COMMON_SESSION 被手动改过，pam-auth-update 不会再修改它：登录记录没有开启。"
@@ -3203,7 +3275,7 @@ login_recent() {
   tail -n "${1:-20}" -- "$STATE_ROOT/logins" | awk -F'\t' 'NF == 6 && $1 ~ /^[0-9]+$/'
 }
 
-# vps logins [N] (menu 7 → 2, and the login item's 3): read-only.
+# vps logins [N] (menu 6 → 2, and the login item's 5): read-only.
 logins_main() {
   local n="${MODE_ARGS[0]:-30}"
   [[ $EUID -eq 0 ]] || die '登录记录只有 root 能读：请用 sudo vps logins。'
@@ -3224,7 +3296,7 @@ logins_show() {
       awk '$4 == "Accepted" && $6 == "for" && $8 == "from" {sub(/\..*/, "", $1); print $1 "\t" $7 "\t" $9 "\t" $5 "\tssh\t0"}' || true)"
     source='系统日志'
     if login_pam_enabled; then echo '登录记录开着，但还没有记下登录。下面是系统日志里还在的 SSH 登录。'
-    else echo "登录记录没开（单项设置第 26 项「登录记录和提醒」，开了以后保存 $(param_value login_keep_days) 天，服务商控制台的登录也记）。下面是系统日志里还在的 SSH 登录，日志删到哪里就只能查到哪里。"; fi
+    else echo "登录记录没开（单项设置「登录记录和提醒」，开了以后保存 $(param_value login_keep_days) 天，服务商控制台的登录也记）。下面是系统日志里还在的 SSH 登录，日志删到哪里就只能查到哪里。"; fi
   fi
   lines="$(awk -F'\t' 'NF == 6 && $1 ~ /^[0-9]+$/' <<< "$lines")"
   if [[ -z "$lines" ]]; then ok "没有找到登录（来源：$source）。"; return 0; fi
@@ -3260,7 +3332,7 @@ logins_show() {
         "$(date -d "@$when" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')" "$(date -d "@$new" '+%Y-%m-%d' 2>/dev/null || echo '?')" \
         "$(tr -cd 'A-Za-z0-9._ -' <<< "$user" | cut -c1-80)" "$method"
     done
-  echo '不认识的 IP：马上改密码、删掉不认识的公钥，再用 vps audit（菜单 7 → 1）安全排查；是你自己的，可以在那里标记为正常。'
+  echo '不认识的 IP：马上改密码、删掉不认识的公钥，再用 vps audit（菜单 6 → 1）安全排查；是你自己的，可以在那里标记为正常。'
 }
 
 # The menu's red line: first-time addresses of the last 3 days that were not
@@ -3301,14 +3373,24 @@ apt_time_apply() {
 # the table itself is never flushed.
 conntrack_stage() {
   say '连接跟踪容量'
-  local max hours original
+  local max hours original unit buckets
   local -a pairs=()
   if ! sysctl -n net.netfilter.nf_conntrack_max >/dev/null 2>&1; then
     ok '现在没有用到连接跟踪（通常防火墙开着才会用到），不需要调整。'; module_result conntrack skipped 'nf_conntrack not loaded'; return 0
   fi
   max="$(param_value conntrack_max)" hours="$(param_value conntrack_hours)"
   original="$(restore_sysctl_original net.netfilter.nf_conntrack_max conntrack_sysctl_runtime || sysctl -n net.netfilter.nf_conntrack_max)"
-  if ((max > original)); then pairs+=("net.netfilter.nf_conntrack_max=$max"); fi
+  if ((max > original)); then
+    pairs+=("net.netfilter.nf_conntrack_max=$max")
+    # The hash table follows the limit, one bucket per entry as in the kernel's
+    # own default: otherwise a full table means long chains, walked for every
+    # packet. The kernel rounds it up to whole pages of 8-byte buckets, and
+    # takes no more than this by itself.
+    unit=$(($(getconf PAGESIZE 2>/dev/null || echo 4096) / 8))
+    buckets=$(((max < 262144 ? max : 262144) + unit - 1)); buckets=$((buckets / unit * unit))
+    original="$(restore_sysctl_original net.netfilter.nf_conntrack_buckets conntrack_sysctl_runtime || sysctl -n net.netfilter.nf_conntrack_buckets 2>/dev/null || true)"
+    if [[ "$original" =~ ^[0-9]+$ ]] && ((buckets > original)); then pairs+=("net.netfilter.nf_conntrack_buckets=$buckets"); fi
+  fi
   original="$(restore_sysctl_original net.netfilter.nf_conntrack_tcp_timeout_established conntrack_sysctl_runtime ||
     sysctl -n net.netfilter.nf_conntrack_tcp_timeout_established)"
   if ((hours * 3600 != original)); then pairs+=("net.netfilter.nf_conntrack_tcp_timeout_established=$((hours * 3600))"); fi
@@ -3369,6 +3451,45 @@ restore_sysctl_original() {
   awk -F= -v k="$1" '$1 == k {print substr($0, length(k) + 2); found = 1; exit} END {exit !found}' "$file"
 }
 
+# The round trip of this SSH connection in whole milliseconds, from the kernel;
+# nothing when unknown.
+ssh_rtt_ms() {
+  local rport lport
+  read -r _ rport _ lport <<< "${SSH_CONNECTION:-}"
+  [[ "$lport" =~ ^[0-9]+$ && "$rport" =~ ^[0-9]+$ ]] || return 0
+  command -v ss >/dev/null || return 0
+  ss -tinH state established "( sport = :$lport and dport = :$rport )" 2>/dev/null |
+    awk '{for (i = 1; i <= NF; i++) if ($i ~ /^rtt:/) {split(substr($i, 5), a, "/"); printf "%d", a[1] + 0.5; exit}}' || true
+}
+
+# MBPS RTT_MS: the buffer limit in MiB for that line: twice what is on the way
+# (125 bytes per Mbps and millisecond; the kernel keeps about half of a buffer
+# for the window), rounded up.
+tcp_bdp_mib() {
+  echo $((($1 * 250 * $2 + 1048575) / 1048576))
+}
+
+# Works the TCP buffer limit out from the line it has to fill.
+tcp_bdp_menu() {
+  local mbps rtt seen mib
+  seen="$(ssh_rtt_ms || true)"
+  echo 'TCP 窗口要装得下「带宽 × 往返延迟」这么多数据才能跑满线路，缓冲区上限按它的两倍算。'
+  read -r -p '这条线路的带宽（Mbps，例如 1000，直接回车取消）: ' mbps || mbps=''
+  [[ -n "$mbps" ]] || { ok '已取消。'; return 0; }
+  read -r -p "到对方的往返延迟（毫秒${seen:+，直接回车用你这条 SSH 连接测到的 $seen}）: " rtt || rtt=''
+  rtt="${rtt:-$seen}"
+  if [[ ! "$mbps" =~ ^[1-9][0-9]{0,5}$ || ! "$rtt" =~ ^[1-9][0-9]{0,3}$ ]]; then
+    warn '带宽和延迟都要写正整数。'; return 0
+  fi
+  mib="$(tcp_bdp_mib "$((10#$mbps))" "$((10#$rtt))")"
+  printf '%s Mbps、%s 毫秒：路上最多有 %s MiB 数据，缓冲区上限要 %s MiB。\n' "$mbps" "$rtt" "$((10#$mbps * 125 * 10#$rtt / 1048576))" "$mib"
+  if ((mib < 4)); then echo '小于最小值 4 MiB，按 4 算。'; mib=4
+  elif ((mib > 256)); then echo '大于最大值 256 MiB，按 256 算。'; mib=256; fi
+  confirm_default_yes "把 TCP 缓冲区上限设成 $mib MiB 吗？" || { ok '没有改动。'; return 0; }
+  param_store tcp_buffer_mib "$mib" || die '无法保存参数。'
+  param_apply tcp
+}
+
 tcp_buffer_stage() {
   step 7 'TCP 缓冲区上限和调优（可选）'
   local mib max key current text='' min def top content old='' ours=0 pair value
@@ -3404,7 +3525,8 @@ tcp_buffer_stage() {
   # A connection idle for a while keeps its speed (no slow start again), and
   # MTU probing starts when large packets are lost without any ICMP reply.
   # Both only ever go one way: an administrator's stricter value stays.
-  for pair in $(if [[ "$(param_value tcp_extras)" == yes ]]; then echo net.ipv4.tcp_slow_start_after_idle=0 net.ipv4.tcp_mtu_probing=1; fi); do
+  for pair in $(if [[ "$(param_value tcp_extras)" == yes ]]; then echo net.ipv4.tcp_slow_start_after_idle=0 net.ipv4.tcp_mtu_probing=1; fi) \
+    $(if (($(param_value tcp_notsent_kib) > 0)); then echo "net.ipv4.tcp_notsent_lowat=$(($(param_value tcp_notsent_kib) * 1024))"; fi); do
     key="${pair%%=*}" value="${pair#*=}"
     if ((ours == 0)) || ! current="$(restore_sysctl_original "$key" tcp_sysctl_runtime)"; then
       current="$(sysctl -n "$key" 2>/dev/null || true)"
@@ -3414,6 +3536,8 @@ tcp_buffer_stage() {
     case "$key" in
       *slow_start_after_idle) ((current != 0)) || continue ;;
       *mtu_probing) ((current < 1)) || continue ;;
+      # Lowered only (the kernel's own value means no limit at all).
+      *tcp_notsent_lowat) ((current > value)) || continue ;;
     esac
     text+="$key = $value"$'\n'
     originals+=("$key=$current")
@@ -3455,7 +3579,7 @@ tcp_buffer_stage() {
     restore_record_sysctl "${key%%=*}" "${key#*=}" tcp_sysctl_runtime || warn "无法记录 ${key%%=*} 的原值；回退后要重启才会恢复默认。"
   done
   if sysctl -e -p "$TCP_BUFFER_FILE" >/dev/null; then
-    ok "TCP 调优已生效：缓冲区上限 $mib MiB（$(param_mode tcp_buffer_mib)，内存 ${MEM_MIB} MiB）$(if [[ "$text" == *slow_start_after_idle* ]]; then echo '，空闲后不重新慢启动'; fi)$(if [[ "$text" == *mtu_probing* ]]; then echo '，自动探测被丢的大包'; fi)。"; module_result tcp applied "$mib MiB"
+    ok "TCP 调优已生效：缓冲区上限 $mib MiB（$(param_mode tcp_buffer_mib)，内存 ${MEM_MIB} MiB）$(if [[ "$text" == *slow_start_after_idle* ]]; then echo '，空闲后不重新慢启动'; fi)$(if [[ "$text" == *mtu_probing* ]]; then echo '，自动探测被丢的大包'; fi)$(if [[ "$text" == *tcp_notsent_lowat* ]]; then echo "，未发送数据最多排队 $(param_value tcp_notsent_kib) KiB"; fi)。"; module_result tcp applied "$mib MiB"
   else warn 'TCP 缓冲区参数没有生效，请查看日志。'; module_result tcp failed 'sysctl -p failed'; fi
 }
 
@@ -3534,6 +3658,8 @@ f2b_jail_text() {
   ((max >= ban)) || max="$ban"
   if [[ "$(param_value f2b_increment)" == yes ]]; then increment=true; fi
   f2b_jail_values_text "$1" "$(param_value f2b_maxretry)" $(($(param_value f2b_findtime_min) * 60)) "$ban" "$increment" "$max" "${2:-}"
+  # Only when asked for: a jail in the default mode keeps its text.
+  if [[ "$(param_value f2b_mode)" != normal ]]; then printf 'mode = %s\n' "$(param_value f2b_mode)"; fi
 }
 
 # PORTS MAXRETRY FINDTIME BANTIME INCREMENT MAXTIME [IGNORE]: times in seconds,
@@ -3612,7 +3738,7 @@ f2b_jail_legacy_text() {
 f2b_jail_is_ours() {
   local body
   local -a values=()
-  body="$(grep -v '^ignoreip = ' <<< "$1" || true)"
+  body="$(grep -Ev '^(ignoreip|mode) = ' <<< "$1" || true)"
   [[ "$body" == "$(f2b_jail_legacy_text "$2")" ]] && return 0
   read -r -a values < <(awk -F' = ' '$1 == "maxretry" || $1 == "findtime" || $1 == "bantime" || $1 == "bantime.increment" || $1 == "bantime.maxtime" {v[$1] = $2}
     END {print v["maxretry"], v["findtime"], v["bantime"], v["bantime.increment"], v["bantime.maxtime"]}' <<< "$body") || return 1
@@ -3876,7 +4002,7 @@ f2b_jail_ready() {
 }
 
 fail2ban_stage() {
-  step 15 'Fail2ban（防火墙生效后，只封 SSH 端口）'
+  step 15 'Fail2ban（只封 SSH 端口）'
   # Not chosen (key-only login under 1 GiB), unless password login is still
   # on after all (the SSH hardening was not done).
   if [[ "${F2B_CHOICE:-1}" == 0 ]]; then
@@ -3885,14 +4011,6 @@ fail2ban_stage() {
       module_result fail2ban declined 'key-only login, RAM < 1 GiB'; return 0
     fi
     ok 'SSH 仍允许密码登录：Fail2ban 还是要装。'
-  fi
-  if [[ "${FIREWALL_READY:-0}" != 1 ]]; then
-    warn '防火墙没有确认生效，跳过 Fail2ban。'
-    module_result fail2ban skipped 'firewall not ready'; return 0
-  fi
-  if ! ufw_active; then
-    warn '防火墙没有开启，Fail2ban 保持不变。'
-    module_result fail2ban skipped 'UFW inactive'; return 0
   fi
   if foreign_f2b_config; then
     ok '已有自定义的 Fail2ban 配置，保持不变。'
@@ -5271,9 +5389,22 @@ ssh_port_reload() {
   return 0
 }
 
-# PORT: a connection to sshd on it now (a new window logged in there).
-ssh_port_established() {
-  [[ -n "$(ss -Htn state established "( sport = :$1 )" 2>/dev/null)" ]]
+# PORT SINCE: someone logged in on PORT since SINCE (epoch seconds): a
+# connection to PORT now whose far end sshd has logged as accepted. A scanner
+# that only connects is not a login. "ss" writes an IPv4 peer on a dual-stack
+# socket (ssh.socket) as [::ffff:1.2.3.4], sshd as 1.2.3.4.
+ssh_port_login_seen() {
+  local port="$1" since="$2" peers accepted line
+  peers="$(ss -Htn state established "( sport = :$port )" 2>/dev/null |
+    awk '{p = $4; i = match(p, /:[0-9]+$/); if (!i) next; ip = substr(p, 1, i - 1); gsub(/\[|\]/, "", ip); sub(/^::ffff:/, "", ip); print ip " " substr(p, i + 1)}' || true)"
+  [[ -n "$peers" ]] || return 1
+  accepted="$(journalctl -q --since "@$since" _UID=0 -t sshd -t sshd-session -o cat --no-pager 2>/dev/null |
+    awk '$1 == "Accepted" && $3 == "for" && $5 == "from" && $7 == "port" {print $6 " " $8}' || true)"
+  [[ -n "$accepted" ]] || return 1
+  while IFS= read -r line; do
+    if grep -Fxq -- "$line" <<< "$peers"; then return 0; fi
+  done <<< "$accepted"
+  return 1
 }
 
 # TAG FILE...: the setting before this change back, with the Port lines it
@@ -5288,7 +5419,7 @@ ssh_port_restore_previous() {
 # Fail2ban watches the ports sshd listens on now (its own jail only).
 ssh_port_follow() {
   [[ -f "$F2B_FILE" ]] && grep -Fq vps-stable-ufw-sshd "$F2B_FILE" && active fail2ban || return 0
-  FIREWALL_READY=1 F2B_IGNORE_CHOICE=none fail2ban_stage > /dev/null || true
+  F2B_IGNORE_CHOICE=none fail2ban_stage > /dev/null || true
   if ssh_detect; then ok "Fail2ban 改为盯 SSH 端口 $(IFS=,; echo "${SSH_PORTS[*]}")。"; fi
 }
 
@@ -5336,7 +5467,7 @@ ipv4_behind_nat() {
 
 ssh_port_stage() {
   say '修改 SSH 端口'
-  local old new verb=allow previous='' unit deadline where fw=0 port_lines tag nat
+  local old new verb=allow previous='' unit deadline where fw=0 port_lines tag nat since
   local -a off_files=()
   if [[ "${SSHPORT_CHOICE:-}" != 1 ]]; then module_result sshport declined 'not requested'; return 0; fi
   if ! ssh_detect || ((${#SSH_PORTS[@]} != 1)); then
@@ -5431,10 +5562,12 @@ ssh_port_stage() {
     warn "SSH 没能同时在 $old 和 $new 上监听，已恢复原样。"; module_result sshport failed 'not listening'; return 0
   fi
   ssh_port_follow
+  # Only a login after this moment can have used the new port.
+  since="$(guard_since)"
   echo "SSH 现在同时在 $old 和 $new 上。请保留这个窗口，再新开一个终端，用新端口登录：
   ssh -p $new 账户名@服务器IP
 新端口上一有登录，这里几秒内就会自动确认；没有自动确认时回到这个窗口输入 CONNECTED。$(param_value guard_seconds) 秒内没有确认就恢复原样。"
-  if guard_confirm "$unit" "$deadline" ssh_port_established "$new"; then
+  if guard_confirm "$unit" "$deadline" ssh_port_login_seen "$new" "$since"; then
     # 3. Only the new port: sshd, then this tool's rules for the old one.
     rm -f -- "$SSH_PORT_DROPIN"
     if put_file "$SSH_PORT_DROPIN" "$(ssh_port_text "$new")" && sshd -t && ssh_port_reload && port_listening "$new"; then
@@ -5462,7 +5595,7 @@ ssh_port_stage() {
 
 # Rollback only widens access: the port SSH goes back to is let in first.
 restore_sshport_group() {
-  local port verb
+  local port verb p new_ports
   local -a files=()
   mapfile -t files < <(sshd_off_files sshport)
   restore_needed sshport_dropin || ((${#files[@]})) || return 0
@@ -5476,12 +5609,23 @@ restore_sshport_group() {
     # The change took the old port's exemptions away with its rules.
     if [[ "$verb" == limit ]]; then RESTORE_READY=1 ssh_limit_exempt; fi
   fi
+  # The ports this tool's file names now: they close once SSH is back.
+  new_ports="$(sed -n 's/^Port //p' "$SSH_PORT_DROPIN" 2>/dev/null || true)"
   restore_resource sshport_dropin
   # The Port lines this tool commented out, back as they were.
   if ((${#files[@]})) && ! sshd_lines_on sshport '' "${files[@]}"; then RESTORE_PARTIAL=1; fi
   if ! ssh_port_reload; then warn 'SSH 重新加载失败：重启 SSH 后才回到原来的端口。'; RESTORE_PARTIAL=1; fi
   ssh_port_follow
-  if [[ "$port" =~ ^[0-9]+$ ]]; then ok "SSH 回到端口 $port（新端口的防火墙规则在撤销防火墙时一起删掉）。"; fi
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  # Only with SSH listening on the old port again; a rule someone else added stays.
+  if port_listening "$port"; then
+    for p in $new_ports; do
+      if [[ "$p" != "$port" ]]; then ssh_port_fw_close "$p" || true; fi
+    done
+    ok "SSH 回到端口 $port，新端口的防火墙规则已删掉。"
+  else
+    warn "SSH 还没有在原来的端口 $port 上监听：新端口的防火墙规则先留着，别把自己关在外面。"
+  fi
 }
 
 # Read-only preflight. A blocking finding is enforced only after APPLY.
@@ -6231,8 +6375,12 @@ backup_config_path() {
   fi
   BACKUP_ITEM_COUNT=$((BACKUP_ITEM_COUNT+1))
   target="$RUN_BACKUP_DIR/files/$(printf '%06d' "$BACKUP_ITEM_COUNT")"
+  # A step run on its own (stage_run_isolated) counted in its own copy.
+  while [[ -e "$target" || -L "$target" ]]; do
+    BACKUP_ITEM_COUNT=$((BACKUP_ITEM_COUNT+1))
+    target="$RUN_BACKUP_DIR/files/$(printf '%06d' "$BACKUP_ITEM_COUNT")"
+  done
   install -d -m 700 -- "$RUN_BACKUP_DIR/files" || die '无法创建配置备份目录。'
-  [[ ! -e "$target" && ! -L "$target" ]] || die '备份目标已存在。'
   cp -aT -- "$source" "$target" || die "配置备份失败：$source"
   printf '%s\t%s\t%s\n' "$source" "$kind" "$target" >> "$RUN_BACKUP_DIR/manifest.tsv" || die '无法写入备份清单。'
   BACKED_UP_PATHS["$source"]=1
@@ -6464,9 +6612,10 @@ record_config_change() {
 # would suppress errexit inside that function; a separate /bin/bash avoids it.
 menu_action() {
   local self="$1" action="$2" code
-  case "$action" in plan|perf|resources|audit|logins|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
+  shift 2
+  case "$action" in report|clean|plan|perf|resources|audit|logins|setup|item|firewall|ssh|port|check|records|uninstall|rollback|reboot|update|bans) ;; *) die '无效的菜单操作。' ;; esac
   # The new interpreter keeps its own errexit even inside the parent's if.
-  if /bin/bash -- "$self" "$action"; then
+  if /bin/bash -- "$self" "$action" "$@"; then
     echo '本项已结束；请查看上方结果、跳过项和注意事项。'
   else
     code=$?
@@ -6478,6 +6627,72 @@ menu_action() {
       printf '本项已停止（退出码 %s）；请先查看错误和记录，再决定是否重试。\n' "$code" >&2
     fi
   fi
+}
+
+# What held the busy TCP connections back, from the kernel's own accounting
+# (ss -ti): this machine's send buffer, the other side's receive window, or
+# neither. The direct evidence of whether the window needs changing.
+perf_tcp_limits() {
+  local n=0 busy=0 rwnd=0 sndbuf=0
+  read -r n busy rwnd sndbuf < <(ss -Htin state established 2>/dev/null | awk '
+    {b = r = s = 0
+     for (i = 1; i <= NF; i++) {
+       if ($i ~ /^busy:[0-9]+ms$/) {b = $i; gsub(/[^0-9]/, "", b)}
+       else if ($i ~ /^rwnd_limited:/) {r = $i; sub(/ms.*/, "", r); sub(/.*:/, "", r)}
+       else if ($i ~ /^sndbuf_limited:/) {s = $i; sub(/ms.*/, "", s); sub(/.*:/, "", s)}
+     }
+     if (b + 0 >= 1000) {n++; busy += b; rwnd += r; sndbuf += s}}
+    END {print n + 0, busy + 0, rwnd + 0, sndbuf + 0}') || true
+  [[ "$n" =~ ^[0-9]+$ && "$busy" =~ ^[0-9]+$ ]] || return 0
+  if ((n == 0 || busy == 0)); then verify_line healthy 'TCP 窗口' '现在没有在大量发送的连接，无从判断（跑流量的时候再看）'; return 0; fi
+  rwnd=$((rwnd * 100 / busy)) sndbuf=$((sndbuf * 100 / busy))
+  if ((sndbuf >= 20)); then verify_line notice 'TCP 窗口' "$n 条忙碌连接的发送时间有 ${sndbuf}% 卡在本机的发送缓冲：可以调大单项设置里的「$(item_label tcp)」"
+  elif ((rwnd >= 20)); then verify_line notice 'TCP 窗口' "$n 条忙碌连接的发送时间有 ${rwnd}% 卡在对方的接收窗口：是对方收得慢（对方的设备或程序），本机调不了"
+  else verify_line healthy 'TCP 窗口' "$n 条忙碌连接，卡在本机发送缓冲 ${sndbuf}%、对方接收窗口 ${rwnd}%：窗口够用"; fi
+}
+
+# Queues and limits that are worth changing only once they are seen to run
+# out: nothing is changed here, and a line only when there is something to do
+# (the receive queue always, as the one every machine has).
+perf_net_queues() {
+  local a b rest proc=0 drop=0 low='' high='' tw names rmem
+  if [[ -r /proc/net/softnet_stat ]]; then
+    while read -r a b rest; do proc=$((proc + 16#$a)) drop=$((drop + 16#$b)); done < /proc/net/softnet_stat
+    if ((drop > 0 && drop * 10000 >= proc)); then
+      verify_line notice '网卡收包队列' "开机以来收了 $proc 个包，丢了 $drop 个：收包队列不够长（net.core.netdev_max_backlog 现在是 $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo '?')），流量大时可以调到 4096 试试"
+    else verify_line healthy '网卡收包队列' "开机以来丢了 $drop 个包"; fi
+  fi
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then read -r low high < /proc/sys/net/ipv4/ip_local_port_range || true; fi
+  tw="$(ss -Htan state time-wait 2>/dev/null | wc -l || true)"
+  if [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ && "$tw" =~ ^[0-9]+$ ]] && ((high > low && tw * 100 / (high - low + 1) >= 70)); then
+    verify_line notice '本地端口' "$tw 条连接在 TIME-WAIT，本地端口一共 $((high - low + 1)) 个：短连接太多（代理、反代常见），用完时新连接会失败。最好让程序用长连接，或者加大 net.ipv4.ip_local_port_range"
+  fi
+  rmem="$(sysctl -n net.core.rmem_max 2>/dev/null || true)"
+  if [[ "$rmem" =~ ^[0-9]+$ ]] && ((rmem < 7500000)); then
+    names="$(ss -Hlunp 2>/dev/null | grep -oE '"(hysteria|hysteria2|tuic|tuic-server|sing-box|xray|v2ray|caddy|naive)"' | tr -d '"' | sort -u | tr '\n' ' ' || true)"
+    if [[ -n "$names" ]]; then
+      verify_line notice 'UDP 缓冲' "${names% } 在收 UDP，而 net.core.rmem_max 只有 $((rmem / 1024)) KiB（QUIC 类程序要约 7.5 MB）：开启单项设置里的「$(item_label tcp)」就够了"
+    fi
+  fi
+}
+
+# Programs close to their limit of open files ("too many open files").
+perf_fd_pressure() {
+  local d a b c soft limit n f name shown=0
+  for d in /proc/[0-9]*; do
+    limit=''
+    while read -r a b c soft _; do
+      if [[ "$a $b $c" == 'Max open files' ]]; then limit="$soft"; break; fi
+    done 2>/dev/null < "$d/limits" || continue
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || continue
+    n=0
+    for f in "$d"/fd/*; do n=$((n + 1)); done
+    ((n >= 512 && n * 100 / limit >= 70)) || continue
+    name="$(cat -- "$d/comm" 2>/dev/null || echo '?')"
+    verify_line notice '打开的文件数' "$name（进程 ${d##*/}）打开了 $n 个，上限 $limit：用完会报 too many open files。在它的 systemd 服务里加 LimitNOFILE=65535"
+    shown=$((shown + 1))
+    if ((shown >= 3)); then break; fi
+  done
 }
 
 # Read-only performance check: a 3-second sample of the CPU (stolen by the
@@ -6525,8 +6740,11 @@ perf_main() {
     else verify_line healthy 'TCP 重传' "开机以来 $((pct / 10)).$((pct % 10))%"; fi
   fi
   verify_conntrack_usage
+  perf_tcp_limits
+  perf_net_queues
+  perf_fd_pressure
   read -r pct line < <(df -P / 2>/dev/null | awk 'NR == 2 {sub(/%/, "", $5); print $5, $4}') || true
-  if [[ "$pct" =~ ^[0-9]+$ ]] && ((pct >= 90)); then verify_line notice '系统盘' "用了 ${pct}%：快满了，满了会出各种奇怪的错误"
+  if [[ "$pct" =~ ^[0-9]+$ ]] && ((pct >= 90)); then verify_line notice '系统盘' "用了 ${pct}%：快满了，满了会出各种奇怪的错误；选 8 磁盘清理"
   elif [[ "$pct" =~ ^[0-9]+$ ]]; then verify_line healthy '系统盘' "用了 ${pct}%"; fi
   pct="$(df -Pi / 2>/dev/null | awk 'NR == 2 {sub(/%/, "", $5); print $5}' || true)"
   if [[ "$pct" =~ ^[0-9]+$ ]] && ((pct >= 90)); then verify_line notice '系统盘文件数（inode）' "用了 ${pct}%：小文件太多，满了就写不了新文件"; fi
@@ -6559,9 +6777,9 @@ resources_main() {
   echo '常驻的服务（只列在运行的）：'
   resources_line ssh ssh.service 'SSH' '不能关：远程登录靠它。'
   resources_line ssh sshd.service 'SSH' '不能关：远程登录靠它。'
-  resources_line fail2ban fail2ban.service 'Fail2ban' '可以关（单项设置 16）：关了就没有防爆破，扫描请求照样打过来，日志会多一些。'
-  resources_line vnstat vnstat.service 'vnStat' '可以关（单项设置 13）：关了就没有流量统计。'
-  resources_line updates unattended-upgrades.service '自动安全更新' '常驻部分只是关机时收尾用的；真正升级时（每天一次）才多占内存。可以关（单项设置 2）。'
+  resources_line fail2ban fail2ban.service 'Fail2ban' '可以关（单项设置里的 Fail2ban 防爆破）：关了就没有防爆破，扫描请求照样打过来，日志会多一些。'
+  resources_line vnstat vnstat.service 'vnStat' '可以关（单项设置里的 vnStat）：关了就没有流量统计。'
+  resources_line updates unattended-upgrades.service '自动安全更新' '常驻部分只是关机时收尾用的；真正升级时（每天一次）才多占内存。可以关（单项设置里的自动安全更新）。'
   resources_line ntp systemd-timesyncd.service '时间同步' '很小，建议保留：时间不准会让证书校验和日志出错。'
   resources_line ntp chrony.service '时间同步（chrony）' '建议保留：时间不准会让证书校验和日志出错。'
   resources_line journal systemd-journald.service '系统日志' '不能关：系统和程序的日志都靠它；大小有上限。'
@@ -6581,6 +6799,178 @@ resources_main() {
       printf '%s%s Fail2ban 的封禁规则有 %s 条：每次封禁、解封都要让 UFW 重新加载规则，攻击很多时会占不少 CPU。在单项设置里重新开启一次 Fail2ban，就换成 nftables 集合封禁。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$rules" "${C_RESET-}"
     else printf '防火墙里的封禁规则：%s 条。\n' "$rules"; fi
   fi
+}
+
+# What the other sections of the report do not cover.
+report_services() {
+  local data
+  say '服务和系统日志（只读）'
+  if data="$(systemctl list-units --state=failed --type=service --no-legend --no-pager --plain 2>/dev/null)" && [[ -n "$data" ]]; then
+    audit_bounded_lines 20 <<< "$data"
+    warn '有服务启动失败：用 systemctl status 服务名 看原因。'
+  else ok '没有启动失败的服务。'; fi
+  audit_journal_health
+}
+
+# Menu 1 / vps report: how the machine stands, in one read-only report with
+# what needs a look first. Accounts, keys and logins are the security audit's.
+report_main() {
+  local details line
+  local -a issues=()
+  [[ $EUID -eq 0 ]] || die '机器体检需要 root：请用 sudo vps report。'
+  details="$(mktemp)" || die '无法创建临时文件。'
+  echo '正在检查，大约需要 5 秒……'
+  { perf_main; resources_main; report_services; preflight_report; } > "$details"
+  mapfile -t issues < <(sed 's/\x1b\[[0-9;]*m//g' "$details" | awk -v w="${SYM_WARN-⚠} " -v f="${SYM_FAIL-✖} " '(index($0, w) == 1 || index($0, f) == 1) && !seen[$0]++')
+  say '机器体检（只读）'
+  if ((${#issues[@]})); then
+    printf '结论：有 %s 项要留意：\n' "${#issues[@]}"
+    for line in "${issues[@]}"; do printf '  %s\n' "$line"; done
+  else
+    printf '%s%s 结论：没有发现要留意的项目。%s\n' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}"
+  fi
+  printf '\n%s详细：%s\n' "${C_BOLD-}" "${C_RESET-}"
+  cat -- "$details"
+  rm -f -- "$details"
+  echo
+  echo '账户、公钥和登录记录在菜单 6 安全排查里；开荒前的完整计划用 vps plan。'
+}
+
+# ---- Disk cleanup (menu 8 / vps clean) --------------------------------------------
+# BYTES as people say it.
+clean_size_text() {
+  if (($1 >= 1073741824)); then printf '%s.%s GiB' "$(($1 / 1073741824))" "$(($1 * 10 / 1073741824 % 10))"
+  elif (($1 >= 1048576)); then printf '%s MiB' "$(($1 / 1048576))"
+  else printf '%s KiB' "$(($1 / 1024))"; fi
+}
+
+# The numbers on stdin added up.
+clean_sum() {
+  awk '{s += $1} END {printf "%d", s}'
+}
+
+# FIND ACTIONS...: the rotated logs old enough to go. The login records (wtmp,
+# btmp, lastlog) are evidence and stay, however old.
+clean_old_logs() {
+  find /var/log -xdev -type f -mtime +"$(param_value clean_log_days)" ! -name 'wtmp*' ! -name 'btmp*' ! -name 'lastlog*' \
+    \( -name '*.gz' -o -name '*.xz' -o -name '*.zst' -o -name '*.old' -o -regex '.*\.[0-9][0-9]?' \) "$@" 2>/dev/null
+}
+
+CLEAN_IDS=() CLEAN_TEXT=() CLEAN_KERNELS=() CLEAN_OTHERS=()
+clean_add() {
+  CLEAN_IDS+=("$1")
+  CLEAN_TEXT+=("$2")
+}
+
+# What could go, and how much of it: read-only; only what is there is listed.
+clean_scan() {
+  local size keep sim pkg running n cache
+  local -a removed=()
+  CLEAN_IDS=() CLEAN_TEXT=() CLEAN_KERNELS=() CLEAN_OTHERS=()
+  size="$(find /var/cache/apt/archives -xdev -maxdepth 2 -type f -name '*.deb' -printf '%s\n' 2>/dev/null | clean_sum || true)"
+  if ((${size:-0} > 0)); then clean_add apt "APT 下载的安装包：$(clean_size_text "$size")（要用时会重新下载）"; fi
+  keep="$(param_value clean_journal_keep_mib)"
+  size="$(du -sb /var/log/journal 2>/dev/null | clean_sum || true)"
+  if ((${size:-0} > keep * 1048576)); then clean_add journal "系统日志：现在 $(clean_size_text "$size")，清到留 $keep MiB（最旧的先删）"; fi
+  size="$(clean_old_logs -printf '%s\n' | clean_sum || true)"
+  if ((${size:-0} > 0)); then clean_add logs "/var/log 里 $(param_value clean_log_days) 天以前的旧日志：$(clean_size_text "$size")"; fi
+  size="$(find /var/crash /var/lib/systemd/coredump -xdev -type f -printf '%s\n' 2>/dev/null | clean_sum || true)"
+  if ((${size:-0} > 0)); then clean_add crash "程序崩溃留下的转储文件：$(clean_size_text "$size")"; fi
+  if command -v docker >/dev/null && active docker; then
+    n="$(docker images -q --filter dangling=true 2>/dev/null | grep -c . || true)"
+    cache="$(docker system df --format '{{.Type}}={{.Reclaimable}}' 2>/dev/null | sed -n 's/^Build Cache=//p' || true)"
+    if ((${n:-0} > 0)) || [[ -n "$cache" && "$cache" != 0B* ]]; then clean_add docker "Docker：${n:-0} 个没有标签的镜像，构建缓存 ${cache:-0B}（不动容器、有标签的镜像和数据卷）"; fi
+  fi
+  running="$(uname -r)"
+  sim="$(apt-get -s autoremove --purge 2>/dev/null || true)"
+  mapfile -t removed < <(awk '$1 == "Purg" || $1 == "Remv" {sub(/:.*/, "", $2); print $2}' <<< "$sim" | sort -u)
+  for pkg in "${removed[@]}"; do
+    if [[ "$pkg" =~ ^linux-(image|modules|modules-extra|headers)-[0-9] && "$pkg" != *"$running"* ]]; then CLEAN_KERNELS+=("$pkg")
+    elif [[ -n "$pkg" ]]; then CLEAN_OTHERS+=("$pkg"); fi
+  done
+  if ((${#CLEAN_KERNELS[@]})); then clean_add kernel "旧内核：${#CLEAN_KERNELS[@]} 个软件包（保留正在用的和上一个版本，还会再问一次）"; fi
+  if ((${#CLEAN_OTHERS[@]})); then clean_add packages "系统认定不再需要的软件包：${#CLEAN_OTHERS[@]} 个（还会列出来再问一次）"; fi
+}
+
+# Only these packages go, and only if nothing else goes with them.
+clean_packages() {
+  local sim
+  local -a removed=()
+  sim="$(apt-get -s remove "${CLEAN_OTHERS[@]}" 2>&1)" || { warn '模拟卸载失败，跳过。'; return 0; }
+  mapfile -t removed < <(awk '$1 == "Remv" {sub(/:.*/, "", $2); print $2}' <<< "$sim" | sort -u)
+  if [[ "$(printf '%s\n' "${removed[@]}")" != "$(printf '%s\n' "${CLEAN_OTHERS[@]}" | sort -u)" ]]; then
+    warn '卸载这些软件包还会连带删除其他软件，为安全起见跳过；需要时请人工处理。'; return 0
+  fi
+  printf '将卸载：%s\n' "${removed[*]}"
+  confirm_yes '确认卸载这些不再需要的软件包吗？' || { ok '保留这些软件包。'; return 0; }
+  apt_wait_idle
+  apt_run -y -q -o DPkg::Lock::Timeout=900 remove "${removed[@]}" || warn '卸载失败，请人工检查。'
+}
+
+clean_apply() {
+  case "$1" in
+    apt) apt_wait_idle; apt_run clean || warn 'APT 缓存没能清理。' ;;
+    journal) journalctl --vacuum-size="$(param_value clean_journal_keep_mib)M" > /dev/null 2>&1 || warn '系统日志没能清理。' ;;
+    logs) clean_old_logs -delete || true ;;
+    crash) find /var/crash /var/lib/systemd/coredump -xdev -type f -delete 2>/dev/null || true ;;
+    docker) docker image prune -f > /dev/null 2>&1 || warn 'Docker 的镜像没能清理。'
+      docker builder prune -f > /dev/null 2>&1 || warn 'Docker 的构建缓存没能清理。' ;;
+    kernel) kernel_cleanup --ask ;;
+    packages) clean_packages ;;
+  esac
+}
+
+# Read-only: what takes the room, and files deleted but still held open (df
+# counts them and du does not: the usual answer to "the disk is full but I
+# cannot find what fills it").
+clean_top() {
+  local line size held
+  say '什么最占地方（只读，可能要一会儿）'
+  echo '最大的目录：'
+  { du -xk --max-depth=2 / 2>/dev/null | sort -nr | head -n 9 | tail -n +2; } 2>/dev/null |
+    while IFS=$'\t' read -r size line; do printf '  %s  %s\n' "$(clean_size_text "$((size * 1024))")" "$line"; done || true
+  echo '100 MiB 以上的文件：'
+  { find / -xdev -type f -size +100M -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -n 8; } 2>/dev/null |
+    while IFS=$'\t' read -r size line; do printf '  %s  %s\n' "$(clean_size_text "$size")" "$line"; done || true
+  held="$(find /proc/[0-9]*/fd -maxdepth 1 -type l -lname '*(deleted)' -printf '%p\n' 2>/dev/null | head -n 500 |
+    while IFS= read -r line; do stat -L -c '%s' -- "$line" 2>/dev/null; done | clean_sum || true)"
+  if ((${held:-0} >= 1048576)); then
+    echo "已经删掉、但程序还开着的文件占着 $(clean_size_text "$held")：重启开着它们的程序才会释放（lsof +L1 可以查是哪个）。"
+  fi
+}
+
+# Menu 8 / vps clean. Lists first; only what is chosen goes.
+clean_main() {
+  local i answer word before after
+  local -a picked=()
+  [[ $EUID -eq 0 ]] || die '磁盘清理需要 root：请用 sudo vps clean。'
+  say '磁盘清理'
+  df -h / 2>/dev/null | awk 'NR == 2 {printf "系统盘：共 %s，已用 %s（%s），还剩 %s。\n", $2, $3, $5, $4}' || true
+  clean_scan
+  if ((${#CLEAN_IDS[@]} == 0)); then ok '没有什么可清理的。'
+  else
+    for ((i = 0; i < ${#CLEAN_IDS[@]}; i++)); do printf '%3s. %s\n' "$((i + 1))" "${CLEAN_TEXT[i]}"; done
+  fi
+  [[ -t 0 ]] || return 0
+  input_flush
+  read -r -p '要清理哪几项？输入编号（空格隔开），a 全部，d 看看什么最占地方，直接回车退出: ' answer || answer=''
+  [[ -n "$answer" ]] || { ok '什么都没有清理。'; return 0; }
+  if [[ "$answer" == d || "$answer" == D ]]; then clean_top; return 0; fi
+  if [[ "$answer" == a || "$answer" == A ]]; then picked=("${CLEAN_IDS[@]}")
+  else
+    for word in $answer; do
+      if [[ "$word" =~ ^[0-9]+$ ]] && ((word >= 1 && word <= ${#CLEAN_IDS[@]})); then picked+=("${CLEAN_IDS[word - 1]}")
+      else warn "没有这一项：$word（跳过）。"; fi
+    done
+  fi
+  ((${#picked[@]})) || { ok '什么都没有清理。'; return 0; }
+  validate_vm
+  tool_lifecycle_lock
+  before="$(df -Pk / | awk 'NR == 2 {print $4}')"
+  for word in "${picked[@]}"; do clean_apply "$word"; done
+  after="$(df -Pk / | awk 'NR == 2 {print $4}')"
+  if [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] && ((after > before)); then ok "清理完了，系统盘多出 $(clean_size_text "$(((after - before) * 1024))") 可用空间。"
+  else ok '清理完了。'; fi
 }
 
 # TG notifications and the monthly traffic alert share one check: a script
@@ -6611,8 +7001,11 @@ setting() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1; }
 param() {
   v="$(awk -F= -v k="$1" '$1 == k {v = substr($0, length(k) + 2)} END {print v}' "$state/params" 2>/dev/null)"
   printf '%s' "${v:-$2}"; }
-# Anything read from a log or a file: no control characters, not too long.
-clean() { LC_ALL=C tr -d '\000-\037\177' | cut -c1-"${1:-120}"; }
+# Anything read from a log or a file: no control characters, not too long,
+# cut between characters (Telegram refuses text that is not valid UTF-8).
+clean() { v="$(LC_ALL=C tr -d '\000-\037\177')"; printf '%s' "${v:0:${1:-120}}"; }
+# Whatever is about to be sent: bytes that are not UTF-8 are dropped.
+utf8() { if command -v iconv > /dev/null; then iconv -c -f UTF-8 -t UTF-8 2> /dev/null; else cat; fi; }
 when() { date -d "@$1" '+%m-%d %H:%M' 2>/dev/null || echo '?'; }
 tg=0; [ -s "$conf" ] && tg=1
 # NAME DEFAULT: a whole-number parameter (DEFAULT for anything else).
@@ -6627,17 +7020,27 @@ queue() {
   if [ "$(wc -l < "$dir/queue")" -gt 200 ]; then tail -n 200 "$dir/queue" > "$dir/queue.new" && mv -f "$dir/queue.new" "$dir/queue"; fi; }
 # Each message one request; the token goes in through stdin, never on the
 # command line. Sent ones leave the queue at once, so a run cut short never
-# sends one twice; a failure keeps the rest for the next run (offline).
+# sends one twice. Offline, rate-limited or a token gone: the rest waits for
+# the next run. A message Telegram refuses for what it says (400, 413) is
+# dropped and noted, or it would hold back every message after it for good; a
+# wrong chat is not the message's fault, so that one waits too.
 send_queue() {
   [ "$tg" = 1 ] && [ -s "$dir/queue" ] || return 0
   token="$(setting token "$conf")" chat="$(setting chat "$conf")" api="$(setting api "$conf")"
   head="【$(param display_name "$(hostname -s 2>/dev/null)" | clean 40) · $(setting ip "$conf")】"
   n=0
   while [ -s "$dir/queue" ] && [ "$n" -lt 10 ]; do
-    { echo "$head"; head -n 1 "$dir/queue" | tr "$us" '\n'; } > "$dir/message"
-    printf 'url = "%s/bot%s/sendMessage"\n' "${api:-https://api.telegram.org}" "$token" |
-      curl -fsS --max-time 15 -o /dev/null -K - --data-urlencode "chat_id=$chat" --data-urlencode "text@$dir/message" \
-        --data disable_web_page_preview=true 2>/dev/null || break
+    { echo "$head"; head -n 1 "$dir/queue" | tr "$us" '\n'; } | utf8 > "$dir/message"
+    code="$(printf 'url = "%s/bot%s/sendMessage"\n' "${api:-https://api.telegram.org}" "$token" |
+      curl -sS --max-time 15 -o "$dir/response" -w '%{http_code}' -K - --data-urlencode "chat_id=$chat" --data-urlencode "text@$dir/message" \
+        --data disable_web_page_preview=true 2>/dev/null)"
+    why="$(sed -n 's/.*"description":"\([^"]*\)".*/\1/p' "$dir/response" 2>/dev/null | clean 120)"
+    case "$code:$why" in
+      2??:*) rm -f "$dir/send-error" ;;
+      400:*[Cc]hat*) [ -f "$dir/send-error" ] || printf '%s\t%s\n' "$now" "$why" > "$dir/send-error"; break ;;
+      400:*|413:*) printf '%s\t%s\n' "$now" "${why:-HTTP $code}" > "$dir/send-dropped" ;;
+      *) [ -f "$dir/send-error" ] || printf '%s\t%s\n' "$now" "${why:-HTTP $code}" > "$dir/send-error"; break ;;
+    esac
     sed -i '1d' "$dir/queue"
     n=$((n + 1))
   done; }
@@ -6697,7 +7100,7 @@ if [ "$tg" = 1 ]; then
       case "$from" in
         console:*) queue console "服务商控制台登录：$u（${from#console:}，$(when "$t")）。不是你登录的，先改服务商面板的密码。" ;;
         *) if [ "$n" = 1 ]; then queue login "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）
-⚠ 第一次从这个 IP 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 7 安全排查。"
+⚠ 第一次从这个 IP 登录。不是你自己的话：马上改密码、删掉不认识的公钥，再用 vps 选 6 安全排查。"
            else queue login "登录：$u 来自 $from（$(say_method "$m")，$(when "$t")）"; fi ;;
       esac
     done < "$dir/logins.new"
@@ -6772,7 +7175,7 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge $((ev_min * 60 - 10)) ]; then
   disk="$(df -P / | awk 'NR == 2 {sub(/%/, "", $5); print $5}')"
   # Told once; again only after it went well below the line (no repeats while it hovers).
   if [ "${disk:-0}" -ge "$limit" ] && [ ! -f "$dir/flag-disk" ]; then
-    : > "$dir/flag-disk"; queue disk "系统盘快满了：已用 ${disk}%。满了会出各种奇怪的错误，先清理日志、备份和不用的文件。"
+    : > "$dir/flag-disk"; queue disk "系统盘快满了：已用 ${disk}%。满了会出各种奇怪的错误，用 vps 选 8 磁盘清理，或者删掉不用的文件。"
   elif [ "${disk:-0}" -lt $((limit - 5)) ]; then rm -f "$dir/flag-disk"; fi
   mem="$(awk '$1 == "MemTotal:" {t = $2} $1 == "MemAvailable:" {a = $2} END {printf "%d", a * 100 / t}' /proc/meminfo)"
   mem_pct="$(num notify_mem_percent 5)"
@@ -6780,7 +7183,7 @@ if [ "$tg" = 1 ] && [ $((now - five)) -ge $((ev_min * 60 - 10)) ]; then
     : > "$dir/flag-memory"; queue memory "内存快不够了：只剩 ${mem}% 可用，再多一点就可能有进程被杀。"
   elif [ "${mem:-100}" -ge $((mem_pct + 10)) ]; then rm -f "$dir/flag-memory"; fi
   if once reboot [ -f /var/run/reboot-required ]; then
-    queue reboot "有更新要重启才生效：$(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null | clean 120)。方便时 vps 选 8 重启。"
+    queue reboot "有更新要重启才生效：$(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null | clean 120)。方便时 vps 选 r 重启。"
   fi
   # The services you named.
   for unit in $(param notify_services none); do
@@ -7104,7 +7507,7 @@ with open(sys.argv[4], "w") as f:
   chmod 644 -- "$temp" && mv -f -- "$temp" "$DOCKER_DAEMON_FILE"
 }
 
-# Security audit (vps audit, menu 7): read-only. Six parts, each line ✔, ⚠ or
+# Security audit (vps audit, menu 6): read-only. Six parts, each line ✔, ⚠ or
 # ✖; a deep check of every package's files only when asked. What the user marks
 # as normal ("KIND VALUE" lines in STATE_ROOT/known: ip, key, exe, file; the
 # login note reads the ip lines too) is not reported again.
@@ -7469,67 +7872,46 @@ audit_main() {
 
 # Main menu entries: group, number, label (menu below maps numbers to actions).
 menu_entries() {
-  printf '%s\t%s\t%s\n' \
-    开荒 1 '体检（只检查，不修改）' \
-    开荒 2 '一键开荒' \
-    开荒 3 '开荒验收（重启后做一次）' \
-    日常管理 4 '端口管理' \
-    日常管理 5 '单项设置' \
-    日常管理 6 'Fail2ban 封禁记录' \
-    日常管理 7 '安全排查和登录记录' \
-    日常管理 8 '重启服务器' \
-    安全加固 9 '防火墙和 SSH 防爆破' \
-    安全加固 10 'SSH 登录加固' \
-    记录与撤销 11 '操作记录和配置备份' \
-    记录与撤销 12 '撤销本工具的设置' \
-    本工具 13 '卸载本工具（保留优化效果）' \
-    本工具 14 '检查更新'
+  printf '%s\t%s\n' \
+    1 '机器体检（只读）' \
+    2 '一键开荒' \
+    3 '开荒验收' \
+    4 '单项设置' \
+    5 'SSH 和防火墙' \
+    6 '安全排查和登录记录' \
+    7 '端口管理' \
+    8 '磁盘清理'
 }
 
-# The menu for a terminal WIDTH columns wide: the groups in pairs side by side
-# when both columns fit, otherwise one under another (a phone, a narrow window).
-# Widths are measured on the plain text; colours are added after the padding.
+# The menu for a terminal WIDTH columns wide: up to three columns as far as they
+# fit, one under another on a phone. Widths are measured on the plain text.
 menu_render() {
-  local width="$1" group key label cell w left_w=0 right_w=0 i n pad
-  local -a order=() left=() right=()
-  local -A body=()
-  while IFS=$'\t' read -r group key label; do
-    if [[ -z "${body[$group]+set}" ]]; then order+=("$group"); body[$group]=''; fi
+  local width="$1" key label cell w max=0 cols i row='' pad
+  local -a cells=()
+  while IFS=$'\t' read -r key label; do
     printf -v cell '%3s. %s' "$key" "$label"
-    body[$group]+="$cell"$'\n'
+    cells+=("$cell")
+    ui_width w "$cell"
+    if ((w > max)); then max=$w; fi
   done < <(menu_entries)
-  for ((i = 0; i < ${#order[@]}; i++)); do
-    while IFS= read -r cell; do
-      ui_width w "$cell"
-      if ((i % 2 == 0 && w > left_w)); then left_w=$w; fi
-      if ((i % 2 == 1 && w > right_w)); then right_w=$w; fi
-    done <<< " ${order[i]}"$'\n'"${body[${order[i]}]%$'\n'}"
+  cols=$(((width + 2) / (max + 2)))
+  if ((cols < 1)); then cols=1; elif ((cols > 3)); then cols=3; fi
+  for ((i = 0; i < ${#cells[@]}; i++)); do
+    row+="${cells[i]}"
+    if (((i + 1) % cols == 0 || i + 1 == ${#cells[@]})); then
+      printf '%s\n' "$row"
+      row=''
+    else
+      ui_width w "${cells[i]}"
+      printf -v pad '%*s' "$((max + 2 - w))" ''
+      row+="$pad"
+    fi
   done
-  if ((width < left_w + 4 + right_w)); then
-    for group in "${order[@]}"; do
-      printf '%s %s%s\n%s\n' "${C_BOLD-}" "$group" "${C_RESET-}" "${body[$group]%$'\n'}"
-    done
+  if ((width >= 78)); then
+    printf '  r. 重启   l. 操作记录   z. 撤销或卸载   u. 检查更新   h. 使用说明   0. 退出\n'
   else
-    for ((i = 0; i < ${#order[@]}; i += 2)); do
-      mapfile -t left <<< " ${order[i]}"$'\n'"${body[${order[i]}]%$'\n'}"
-      right=()
-      if ((i + 1 < ${#order[@]})); then mapfile -t right <<< " ${order[i + 1]}"$'\n'"${body[${order[i + 1]}]%$'\n'}"; fi
-      n=${#left[@]}
-      if ((${#right[@]} > n)); then n=${#right[@]}; fi
-      for ((w = 0; w < n; w++)); do
-        cell="${left[w]:-}"
-        ui_width pad "$cell"
-        pad=$((left_w + 4 - pad))
-        if [[ -z "${right[w]:-}" ]]; then pad=0; fi
-        if ((w == 0)); then
-          printf '%s%s%*s%s%s\n' "${C_BOLD-}" "$cell" "$pad" '' "${right[w]:-}" "${C_RESET-}"
-        else
-          printf '%s%*s%s\n' "$cell" "$pad" '' "${right[w]:-}"
-        fi
-      done
-    done
+    printf '  r. 重启   l. 操作记录   z. 撤销或卸载\n  u. 检查更新   h. 使用说明   0. 退出\n'
   fi
-  printf '%3s. %s      %s. %s\n' h 使用说明 0 退出
 }
 
 # The address the user reached this machine on (the SSH session's), or the one
@@ -7543,16 +7925,39 @@ menu_ip() {
   printf '%s\n' "${addr:-IP 未知}"
 }
 
-# Who this machine is and how it stands: the title, a machine line and a
-# status line. Only cheap reads, since it is drawn before every choice.
+# PERCENT: ten marks, in plain ASCII (block characters take two columns on CJK
+# terminals, and a bar drawn with them would not line up).
+ui_bar() {
+  local n=$((($1 + 5) / 10)) i out=''
+  for ((i = 0; i < 10; i++)); do
+    if ((i < n)); then out+='#'; else out+='.'; fi
+  done
+  printf '[%s]' "$out"
+}
+
+# Who this machine is and how it stands: the title, a machine line, the load
+# and a status line. Only cheap reads, since it is drawn before every choice.
 menu_header() {
-  local name display ram cores report='' file conclusion setup check fw f2b
+  local width="${1:-80}" name display ram cores report='' file conclusion setup check fw f2b mem disk load='?' days='?' seconds used quota traffic=''
   name="$(hostname -s 2>/dev/null || true)"
   if display="$(display_name_get)"; then name="$display（${name:-?}）"; fi
   ram="$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo 2>/dev/null || true)"
   cores="$(nproc 2>/dev/null || echo '?')"
+  if [[ -r /proc/uptime ]]; then
+    read -r seconds _ < /proc/uptime || seconds=''
+    if [[ "$seconds" =~ ^[0-9]+ ]]; then days=$((BASH_REMATCH[0] / 86400)); fi
+  fi
   printf '\n%s%sVPS 机器管家 %s%s%s\n' "${C_TITLE-}" "${UI_OPEN-【}" "${SCRIPT_VERSION:-}" "${UI_CLOSE-】}" "${C_RESET-}"
-  printf ' %s · %s · %s %s · %s 核 · %s GiB 内存 · %s GB 硬盘\n' "${name:-本机}" "$(menu_ip)" "${OS^}" "${OS_VERSION:-}" "$cores" "${ram:-?}" "${ROOT_GIB:-?}"
+  printf ' %s · %s · %s %s · %s 核 · 已运行 %s 天\n' "${name:-本机}" "$(menu_ip)" "${OS^}" "${OS_VERSION:-}" "$cores" "$days"
+  mem="$(awk '$1 == "MemTotal:" {t = $2} $1 == "MemAvailable:" {a = $2} END {if (t) printf "%d", (t - a) * 100 / t; else print 0}' /proc/meminfo 2>/dev/null || echo 0)"
+  disk="$(df -Pk / 2>/dev/null | awk 'NR == 2 {sub(/%/, "", $5); print $5}' || true)"
+  [[ "$disk" =~ ^[0-9]+$ ]] || disk=0
+  if [[ -r /proc/loadavg ]]; then read -r load _ < /proc/loadavg || load='?'; fi
+  if ((width >= 72)); then
+    printf ' 内存 %s%% %s 共 %s GiB   硬盘 %s%% %s 共 %s GB   负载 %s\n' "$mem" "$(ui_bar "$mem")" "${ram:-?}" "$disk" "$(ui_bar "$disk")" "${ROOT_GIB:-?}" "$load"
+  else
+    printf ' 内存 %s%% %s 共 %s GiB\n 硬盘 %s%% %s 共 %s GB\n 负载 %s\n' "$mem" "$(ui_bar "$mem")" "${ram:-?}" "$disk" "$(ui_bar "$disk")" "${ROOT_GIB:-?}" "$load"
+  fi
   setup="${C_DIM-}${SYM_SKIP-○} 还没开荒${C_RESET-}"
   for file in "${STATE_ROOT:-/nonexistent}"/modules/*; do
     if [[ -f "$file" && ! -L "$file" ]]; then setup="${C_OK-}${SYM_OK-✔}${C_RESET-} 已开荒"; break; fi
@@ -7574,56 +7979,60 @@ menu_header() {
   elif grep -qsx 'ENABLED=yes' "${UFW_CONF:-/etc/ufw/ufw.conf}"; then fw='防火墙 开'; fi
   f2b='Fail2ban 关'
   if systemctl is-active -q fail2ban 2>/dev/null; then f2b='Fail2ban 开'; fi
-  printf ' %s · %s · %s · %s\n' "$setup" "$check" "$fw" "$f2b"
+  if read -r used quota < <(quota_status 2>/dev/null) && [[ "$used" =~ ^[0-9]+$ && "$quota" =~ ^[1-9][0-9]*$ ]]; then
+    traffic=" · 流量 $((used / 1000))/$((quota / 1000)) GB"
+  fi
+  printf ' %s · %s · %s · %s%s\n' "$setup" "$check" "$fw" "$f2b" "$traffic"
 }
 
 menu() {
-  local self choice action before='' width
+  local self choice action arg before='' width
   [[ -t 0 ]] || die '菜单需要交互终端；请登录 SSH 后输入 vps。'
   self="$(readlink -f -- "${BASH_SOURCE[0]}")" || die '无法确定本工具所在位置。'
   [[ -f "$self" && -r "$self" ]] || die '无法读取本工具的脚本文件。'
   while :; do
-    menu_header
+    width="$(stty size 2>/dev/null < /dev/tty | awk '{print $2}' || true)"
+    [[ "$width" =~ ^[0-9]+$ ]] || width="${COLUMNS:-80}"
+    menu_header "$width"
     # The alerts: what is waiting for the user.
     # (Each can be switched off in the general settings, menu_alerts.)
-    if menu_alert_on verify; then menu_reboot_hint; fi
+    if menu_alert_on verify; then menu_reboot_hint; menu_stale_check_hint; fi
     if menu_alert_on reboot; then menu_pending_reboot_hint; fi
     if menu_alert_on login; then menu_login_alert; fi
     if menu_alert_on quota; then menu_quota_alert; fi
     if setup_tmux_running; then printf '%s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" '一键开荒正在 tmux 里运行（可能是之前 SSH 断线了）：选 2 回到那个界面。' "${C_RESET-}"; fi
     echo
-    width="$(stty size 2>/dev/null < /dev/tty | awk '{print $2}' || true)"
-    [[ "$width" =~ ^[0-9]+$ ]] || width="${COLUMNS:-80}"
     menu_render "$width"
     if [[ ! -d "$STATE_ROOT/modules" ]]; then
-      printf '\n第一次用：先选 1 体检，再选 2 一键开荒，重启后选 3 验收。以后单独改哪一项选 5。\n'
+      printf '\n第一次用：先选 1 体检，再选 2 一键开荒，重启后选 3 验收。以后单独改哪一项选 4。\n'
     fi
-    if ! read -r -p $'\n请输入选项 [0-14 或 h]: ' choice; then printf '\n'; return 0; fi
+    if ! read -r -p $'\n请输入选项 [1-8 或字母，0 退出]: ' choice; then printf '\n'; return 0; fi
+    action='' arg=''
     case "$choice" in
       0) return 0 ;;
-      1)
-        read -r -p '1) 开荒前体检（只检查）   2) 性能体检   3) 资源占用一览   回车返回: ' choice || choice=''
-        case "$choice" in 1) action=plan ;; 2) action=perf ;; 3) action=resources ;; *) continue ;; esac ;;
+      1) action=report ;;
       2) action=setup ;;
       3) action=check ;;
-      4) action=port ;;
-      5) action=item ;;
-      6) action=bans ;;
-      7)
+      4) action=item ;;
+      5)
+        read -r -p '1) 防火墙和防爆破   2) SSH 登录加固   3) 修改 SSH 端口   4) Fail2ban 封禁记录   回车返回: ' choice || choice=''
+        case "$choice" in 1) action=firewall ;; 2) action=ssh ;; 3) action=item arg=sshport ;; 4) action=bans ;; *) continue ;; esac ;;
+      6)
         read -r -p '1) 安全排查（只读）   2) 查看登录记录   回车返回: ' choice || choice=''
         case "$choice" in 1) action=audit ;; 2) action=logins ;; *) continue ;; esac ;;
-      8) action=reboot ;;
-      9) action=firewall ;;
-      10) action=ssh ;;
-      11) action=records ;;
-      12) action=rollback ;;
-      13) action=uninstall ;;
-      14) action=update ;;
-      h|H) /bin/bash -- "$self" help; action='' ;;
-      *) echo '无效选项，请输入 0 至 14 或 h。'; continue ;;
+      7) action=port ;;
+      8) action=clean ;;
+      r|R) action=reboot ;;
+      l|L) action=records ;;
+      z|Z)
+        read -r -p '1) 撤销本工具的设置   2) 卸载本工具（保留优化效果）   回车返回: ' choice || choice=''
+        case "$choice" in 1) action=rollback ;; 2) action=uninstall ;; *) continue ;; esac ;;
+      u|U) action=update ;;
+      h|H) /bin/bash -- "$self" help ;;
+      *) echo '无效选项，请输入 1 至 8，或 r、l、z、u、h，0 退出。'; continue ;;
     esac
     if [[ "$action" == update ]]; then before="$(sha256sum -- "$self" 2>/dev/null || true)"; fi
-    if [[ -n "$action" ]]; then menu_action "$self" "$action"; fi
+    if [[ -n "$action" ]]; then menu_action "$self" "$action" ${arg:+"$arg"}; fi
     # Uninstall may remove the installed source and launcher in its child.
     if [[ ! -f "$self" ]]; then echo '本工具已卸载，菜单退出。'; return 0; fi
     # This menu is still the old version in memory: the new one replaces it.
@@ -7640,6 +8049,14 @@ menu() {
     fi
     if ! read -r -p '按回车返回菜单（或 Ctrl+D 退出）…' choice; then printf '\n'; return 0; fi
   done
+}
+
+# After an update the check behind TG and the traffic alert is still the old
+# version's until it is written again (by turning the item on once more).
+menu_stale_check_hint() {
+  [[ -f "$STATE_ROOT/notify-check" && ! -L "$STATE_ROOT/notify-check" ]] || return 0
+  [[ "$(cat -- "$STATE_ROOT/notify-check" 2>/dev/null || true)" != "$(notify_check_text)" ]] || return 0
+  printf '%s%s TG 通知和流量提醒的检查脚本还是旧版本：选 4 单项设置 → TG 通知（或月流量提醒）→ 1 重新应用，不用重新填 Token。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "${C_RESET-}"
 }
 
 records_report() {
@@ -7873,7 +8290,7 @@ decision_report() {
   elif [[ -f "$F2B_FILE" && ! -L "$F2B_FILE" ]] && active fail2ban; then
     decision_line '保留现状' 'SSH 防爆破' '本工具的 Fail2ban 规则已经在运行，执行时仍会核验。'
   else
-    decision_line '准备调整' 'SSH 防爆破' '仅在防火墙生效并确认后，再检查组件和配置，配置 SSH 防爆破；不改变密码登录方式。'
+    decision_line '准备调整' 'SSH 防爆破' '检查组件和配置后，配置 SSH 防爆破（封禁不靠防火墙）；不改变密码登录方式。'
   fi
   echo '“需要先处理”中的开始条件会阻止整套调优；单项问题通常只跳过对应项目，详情以上方执行前体检为准。'
   echo 'SSH 登录方式、服务故障等体检提示仍需人工判断；本工具不会据此自动关闭密码登录或重启故障业务。'
@@ -8948,6 +9365,15 @@ restore_zram_group() {
     restore_resource zram_swap
     if [[ "$(restore_read zram_swap state 2>/dev/null || true)" == applied ]]; then return 0; fi
   fi
+  # The package's own default would start a ZRAM of half the RAM as soon as
+  # the file is gone, and the rollback could not take it away again on a small
+  # machine (seen in CI). Held off until the package is dealt with
+  # (restore_zram_settle); /run only, so nothing of it outlives a reboot.
+  if [[ "$origin" == absent ]] && installed systemd-zram-generator && restore_tool_package systemd-zram-generator &&
+     grep -q '^[[:space:]]*\[zram' "$ZRAM_VENDOR_FILE" 2>/dev/null &&
+     systemctl mask --runtime dev-zram0.swap systemd-zram-setup@zram0.service >/dev/null 2>&1; then
+    ZRAM_HELD_OFF=1
+  fi
   restore_resource zram_file
   if ((file_needed)) && ! systemctl daemon-reload; then
     warn '无法重新加载 ZRAM 服务，留待下次重试。'
@@ -9005,6 +9431,10 @@ restore_hostname_group() {
 }
 
 restore_zram_settle() {
+  if ((${ZRAM_HELD_OFF:-0})); then
+    systemctl unmask --runtime dev-zram0.swap systemd-zram-setup@zram0.service >/dev/null 2>&1 || true
+    ZRAM_HELD_OFF=0
+  fi
   [[ -d "$RESTORE_ROOT/zram_swap" && ! -e "$ZRAM_FILE" ]] || return 0
   [[ "$(restore_read zram_swap origin_value 2>/dev/null || true)" == absent ]] || return 0
   if installed systemd-zram-generator; then
@@ -9394,14 +9824,13 @@ restore_pick_group() {
   if [[ "$group" == ssh ]] && ((RESTORE_PARTIAL == 0)); then f2b_password_note; fi
 }
 
-# The SSH hardening undone on its own: password login works again while the
-# firewall stays on without Fail2ban, which the setup leaves out on a key-only
+# The SSH hardening undone on its own: password login works again without
+# Fail2ban, which the setup leaves out on a key-only
 # machine under 1 GiB (there was nothing to guess then).
 f2b_password_note() {
-  ufw_active || return 0
   if active fail2ban || ssh_password_disabled; then return 0; fi
   warn "密码登录又能用了，但 Fail2ban 没有运行（只允许密钥登录、内存不到 $(mib_text "$(param_value f2b_optional_below_mib)") 时，开荒按推荐不装它）：现在猜密码的程序没人挡。"
-  echo '建议开启：菜单 5 单项设置 → Fail2ban 防爆破 → 开启。'
+  echo '建议开启：菜单 4 单项设置 → Fail2ban 防爆破 → 开启。'
 }
 
 restore_main() {
@@ -9601,22 +10030,30 @@ check_sshport() {
 check_timer_ok() {
   if ! systemctl is-active -q vps-stable-check.timer 2>/dev/null; then verify_set fail '检查定时任务没有运行'; return 1; fi
   if [[ "$(cat -- "$STATE_ROOT/notify-check" 2>/dev/null)" != "$(notify_check_text)" ]]; then
-    verify_set update '检查脚本不是这个版本的：选 5 单项设置里这一项 → 1 开启，就会更新'; return 1
+    verify_set update '检查脚本不是这个版本的：选 4 单项设置里这一项 → 1 开启，就会更新'; return 1
   fi
 }
 
 # The check runs every check_minutes_tg minutes: missing for that long and 9
 # minutes more (10 minutes with the default 1) it has stopped.
 check_notify() {
-  local last waiting every
+  local last waiting every since='' why='' note='' now last_drop=''
   [[ -s "$STATE_ROOT/notify.conf" ]] || { verify_set fail 'TG 的设置不见了'; return 0; }
   check_timer_ok || return 0
   last="$(cat -- "$STATE_ROOT/notify/last-run" 2>/dev/null || echo 0)"
   waiting="$(grep -c . "$STATE_ROOT/notify/queue" 2>/dev/null || true)"
-  every="$(param_value check_minutes_tg)"
-  if (($(date +%s) - last > (every + 9) * 60)); then verify_set fail "检查已经超过 $((every + 9)) 分钟没跑了（应该每 $every 分钟一次；上次：$(audit_when "$last")）"
-  elif ((${waiting:-0} > 20)); then verify_set fail "有 ${waiting} 条消息发不出去：检查网络，或者 Token 是不是被作废了"
-  else verify_set pass "每 $(param_value check_minutes_tg) 分钟检查一次，上次在 $(audit_when "$last")$(if ((${waiting:-0})); then echo "，${waiting} 条等着发"; fi)"; fi
+  every="$(param_value check_minutes_tg)" now="$(date +%s)"
+  # Failing since then, and why (what Telegram said; nothing means no answer).
+  if [[ -s "$STATE_ROOT/notify/send-error" ]]; then IFS=$'\t' read -r since why < "$STATE_ROOT/notify/send-error" || true; fi
+  [[ "$since" =~ ^[0-9]+$ ]] || since=''
+  if [[ -s "$STATE_ROOT/notify/send-dropped" ]]; then
+    IFS=$'\t' read -r last_drop note < "$STATE_ROOT/notify/send-dropped" || true
+    if [[ "${last_drop:-}" =~ ^[0-9]+$ ]] && ((now - last_drop < 86400)); then note="；最近有消息被 Telegram 拒收并丢弃（$note）"; else note=''; fi
+  fi
+  if ((now - last > (every + 9) * 60)); then verify_set fail "检查已经超过 $((every + 9)) 分钟没跑了（应该每 $every 分钟一次；上次：$(audit_when "$last")）"
+  elif [[ -n "$since" ]] && ((now - since > (every + 29) * 60)); then verify_set fail "TG 消息已经 $(((now - since) / 60)) 分钟发不出去（${waiting:-0} 条等着发）：${why:-连不上 Telegram，检查网络}"
+  elif ((${waiting:-0} > 20)); then verify_set fail "有 ${waiting} 条消息等着发：${why:-可能刚断过网，过几分钟再看}"
+  else verify_set pass "每 $every 分钟检查一次，上次在 $(audit_when "$last")$(if ((${waiting:-0})); then echo "，${waiting} 条等着发"; fi)$note"; fi
 }
 
 check_quota() {
@@ -9633,7 +10070,7 @@ check_quota() {
 check_dockerlog() {
   local limits mono up changed started
   [[ "$(cat -- "$DOCKER_DAEMON_FILE" 2>/dev/null)" == *"\"max-size\": \"$(param_value docker_log_max_mb)m\""* ]] ||
-    { verify_set update "$DOCKER_DAEMON_FILE 里的上限和参数不一样：选 5 单项设置 → Docker 容器日志上限 → 1 开启，就会更新"; return 0; }
+    { verify_set update "$DOCKER_DAEMON_FILE 里的上限和参数不一样：选 4 单项设置 → Docker 容器日志上限 → 1 开启，就会更新"; return 0; }
   limits="每个容器的日志最多 $(param_value docker_log_max_mb) MiB × $(param_value docker_log_files) 个（只对新建的容器生效）"
   if ! active docker; then verify_set pass "$limits；Docker 现在没在运行，启动时就会用上"; return 0; fi
   mono="$(systemctl show docker -p ActiveEnterTimestampMonotonic --value 2>/dev/null || true)"
@@ -9654,7 +10091,7 @@ check_login() {
   if ! login_pam_enabled; then verify_set fail "$PAM_COMMON_SESSION 里没有本工具的那一行了：登录不会再记录"; return 0; fi
   if [[ ! -f "$STATE_ROOT/login-hook" || "$(cat -- "$STATE_ROOT/login-hook" 2>/dev/null)" != "$(login_hook_text)" ||
         "$(cat -- "$LOGIN_PROFILE_FILE" 2>/dev/null)" != "$(login_profile_text)" ]]; then
-    verify_set update '登录记录脚本不是这个版本的：选 5 单项设置 → 登录记录和提醒 → 1 开启，就会更新'; return 0
+    verify_set update '登录记录脚本不是这个版本的：选 4 单项设置 → 登录记录和提醒 → 1 开启，就会更新'; return 0
   fi
   count="$(login_recent "$(param_value login_keep_lines)" | grep -c . || true)"
   verify_set pass "已开启，记下了 ${count} 次登录"
@@ -9769,7 +10206,7 @@ check_journal() {
   want="$(param_value journal_max_mb)M" want_days="$(param_value journal_days)day"
   if [[ "$value" != "$1" && "$value" != "${1#SystemMaxUse=}" ]]; then verify_set fail "当前生效的日志上限是 ${value:-默认值}，不是 ${1#SystemMaxUse=}"
   elif [[ "${1#SystemMaxUse=}" != "$want" || "$days" != "$want_days" ]]; then
-    verify_set update "生效的是上限 ${value}、保留 ${days:-不限}，现在应是 ${want}、${want_days}：选 5 单项设置 → 日志空间限制 → 开启，就会更新"
+    verify_set update "生效的是上限 ${value}、保留 ${days:-不限}，现在应是 ${want}、${want_days}：选 4 单项设置 → 日志空间限制 → 开启，就会更新"
   else verify_set pass "日志上限 ${value}、保留 ${days} 已生效，当前占用 ${usage:-未知}"; fi
 }
 
@@ -9820,7 +10257,7 @@ check_ssh() {
   if ! ssh_password_disabled; then
     where="$(check_ssh_override passwordauthentication no "$SSH_DROPIN")"
     [[ -n "$where" ]] || where="$(check_ssh_override kbdinteractiveauthentication no "$SSH_DROPIN")"
-    if [[ -n "$where" ]]; then where+='。再运行一次 SSH 加固（菜单 10），会问你要不要把它注释掉'; fi
+    if [[ -n "$where" ]]; then where+='。再运行一次 SSH 加固（菜单 5 → 2），会问你要不要把它注释掉'; fi
     verify_set fail "当前生效的 SSH 配置仍允许密码登录$where"; return 0
   fi
   if [[ "$1" == *root-ssh=off* ]]; then
@@ -9917,7 +10354,7 @@ check_fail2ban() {
   actions="$(fail2ban-client get sshd actions 2>/dev/null || true)"
   if [[ "$actions" != *vps-stable-ufw-sshd* ]]; then verify_set fail 'sshd 规则没有使用本工具的封禁动作'; return 0; fi
   if [[ "$kind" == ufw ]]; then
-    verify_set update '封禁还是旧版的做法（每封一个 IP 加一条 UFW 规则，封得多时很慢，服务商硬重启后过期的封禁会一直留着）：选 5 单项设置 → Fail2ban 防爆破 → 1 开启，换成 nftables 集合'; return 0
+    verify_set update '封禁还是旧版的做法（每封一个 IP 加一条 UFW 规则，封得多时很慢，服务商硬重启后过期的封禁会一直留着）：选 4 单项设置 → Fail2ban 防爆破 → 1 开启，换成 nftables 集合'; return 0
   fi
   if ! nft list chain inet vps-stable-f2b input > /dev/null 2>&1; then
     verify_set fail 'nftables 里没有本工具的封禁表（inet vps-stable-f2b），封不住任何 IP：运行 systemctl restart fail2ban 后再查'; return 0
@@ -9926,11 +10363,11 @@ check_fail2ban() {
   want="$(f2b_jail_text x | awk -F' = ' '$1 == "maxretry" || $1 == "findtime" || $1 == "bantime" {printf "%s ", $2}')"
   have="$(for key in maxretry findtime bantime; do printf '%s ' "$(fail2ban-client get sshd "$key" 2>/dev/null | tr -d '[:space:]')"; done)"
   if [[ "$have" != "$want" ]]; then
-    verify_set update "生效的是（次数 时间窗口 封禁秒数）${have% }，参数要求 ${want% }：选 5 单项设置 → Fail2ban 防爆破 → 1 开启，就会按新值应用"; return 0
+    verify_set update "生效的是（次数 时间窗口 封禁秒数）${have% }，参数要求 ${want% }：选 4 单项设置 → Fail2ban 防爆破 → 1 开启，就会按新值应用"; return 0
   fi
   old="$(f2b_ufw_bans "$(awk -F' = ' '$1 == "port" {print $2; exit}' "$F2B_FILE" 2>/dev/null)" | grep -c . || true)"
   if ((old)); then
-    verify_set update "UFW 里还有 $old 条旧版留下的封禁规则（现在封禁在 nftables 集合里）：选 5 单项设置 → Fail2ban 防爆破 → 1 开启，会清掉"; return 0
+    verify_set update "UFW 里还有 $old 条旧版留下的封禁规则（现在封禁在 nftables 集合里）：选 4 单项设置 → Fail2ban 防爆破 → 1 开启，会清掉"; return 0
   fi
   if [[ "${failed:-0}" == 0 ]]; then
     verify_set pass '规则已加载；暂无失败登录记录（刚开机或还没被扫描，过一阵再查）'
@@ -9983,8 +10420,8 @@ check_tcp() {
   if [[ -n "$bad" ]]; then verify_set fail "这些参数的当前值和配置不一致：${bad# }"
   elif [[ -n "$missing" ]]; then verify_set unknown "其余已生效；这些参数读不到，无法确认：${missing# }"
   elif [[ "$1" != "$(param_value tcp_buffer_mib) MiB" ]]; then
-    if param_read tcp_buffer_mib > /dev/null; then verify_set update "生效的上限是 $1，你设置的是 $(param_value tcp_buffer_mib) MiB：选 5 单项设置 → TCP 缓冲区上限 → 开启，就会按新值应用"
-    else verify_set update "生效的上限是 $1，本机现在推荐 $(param_value tcp_buffer_mib) MiB（内存 ${MEM_MIB:-?} MiB）：选 5 单项设置 → TCP 缓冲区上限 → 开启，就会更新"; fi
+    if param_read tcp_buffer_mib > /dev/null; then verify_set update "生效的上限是 $1，你设置的是 $(param_value tcp_buffer_mib) MiB：选 4 单项设置 → TCP 缓冲区上限 → 开启，就会按新值应用"
+    else verify_set update "生效的上限是 $1，本机现在推荐 $(param_value tcp_buffer_mib) MiB（内存 ${MEM_MIB:-?} MiB）：选 4 单项设置 → TCP 缓冲区上限 → 开启，就会更新"; fi
   else verify_set pass "已生效（上限 $1，$(param_mode tcp_buffer_mib)）"; fi
 }
 
@@ -10167,7 +10604,7 @@ verify_summary() {
     printf '%s%s 没有需要处理的项目。%s\n' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}"
   fi
   if ((VERIFY_FAIL)); then echo '“未生效”的项目请按说明处理；处理后可再次运行 vps check。'; fi
-  if ((${VERIFY_REBOOT:-0})); then echo '“待重启”的项目重启后自动生效：选菜单 8 重启，重启后再选 3 验收。'; fi
+  if ((${VERIFY_REBOOT:-0})); then echo '“待重启”的项目重启后自动生效：选 r 重启，重启后再选 3 验收。'; fi
   printf '\n%s详细：%s\n' "${C_BOLD-}" "${C_RESET-}"
   cat -- "$details"
   rm -f -- "$details"
@@ -10289,7 +10726,7 @@ menu_pending_reboot_hint() {
   if [[ "$since" =~ ^[0-9]+$ ]] && (( $(date +%s) - since >= 86400 )); then
     days="（已等 $(( ($(date +%s) - since) / 86400 )) 天）"
   fi
-  printf '%s%s %s%s：方便时选 8 重启。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$text" "$days" "${C_RESET-}"
+  printf '%s%s %s%s：方便时选 r 重启。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$text" "$days" "${C_RESET-}"
 }
 
 # ---- Port management ------------------------------------------------------
@@ -10654,7 +11091,48 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot bbr sysctl zram journal trim ntp timezone hosts tools vnstat kernel firewall fail2ban ssh ports tcp hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog sshport general
+  printf '%s\n' upgrade updates autoreboot kernel bbr tcp conntrack ipv4 sysctl zram swap journal trim ssh sshport keepalive firewall fail2ban ports login notify quota dockerlog ntp timezone hosts hostname tools vnstat ping general
+}
+
+# The heading a single item is listed under (item_keys holds them in order).
+item_group() {
+  case "$1" in
+    upgrade|updates|autoreboot|kernel) echo '系统更新' ;;
+    bbr|tcp|conntrack|ipv4|sysctl) echo '网络' ;;
+    zram|swap|journal|trim) echo '内存和硬盘' ;;
+    ssh|sshport|keepalive|firewall|fail2ban|ports|login) echo 'SSH 和安全' ;;
+    notify|quota|dockerlog) echo '通知和监控' ;;
+    ntp|timezone|hosts|hostname|tools) echo '基础设置' ;;
+    *) echo '高级' ;;
+  esac
+}
+
+# KEY STATUS: on, off, or none for an item that is not switched on or off.
+item_state() {
+  case "$1" in upgrade|ports|general|timezone|hostname|kernel|tools) echo none; return 0 ;; esac
+  case "$2" in
+    未*|默认*|不自动*|没*|允许密码*|回应*|内核不支持*|系统盘不支持*|无法解析*|已有其他*|已安装，未运行|*（默认）) echo off ;;
+    *) echo on ;;
+  esac
+}
+
+# KEY STATUS: the mark in front of a status in the list.
+item_mark() {
+  case "$(item_state "$1" "$2")" in
+    on) printf '%s%s%s ' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}" ;;
+    off) printf '%s%s%s ' "${C_DIM-}" "${SYM_SKIP-○}" "${C_RESET-}" ;;
+  esac
+}
+
+# What the list of items reads once per drawing instead of once per item.
+ITEM_LIST_MODE=0 ITEM_SSHD_T='' ITEM_APT_DUMP=''
+item_status_prepare() {
+  ITEM_APT_DUMP="$(apt-config dump 2>/dev/null || true)"
+  ITEM_SSHD_T=''
+  if command -v sshd >/dev/null; then
+    sshd_runtime_dir
+    ITEM_SSHD_T="$(sshd -T 2>/dev/null || true)"
+  fi
 }
 
 item_label() {
@@ -10667,7 +11145,7 @@ item_label() {
     login) echo '登录记录和提醒' ;;
     notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; dockerlog) echo 'Docker 容器日志上限' ;; sshport) echo 'SSH 端口' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
-    tcp) echo 'TCP 缓冲区上限（跨洲代理提速）' ;;
+    tcp) echo 'TCP 窗口和缓冲区上限' ;;
     general) echo '本工具的通用设置' ;;
     *) printf '%s\n' "$1" ;;
   esac
@@ -10678,13 +11156,15 @@ item_status() {
   local value count=0 total=0 pkg dump
   case "$1" in
     upgrade)
+      # Simulating an upgrade reads the whole package index: only when asked.
+      if ((${ITEM_LIST_MODE:-0})); then echo '进入后检查'; return 0; fi
       value="$(apt-get -s upgrade --with-new-pkgs 2>/dev/null | grep -c '^Inst ' || true)"
       if [[ "${value:-0}" == 0 ]]; then echo '已是最新（按当前软件索引）'; else echo "有 $value 个可升级"; fi ;;
     updates)
-      dump="$(apt-config dump 2>/dev/null || true)"
+      dump="${ITEM_APT_DUMP:-$(apt-config dump 2>/dev/null || true)}"
       if grep -Fq 'APT::Periodic::Unattended-Upgrade "1";' <<< "$dump" && active apt-daily-upgrade.timer; then echo '已开启'; else echo '未开启'; fi ;;
     autoreboot)
-      dump="$(apt-config dump 2>/dev/null || true)"
+      dump="${ITEM_APT_DUMP:-$(apt-config dump 2>/dev/null || true)}"
       value="$(awk -F'"' '$1 ~ /^Unattended-Upgrade::Automatic-Reboot-Time / {print $2}' <<< "$dump" | tail -n 1)"
       if grep -Fq 'Unattended-Upgrade::Automatic-Reboot "true";' <<< "$dump"; then echo "每天 ${value:-02:00} 自动重启"; else echo '不自动重启'; fi ;;
     bbr)
@@ -10715,11 +11195,11 @@ item_status() {
       else echo "默认（上限 $value 条，用了 $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo ?) 条）"; fi ;;
     ping) if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" == 1 ]]; then echo '不回应 ping'; else echo '回应 ping（默认）'; fi ;;
     keepalive)
-      sshd_runtime_dir
-      value="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"
+      if [[ -n "${ITEM_SSHD_T:-}" ]]; then value="$(awk '$1 == "clientaliveinterval" {print $2}' <<< "$ITEM_SSHD_T")"
+      else sshd_runtime_dir; value="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"; fi
       if [[ -n "$value" && "$value" != 0 ]]; then echo "每 $value 秒"; else echo '未开启'; fi ;;
     ipv4) if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' "$GAI_FILE" 2>/dev/null; then echo '已优先 IPv4'; else echo '默认（IPv6 优先）'; fi ;;
-    login) if login_pam_enabled; then echo "已开启，记下了 $(login_recent "$(param_value login_keep_lines)" | grep -c . || true) 次登录"; else echo '未开启'; fi ;;
+    login) if login_pam_enabled; then echo "已开启，记下了 $(grep -c . "$STATE_ROOT/logins" 2>/dev/null || true) 次登录"; else echo '未开启'; fi ;;
     notify) if [[ -s "$STATE_ROOT/notify.conf" ]]; then echo '已开启'; else echo '未开启'; fi ;;
     quota)
       if read -r value total < <(quota_status); then echo "本周期已用 $((value / 1000)) GB / $((total / 1000)) GB"
@@ -10746,10 +11226,17 @@ item_status() {
       count="$(boot_kernels | grep -c . || true)"
       echo "已安装 $count 个内核" ;;
     firewall)
-      if ! command -v ufw >/dev/null; then echo '未安装'; elif ufw_active; then echo '已开启'; else echo '未开启'; fi ;;
+      if ! command -v ufw >/dev/null; then echo '未安装'
+      elif ((${ITEM_LIST_MODE:-0})); then if grep -qsx 'ENABLED=yes' "$UFW_CONF"; then echo '已开启'; else echo '未开启'; fi
+      elif ufw_active; then echo '已开启'; else echo '未开启'; fi ;;
     fail2ban) if active fail2ban; then echo '已开启'; else echo '未开启'; fi ;;
     ssh)
-      if ssh_password_disabled; then
+      # The list reads sshd's settings once; the page of the item looks closer.
+      if ((${ITEM_LIST_MODE:-0})) && [[ -n "${ITEM_SSHD_T:-}" ]]; then
+        if grep -Fxq 'passwordauthentication no' <<< "$ITEM_SSHD_T" && grep -Fxq 'kbdinteractiveauthentication no' <<< "$ITEM_SSHD_T"; then
+          if grep -Fxq 'permitrootlogin no' <<< "$ITEM_SSHD_T"; then echo '只允许密钥登录，root 不能直接登录'; else echo '只允许密钥登录'; fi
+        else echo '允许密码登录'; fi
+      elif ssh_password_disabled; then
         value="$(ssh_effective_value "$(ssh_effective root || true)" permitrootlogin)"
         if [[ "$value" == no ]]; then echo '只允许密钥登录，root 不能直接登录'; else echo '只允许密钥登录'; fi
       else echo '允许密码登录'; fi ;;
@@ -10866,8 +11353,6 @@ item_turn_on() {
       stage_run firewall firewall_stage
       if ((FIREWALL_READY)) && ! active fail2ban && confirm_default_yes '防火墙已开启，同时配置 Fail2ban 防爆破吗？'; then item_turn_on fail2ban; fi ;;
     fail2ban)
-      if ! ufw_active; then warn '要先开启防火墙，Fail2ban 才能封禁。'; return 0; fi
-      FIREWALL_READY=1
       apt_index_ready || return 0
       stage_run fail2ban fail2ban_stage ;;
     ssh) SSH_CHOICE=1 ADMIN_CHOICE='' ADMIN_NAME=''
@@ -10924,52 +11409,66 @@ item_firewall_pause() {
 }
 
 item_action() {
-  local key="$1" choice=''
+  local key="$1" choice='' status
   if [[ "$key" == ports ]]; then port_menu; return 0; fi
   say "$(item_label "$key")"
-  printf '当前状态：%s\n' "$(item_status "$key")"
-  case "$key" in
-    upgrade|kernel) echo '1. 立即执行   0. 返回' ;;
-    tools|vnstat) echo '1. 安装   2. 卸载（只卸载本工具装的）   0. 返回' ;;
-    timezone) echo '1. 修改时区   2. 恢复成原来的时区   0. 返回' ;;
-    hostname) echo '1. 修改显示名   2. 修改主机名   3. 撤销主机名修改（恢复原来的名字）   0. 返回' ;;
-    fail2ban) echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 管理白名单（不会被封的 IP）   4. 调整参数   5. 恢复推荐值   0. 返回' ;;
-    autoreboot) echo '1. 设置自动重启时间   2. 取消（撤销本工具的设置）   0. 返回' ;;
-    login) echo '1. 开启   2. 关闭（撤销本工具的修改，已有的记录保留）   3. 查看登录记录   0. 返回' ;;
-    sshport) echo '1. 修改端口（新旧端口先同时开着，新端口能登录才关旧的）   2. 恢复原来的端口   0. 返回' ;;
-    general) echo '1. 调整参数   2. 恢复推荐值   0. 返回' ;;
-    ssh) echo '1. 加固（只允许密钥登录，可选禁止 root）   2. 撤销（恢复密码和 root 登录）   3. 调整参数   4. 恢复推荐值   0. 返回' ;;
-    firewall) echo '1. 开启（需要新开 SSH 窗口确认）   2. 临时关闭   3. 撤销本工具的防火墙设置   4. 调整参数   5. 恢复推荐值   0. 返回' ;;
-    *) if [[ -n "$(param_names "$key")" ]]; then echo '1. 开启   2. 关闭（撤销本工具的修改）   3. 调整参数   4. 恢复推荐值   0. 返回'
-       else echo '1. 开启   2. 关闭（撤销本工具的修改）   0. 返回'; fi ;;
-  esac
+  status="$(item_status "$key")"
+  printf '当前状态：%s\n' "$status"
+  item_actions "$key" "$status"
   read -r -p '请选择: ' choice || return 0
-  # Fail2ban's 3 is the allowlist and the firewall's 3 its rollback: their
-  # parameters are 4 and 5. The general settings are parameters only.
+  # The numbers mean the same on every page (see item_actions).
   case "$key:$choice" in
-    fail2ban:4|firewall:4) choice=3 ;; fail2ban:5|firewall:5) choice=4 ;;
-    fail2ban:3) f2b_allowlist_menu; return 0 ;;
-    firewall:3) item_turn_off firewall; return 0 ;;
-    general:1) choice=3 ;; general:2) choice=4 ;;
-    general:*) return 0 ;;
-  esac
-  if [[ ( "$choice" == 3 || "$choice" == 4 ) && -n "$(param_names "$key")" ]]; then
-    if [[ "$choice" == 3 ]]; then param_adjust "$key"; else param_reset "$key"; fi
-    return 0
-  fi
-  case "$key:$choice" in
-    hostname:1) display_name_ask ;;
-    hostname:2) item_turn_on hostname ;;
-    hostname:3) item_turn_off hostname ;;
-    hostname:*) return 0 ;;
-    firewall:2) item_firewall_pause ;;
-    login:3) logins_show 30 ;;
+    *:|*:0) return 0 ;;
+    firewall:5) item_firewall_pause ;;
+    fail2ban:5) f2b_allowlist_menu ;;
+    login:5) logins_show 30 ;;
+    tcp:5) tcp_bdp_menu ;;
+    hostname:5) display_name_ask ;;
     upgrade:1|kernel:1) item_turn_on "$key" ;;
     upgrade:*|kernel:*) return 0 ;;
+    *:3) if [[ -n "$(param_names "$key")" ]]; then param_adjust "$key"; fi ;;
+    *:4) if [[ -n "$(param_names "$key")" ]]; then param_reset "$key"; fi ;;
+    general:*) return 0 ;;
     *:1) item_turn_on "$key" ;;
     *:2) item_turn_off "$key" ;;
     *) return 0 ;;
   esac
+}
+
+# KEY STATUS: what can be done with a single item. A number means the same on
+# every page: 1 turn on (or apply again), 2 turn off or undo, 3 adjust the
+# parameters, 4 back to the recommended values, 5 what only this item has.
+item_actions() {
+  local key="$1" status="$2" state line=''
+  local -a a=()
+  state="$(item_state "$key" "$status")"
+  case "$key" in
+    upgrade|kernel) a+=('1. 立即执行') ;;
+    tools|vnstat) a+=('1. 安装' '2. 卸载（只卸载本工具装的）') ;;
+    timezone) a+=('1. 修改时区' '2. 恢复成原来的时区') ;;
+    hostname) a+=('1. 修改主机名' '2. 撤销主机名修改（恢复原来的名字）' '5. 修改显示名') ;;
+    autoreboot) a+=('1. 设置自动重启时间' '2. 取消（撤销本工具的设置）') ;;
+    sshport) a+=('1. 修改端口（新旧端口先同时开着，新端口能登录才关旧的）' '2. 恢复原来的端口') ;;
+    general) ;;
+    ssh)
+      if [[ "$state" == on ]]; then a+=('2. 撤销（恢复密码和 root 登录）')
+      else a+=('1. 加固（只允许密钥登录，可选禁止 root）'); fi ;;
+    firewall)
+      if [[ "$state" == on ]]; then a+=('1. 重新应用'); else a+=('1. 开启（需要新开 SSH 窗口确认）'); fi
+      a+=('2. 撤销本工具的防火墙设置') ;;
+    *)
+      if [[ "$state" == on ]]; then a+=('1. 重新应用' '2. 关闭（撤销本工具的修改）')
+      else a+=('1. 开启'); fi ;;
+  esac
+  if [[ -n "$(param_names "$key")" ]]; then a+=('3. 调整参数' '4. 恢复推荐值'); fi
+  case "$key" in
+    firewall) a+=('5. 临时关闭') ;;
+    fail2ban) a+=('5. 管理白名单（不会被封的 IP）') ;;
+    login) a+=('5. 查看登录记录') ;;
+    tcp) a+=('5. 按带宽和延迟计算') ;;
+  esac
+  for status in "${a[@]}"; do line+="$status   "; done
+  printf '%s回车返回\n' "$line"
 }
 
 # The symbols for terminals that cannot draw them: a saved setting (VPS_ASCII
@@ -10986,18 +11485,29 @@ item_symbols() {
 }
 
 item_menu() {
-  local choice i key
+  local choice i key group last label status width=0 w
   local -a keys=()
   mapfile -t keys < <(item_keys)
+  for key in "${keys[@]}"; do
+    ui_width w "$(item_label "$key")"
+    if ((w > width)); then width=$w; fi
+  done
   while :; do
-    say '单项设置（逐项开启或关闭）'
-    i=0
+    say '单项设置（选一项看详情）'
+    item_status_prepare
+    ITEM_LIST_MODE=1
+    i=0 last=''
     for key in "${keys[@]}"; do
       i=$((i + 1))
-      printf '%3s. %s  [%s]\n' "$i" "$(item_label "$key")" "$(item_status "$key")"
+      group="$(item_group "$key")"
+      if [[ "$group" != "$last" ]]; then printf ' %s%s%s\n' "${C_BOLD-}" "$group" "${C_RESET-}"; last="$group"; fi
+      label="$(item_label "$key")" status="$(item_status "$key")"
+      ui_width w "$label"
+      printf '%3s. %s%*s  %s%s\n' "$i" "$label" "$((width - w))" '' "$(item_mark "$key" "$status")" "$status"
     done
+    ITEM_LIST_MODE=0 ITEM_SSHD_T='' ITEM_APT_DUMP=''
     printf '  p. 参数总览（现在的值、推荐值和理由）   e. 导出参数   i. 导入参数\n'
-    printf '  u. 界面符号（现在：%s）   0. 返回\n' "$(if [[ "${SYM_OK-}" == '[OK]' ]]; then echo '纯 ASCII'; else echo '✔ ⚠ ✖ ○'; fi)"
+    printf '  u. 界面符号（现在：%s）   回车返回\n' "$(if [[ "${SYM_OK-}" == '[OK]' ]]; then echo '纯 ASCII'; else echo '✔ ⚠ ✖ ○'; fi)"
     read -r -p "请选择要修改的项目 [1-$i，p/e/i/u，0 返回]: " choice || return 0
     if [[ -z "$choice" || "$choice" == 0 ]]; then return 0; fi
     case "$choice" in
@@ -11024,7 +11534,12 @@ item_main() {
   stage_run backup backup_configs
   restore_prepare
   run_state_mark_start
-  item_menu
+  if [[ -n "${MODE_ARGS[0]:-}" ]]; then
+    grep -Fxq -- "${MODE_ARGS[0]}" <<< "$(item_keys)" || die "没有这一项：${MODE_ARGS[0]}。"
+    item_action "${MODE_ARGS[0]}"
+  else
+    item_menu
+  fi
   if run_state_changed; then finish_run_state; else run_state_discard "$previous"; fi
   # Offer a reboot only for an upgrade made in this session; an older pending
   # reboot is just mentioned.
@@ -11063,12 +11578,13 @@ reboot_main() {
   systemctl reboot
 }
 
-# ---- Update (menu 14 / vps update) -------------------------------------------------
-# Same source and checks as the one-line install in the README: install.sh and
-# the main script from the repository's main branch over HTTPS; the script must
+# ---- Update (menu u / vps update) -------------------------------------------------
+# The same checks as the one-line install in the README, from the "stable"
+# branch, which moves to a release only after main has passed the checks made
+# on what GitHub serves (VPS_UPDATE_URL: those checks, on the new version): the script must
 # match the hash pinned in that install.sh, which then installs it in place
 # (records, backups and rollback data stay). No system setting is changed.
-UPDATE_BASE_URL='https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main'
+UPDATE_BASE_URL="${VPS_UPDATE_URL:-https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/stable}"
 
 update_fetch() {
   local url="$1" out="$2"
@@ -11133,7 +11649,7 @@ update_main() {
   ok "已更新到 $latest。重新输入 vps 打开新版本。"
 }
 
-# ---- Fail2ban ban records (menu 6 / vps bans) --------------------------------------
+# ---- Fail2ban ban records (menu 5 → 4 / vps bans) --------------------------------------
 # Recent sshd-jail ban and unban events from Fail2ban's log file (the current
 # and the previous one), or from the journal when Fail2ban logs there, oldest
 # first, as "time<TAB>event<TAB>address".
@@ -11204,7 +11720,7 @@ bans_main() {
   fi
   ignore="$(fail2ban-client get sshd ignoreip 2>/dev/null | sed -n 's/^[|`]- *//p' | tr '\n' ' ' || true)"
   if [[ -n "$ignore" ]]; then echo "白名单（不会被封）：$ignore"; fi
-  echo '管理白名单：选 5 单项设置 → Fail2ban 防爆破 → 3。'
+  echo '管理白名单：选 4 单项设置 → Fail2ban 防爆破 → 5。'
 
   echo '最近的封禁和解封记录（最多 20 条，时间按服务器时区）：'
   line="$(f2b_ban_events)"
@@ -11248,6 +11764,8 @@ main() {
     records) records_report; return 0 ;;
     check) verify_main; exit "$VERIFY_EXIT" ;;
     plan) plan; return 0 ;;
+    report) report_main; return 0 ;;
+    clean) clean_main; return 0 ;;
     perf) perf_main; return 0 ;;
     resources) resources_main; return 0 ;;
     audit) audit_main; return 0 ;;
@@ -11276,12 +11794,7 @@ main() {
     stage_run ssh ssh_harden_stage
   elif [[ "$MODE" == firewall ]]; then
     stage_run firewall firewall_stage
-    if ((FIREWALL_READY)); then
-      stage_run fail2ban fail2ban_stage
-    else
-      state_event fail2ban skipped 0
-      warn '防火墙没有确认生效，跳过 Fail2ban。'
-    fi
+    stage_run fail2ban fail2ban_stage
   else
     UI_STEPS=15
     # Time first (APT validates Release dates), every question next, ZRAM
@@ -11307,12 +11820,7 @@ main() {
     attention_banner
     setup_run ssh ssh_harden_stage
     setup_run firewall firewall_stage
-    if ((FIREWALL_READY)); then
-      setup_run fail2ban fail2ban_stage
-    else
-      state_event fail2ban skipped 0
-      warn '防火墙没有确认生效，跳过 Fail2ban。'
-    fi
+    setup_run fail2ban fail2ban_stage
   fi
   stage_run verification verify_summary
   finish_run_state

@@ -31,9 +31,30 @@ notify_check_text | sed -e "s#/usr/local/lib/vps-stable-opt/vps-stable-opt.sh#$T
   -e "s#/etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron/crontabs#$F/cron.d#" > "$T/check"
 stub() { printf '#!/bin/bash\n%s\n' "$2" > "$B/$1"; chmod +x "$B/$1"; }
 # Telegram: the config (with the token) from stdin, the message from its file.
-stub curl "[ -e '$T/offline' ] && exit 7
-cat > '$T/curl-stdin'; printf '%s\n' \"\$*\" >> '$T/curl-args'
-for a in \"\$@\"; do case \"\$a\" in text@*) cat \"\${a#text@}\" >> '$T/sent'; echo '--' >> '$T/sent' ;; esac; done"
+# It answers as curl does (-w, -o, and -f for the check scripts of earlier
+# versions); text that is not UTF-8 gets Telegram's 400, and the file refuse
+# names text it answers refuse-code and refuse-body to.
+cat > "$B/curl" <<STUB
+#!/bin/bash
+[ -e '$T/offline' ] && { printf 000; exit 7; }
+cat > '$T/curl-stdin'; printf '%s\n' "\$*" >> '$T/curl-args'
+code=200 body='{"ok":true}' out='' prev='' msg=''
+for a in "\$@"; do
+  case "\$a" in text@*) msg="\${a#text@}" ;; esac
+  [ "\$prev" = -o ] && out="\$a"
+  prev="\$a"
+done
+if [ -n "\$msg" ]; then
+  if ! iconv -f UTF-8 -t UTF-8 "\$msg" > /dev/null 2>&1; then code=400 body='{"ok":false,"error_code":400,"description":"Bad Request: strings must be encoded in UTF-8"}'
+  elif [ -s '$T/refuse' ] && grep -qf '$T/refuse' "\$msg"; then code="\$(cat '$T/refuse-code')" body="\$(cat '$T/refuse-body')"
+  else cat "\$msg" >> '$T/sent'; echo '--' >> '$T/sent'; fi
+fi
+[ -z "\$out" ] || [ "\$out" = /dev/null ] || printf '%s' "\$body" > "\$out"
+case "\$*" in *-fsS*) [ "\$code" -ge 400 ] && exit 22 ;; esac
+printf '%s' "\$code"
+exit 0
+STUB
+chmod +x "$B/curl"
 stub journalctl "if [ \"\$*\" = '-q -n 1 --show-cursor -o cat --no-pager' ]; then echo x; echo '-- cursor: c0'; exit 0; fi
 cat '$T/journal' 2>/dev/null; echo \"-- cursor: c\$(date +%s%N)\""
 stub ss "cat '$T/ss' 2>/dev/null"
@@ -131,6 +152,37 @@ printf '%s\troot\t203.0.113.5\tpublickey\tssh\t0\n' "$(($(date +%s) + 5))" >> "$
 rm -f "$T/offline"; run
 [[ "$(grep -c '登录：root 来自 203.0.113.5' "$T/sent")" == 1 && ! -s "$D/queue" ]] || fail "not sent once when back online: $(sent)"
 printf 'PASS: messages wait while offline and go out once when the network is back.\n'
+
+# A message Telegram refuses for what it says must not hold back the ones
+# after it (it stayed first in the queue for good: nothing else went out until
+# 200 more had piled up), and it is noted so that vps check can say so.
+refuse() { printf '%s\n' "$1" > "$T/refuse"; printf '%s' "$2" > "$T/refuse-code"; printf '%s' "$3" > "$T/refuse-body"; }
+refuse POISON 400 '{"ok":false,"error_code":400,"description":"Bad Request: message is too long"}'
+printf 'POISON one\nafter it\n' > "$D/queue"
+: > "$T/sent"; run
+sent | grep -Fq 'after it' && [[ ! -s "$D/queue" ]] || fail "a refused message held back the next: queue $(cat "$D/queue"), sent $(sent)"
+grep -Fq 'message is too long' "$D/send-dropped" || fail "the refused message was not noted: $(cat "$D/send-dropped" 2>&1)"
+# Bytes that are not UTF-8 are taken out; the rest of the message goes.
+: > "$T/refuse"; printf 'broken \xe6\xb1 text\n' > "$D/queue"
+: > "$T/sent"; run
+sent | grep -Fq 'broken' && [[ ! -s "$D/queue" ]] || fail "a message with bad bytes did not go out: queue $(cat "$D/queue"), sent $(sent)"
+# Rate limits, a token that is gone, a wrong chat: not the message's fault: it waits.
+for answer in '429|{"ok":false,"description":"Too Many Requests: retry after 5"}' '401|{"ok":false,"description":"Unauthorized"}' '400|{"ok":false,"description":"Bad Request: chat not found"}' '500|'; do
+  refuse POISON "${answer%%|*}" "${answer#*|}"; rm -f "$D/send-error"
+  printf 'POISON again\nthe next\n' > "$D/queue"
+  : > "$T/sent"; run
+  [[ "$(grep -c . "$D/queue")" == 2 && -z "$(sent)" ]] || fail "HTTP ${answer%%|*}: queue $(cat "$D/queue"), sent $(sent)"
+  [[ -s "$D/send-error" ]] || fail "HTTP ${answer%%|*} not noted"
+done
+first="$(cut -f1 "$D/send-error")"; sleep 1; run
+[[ "$(cut -f1 "$D/send-error")" == "$first" ]] || fail 'the time of the first failure was overwritten'
+: > "$T/refuse"; : > "$T/sent"; run
+[[ ! -s "$D/queue" && ! -e "$D/send-error" ]] || fail "not sent, or the failure not cleared, once it works: $(cat "$D/queue")"
+# Cut between characters, however long the text (a cut inside one is not UTF-8).
+eval "$(grep '^clean() ' "$T/check")"
+[[ "$(export LC_ALL=C.UTF-8; printf '汉字汉字' | clean 3)" == 汉字汉 ]] || fail "not cut between characters: $(export LC_ALL=C.UTF-8; printf '汉字汉字' | clean 3)"
+[[ "$(export LC_ALL=C.UTF-8; printf 'a\tb\033c' | clean 9)" == abc ]] || fail 'control characters not taken out'
+printf 'PASS: a message Telegram refuses does not hold back the rest; what is not its fault waits; text is cut between characters.\n'
 
 # The tool gone: the check stops quietly.
 rm -f "$T/main.sh"; printf '%s\troot\t203.0.113.6\tpublickey\tssh\t0\n' "$(($(date +%s) + 9))" >> "$STATE_ROOT/logins"
@@ -270,6 +322,21 @@ printf 'check_minutes_tg=30\n' >> "$PARAMS_FILE"; check_notify
 printf '%s\n' "$(($(date +%s) - 2400))" > "$D/last-run"; check_notify
 [[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'超过 39 分钟没跑了'* ]] || fail "a check 40 minutes ago, every 30 minutes: $VERIFY_STATUS $VERIFY_TEXT"
 sed -i '/^check_minutes_tg=/d' "$PARAMS_FILE"
+# vps check says why messages do not get through, and since when.
+printf '%s\n' "$(($(date +%s) - 60))" > "$D/last-run"
+printf '%s\tUnauthorized\n' "$(($(date +%s) - 3600))" > "$D/send-error"; printf 'x\n' > "$D/queue"
+check_notify
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'60 分钟发不出去'*'Unauthorized'* ]] || fail "a queue stuck for an hour: $VERIFY_STATUS $VERIFY_TEXT"
+printf '%s\t\n' "$(($(date +%s) - 3600))" > "$D/send-error"; check_notify
+[[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'连不上 Telegram'* ]] || fail "no answer from Telegram: $VERIFY_STATUS $VERIFY_TEXT"
+printf '%s\tUnauthorized\n' "$(($(date +%s) - 120))" > "$D/send-error"; check_notify
+[[ "$VERIFY_STATUS" == pass ]] || fail "a failure of two minutes ago: $VERIFY_STATUS $VERIFY_TEXT"
+rm -f "$D/send-error"; : > "$D/queue"
+printf '%s\tmessage is too long\n' "$(($(date +%s) - 120))" > "$D/send-dropped"; check_notify
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'被 Telegram 拒收并丢弃（message is too long）'* ]] || fail "a dropped message not mentioned: $VERIFY_TEXT"
+printf '%s\tmessage is too long\n' "$(($(date +%s) - 200000))" > "$D/send-dropped"; check_notify
+[[ "$VERIFY_TEXT" != *拒收* ]] || fail "an old dropped message still mentioned: $VERIFY_TEXT"
+rm -f "$D/send-dropped"
 # Other intervals when the parameters say so (this tool's timer is written again).
 printf 'check_minutes_tg=3\ncheck_minutes_quota=10\n' >> "$PARAMS_FILE"
 reset; check_reconcile

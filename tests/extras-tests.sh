@@ -724,8 +724,12 @@ printf 'PASS: a failed APT step stops with the next step to take.\n'
   printf 'setup_skip=sysctl tcp ssh firewall autoreboot\n' > "$TEST_ROOT/params-q"; PARAMS_FILE="$TEST_ROOT/params-q"
   rm -f "$TEST_ROOT/tcp-question"; AUTO_UPDATES=1 ADMIN_NAME='' AUTO_REBOOT_TIME=''
   setup_questions < "$TEST_ROOT/q-input" > "$TEST_ROOT/q-out"
-  [[ "$SYSCTL_CHOICE" == 0 && "$TCP_BUFFER_CHOICE" == 0 && "$SSH_CHOICE" == 0 && "$WEB_CHOICE" == 0 && "$F2B_CHOICE" == 0 ]] ||
+  # Fail2ban does not need the firewall: leaving the firewall out keeps it.
+  [[ "$SYSCTL_CHOICE" == 0 && "$TCP_BUFFER_CHOICE" == 0 && "$SSH_CHOICE" == 0 && "$WEB_CHOICE" == 0 && "$F2B_CHOICE" == 1 ]] ||
     fail "choices of steps left out: sysctl=$SYSCTL_CHOICE tcp=$TCP_BUFFER_CHOICE ssh=$SSH_CHOICE web=$WEB_CHOICE f2b=$F2B_CHOICE"
+  printf 'setup_skip=sysctl tcp ssh firewall autoreboot fail2ban\n' > "$TEST_ROOT/params-q"
+  setup_questions < "$TEST_ROOT/q-input" > "$TEST_ROOT/q-out2"
+  [[ "$F2B_CHOICE" == 0 ]] || fail 'Fail2ban asked about although it is left out'
   [[ ! -e "$TEST_ROOT/tcp-question" && -z "${AUTO_REBOOT_TIME:-}" ]] || fail 'a question of a step left out was asked'
 )
 printf 'PASS: setup questions are asked once and stored; steps left out ask nothing.\n'

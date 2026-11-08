@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions f2b_optional ssh_effective_value confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending sshd_off_files restore_data_safe state_path_safe restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_label item_turn_off item_action param_list param_names item_firewall_pause ufw_forward_restore item_ask_reboot_time reboot_time_normalize restore_tool_package item_menu guard_confirm coreutils_selfcheck release_info
+load_optimizer_functions f2b_optional ssh_effective_value confirm_default_yes upgrade_has_kernel apt_index_stage setup_questions admin_name_valid port_source_valid restore_groups restore_group_label restore_group_ids restore_group_pending sshd_off_files restore_data_safe state_path_safe restore_group_apply restore_all_groups restore_pick_group restore_firewall_warning item_keys item_group item_state item_mark item_status_prepare item_actions ui_width item_label item_turn_off item_action param_list param_names item_firewall_pause ufw_forward_restore item_ask_reboot_time reboot_time_normalize restore_tool_package item_menu guard_confirm coreutils_selfcheck release_info
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -192,9 +192,9 @@ restore_tool_packages() { :; }
 reset; STATE=([apt_file]=applied)
 item_turn_off updates
 if grep -q '^packages' "$TEST_ROOT/trace"; then fail 'a preinstalled unattended-upgrades was offered for removal'; fi
-# The SSH hardening undone on its own: password login works again, the
-# firewall stays on, Fail2ban is not there (left out on a key-only machine
-# under 1 GiB): turning it on is suggested; otherwise nothing is said.
+# The SSH hardening undone on its own: password login works again, Fail2ban
+# is not there (left out on a key-only machine under 1 GiB): turning it on is
+# suggested, with the firewall on or not; otherwise nothing is said.
 (
   load_optimizer_functions f2b_password_note
   restore_group_pending() { return 0; }
@@ -211,7 +211,9 @@ if grep -q '^packages' "$TEST_ROOT/trace"; then fail 'a preinstalled unattended-
   reset; printf '1\n' > "$TEST_ROOT/pick"; RESTORE_PARTIAL=0
   restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
   note || fail 'not suggested after undoing the SSH hardening from the rollback menu'
-  for case in 'F2B=1' 'PW_OFF=1' 'UFW=0'; do
+  UFW=0; reset; item_turn_off ssh > "$TEST_ROOT/out"
+  note || fail 'not suggested with the firewall off: Fail2ban does not need it'
+  for case in 'F2B=1' 'PW_OFF=1'; do
     UFW=1 F2B=0 PW_OFF=0; eval "$case"
     reset; item_turn_off ssh > /dev/null
     if note; then fail "Fail2ban suggested although $case"; fi
@@ -243,36 +245,74 @@ reset; item_firewall_pause
 item_turn_on() { record "on $1"; }
 item_status() { echo status; }
 port_menu() { record 'port menu'; }
-reset; printf '2\n' | item_action firewall > /dev/null; UFW_ON=1
+reset; printf '5\n' | item_action firewall > /dev/null; UFW_ON=1
 item_action firewall < <(printf '1\n') > /dev/null
 item_action upgrade < <(printf '2\n') > /dev/null
 item_action bbr < <(printf '1\n') > /dev/null
 item_action ports < /dev/null > /dev/null
 [[ "$(grep -v '^adopt\|^ufw off' "$TEST_ROOT/trace" | tr '\n' ' ')" == 'on firewall on bbr port menu ' ]] || fail "item dispatch: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
-# The parameters of the items with more actions: the general settings (1
-# adjust, 2 reset, nothing else), SSH (3, 4), the firewall (4, 5; 3 stays its
-# rollback) and Fail2ban (4, 5; 3 stays the allowlist).
+# A number means the same on every page: 1 on, 2 off or undo, 3 the
+# parameters, 4 their recommended values, 5 what only this item has. (Before
+# 3.0 the login record's "3. 查看登录记录" opened its parameters instead.)
 (
   param_adjust() { record "adjust $1"; }
   param_reset() { record "reset $1"; }
   item_turn_off() { record "off $1"; }
   f2b_allowlist_menu() { record allowlist; }
+  item_firewall_pause() { record pause; }
+  logins_show() { record logins; }
+  tcp_bdp_menu() { record bdp; }
+  display_name_ask() { record display; }
   reset
-  for pair in 'general 1' 'general 2' 'general 3' 'ssh 3' 'ssh 4' 'ssh 1' 'firewall 3' 'firewall 4' 'firewall 5' 'fail2ban 3' 'fail2ban 4' 'fail2ban 5'; do
+  for pair in 'general 3' 'general 4' 'general 1' 'ssh 3' 'ssh 4' 'ssh 1' 'firewall 2' 'firewall 3' 'firewall 4' 'firewall 5' 'fail2ban 3' 'fail2ban 4' 'fail2ban 5' \
+      'login 3' 'login 5' 'tcp 3' 'tcp 5' 'hostname 1' 'hostname 2' 'hostname 5' 'bbr 0' 'bbr '; do
     item_action "${pair% *}" <<< "${pair#* }" > /dev/null
   done
-  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'adjust general reset general adjust ssh reset ssh on ssh off firewall adjust firewall reset firewall allowlist adjust fail2ban reset fail2ban ' ]] ||
-    fail "parameter actions: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'adjust general reset general adjust ssh reset ssh on ssh off firewall adjust firewall reset firewall pause adjust fail2ban reset fail2ban allowlist adjust login logins adjust tcp bdp on hostname off hostname display ' ]] ||
+    fail "the numbers of a page: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
 )
-printf 'PASS: the general settings, SSH, the firewall and Fail2ban reach their parameters from the single-item menu.\n'
+printf 'PASS: a number on the page of a single item means the same on every page.\n'
+# What a page offers follows the state of the item.
+param_names() { [[ "$1" == bbr ]] && return 0; [[ "$1" == fail2ban ]] && echo f2b_maxretry; return 0; }
+page="$(item_actions bbr '未开启（当前 cubic）')"
+[[ "$page" == *'1. 开启'* && "$page" != *'2.'* && "$page" == *回车返回* ]] || fail "a page of an item that is off: $page"
+page="$(item_actions bbr '已开启')"
+[[ "$page" == *'1. 重新应用'* && "$page" == *'2. 关闭'* ]] || fail "a page of an item that is on: $page"
+page="$(item_actions fail2ban '已开启')"
+[[ "$page" == *'3. 调整参数'* && "$page" == *'4. 恢复推荐值'* && "$page" == *'5. 管理白名单'* ]] || fail "the page of Fail2ban: $page"
+for pair in 'updates:未开启:off' 'autoreboot:不自动重启:off' 'ping:回应 ping（默认）:off' 'ping:不回应 ping:on' 'sshport:22 （默认）:off' 'sshport:2244 （原来是 22）:on' 'conntrack:默认（上限 8192 条，用了 3 条）:off' 'upgrade:进入后检查:none' 'tools:已安装 3/8:none'; do
+  IFS=: read -r key status want <<< "$pair"
+  [[ "$(item_state "$key" "$status")" == "$want" ]] || fail "state of $key with <$status>: $(item_state "$key" "$status")"
+done
+unset -f param_names; load_optimizer_functions param_names
+printf 'PASS: the page of a single item offers what fits its state.\n'
 reset; item_action() { record "action $1"; }
-printf '4\n0\n' | item_menu > /dev/null
+printf '5\n0\n' | item_menu > "$TEST_ROOT/out"
 [[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-# (31: the general settings, parameters only, came last in 2.9.)
+grep -q '^ 网络$' "$TEST_ROOT/out" && grep -q '^ 高级$' "$TEST_ROOT/out" || fail "no groups in the list: $(cat "$TEST_ROOT/out")"
+# Status column lined up by display width, whatever the labels are.
+starts="$(sed -n 's/^ *[0-9]*\. \(.*\)  status$/\1/p' "$TEST_ROOT/out" | while IFS= read -r line; do ui_width "$line"; done | sort -u)"
+[[ -n "$starts" && "$(wc -l <<< "$starts")" == 1 ]] || fail "status column not aligned: $(tr '\n' ' ' <<< "$starts")"
 [[ "$(item_keys | wc -l | tr -d ' ')" == 31 ]] || fail 'item count'
-# New items are appended: the numbers the user knows stay the same.
-[[ "$(item_keys | sed -n '18p;19p' | tr '\n' ' ')" == 'ports tcp ' ]] || fail 'existing item numbers moved'
-[[ "$(item_keys | sed -n '20,30p' | tr '\n' ' ')" == 'hostname swap conntrack ping keepalive ipv4 login notify quota dockerlog sshport ' ]] || fail 'new items are not appended in order'
+# Each group is one run of items: no heading appears twice.
+if [[ -n "$(for key in $(item_keys); do item_group "$key"; done | uniq | sort | uniq -d)" ]]; then fail 'the items of a group are not next to each other'; fi
+(
+  # Drawing the list does not simulate an upgrade or ask sshd for every item.
+  load_optimizer_functions item_status
+  apt-get() { fail 'the list ran apt-get'; }
+  ITEM_LIST_MODE=1
+  [[ "$(item_status upgrade)" == 进入后检查 ]] || fail "upgrade in the list: $(item_status upgrade)"
+  ITEM_SSHD_T=$'clientaliveinterval 60\npasswordauthentication no\nkbdinteractiveauthentication no\npermitrootlogin no'
+  sshd() { fail 'the list asked sshd again'; }
+  [[ "$(item_status keepalive)" == '每 60 秒' ]] || fail "keepalive in the list: $(item_status keepalive)"
+  [[ "$(item_status ssh)" == '只允许密钥登录，root 不能直接登录' ]] || fail "SSH in the list: $(item_status ssh)"
+  UFW_CONF="$TEST_ROOT/ufw.conf"; printf 'ENABLED=yes\n' > "$UFW_CONF"
+  ufw() { fail 'the list ran ufw'; }
+  ufw_active() { fail 'the list ran ufw'; }
+  command() { [[ "$2" != ufw ]] || return 0; builtin command "$@"; }
+  [[ "$(item_status firewall)" == 已开启 ]] || fail "firewall in the list: $(item_status firewall)"
+)
+printf 'PASS: the list of single items is grouped, aligned and does not run the expensive checks for every item.\n'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

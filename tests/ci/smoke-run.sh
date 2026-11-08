@@ -28,10 +28,11 @@ git -C "$ROOT" show "$old_commit:install.sh" > "$LOGS/old-install.sh"
 git -C "$ROOT" show "$old_commit:vps-stable-opt.sh" > "$LOGS/old-vps-stable-opt.sh"
 sudo bash "$LOGS/old-install.sh" --local-file "$LOGS/old-vps-stable-opt.sh" --no-run
 [[ "$(sudo vps --version)" == "$old_version" ]] || fail "the previous release $old_version is not installed"
-drive update.rules update sudo vps update || fail "update exited with $?"
+# (From 3.0 on the tool follows the branch that moves after these checks.)
+drive update.rules update sudo VPS_UPDATE_URL="$raw" vps update || fail "update exited with $?"
 has update "已更新到 $version"
 [[ "$(sudo vps --version)" == "$version" ]] || fail "vps update did not install $version"
-drive update.rules update-again sudo vps update || fail "second update exited with $?"
+drive update.rules update-again sudo VPS_UPDATE_URL="$raw" vps update || fail "second update exited with $?"
 has update-again '已经是最新版本，不需要更新'
 drive uninstall.rules uninstall-1 sudo vps uninstall || fail "uninstall exited with $?"
 endgroup

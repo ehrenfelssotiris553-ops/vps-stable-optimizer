@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions main setup_run
+load_optimizer_functions main setup_run setup_step_independent stage_run_isolated
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -108,9 +108,11 @@ for mode in setup firewall ssh; do
 
   run_case "firewall_not_ready_$mode" "$mode" 1 0 0
   [[ "$CASE_STATUS" == 0 ]] || fail "$mode mock run failed"
-  if grep -Fxq 'stage fail2ban fail2ban_stage' "$CASE_DIR/calls"; then fail "$mode enabled Fail2ban after an unconfirmed firewall"; fi
-  if [[ "$mode" != ssh ]]; then
-    grep -Fxq 'event fail2ban skipped 0' "$CASE_DIR/calls" || fail "$mode omitted its Fail2ban skip record"
+  # The bans are Fail2ban's own (nftables): it does not wait for the firewall.
+  if [[ "$mode" == ssh ]]; then
+    if grep -Fxq 'stage fail2ban fail2ban_stage' "$CASE_DIR/calls"; then fail 'the SSH hardening ran Fail2ban'; fi
+  else
+    grep -Fxq 'stage fail2ban fail2ban_stage' "$CASE_DIR/calls" || fail "$mode left Fail2ban out because the firewall was not confirmed"
   fi
   grep -Fxq 'stage verification verify_summary' "$CASE_DIR/calls" || fail "$mode skipped the final acceptance summary"
   [[ "$(tail -n 1 "$CASE_DIR/calls")" == 'offer reboot' ]] || fail "$mode did not offer the reboot last"
@@ -120,7 +122,7 @@ done
 # upgrade, the attended SSH/firewall steps last.
 run_case setup_order setup 1 0 0
 order="$(awk '/^stage / {print $2}' "$CASE_DIR/calls" | tr '\n' ' ')"
-[[ "$order" == 'backup ntp apt_index questions zram swap apt_upgrade bbr sysctl tcp journal trim updates autoreboot timezone hosts keepalive ipv4 login ssh firewall verification ' ]] || fail "unexpected setup stage order: $order"
+[[ "$order" == 'backup ntp apt_index questions zram swap apt_upgrade bbr sysctl tcp journal trim updates autoreboot timezone hosts keepalive ipv4 login ssh firewall fail2ban verification ' ]] || fail "unexpected setup stage order: $order"
 [[ "$(grep -n -e '^banner$' -e '^stage ssh ' "$CASE_DIR/calls" | head -n 1)" == *banner ]] || fail 'attention banner not shown before the attended steps'
 grep -Fxq 'read session' "$CASE_DIR/calls" || fail 'setup did not check for tmux/screen'
 # Asked before the plan: a setup handed to tmux shows its plan there, once.
@@ -157,3 +159,34 @@ printf '%s\n' 'PASS: actual main gates read-only modes, confirmation, preflight,
   rm -rf "$T"
 )
 printf 'PASS: one-click setup leaves out the steps the parameter names, recorded as skipped.\n'
+
+# A small step stopping on an unexpected error does not take the rest of the
+# setup with it (the SSH hardening, the firewall and Fail2ban come last); the
+# steps the rest depends on still end the run. Not run inside a condition:
+# Bash would switch errexit off for everything in it.
+CASE_DIR="$TEST_ROOT/isolated"; mkdir -p "$CASE_DIR"; : > "$CASE_DIR/calls"
+set +e
+(
+  set -Eeuo pipefail
+  WARNINGS=3
+  stage_run() { shift; "$@"; }
+  state_write() { record "state $*"; }
+  state_event() { record "event $*"; }
+  module_result() { record "result $1 $2"; }
+  item_label() { printf '%s' "$1"; }
+  warn() { WARNINGS=$((WARNINGS + 1)); }
+  boom() { false; record 'went on after the error'; }
+  fine() { warn; record "ran with $WARNINGS warnings"; }
+  setup_run trim boom
+  record 'next step'
+  setup_run bbr fine
+  record "warnings $WARNINGS"
+  setup_run ssh boom
+  record 'went on after an error in the SSH step'
+) > "$CASE_DIR/output" 2>&1
+CASE_STATUS=$?
+set -e
+[[ "$(tr '\n' '|' < "$CASE_DIR/calls")" == 'state active_stage none|event trim failed 1|result trim failed|next step|ran with 5 warnings|warnings 5|' ]] ||
+  fail "an error in one step: $(tr '\n' '|' < "$CASE_DIR/calls")"
+[[ "$CASE_STATUS" != 0 ]] || fail 'an error in the SSH step did not end the run'
+printf '%s\n' 'PASS: an unexpected error ends only that step of the setup; steps the rest depends on still end the run.'

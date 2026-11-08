@@ -11,7 +11,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
 load_optimizer_functions sysctl_owned_apply restore_sysctl_original conntrack_stage ping_stage ping_ufw_sync ping_ufw_text check_conntrack check_ping \
   verify_conntrack_usage verify_line verify_set param_value param_read param_recommended param_check param_caution param_store \
-  ipv6_broken append_line_safely ipv4_stage check_ipv4 apt_time_apply check_keepalive param_kind
+  ipv6_broken append_line_safely ipv4_stage check_ipv4 apt_time_apply check_keepalive param_kind perf_tcp_limits perf_net_queues perf_fd_pressure tcp_bdp_mib ssh_rtt_ms
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -52,12 +52,18 @@ sysctl_file_mismatch() {
   done < "$1"
 }
 
+getconf() { echo 4096; }
+item_label() { printf '%s' "$1"; }
 # Connection tracking not in use (no firewall): nothing to do.
 reset; MEM_MIB=2048; conntrack_stage
 grep -q '^result conntrack skipped' "$TEST_ROOT/trace" || fail 'conntrack set without the module'
 # 2 GiB: 131072 entries, above the kernel's 65536; the 5-day timeout is the kernel's own: not written.
-SYSVAL[net.netfilter.nf_conntrack_max]=65536 SYSVAL[net.netfilter.nf_conntrack_tcp_timeout_established]=432000 SYSVAL[net.netfilter.nf_conntrack_count]=100
+SYSVAL[net.netfilter.nf_conntrack_max]=65536 SYSVAL[net.netfilter.nf_conntrack_tcp_timeout_established]=432000 SYSVAL[net.netfilter.nf_conntrack_count]=100 SYSVAL[net.netfilter.nf_conntrack_buckets]=8192
 reset; conntrack_stage
+# The hash table follows the limit, rounded as the kernel rounds it (whole
+# pages of 8-byte buckets), or a full table means long chains for every packet.
+grep -Fxq 'net.netfilter.nf_conntrack_buckets = 131072' "$CONNTRACK_FILE" || fail "buckets not raised: $(cat "$CONNTRACK_FILE")"
+grep -Fxq 'orig net.netfilter.nf_conntrack_buckets=8192 conntrack_sysctl_runtime' "$TEST_ROOT/trace" || fail 'original buckets not recorded'
 grep -Fxq 'net.netfilter.nf_conntrack_max = 131072' "$CONNTRACK_FILE" || fail "limit not raised: $(cat "$CONNTRACK_FILE")"
 if grep -q timeout_established "$CONNTRACK_FILE"; then fail 'the default timeout was written'; fi
 [[ "$(cat "$CONNTRACK_MODULE_FILE")" == nf_conntrack ]] || fail 'the module is not loaded before systemd-sysctl at boot'
@@ -75,6 +81,18 @@ reset; conntrack_stage
 [[ ! -e "$CONNTRACK_FILE" && ! -e "$CONNTRACK_MODULE_FILE" ]] || fail "this tool's files stayed though nothing is raised"
 grep -Fxq 'sysctl -w net.netfilter.nf_conntrack_max=262144' "$TEST_ROOT/trace" || fail 'the larger kernel value was not set back'
 grep -q '^result conntrack preserved' "$TEST_ROOT/trace" || fail 'result when nothing is raised'
+# A limit that is no multiple of a page of buckets: rounded up as the kernel does.
+(
+  rm -f "$CONNTRACK_FILE" "$RESTORE_ROOT/conntrack_sysctl_runtime"; OURS=0
+  SYSVAL[net.netfilter.nf_conntrack_max]=8192 SYSVAL[net.netfilter.nf_conntrack_buckets]=8192
+  printf 'conntrack_max=62272\n' >> "$PARAMS_FILE"
+  reset; conntrack_stage
+  grep -Fxq 'net.netfilter.nf_conntrack_buckets = 62464' "$CONNTRACK_FILE" || fail "buckets not rounded: $(cat "$CONNTRACK_FILE")"
+  printf 'conntrack_max=1048576\n' >> "$PARAMS_FILE"; rm -f "$CONNTRACK_FILE" "$RESTORE_ROOT/conntrack_sysctl_runtime"; SYSVAL[net.netfilter.nf_conntrack_max]=8192 SYSVAL[net.netfilter.nf_conntrack_buckets]=8192
+  reset; conntrack_stage
+  grep -Fxq 'net.netfilter.nf_conntrack_buckets = 262144' "$CONNTRACK_FILE" || fail "buckets over the kernel's own largest: $(cat "$CONNTRACK_FILE")"
+)
+sed -i '/^conntrack_max=/d' "$PARAMS_FILE"; rm -f "$CONNTRACK_FILE"
 printf 'PASS: connection tracking is only raised, loaded before systemd-sysctl, and goes away when not needed.\n'
 
 # vps check: the values and how full the table is.
@@ -299,3 +317,32 @@ sleep() { printf '%s\n' "$STAT2" > "$F/stat"; }
 printf 'pswpin 0\npswpout 0\n' > "$F/vmstat"
 [[ "$(perf_main)" == *'都正常'* ]] || fail 'a quiet machine not all clear'
 printf 'PASS: the performance check reports stolen CPU and paging with what they mean.\n'
+
+# Reading what limits the connections: nothing is changed, only said. The
+# connection lines are as `ss -ti` prints them (a state line, then the details).
+(
+  VERIFY_PASS=0 VERIFY_FAIL=0 VERIFY_NA=0 VERIFY_UNKNOWN=0 VERIFY_NOTICE=0 VERIFY_ISSUES=()
+  SS_I=$'0 0 1.1.1.1:443 2.2.2.2:1\n\t cubic rtt:150/1 busy:10000ms sndbuf_limited:4000ms(40.0%) bytes_sent:1'
+  ss() { case "$*" in '-Htin state established') printf '%s\n' "$SS_I" ;; esac; }
+  out="$(perf_tcp_limits)"
+  [[ "$out" == *'注意  TCP 窗口'*'40% 卡在本机的发送缓冲'* ]] || fail "send buffer not named: $out"
+  SS_I=$'0 0 1.1.1.1:443 2.2.2.2:1\n\t rtt:150/1 busy:10000ms rwnd_limited:5000ms(50.0%)'
+  out="$(perf_tcp_limits)"
+  [[ "$out" == *'50% 卡在对方的接收窗口'* ]] || fail "the other side's window not named: $out"
+  SS_I=$'0 0 1.1.1.1:443 2.2.2.2:1\n\t rtt:150/1 busy:10000ms'
+  [[ "$(perf_tcp_limits)" == *'正常  TCP 窗口'*'窗口够用'* ]] || fail "no limit seen: $(perf_tcp_limits)"
+  # A connection that was busy for a moment says nothing.
+  SS_I=$'0 0 1.1.1.1:443 2.2.2.2:1\n\t rtt:150/1 busy:20ms sndbuf_limited:20ms(100.0%)'
+  [[ "$(perf_tcp_limits)" == *'无从判断'* ]] || fail "an idle machine: $(perf_tcp_limits)"
+)
+printf 'PASS: the performance check says what limits busy TCP connections.\n'
+
+(
+  [[ "$(tcp_bdp_mib 1000 200)" == 48 ]] || fail "1 Gbps, 200 ms: $(tcp_bdp_mib 1000 200)"
+  [[ "$(tcp_bdp_mib 100 50)" == 2 ]] || fail "100 Mbps, 50 ms: $(tcp_bdp_mib 100 50)"
+  SSH_CONNECTION='203.0.113.9 5000 192.0.2.1 22'
+  command() { [[ "$2" != ss ]] || return 0; builtin command "$@"; }
+  ss() { printf '0 0 192.0.2.1:22 203.0.113.9:5000\n\t cubic rtt:149.6/2.5 ato:40\n'; }
+  [[ "$(ssh_rtt_ms)" == 150 ]] || fail "RTT of this connection: $(ssh_rtt_ms)"
+)
+printf 'PASS: the buffer limit is worked out from the line, the delay read from this connection.\n'

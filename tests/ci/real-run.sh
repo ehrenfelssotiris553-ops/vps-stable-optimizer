@@ -481,6 +481,10 @@ if ct_before="$(ct_max)"; then
   item_do item-conntrack-on conntrack 1
   [[ "$(ct_max)" == "$ct_want" ]] || fail "connection tracking on: nf_conntrack_max is $(ct_max), not $ct_want"
   if ((ct_want > ct_before)); then
+    # The hash table with it: what the file says is what the kernel took.
+    grep -E '^net\.netfilter\.nf_conntrack_buckets = ' /etc/sysctl.d/99-vps-stable-conntrack.conf > /dev/null || fail 'connection tracking on: the hash table was not raised'
+    [[ "$(sysctl -n net.netfilter.nf_conntrack_buckets)" == "$(awk '$1 == "net.netfilter.nf_conntrack_buckets" {print $3}' /etc/sysctl.d/99-vps-stable-conntrack.conf)" ]] ||
+      fail "connection tracking on: the kernel has $(sysctl -n net.netfilter.nf_conntrack_buckets) buckets, not what the file says"
     sudo grep -Fxq nf_conntrack /etc/modules-load.d/99-vps-stable-conntrack.conf || fail 'connection tracking on: the module is not loaded at boot'
   fi
   item_do item-conntrack-off conntrack 2
@@ -708,11 +712,16 @@ item_do item-tools-on tools 1
 item_do item-fail2ban-off fail2ban 2
 # jail.d is root-only on some releases (Ubuntu 26.04).
 if sudo test -e /etc/fail2ban/jail.d/99-vps-stable-sshd.local; then fail 'Fail2ban off: jail left'; fi
-item_do item-firewall-off firewall 3
+item_do item-firewall-off firewall 2
 [[ "$(ufw_line)" == "$before_ufw" ]] || fail "firewall off: $(ufw_line)"
 # Not answering ping is still on: neither UFW's values from before it was
 # turned on nor its sysctl.conf at the start again may take that back.
 [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == 1 ]] || fail 'firewall off: ping answered again (that item is still on)'
+# The bans are Fail2ban's own nftables set: it works with the firewall off.
+item_do item-fail2ban-no-firewall fail2ban 1
+systemctl is-active -q fail2ban || fail 'Fail2ban with the firewall off: not running'
+sudo nft list chain inet vps-stable-f2b input > /dev/null || fail 'Fail2ban with the firewall off: no ban table'
+item_do item-fail2ban-off-again fail2ban 2
 item_do item-firewall-on firewall 1
 [[ "$(ufw_line)" == 'Status: active' ]] || fail 'firewall on: not active'
 [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all)" == 1 ]] || fail 'firewall on: ping answered again (that item is still on)'
@@ -739,6 +748,7 @@ sudo grep -Fxq 'tcp_buffer_mib=40' /var/lib/vps-stable-opt/params || fail 'the a
 # shellcheck disable=SC2024
 sudo vps params export > "$LOGS/params-export.txt" || fail 'vps params export failed'
 grep -Fxq 'tcp_buffer_mib=40' "$LOGS/params-export.txt" || fail "export: $(cat "$LOGS/params-export.txt")"
+[[ "$(sysctl -n net.ipv4.tcp_notsent_lowat)" == 131072 ]] || fail "the limit of what waits to be sent: $(sysctl -n net.ipv4.tcp_notsent_lowat)"
 # Back to the recommendation from the single item.
 item_do item-tcp-reset tcp 4
 [[ "$(tcp_rmem_max)" == $((want * 1048576)) ]] || fail "reset: tcp_rmem is $(tcp_rmem_max), not $want MiB"
@@ -748,6 +758,23 @@ drive params.rules params-import sudo vps params import "$LOGS/params-export.txt
 [[ "$(tcp_rmem_max)" == $((40 * 1048576)) ]] || fail "import: tcp_rmem is $(tcp_rmem_max), not 40 MiB"
 item_do item-tcp-reset-again tcp 4
 [[ "$(tcp_rmem_max)" == $((want * 1048576)) ]] || fail "second reset: tcp_rmem is $(tcp_rmem_max)"
+endgroup
+
+group 'The machine report, and the disk cleanup on what it should and should not take'
+# shellcheck disable=SC2024
+sudo vps report > "$LOGS/report.log" 2>&1 || fail "vps report exited with $?"
+has report '结论'
+has report '详细：'
+has report '资源占用一览'
+sudo sh -c 'printf x > /var/log/vps-ci.log.1; printf x > /var/log/vps-ci-fresh.log.1; printf x > /var/log/wtmp.7; printf x > /var/log/vps-ci.log; touch -d "60 days ago" /var/log/vps-ci.log.1 /var/log/wtmp.7 /var/log/vps-ci.log'
+printf '%s\n' '要清理哪几项 ==> a' '确认删除这些旧内核吗？ ==> n' '确认卸载这些不再需要的软件包吗？ ==> n' > "$LOGS/clean.rules"
+drive "$LOGS/clean.rules" clean sudo vps clean || fail "vps clean exited with $?"
+has clean '清理完了'
+if sudo test -e /var/log/vps-ci.log.1; then fail 'the cleanup left an old rotated log'; fi
+for f in /var/log/vps-ci-fresh.log.1 /var/log/wtmp.7 /var/log/vps-ci.log; do
+  sudo test -e "$f" || fail "the cleanup took $f"
+done
+sudo rm -f /var/log/vps-ci-fresh.log.1 /var/log/wtmp.7 /var/log/vps-ci.log
 endgroup
 
 group 'Port management'
