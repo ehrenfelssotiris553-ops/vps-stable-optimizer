@@ -38,11 +38,26 @@ listen_from_config() {
   LISTEN="$( { sed -n 's/^Port //p' "$SSHD_CONFIG"; sed -n 's/^Port //p' "$SSH_PORT_DROPIN"; } 2>/dev/null | sort -u | tr '\n' ' ')"
   LISTEN="${LISTEN:-22}"
 }
-ssh_reload() { record 'ssh reload'; ((RELOAD_OK)) && listen_from_config; }
+# sshd executes itself again on a reload: with REEXEC_SLEEPS set, the ports
+# of its configuration only listen after that many sleeps of the caller (a new
+# port listened 58 ms after systemctl returned on a small VPS).
+REEXEC_SLEEPS=0 PENDING=''
+ssh_reload() {
+  record 'ssh reload'; ((RELOAD_OK)) || return 1
+  if ((REEXEC_SLEEPS)); then local now="$LISTEN"; listen_from_config; PENDING="$LISTEN" LISTEN="$now" SLEEPS_LEFT="$REEXEC_SLEEPS"
+  else listen_from_config; fi
+}
+sleep() { if [[ -n "$PENDING" ]] && ((--SLEEPS_LEFT <= 0)); then LISTEN="$PENDING" PENDING=''; fi; }
 systemctl() { record "systemctl $*"; case "$1" in is-active) return 1 ;; esac; }
 ssh_detect() { SSH_PORTS=(22); }
 port_listening() { [[ " $LISTEN " == *" $1 "* ]]; }
-sshd() { ((SSHD_OK)); }
+# sshd -T: the ports of its configuration (22 without any Port line).
+sshd() {
+  if [[ "${1:-}" == -T ]]; then
+    { sed -n 's/^Port //p' "$SSHD_CONFIG"; sed -n 's/^Port //p' "$SSH_PORT_DROPIN"; } 2>/dev/null | sort -u | sed 's/^/port /' | grep . || echo 'port 22'
+  fi
+  ((SSHD_OK))
+}
 sshd_runtime_dir() { :; }
 guard_leftovers() { return 1; }
 guard_arm() { record "guard $1"; }
@@ -73,7 +88,7 @@ start() {
   printf 'ufw limit 22/tcp\nufw allow from 203.0.113.9 to any port 22 proto tcp\n' > "$TEST_ROOT/ufw"
   printf 'ufw limit 22/tcp\nufw allow from 203.0.113.9 to any port 22 proto tcp\n' > "$RESTORE_ROOT/fw_rules"
   rm -f "$SSH_PORT_DROPIN" "$RESTORE_ROOT/sshport"
-  LISTEN=22 SSHD_OK=1 RELOAD_OK=1 CONFIRM=1 PROVIDER=1 SSHPORT_CHOICE=1 COMMENT_OK=1
+  LISTEN=22 SSHD_OK=1 RELOAD_OK=1 CONFIRM=1 PROVIDER=1 SSHPORT_CHOICE=1 COMMENT_OK=1 REEXEC_SLEEPS=0 PENDING=''
 }
 
 # Confirmed: the new port let in first, both ports while waiting, then only the
@@ -88,7 +103,14 @@ grep -Fxq 'ufw limit 2244/tcp' "$RESTORE_ROOT/fw_rules" && ! grep -q ' 22/tcp\|p
 [[ "$(cat "$RESTORE_ROOT/sshport")" == $'port=22\nverb=limit' ]] || fail "original: $(cat "$RESTORE_ROOT/sshport")"
 grep -Fxq exempt "$TEST_ROOT/trace" && grep -q '^result sshport applied port 2244' "$TEST_ROOT/trace" || fail "result: $(cat "$TEST_ROOT/trace")"
 grep -q '安全组里把旧端口 22 关掉' "$TEST_ROOT/log" || fail 'the provider firewall not mentioned'
-printf 'PASS: a confirmed change lets the new port in first, waits on both, then closes the old port everywhere.\n'
+# sshd listening on the new port only a moment after each reload (a 512 MiB
+# VM on the CI): waited for, not taken for a failure.
+start; REEXEC_SLEEPS=3
+ssh_port_stage <<< 2244 > /dev/null
+# (The last reload needs no wait: 2244 listens already, 22 goes later.)
+[[ "$(cat "$SSH_PORT_DROPIN")" == $'# VPS Stable Optimizer v2.8: SSH port\nPort 2244' ]] && grep -q '^result sshport applied port 2244' "$TEST_ROOT/trace" ||
+  fail "a slow reload taken for a failure: $(cat "$SSH_PORT_DROPIN"); $(grep '^result' "$TEST_ROOT/trace")"
+printf 'PASS: a confirmed change lets the new port in first, waits on both, then closes the old port everywhere (also when sshd listens a moment after a reload).\n'
 
 # Not confirmed: everything as it was, the timer stopped.
 start; CONFIRM=0

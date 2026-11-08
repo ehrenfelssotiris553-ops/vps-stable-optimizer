@@ -5253,9 +5253,22 @@ ssh_port_elsewhere() {
 
 # The ports in force: where systemd listens for sshd (ssh.socket, Ubuntu 24.04
 # and later) it makes the socket from sshd's configuration at daemon-reload.
+# A reload makes sshd execute itself again, and a port it is to listen on now
+# only listens a moment after systemctl returns (58 ms on a small VPS; a check
+# right after it missed the new port on a 512 MiB VM): up to 5 seconds are
+# given for every port of its configuration. What follows checks the ports.
 ssh_port_reload() {
-  if systemctl is-active -q ssh.socket 2>/dev/null; then systemctl daemon-reload && systemctl restart ssh.socket
-  else ssh_reload; fi
+  local i p ports missing
+  if systemctl is-active -q ssh.socket 2>/dev/null; then systemctl daemon-reload && systemctl restart ssh.socket || return 1
+  else ssh_reload || return 1; fi
+  ports="$(sshd_runtime_dir; sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true)"
+  for ((i = 0; i < 25; i++)); do
+    missing=0
+    for p in $ports; do port_listening "$p" || missing=1; done
+    ((missing)) || return 0
+    sleep 0.2
+  done
+  return 0
 }
 
 # PORT: a connection to sshd on it now (a new window logged in there).
