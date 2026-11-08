@@ -128,6 +128,8 @@ restore_created_dirs() { :; }
 restore_fail2ban_group() { record 'group fail2ban'; }
 restore_ssh_group() { record 'group ssh'; }
 restore_zram_group() { record 'group zram'; }
+restore_dockerfw_group() { record 'group dockerfw'; }
+restore_databackup_group() { record 'group databackup'; }
 restore_hostname_group() { record 'group hostname'; }
 restore_swap_group() { record 'group swap'; }
 restore_sshport_group() { record 'group sshport'; }
@@ -293,7 +295,7 @@ grep -q '^ 网络$' "$TEST_ROOT/out" && grep -q '^ 高级$' "$TEST_ROOT/out" || 
 # Status column lined up by display width, whatever the labels are.
 starts="$(sed -n 's/^ *[0-9]*\. \(.*\)  status$/\1/p' "$TEST_ROOT/out" | while IFS= read -r line; do ui_width "$line"; done | sort -u)"
 [[ -n "$starts" && "$(wc -l <<< "$starts")" == 1 ]] || fail "status column not aligned: $(tr '\n' ' ' <<< "$starts")"
-[[ "$(item_keys | wc -l | tr -d ' ')" == 31 ]] || fail 'item count'
+[[ "$(item_keys | wc -l | tr -d ' ')" == 33 ]] || fail 'item count'
 # Each group is one run of items: no heading appears twice.
 if [[ -n "$(for key in $(item_keys); do item_group "$key"; done | uniq | sort | uniq -d)" ]]; then fail 'the items of a group are not next to each other'; fi
 (

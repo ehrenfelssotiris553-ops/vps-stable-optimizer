@@ -6,8 +6,10 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width ui_bar display_name_get menu_login_alert login_recent menu_quota_alert quota_status menu_stale_check_hint
+load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width ui_bar display_name_get menu_login_alert login_recent menu_quota_alert quota_status menu_backup_alert menu_stale_check_hint
 TEST_ROOT="$(mktemp -d)"
+# No data backup set up, unless a test says so.
+BACKUP_SERVICE_FILE="$TEST_ROOT/backup.service"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 # No display name stored (the header shows the hostname).
 PARAMS_FILE="$TEST_ROOT/params"
@@ -83,13 +85,13 @@ printf '%s\n' 'PASS: dispatch rejects invalid action text before invoking Bash.'
     printf '1\n\n2\n\n3\n\n4\n\n'
     printf '5\n1\n\n5\n2\n\n5\n3\n\n5\n4\n\n5\n\n'
     printf '6\n1\n\n6\n2\n\n6\n\n'
-    printf '7\n\n8\n\nr\n\nl\n\nz\n1\n\nz\n2\n\nz\n\nu\n\n9\n'
+    printf '7\n\n8\n\n9\n\nr\n\nl\n\nz\n1\n\nz\n2\n\nz\n\nu\n\n10\n'
     printf '0\n'
   } > "$TEST_ROOT/menu-input"
   menu < "$TEST_ROOT/menu-input" > "$TEST_ROOT/menu-out"
-  expected='report|setup|check|item|firewall|ssh|item sshport|bans|audit|logins|port|clean|reboot|records|rollback|uninstall|update|'
+  expected='report|setup|check|item|firewall|ssh|item sshport|bans|audit|logins|port|clean|item databackup|reboot|records|rollback|uninstall|update|'
   [[ "$(tr '\n' '|' < "$TEST_ROOT/menu-actions")" == "$expected" ]] || fail "menu numbers map to: $(tr '\n' '|' < "$TEST_ROOT/menu-actions")"
-  grep -Fq '无效选项，请输入 1 至 8，或 r、l、z、u、h，0 退出' "$TEST_ROOT/menu-out" || fail 'number 9 not rejected'
+  grep -Fq '无效选项，请输入 1 至 9，或 r、l、z、u、h，0 退出' "$TEST_ROOT/menu-out" || fail 'number 10 not rejected'
   grep -Fq '3. 开荒验收' "$TEST_ROOT/menu-out" || fail 'acceptance check does not follow setup'
   grep -Fq '第一次用：先选 1 体检' "$TEST_ROOT/menu-out" || fail 'no first-time hint before any setup'
   # Banners: an update waiting for a reboot, and a setup still running in tmux.
@@ -135,11 +137,18 @@ printf '%s\n' 'PASS: the menu points out a check script from an earlier version.
   menu_pending_reboot_hint() { echo 'PENDING-REBOOT-HINT'; }
   menu_login_alert() { echo 'LOGIN-HINT'; }
   menu_quota_alert() { echo 'QUOTA-HINT'; }
+  menu_backup_alert() { echo 'BACKUP-HINT'; }
   setup_tmux_running() { return 1; }
   systemctl() { return 1; }
   printf 'menu_alerts=login quota\n' > "$PARAMS_FILE"
   menu <<< 0 > "$TEST_ROOT/menu-out"
   grep -Fq LOGIN-HINT "$TEST_ROOT/menu-out" && grep -Fq QUOTA-HINT "$TEST_ROOT/menu-out" || fail 'a hint asked for is missing'
+  if grep -Fq BACKUP-HINT "$TEST_ROOT/menu-out"; then fail 'the backup hint shown without being asked for'; fi
+  printf 'menu_alerts=backup\n' > "$PARAMS_FILE"
+  menu <<< 0 > "$TEST_ROOT/menu-out"
+  grep -Fq BACKUP-HINT "$TEST_ROOT/menu-out" || fail 'the backup hint is missing although asked for'
+  printf 'menu_alerts=login quota\n' > "$PARAMS_FILE"
+  menu <<< 0 > "$TEST_ROOT/menu-out"
   if grep -Eq 'VERIFY-HINT|PENDING-REBOOT-HINT' "$TEST_ROOT/menu-out"; then fail 'a hint left out is shown'; fi
   printf 'menu_alerts=none\n' > "$PARAMS_FILE"
   menu <<< 0 > "$TEST_ROOT/menu-out"
@@ -152,7 +161,7 @@ printf '%s\n' 'PASS: the menu shows only the hints the parameter asks for.'
 # phone; every entry in each.
 (
   wide="$(menu_render 100)" narrow="$(menu_render 30)"
-  for n in $(seq 1 8); do
+  for n in $(seq 1 9); do
     grep -Eq "(^| )$n\. " <<< "$wide" || fail "entry $n missing from the wide menu"
     grep -Eq "^ *$n\. " <<< "$narrow" || fail "entry $n missing from the narrow menu"
   done

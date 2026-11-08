@@ -45,6 +45,8 @@ load_optimizer_functions notify_event_names setup_skippable menu_alert_names men
 # Which Fail2ban ban action is in place (the check, the plan, the firewall
 # pause and the resources read it); none unless a test writes the file.
 load_optimizer_functions f2b_action_text f2b_action_legacy_text f2b_action_kind 2>/dev/null || true
+# The rollback tables, which every restore_* lookup reads.
+load_optimizer_functions restore_table restore_group_table 2>/dev/null || true
 F2B_ACTION_FILE="${F2B_ACTION_FILE:-/nonexistent/vps-test-f2b-action}"
 # The parameters: many functions read theirs. Without a PARAMS_FILE of the
 # test's own, every one is the recommended value; a test that sets one, or

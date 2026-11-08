@@ -116,9 +116,15 @@ LOGIN_NOTE_DIR=/run/vps-stable-login
 CHECK_SERVICE_FILE=/etc/systemd/system/vps-stable-check.service
 CHECK_TIMER_FILE=/etc/systemd/system/vps-stable-check.timer
 DOCKER_DAEMON_FILE=/etc/docker/daemon.json
+# Published Docker ports behind the firewall: the rules at boot, and following UFW's.
+DOCKER_FW_SERVICE_FILE=/etc/systemd/system/vps-stable-docker-fw.service
+DOCKER_FW_PATH_FILE=/etc/systemd/system/vps-stable-docker-fw.path
+# Data backup: what runs it, and when.
+BACKUP_SERVICE_FILE=/etc/systemd/system/vps-stable-backup.service
+BACKUP_TIMER_FILE=/etc/systemd/system/vps-stable-backup.timer
 NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE='' SSHPORT_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report|clean|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|report|clean|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report|clean|backup|databackup-run|docker-fw-sync|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|report|clean|backup|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
@@ -126,6 +132,7 @@ VPS 机器管家 V3.0.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps report     机器体检（只读）：性能、资源、磁盘、服务和系统状况一份看完，要留意的排在最前
   vps clean      磁盘清理：先列出能清掉多少，你选了才清
+  vps backup     数据备份：开启、选备份目标；vps backup now 立即备份，vps backup list 查看有哪些备份
   vps plan       开荒前的完整计划（只检查）
   vps perf       性能体检（只读）：CPU 是否被抢、内存和硬盘压力、换页、网络重传、连接跟踪
   vps resources  资源占用一览（只读）：常驻服务各占多少内存和 CPU、能不能关、封禁规则多少
@@ -581,7 +588,7 @@ nft_ruleset_has_policy() {
   awk -v xt="${1:-0}" '
     {line=$0; sub(/^[ \t]+/,"",line); sub(/[ \t]+$/,"",line)}
     xt == 1 && !skip && line ~ /^table (ip|ip6) (filter|nat|raw|mangle|security) \{$/ {skip = 1; depth = 0}
-    !skip && line == "table inet vps-stable-f2b {" {skip = 1; depth = 0}
+    !skip && (line == "table inet vps-stable-f2b {" || line == "table inet vps-stable-docker {") {skip = 1; depth = 0}
     skip {o = line; c = line; depth += gsub(/\{/, "", o) - gsub(/\}/, "", c); if (depth <= 0) skip = 0; next}
     line=="" || line=="}" || line ~ /^#/ {next}
     line ~ /^table [a-z0-9]+ [A-Za-z0-9_.-]+ \{$/ {next}
@@ -2164,7 +2171,16 @@ param_list() {
     notify_events_minutes notify '装软件、加公钥这类变化多久查一次' 分钟 \
     check_minutes_quota quota '只开流量提醒时多久检查一次' 分钟 \
     clean_log_days general '磁盘清理时删多少天以前的旧日志' 天 \
-    clean_journal_keep_mib general '磁盘清理后系统日志至少留多少' MiB
+    clean_journal_keep_mib general '磁盘清理后系统日志至少留多少' MiB \
+    backup_paths databackup '要备份的目录' '' \
+    backup_exclude databackup '备份时排除的内容' '' \
+    backup_time databackup '每天几点备份' '' \
+    backup_keep_daily databackup '备份保留最近几天' 天 \
+    backup_keep_weekly databackup '备份保留最近几周' 周 \
+    backup_keep_monthly databackup '备份保留最近几个月' 个月 \
+    backup_limit_mbps databackup '备份上传限速' Mbps \
+    backup_drill_days databackup '多少天做一次恢复演练' 天 \
+    backup_notify databackup '备份结果通知' ''
 }
 
 # MIB as people say it: "2GiB" for whole GiB, else "1536 MiB".
@@ -2231,7 +2247,7 @@ setup_run() {
 
 # The alerts at the top of the menu that can be switched (menu_alerts).
 menu_alert_names() {
-  printf '%s' 'verify（开荒后重启过，建议验收）、reboot（有更新等重启）、login（陌生 IP 登录过）、quota（流量快用完）'
+  printf '%s' 'verify（开荒后重启过，建议验收）、reboot（有更新等重启）、login（陌生 IP 登录过）、quota（流量快用完）、backup（数据备份失败）'
 }
 
 # NAME: the menu shows this alert.
@@ -2263,12 +2279,13 @@ param_check_words() {
 
 # The TG notifications that can be switched one by one (notify_events).
 notify_event_names() {
-  printf '%s' 'boot（开机重启）、login（登录）、console（服务商控制台登录）、account（新建账户和改密码）、sudo、oom（内存不够杀进程）、package（装删软件包）、key（加公钥）、port（新开端口）、autostart（开机自启和定时任务）、cpu、disk（系统盘）、memory（内存）、reboot（等重启）、service（盯的服务）、traffic（流量）'
+  printf '%s' 'boot（开机重启）、login（登录）、console（服务商控制台登录）、account（新建账户和改密码）、sudo、oom（内存不够杀进程）、package（装删软件包）、key（加公钥）、port（新开端口）、autostart（开机自启和定时任务）、cpu、disk（系统盘）、memory（内存）、reboot（等重启）、service（盯的服务）、backup（数据备份）、traffic（流量）'
 }
 
 # NAME: "int" (a whole number) or "word" (one of a few names).
 param_kind() {
   case "$1" in
+    backup_paths|backup_exclude|backup_time|backup_notify) echo word ;;
     zram_algorithm|apt_upgrade_time|tools_list|f2b_increment|f2b_mode|notify_summary|notify_summary_time|notify_summary_check|notify_events|notify_sudo_args|notify_services|quota_alerts) echo word ;;
     setup_skip|menu_alerts|ssh_rate_limit|ssh_x11_forwarding|sysctl_hardening_skip|bbr_qdisc|zram_swappiness|zram_page_cluster|tcp_extras|login_note) echo word ;;
     *) echo int ;;
@@ -2344,6 +2361,18 @@ param_recommended() {
     conntrack_notice_percent) echo 70 ;;
     tcp_notsent_kib) echo 128 ;;
     clean_log_days) echo 30 ;;
+    backup_paths)
+      local dir list='/etc /root /home'
+      for dir in /var/www /opt /srv /var/lib/docker/volumes; do if [[ -d "$dir" ]]; then list+=" $dir"; fi; done
+      echo "$list" ;;
+    backup_exclude) echo '/root/.cache /home/*/.cache *.tmp' ;;
+    backup_time) echo 03:30 ;;
+    backup_keep_daily) echo 7 ;;
+    backup_keep_weekly) echo 4 ;;
+    backup_keep_monthly) echo 6 ;;
+    backup_limit_mbps) echo 0 ;;
+    backup_drill_days) echo 30 ;;
+    backup_notify) echo fail ;;
     clean_journal_keep_mib) echo 50 ;;
     login_keep_days) echo 365 ;;
     login_keep_lines) echo 20000 ;;
@@ -2413,6 +2442,13 @@ param_reason() {
     swap_min_free_gb) echo '3 GB：系统升级、日志、临时文件都要地方；建 Swap 后剩得不够，Swap 会自动缩小。' ;;
     tcp_extras) echo 'yes：连接空闲一会儿后不重新慢启动（跑代理时网速不会忽快忽慢），大包被路上的设备丢掉时自动找到能走的大小。' ;;
     tcp_notsent_kib) echo '128：程序写得比线路发得快时，多出来的数据留在程序里，不堆在内核的发送队列里，延迟低、省内存；路上正在传的数据不受限，速度不变。0 表示不设置（内核默认不限）。' ;;
+    backup_paths) echo '系统配置、root 和普通账户的文件，再加这台机器上有的网站目录、/opt、/srv 和 Docker 数据卷。数据库要先导出再备份（直接备份正在写的数据文件可能恢复不了）。' ;;
+    backup_exclude) echo '缓存和临时文件没有备份价值。可以写目录、文件或带 * 的规则，none 表示不排除。' ;;
+    backup_time) echo '03:30（服务器时间，随机推迟最多 15 分钟）；写 manual 表示不定时，只手动备份。' ;;
+    backup_keep_daily|backup_keep_weekly|backup_keep_monthly) echo '7 天、4 周、6 个月：最近的备份密，以前的疏，重复的数据只存一份，多留几份占不了多少地方。' ;;
+    backup_limit_mbps) echo '0 表示不限；机器上跑着网站或代理、不想被备份占满上传带宽时再限。' ;;
+    backup_drill_days) echo '30：每月从最新的备份里真的恢复几个文件核对一次，备份坏了能提前知道。0 表示不做。' ;;
+    backup_notify) echo 'fail：只在失败时发 TG；all 每次都发；never 不发。没开 TG 通知时菜单顶部照样会提醒失败。' ;;
     clean_log_days) echo '30：一个月以前的旧日志一般用不上了；wtmp、btmp 这类登录记录不删。' ;;
     clean_journal_keep_mib) echo '50：清理以后系统日志至少还留这么多，最旧的先删；出了问题还能往回查。' ;;
     f2b_mode) echo 'normal：只算明确的失败，比如输错密码。aggressive：没试密码就断开的扫描也算，只允许密钥登录时才封得到扫描者。OpenSSH 9.8 起（Debian 13 等）sshd 自己会惩罚这类连接，一般不用开。' ;;
@@ -2609,6 +2645,40 @@ param_check() {
     tcp_notsent_kib)
       if [[ "$2" =~ ^[0-9]{1,5}$ ]] && { ((10#$2 == 0)) || ((10#$2 >= 16 && 10#$2 <= 16384)); }; then return 0; fi
       echo '请输入 0（不设置）或 16 到 16384 之间的整数（单位 KiB）。' ;;
+    backup_paths)
+      local item n=0
+      for item in $2; do
+        n=$((n + 1))
+        [[ "$item" =~ ^/[A-Za-z0-9._/@+-]*$ ]] || { echo "目录要写绝对路径：$item"; return 1; }
+      done
+      if ((n >= 1 && n <= 30)); then return 0; fi
+      echo '请输入 1 到 30 个目录，用空格隔开。' ;;
+    backup_exclude)
+      local item n=0
+      [[ "$2" != none ]] || return 0
+      set -f
+      for item in $2; do
+        n=$((n + 1))
+        [[ "$item" =~ ^[A-Za-z0-9._/*?@+-]+$ ]] || { set +f; echo "规则里有不能用的字符：$item"; return 1; }
+      done
+      set +f
+      if ((n >= 1 && n <= 40)); then return 0; fi
+      echo '请输入 1 到 40 条规则，用空格隔开，或者 none。' ;;
+    backup_time)
+      if [[ "$2" == manual || "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then return 0; fi
+      echo '请输入 24 小时制的时间（例如 03:30），或者 manual。' ;;
+    backup_keep_daily|backup_keep_weekly|backup_keep_monthly)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 <= 365)); then return 0; fi
+      echo '请输入 0 到 365 之间的整数。' ;;
+    backup_limit_mbps)
+      if [[ "$2" =~ ^[0-9]{1,5}$ ]] && ((10#$2 <= 10000)); then return 0; fi
+      echo '请输入 0 到 10000 之间的整数（单位 Mbps，0 表示不限）。' ;;
+    backup_drill_days)
+      if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 <= 365)); then return 0; fi
+      echo '请输入 0 到 365 之间的整数（天，0 表示不做）。' ;;
+    backup_notify)
+      case "$2" in all|fail|never) return 0 ;; esac
+      echo '请输入 all、fail 或 never。' ;;
     clean_log_days)
       if [[ "$2" =~ ^[0-9]{1,4}$ ]] && ((10#$2 >= 1 && 10#$2 <= 3650)); then return 0; fi
       echo '请输入 1 到 3650 之间的整数（天）。' ;;
@@ -2710,6 +2780,14 @@ param_caution() {
       if [[ "$2" == no ]]; then echo '关掉：连接空闲后重新慢启动，跨洲代理时网速会忽快忽慢。'; fi ;;
     tcp_notsent_kib)
       if ((10#$2 != 0 && 10#$2 < 64)); then echo '比较小：带宽很高时程序要写得非常勤，CPU 弱的机器速度可能上不去。'; fi ;;
+    backup_paths)
+      if [[ " $2 " == *' / '* ]]; then echo '备份整个系统盘：会把系统文件也备份进去，又慢又占地方，一般只备份数据目录。'; fi ;;
+    backup_time)
+      if [[ "$2" == manual ]]; then echo '不定时：要记得自己备份。'; fi ;;
+    backup_drill_days)
+      if ((10#$2 == 0)); then echo '不做恢复演练：备份坏了要到真正恢复时才知道。'; fi ;;
+    backup_notify)
+      if [[ "$2" == never ]]; then echo '不发通知：备份失败时只有菜单顶部和 vps check 会提醒。'; fi ;;
     clean_log_days)
       if ((10#$2 < 7)); then echo '不到一周：刚出的问题可能查不到日志了。'; fi ;;
     f2b_mode)
@@ -2836,6 +2914,10 @@ param_live() {
 param_apply() {
   case "$1" in
     general) ok '已保存：下次用到时就按新的参数。'; return 0 ;;
+    # Read at every run; only the time is in a unit.
+    databackup)
+      if databackup_on; then databackup_units_write; fi
+      ok '已保存：下次备份就按新的参数。'; return 0 ;;
     # Key-only login with other session limits: under a guard, like the hardening.
     ssh) stage_run ssh ssh_dropin_refresh; return 0 ;;
     # The SSH rule of a running firewall follows the rate-limit switch.
@@ -4226,7 +4308,8 @@ guard_confirm() {
       ok '已在系统日志里看到新窗口登录成功，自动确认。'; break
     fi
     if ((prompt)); then
-      printf '等待确认（剩余 %s 秒）：新窗口登录成功后这里会自动确认；没有自动确认时，在【这个窗口】输入 CONNECTED 并回车；新窗口登录失败就在这里输入 n，立即恢复: ' "$remaining"
+      if [[ -n "${GUARD_HINT:-}" ]]; then printf '等待确认（剩余 %s 秒）：%s: ' "$remaining" "$GUARD_HINT"
+      else printf '等待确认（剩余 %s 秒）：新窗口登录成功后这里会自动确认；没有自动确认时，在【这个窗口】输入 CONNECTED 并回车；新窗口登录失败就在这里输入 n，立即恢复: ' "$remaining"; fi
       prompt=0
     fi
     answer=''
@@ -4274,8 +4357,252 @@ docker_present() {
 # so UFW's INPUT rules never see that traffic.
 docker_firewall_note() {
   docker_present || return 0
+  if dockerfw_on; then
+    ok '检测到 Docker：发布的容器端口受防火墙管（单项设置「Docker 端口受防火墙管」已开启），要对外的在端口管理里放行。'
+    return 0
+  fi
   warn '检测到 Docker：用 -p 发布的容器端口会绕过 UFW，防火墙挡不住它们。'
-  echo '对策：只在本机使用的容器端口绑定到 127.0.0.1（例如 -p 127.0.0.1:8080:80）；需要对外的，在服务商安全组限制来源，或使用 DOCKER-USER 链（例如 ufw-docker）。'
+  echo '对策：只在本机使用的容器端口绑定到 127.0.0.1（例如 -p 127.0.0.1:8080:80）；或者打开单项设置里的「Docker 端口受防火墙管」，放行了才能从外面连。'
+}
+
+# ---- Published Docker ports behind the firewall (single item, off by default) ----
+# Docker turns a published port into a DNAT before UFW's rules look at it, so
+# UFW never sees that traffic. This table's chain sits on the forward hook,
+# before UFW's and Docker's own, and drops a new connection from outside to a
+# published port unless UFW has an allow rule for that port as seen from
+# outside. UFW stays the one list of what is open (a path unit follows it);
+# neither UFW's nor Docker's files are touched, and switching it off is
+# deleting the table.
+dockerfw_on() {
+  [[ -f "$DOCKER_FW_PATH_FILE" ]] && systemctl is-enabled -q vps-stable-docker-fw.path 2>/dev/null
+}
+
+# Why this machine cannot have it, in words; nothing when it can.
+dockerfw_unsupported() {
+  if ! docker_present || ! active docker; then echo '这台机器没有在运行 Docker。'; return 0; fi
+  if grep -Eq '"firewall-backend"[[:space:]]*:[[:space:]]*"nftables"' "$DOCKER_DAEMON_FILE" 2>/dev/null; then
+    echo 'Docker 用的是实验性的 nftables 防火墙模式，这种情况还没有测试过，不提供这个开关。'; return 0
+  fi
+  if [[ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)" == active ]]; then
+    echo '这台 Docker 开着 Swarm：它的端口走另一条路，这个开关管不到。'; return 0
+  fi
+  if ! command -v ufw >/dev/null || ! ufw_active; then
+    echo '防火墙没开：要靠防火墙的规则决定放行哪些端口，先开启防火墙。'
+  fi
+}
+
+# TEXT of "docker ps": one PORT/PROTO<TAB>CONTAINER per port published to the
+# outside (PORT may be a range with -); those bound to this machine only are not.
+dockerfw_published() {
+  local name ports item host port proto
+  while IFS=$'\t' read -r name ports; do
+    [[ -n "$ports" ]] || continue
+    while IFS= read -r item; do
+      item="${item# }"
+      [[ "$item" =~ ^(.*):([0-9]+(-[0-9]+)?)-\>[0-9]+(-[0-9]+)?/(tcp|udp)$ ]] || continue
+      host="${BASH_REMATCH[1]}" port="${BASH_REMATCH[2]}" proto="${BASH_REMATCH[5]}"
+      case "$host" in 127.*|'[::1]'|::1) continue ;; esac
+      printf '%s/%s\t%s\n' "$port" "$proto" "$name"
+    done <<< "${ports//, /$'\n'}"
+  done < <(docker ps --format '{{.Names}}'$'\t''{{.Ports}}' 2>/dev/null || true)
+}
+
+# UFW's allow rules, as LOW-HIGH or PORT<TAB>tcp or udp<TAB>SOURCE (empty:
+# anyone). A rule with "both" gives two lines.
+dockerfw_rules() {
+  local line fields spec proto src
+  while IFS= read -r line; do
+    if ! fields="$(port_rule_parse "$line")"; then continue; fi
+    IFS=$'\t' read -r spec proto src <<< "$fields"
+    spec="${spec/:/-}"
+    if [[ "$proto" == both ]]; then printf '%s\ttcp\t%s\n%s\tudp\t%s\n' "$spec" "$src" "$spec" "$src"
+    else printf '%s\t%s\t%s\n' "$spec" "$proto" "$src"; fi
+  done < <(ufw show added 2>/dev/null || true)
+}
+
+# PORT PROTO: UFW lets everyone in on it (a range counts when all of it is in).
+dockerfw_open() {
+  local low="${1%-*}" high="${1#*-}" spec proto src a b
+  while IFS=$'\t' read -r spec proto src; do
+    [[ "$proto" == "$2" && -z "$src" ]] || continue
+    a="${spec%-*}" b="${spec#*-}"
+    if ((a <= low && high <= b)); then return 0; fi
+  done < <(dockerfw_rules)
+  return 1
+}
+
+# The nftables script for what UFW allows now.
+dockerfw_text() {
+  local tcp='' udp='' extra='' spec proto src name
+  while IFS=$'\t' read -r spec proto src; do
+    if [[ -n "$src" ]]; then
+      if [[ "$src" == *:* ]]; then extra+="    ip6 saddr $src meta l4proto $proto ct original proto-dst $spec return"$'\n'
+      else extra+="    ip saddr $src meta l4proto $proto ct original proto-dst $spec return"$'\n'; fi
+    elif [[ "$proto" == tcp ]]; then tcp+="$spec, "
+    else udp+="$spec, "; fi
+  done < <(dockerfw_rules)
+  printf '%s\n' 'add table inet vps-stable-docker' 'delete table inet vps-stable-docker' 'table inet vps-stable-docker {'
+  if [[ -n "$tcp" ]]; then tcp=" elements = { ${tcp%, } };"; fi
+  if [[ -n "$udp" ]]; then udp=" elements = { ${udp%, } };"; fi
+  printf '  set open_tcp { type inet_service; flags interval; auto-merge;%s }\n' "$tcp"
+  printf '  set open_udp { type inet_service; flags interval; auto-merge;%s }\n' "$udp"
+  printf '%s\n' '  chain forward {' '    type filter hook forward priority -1; policy accept;' '    ct state new ct status dnat jump published' '  }' '  chain published {'
+  # A container reaching a published port through the host is no outside connection.
+  printf '%s\n' '    iifname "docker0" return' '    iifname "docker_gwbridge" return' '    iifname "br-*" return'
+  while IFS= read -r name; do
+    if [[ "$name" =~ ^[A-Za-z0-9_.-]+$ && "$name" != docker0 && "$name" != docker_gwbridge && "$name" != br-* ]]; then printf '    iifname "%s" return\n' "$name"; fi
+  done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{sub(/@.*/, "", $2); print $2}' || true)
+  printf '%s\n' '    meta l4proto tcp ct original proto-dst @open_tcp return' '    meta l4proto udp ct original proto-dst @open_udp return'
+  printf '%s' "$extra"
+  printf '%s\n' '    drop' '  }' '}'
+}
+
+# What the rules and the switch of UFW are at this moment.
+dockerfw_ufw_state() {
+  { cat -- /etc/ufw/user.rules /etc/ufw/user6.rules /etc/ufw/ufw.conf 2>/dev/null || true; } | cksum
+}
+
+# Puts the table in line with UFW's rules, again as long as they keep changing:
+# the path unit does not start this anew for what changes while it runs, and
+# several ufw commands in a row take about as long as this does.
+dockerfw_sync() {
+  local i now seen=''
+  dockerfw_on || return 0
+  command -v nft >/dev/null || return 0
+  for ((i = 0; i < 20; i++)); do
+    now="$(dockerfw_ufw_state)"
+    if [[ "$now" == "$seen" ]]; then return 0; fi
+    seen="$now"
+    dockerfw_load || return 1
+  done
+}
+
+# With the firewall off there is no list of what is open, so nothing is held
+# back (as without this switch).
+dockerfw_load() {
+  local temp
+  if ! ufw_active; then nft delete table inet vps-stable-docker 2>/dev/null || true; return 0; fi
+  temp="$(mktemp "$STATE_ROOT/.docker-fw.XXXXXX")" || return 1
+  if ! dockerfw_text > "$temp" || ! nft -c -f "$temp" || ! mv -fT -- "$temp" "$STATE_ROOT/docker-fw.nft"; then
+    rm -f -- "$temp"; return 1
+  fi
+  nft -f "$STATE_ROOT/docker-fw.nft"
+}
+
+dockerfw_service_text() {
+  printf '%s\n' '# VPS Stable Optimizer: published Docker ports behind the firewall' '[Unit]' 'Description=VPS Stable Optimizer: Docker ports behind the firewall' \
+    'After=ufw.service' 'Before=docker.service' '[Service]' 'Type=oneshot' \
+    'ExecStart=/bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh docker-fw-sync' 'LogLevelMax=notice' '[Install]' 'WantedBy=multi-user.target'
+}
+
+dockerfw_path_text() {
+  printf '%s\n' '# VPS Stable Optimizer: the rules follow what UFW allows' '[Unit]' 'Description=VPS Stable Optimizer: follow the rules of UFW' \
+    '[Path]' 'PathChanged=/etc/ufw/user.rules' 'PathChanged=/etc/ufw/user6.rules' 'PathChanged=/etc/ufw/ufw.conf' 'Unit=vps-stable-docker-fw.service' '[Install]' 'WantedBy=multi-user.target'
+}
+
+# The switch and the table off; the unit files are the rollback's.
+dockerfw_off() {
+  systemctl disable --now vps-stable-docker-fw.path >/dev/null 2>&1 || true
+  systemctl disable vps-stable-docker-fw.service >/dev/null 2>&1 || true
+  if command -v nft >/dev/null; then nft delete table inet vps-stable-docker 2>/dev/null || true; fi
+  rm -f -- "$STATE_ROOT/docker-fw.nft"
+}
+
+# Off again by this tool, with the firewall rules it added for it.
+dockerfw_rules_undo() {
+  local rule words temp fw="$RESTORE_ROOT/fw_rules" own="$RESTORE_ROOT/dockerfw_rules"
+  [[ -f "$own" && ! -L "$own" ]] || return 0
+  while IFS= read -r rule; do
+    [[ "$rule" == 'ufw allow '* ]] || continue
+    read -r -a words <<< "${rule#ufw }"
+    if command -v ufw >/dev/null && ! ufw --force delete "${words[@]}" >/dev/null 2>&1; then warn "没能删掉防火墙规则：${rule#ufw }"; fi
+    if [[ -f "$fw" && ! -L "$fw" ]] && temp="$(mktemp "$RESTORE_ROOT/.write.XXXXXX")"; then
+      { grep -vxF -- "$rule" "$fw" > "$temp" || true; }
+      if ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$fw"; then rm -f -- "$temp"; fi
+    fi
+  done < "$own"
+  rm -f -- "$own"
+}
+
+# The ports containers publish, and whether the firewall lets them through.
+dockerfw_show() {
+  local line port proto name n=0
+  while IFS=$'\t' read -r line name; do
+    [[ -n "$line" ]] || continue
+    port="${line%/*}" proto="${line#*/}" n=$((n + 1))
+    if dockerfw_open "$port" "$proto"; then printf '  %-16s %s（放行）\n' "$line" "$name"
+    else printf '  %-16s %s（外面连不上：vps port open %s %s）\n' "$line" "$name" "${port/-/:}" "$proto"; fi
+  done < <(dockerfw_published | sort -u)
+  ((n)) || echo '现在没有容器把端口发布到外面。'
+}
+
+dockerfw_stage() {
+  say 'Docker 端口受防火墙管'
+  local why line port proto name unit deadline
+  local -a add=()
+  if [[ "${DOCKERFW_CHOICE:-}" != 1 ]]; then ok '按你的选择不开启。'; module_result dockerfw declined 'not requested'; return 0; fi
+  why="$(dockerfw_unsupported)"
+  if [[ -n "$why" ]]; then warn "$why"; module_result dockerfw unsupported 'not available here'; return 0; fi
+  if guard_leftovers; then module_result dockerfw skipped 'earlier protection timer pending'; return 0; fi
+  if ! command -v nft >/dev/null && ! install_pkgs nftables; then warn 'nftables 没能安装，这一项没有开启。'; module_result dockerfw failed 'nftables missing'; return 0; fi
+  command -v nft >/dev/null || { warn '找不到 nft 命令，这一项没有开启。'; module_result dockerfw failed 'nft missing'; return 0; }
+  while IFS=$'\t' read -r line name; do
+    [[ -n "$line" ]] || continue
+    if ! dockerfw_open "${line%/*}" "${line#*/}"; then add+=("$line"$'\t'"$name"); fi
+  done < <(dockerfw_published | sort -u)
+  if ((${#add[@]})); then
+    echo '这些容器端口现在对外开放，防火墙里还没有放行：'
+    for line in "${add[@]}"; do printf '  %-16s %s\n' "${line%%$'\t'*}" "${line#*$'\t'}"; done
+    if confirm_default_yes '继续让外面访问这些端口吗？（回车就放行；选 n 的话它们从现在起连不上）'; then
+      for line in "${add[@]}"; do
+        line="${line%%$'\t'*}" port="${line%/*}" proto="${line#*/}"
+        port="${port/-/:}"
+        if ufw_rule allow "$port" "$proto"; then printf 'ufw allow %s/%s\n' "$port" "$proto" >> "$RESTORE_ROOT/dockerfw_rules"
+        else warn "放行 $line 失败，开启后它会被挡住。"; fi
+      done
+    fi
+  fi
+  echo '开启后，以后新发布的容器端口默认从外面连不上，要在端口管理里放行（vps port open 端口，写外面看到的端口）。'
+  check_file_write dockerfw_service "$DOCKER_FW_SERVICE_FILE" "$(dockerfw_service_text)" || { module_result dockerfw preserved 'unit file conflict'; return 0; }
+  check_file_write dockerfw_path "$DOCKER_FW_PATH_FILE" "$(dockerfw_path_text)" || { module_result dockerfw preserved 'unit file conflict'; return 0; }
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  unit="vps-stable-ufw-rollback-docker-$(date +%s)-$$"
+  if ! guard_arm "$unit" /bin/sh -c 'systemctl disable --now vps-stable-docker-fw.path; systemctl disable vps-stable-docker-fw.service; nft delete table inet vps-stable-docker'; then
+    dockerfw_off; warn '无法启用自动撤销计时器，这一项没有开启。'; module_result dockerfw failed 'guard not armed'; return 0
+  fi
+  deadline=$((SECONDS + $(param_value guard_seconds)))
+  if ! systemctl enable vps-stable-docker-fw.service >/dev/null 2>&1 || ! systemctl enable --now vps-stable-docker-fw.path >/dev/null 2>&1 || ! dockerfw_sync; then
+    dockerfw_off; systemctl stop "$unit.timer" 2>/dev/null || true
+    warn '规则没能加载，这一项没有开启。'; module_result dockerfw failed 'rules not loaded'; return 0
+  fi
+  echo "规则已生效。$(param_value guard_seconds) 秒内没有确认就自动恢复原样。"
+  GUARD_HINT='从外面打开你的网站或服务试一下，还能用就在这里输入 CONNECTED；不能用输入 n，立即恢复'
+  if guard_confirm "$unit" "$deadline"; then
+    GUARD_HINT=''
+    ok '已开启：容器端口放行了才能从外面连。'
+    module_result dockerfw applied 'ports follow UFW'
+    return 0
+  fi
+  GUARD_HINT=''
+  warn '这次没有确认：已经恢复原样。'
+  dockerfw_off
+  systemctl stop "$unit.timer" 2>/dev/null || true
+  dockerfw_rules_undo
+  module_result dockerfw failed 'not confirmed; reverted'
+}
+
+check_dockerfw() {
+  local line name blocked=''
+  [[ -f "$DOCKER_FW_PATH_FILE" ]] || { verify_set fail '开关的配置不见了'; return 0; }
+  if ! systemctl is-enabled -q vps-stable-docker-fw.path 2>/dev/null; then verify_set fail '跟随防火墙规则的任务没有开启'; return 0; fi
+  if ! ufw_active; then verify_set notice '防火墙没开：容器端口暂时不受管'; return 0; fi
+  if ! nft list chain inet vps-stable-docker published >/dev/null 2>&1; then verify_set fail 'nftables 里没有规则：运行 systemctl start vps-stable-docker-fw.service 后再查'; return 0; fi
+  while IFS=$'\t' read -r line name; do
+    [[ -n "$line" ]] || continue
+    if ! dockerfw_open "${line%/*}" "${line#*/}"; then blocked+=" $line（$name）"; fi
+  done < <(dockerfw_published | sort -u)
+  if [[ -n "$blocked" ]]; then verify_set notice "这些容器端口发布了但没放行，外面连不上：${blocked# }"
+  else verify_set pass '发布的容器端口都按防火墙的规则放行'; fi
 }
 
 # [FILE]: what to do when this machine forwards traffic (a WireGuard or
@@ -6411,7 +6738,7 @@ backup_configs() {
       /etc/sysctl.conf /etc/systemd/journald.conf /etc/default/zramswap \
       /etc/apt/apt.conf /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/sources.list /etc/fail2ban/jail.conf /etc/fail2ban/jail.local \
       /etc/systemd/timesyncd.conf /etc/hostname "$CLOUD_HOSTNAME_FILE" "$SWAP_UNIT_FILE" "$CONNTRACK_FILE" "$CONNTRACK_MODULE_FILE" "$PING_FILE" "$PING_UFW_FILE" \
-      "$KEEPALIVE_FILE" "$GAI_FILE" "$APT_TIME_FILE"; do
+      "$KEEPALIVE_FILE" "$GAI_FILE" "$APT_TIME_FILE" "$DOCKER_FW_SERVICE_FILE" "$DOCKER_FW_PATH_FILE" "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"; do
     backup_config_path "$file"
   done
   backup_config_group /etc/ssh/sshd_config.d '*.conf'
@@ -6971,6 +7298,413 @@ clean_main() {
   after="$(df -Pk / | awk 'NR == 2 {print $4}')"
   if [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ ]] && ((after > before)); then ok "清理完了，系统盘多出 $(clean_size_text "$(((after - before) * 1024))") 可用空间。"
   else ok '清理完了。'; fi
+}
+
+# ---- Data backup (single item, off by default; menu 9 / vps backup) ---------------
+# restic encrypts on this machine and keeps the backups at the target chosen:
+# another machine over SFTP, S3-compatible storage, rclone or a local directory.
+# A timer runs it; nothing stays in memory between runs. Everything of it lives
+# in STATE_ROOT/databackup (conf, password, key: root only).
+
+# True when this tool runs backups here.
+databackup_on() {
+  [[ -f "$BACKUP_SERVICE_FILE" && -s "$STATE_ROOT/databackup/conf" ]]
+}
+
+# KEY: its value in the settings (never sourced).
+databackup_conf() {
+  sed -n "s/^$1=//p" "$STATE_ROOT/databackup/conf" 2>/dev/null | head -n 1 || true
+}
+
+# KEY=VALUE...: the settings, all of them at once.
+databackup_conf_write() {
+  local temp pair d="$STATE_ROOT/databackup"
+  temp="$(mktemp "$d/.conf.XXXXXX")" || return 1
+  for pair in "$@"; do
+    if ! printf '%s\n' "$pair" >> "$temp"; then rm -f -- "$temp"; return 1; fi
+  done
+  if ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$d/conf"; then rm -f -- "$temp"; return 1; fi
+}
+
+# ARGS...: restic on the configured repository. The password and the storage
+# keys reach it through a file and a subshell's environment, never its command line.
+databackup_restic() {
+  local d="$STATE_ROOT/databackup" type repo region
+  local -a opts=()
+  type="$(databackup_conf type)" repo="$(databackup_conf repo)"
+  opts=(--cache-dir "$d/cache" --password-file "$d/password" -r "$repo")
+  if [[ "$type" == sftp ]]; then
+    opts+=(-o "sftp.command=ssh -i $d/id_ed25519 -p $(databackup_conf port) -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o ConnectTimeout=20 -o ServerAliveInterval=30 $(databackup_conf user)@$(databackup_conf host) -s sftp")
+  fi
+  (
+    if [[ "$type" == s3 ]]; then
+      AWS_ACCESS_KEY_ID="$(databackup_conf access_key)" AWS_SECRET_ACCESS_KEY="$(databackup_conf secret_key)"
+      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+      region="$(databackup_conf region)"
+      if [[ -n "$region" ]]; then export AWS_DEFAULT_REGION="$region"; fi
+    fi
+    restic "${opts[@]}" "$@"
+  )
+}
+
+# TEXT: queued for TG, under the check's own lock (its sender rewrites the queue).
+databackup_notify() {
+  local dir="$STATE_ROOT/notify" events
+  [[ -s "$STATE_ROOT/notify.conf" ]] || return 0
+  events=" $(param_value notify_events) "
+  [[ "$events" == *' all '* || "$events" == *' backup '* ]] || return 0
+  mkdir -p -- "$dir" || return 0
+  (
+    flock -w 30 9 || exit 0
+    { printf '%s' "$1" | tr '\n' '\037'; echo; } >> "$dir/queue"
+  ) 9> "$dir/lock" || true
+}
+
+# STATUS NOTE: what this run came to, for the menu, vps check and TG.
+databackup_finish() {
+  local d="$STATE_ROOT/databackup" now
+  # An open menu must not keep holding the lock against the timer.
+  exec 7>&-
+  now="$(date +%s)"
+  printf '%s\t%s\t%s\n' "$now" "$1" "$2" > "$d/last"
+  if [[ "$1" == ok ]]; then printf '%s\n' "$now" > "$d/last-ok"; fi
+  case "$(param_value backup_notify):$1" in
+    all:ok) databackup_notify "数据备份完成：$2" ;;
+    all:fail|fail:fail) databackup_notify "数据备份失败：$2。用 vps backup now 再试一次，详情在 $d/last.log" ;;
+  esac
+}
+
+# A real restore of a sample of the newest backup into a temporary directory,
+# after restic's own check: true when what came back has the right sizes.
+databackup_drill() {
+  local d="$STATE_ROOT/databackup" tmp list line good=1
+  local -a sample=() includes=()
+  databackup_restic check > "$d/drill.log" 2>&1 || return 1
+  list="$(databackup_restic ls --long latest 2>> "$d/drill.log")" || return 1
+  mapfile -t sample < <(awk 'NF == 7 && $1 ~ /^-/ && $4 + 0 > 0 && $4 + 0 <= 1048576 && $7 !~ /[][*?\\]/ {print $4 "\t" $7}' <<< "$list" | shuf -n 10 || true)
+  ((${#sample[@]})) || return 0
+  for line in "${sample[@]}"; do includes+=(--include "${line#*$'\t'}"); done
+  tmp="$(mktemp -d /var/tmp/vps-backup-drill.XXXXXX)" || return 1
+  if databackup_restic restore latest --target "$tmp" "${includes[@]}" >> "$d/drill.log" 2>&1; then
+    for line in "${sample[@]}"; do
+      [[ "$(stat -c %s -- "$tmp${line#*$'\t'}" 2>/dev/null || echo none)" == "${line%%$'\t'*}" ]] || good=0
+    done
+  else good=0; fi
+  rm -rf --one-file-system -- "$tmp"
+  ((good))
+}
+
+# One backup, with the cleaning up of old ones and the restore drill when due.
+# Runs from the timer as well: says what happened through databackup_finish.
+databackup_run() {
+  local d="$STATE_ROOT/databackup" rc=0 p kib note='' now last days
+  local -a paths=() excludes=() args=() prune=()
+  [[ -s "$d/conf" ]] || { echo '还没有设置备份目标。'; return 1; }
+  exec 7> "$d/lock"
+  flock -n 7 || return 75
+  now="$(date +%s)"
+  : > "$d/last.log"
+  # What to do first (a database dump), if the owner has put a script there.
+  if [[ -f "$STATE_ROOT/backup-before" && ! -L "$STATE_ROOT/backup-before" && -O "$STATE_ROOT/backup-before" && -x "$STATE_ROOT/backup-before" ]]; then
+    if ! timeout 3600 "$STATE_ROOT/backup-before" >> "$d/last.log" 2>&1 7>&-; then databackup_finish fail '备份前要运行的脚本失败了'; return 1; fi
+  fi
+  for p in $(param_value backup_paths); do
+    if [[ -e "$p" ]]; then paths+=("$p"); fi
+  done
+  ((${#paths[@]})) || { databackup_finish fail '要备份的目录都不存在'; return 1; }
+  read -r -a excludes <<< "$(param_value backup_exclude)"
+  args=(--one-file-system --exclude-caches --tag vps-stable --exclude "$d")
+  if [[ "${excludes[0]:-none}" != none ]]; then
+    for p in "${excludes[@]}"; do args+=(--exclude "$p"); done
+  fi
+  if [[ "$(databackup_conf type)" == local ]]; then args+=(--exclude "$(databackup_conf repo)"); fi
+  kib=$(($(param_value backup_limit_mbps) * 122))
+  if ((kib > 0)); then args+=(--limit-upload "$kib"); fi
+  databackup_restic backup "${args[@]}" "${paths[@]}" >> "$d/last.log" 2>&1 || rc=$?
+  # 3: some files could not be read (they changed or went away); the rest is in.
+  if ((rc != 0 && rc != 3)); then databackup_finish fail "$(tail -n 1 -- "$d/last.log" | audit_clean_text | cut -c1-200)"; return 1; fi
+  note="$(sed -n 's/^processed \([0-9]*\) files, \(.*\) in \(.*\)$/\1 个文件，\2，用时 \3/p' "$d/last.log" | tail -n 1)"
+  if ((rc == 3)); then note+='；有文件读不了，已跳过'; fi
+  # Removing what no snapshot needs is the heavy part: once a week.
+  last="$(cat -- "$d/last-prune" 2>/dev/null || echo 0)"
+  if ((now - last >= 604800)); then prune=(--prune); fi
+  if databackup_restic forget --tag vps-stable --keep-daily "$(param_value backup_keep_daily)" --keep-weekly "$(param_value backup_keep_weekly)" \
+       --keep-monthly "$(param_value backup_keep_monthly)" "${prune[@]}" >> "$d/last.log" 2>&1; then
+    if ((${#prune[@]})); then printf '%s\n' "$now" > "$d/last-prune"; fi
+  else
+    note+='；清理旧备份没有成功'
+  fi
+  days="$(param_value backup_drill_days)"
+  last="$(cat -- "$d/drill-last" 2>/dev/null || echo 0)"
+  if ((days > 0 && now - last >= days * 86400)); then
+    if ! databackup_drill; then databackup_finish fail "恢复演练没有通过，详情在 $d/drill.log"; return 1; fi
+    printf '%s\n' "$now" > "$d/drill-last"
+    note+='；恢复演练通过'
+  fi
+  databackup_finish ok "${note:-完成}"
+}
+
+databackup_service_text() {
+  printf '%s\n' '# VPS Stable Optimizer: data backup' '[Unit]' 'Description=VPS Stable Optimizer: data backup' 'After=network-online.target' 'Wants=network-online.target' \
+    '[Service]' 'Type=oneshot' 'Environment=HOME=/root' 'ExecStart=/bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh databackup-run' 'Nice=10' 'IOSchedulingClass=idle' 'OOMScoreAdjust=500'
+}
+
+# HH:MM: when.
+databackup_timer_text() {
+  printf '%s\n' '# VPS Stable Optimizer: data backup' '[Unit]' 'Description=VPS Stable Optimizer: data backup' '[Timer]' "OnCalendar=*-*-* $1:00" 'RandomizedDelaySec=900' 'Persistent=true' '[Install]' 'WantedBy=timers.target'
+}
+
+# The service and the timer as the parameters say now.
+databackup_units_write() {
+  local time id
+  time="$(param_value backup_time)"
+  check_file_write databackup_service "$BACKUP_SERVICE_FILE" "$(databackup_service_text)" || return 1
+  if [[ "$time" == manual ]]; then
+    systemctl disable --now vps-stable-backup.timer >/dev/null 2>&1 || true
+    if [[ -f "$BACKUP_TIMER_FILE" ]] && restore_file_ours databackup_timer_file; then rm -f -- "$BACKUP_TIMER_FILE"; fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  else
+    check_file_write databackup_timer_file "$BACKUP_TIMER_FILE" "$(databackup_timer_text "$time")" || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if ! systemctl enable --now vps-stable-backup.timer >/dev/null 2>&1; then warn '定时备份没能启动。'; return 1; fi
+  fi
+  # Changed outside a stage (a parameter): still this tool's own.
+  if [[ -z "${RESTORE_STAGE:-}" ]]; then
+    for id in databackup_timer databackup_service databackup_timer_file; do restore_adopt "$id" || true; done
+  fi
+}
+
+databackup_ask_sftp() {
+  local d="$STATE_ROOT/databackup" host port user dir tries repo_host
+  read -r -p '对方的地址（IP 或域名，直接回车取消）: ' host || host=''
+  [[ -n "$host" ]] || return 1
+  [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || { warn '地址里有不能用的字符。'; return 1; }
+  read -r -p '对方的 SSH 端口 [22]: ' port || port=''
+  port="${port:-22}"
+  if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1 || 10#$port > 65535)); then warn '端口要在 1 到 65535 之间。'; return 1; fi
+  read -r -p '对方的账户名（建议专门建一个，不用 root）: ' user || user=''
+  [[ "$user" =~ ^[a-z_][a-z0-9_.-]*$ ]] || { warn '账户名不对。'; return 1; }
+  read -r -p "对方保存备份的目录 [backups/$(hostname -s)]: " dir || dir=''
+  dir="${dir:-backups/$(hostname -s)}"
+  [[ "$dir" =~ ^[A-Za-z0-9._/-]+$ && "$dir" != *..* ]] || { warn '目录里有不能用的字符。'; return 1; }
+  if [[ ! -f "$d/id_ed25519" ]]; then ssh-keygen -q -t ed25519 -N '' -C "vps-backup@$(hostname -s)" -f "$d/id_ed25519" || { warn '没能生成备份用的密钥。'; return 1; }; fi
+  if ! ssh-keyscan -T 10 -p "$port" "$host" > "$d/known_hosts.new" 2>/dev/null || [[ ! -s "$d/known_hosts.new" ]]; then
+    rm -f -- "$d/known_hosts.new"; warn "连不上 $host 的 SSH（端口 $port）。"; return 1
+  fi
+  echo '对方的主机指纹：'
+  ssh-keygen -lf "$d/known_hosts.new" | sed 's/^/  /'
+  if ! confirm_default_yes '指纹对得上吗？（对不上说明连到了别的机器）'; then rm -f -- "$d/known_hosts.new"; return 1; fi
+  mv -fT -- "$d/known_hosts.new" "$d/known_hosts"
+  echo "在 $host 的账户 $user 里运行一次这一行，把备份用的公钥加进去："
+  printf "  mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '%s' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys\n" "$(cat -- "$d/id_ed25519.pub")"
+  for tries in 1 2 3; do
+    read -r -p '加好了按回车: ' _ || return 1
+    if sftp -q -b - -i "$d/id_ed25519" -P "$port" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$d/known_hosts" -o ConnectTimeout=20 "$user@$host" <<< 'pwd' > /dev/null 2>&1; then
+      ok '能用这把密钥登录对方了。'
+      repo_host="$host"
+      if [[ "$host" == *:* ]]; then repo_host="[$host]"; fi
+      databackup_conf_write type=sftp "repo=sftp:$user@$repo_host:$dir" "host=$host" "port=$((10#$port))" "user=$user"
+      return
+    fi
+    warn "还登录不了（第 $tries 次）：检查账户名和公钥。"
+  done
+  return 1
+}
+
+databackup_ask_s3() {
+  local endpoint bucket prefix access secret region
+  read -r -p '对象存储的地址（例如 https://xxx.r2.cloudflarestorage.com，直接回车取消）: ' endpoint || endpoint=''
+  [[ -n "$endpoint" ]] || return 1
+  endpoint="${endpoint%/}"
+  [[ "$endpoint" =~ ^https?://[A-Za-z0-9.:-]+$ ]] || { warn '地址要以 https:// 开头，只写到域名。'; return 1; }
+  read -r -p '存储桶的名字: ' bucket || bucket=''
+  [[ "$bucket" =~ ^[A-Za-z0-9._-]{3,63}$ ]] || { warn '存储桶的名字不对。'; return 1; }
+  read -r -p "桶里的目录 [$(hostname -s)]: " prefix || prefix=''
+  prefix="${prefix:-$(hostname -s)}"
+  [[ "$prefix" =~ ^[A-Za-z0-9._/-]+$ && "$prefix" != *..* ]] || { warn '目录里有不能用的字符。'; return 1; }
+  read -r -p '区域（Cloudflare R2 写 auto，不知道就回车）: ' region || region=''
+  [[ -z "$region" || "$region" =~ ^[a-z0-9-]+$ ]] || { warn '区域不对。'; return 1; }
+  read -r -p 'Access Key: ' access || access=''
+  read -r -s -p 'Secret Key（输入时不显示）: ' secret || secret=''
+  echo
+  [[ "$access" =~ ^[A-Za-z0-9/+=_-]+$ && "$secret" =~ ^[A-Za-z0-9/+=_-]+$ ]] || { warn 'Access Key 或 Secret Key 不对。'; return 1; }
+  databackup_conf_write type=s3 "repo=s3:$endpoint/$bucket/$prefix" "access_key=$access" "secret_key=$secret" "region=$region"
+}
+
+databackup_ask_rclone() {
+  local target
+  if ! command -v rclone >/dev/null; then install_pkgs rclone || { warn '没能安装 rclone。'; return 1; }; fi
+  if [[ -z "$(rclone listremotes 2>/dev/null || true)" ]]; then
+    warn '还没有配置网盘：先运行 rclone config 配好，再回到这里。'; return 1
+  fi
+  echo '已经配置的网盘：'
+  rclone listremotes 2>/dev/null | sed 's/^/  /' || true
+  read -r -p "备份到哪里（写成 网盘名:目录，例如 gdrive:backups/$(hostname -s)，直接回车取消）: " target || target=''
+  [[ -n "$target" ]] || return 1
+  [[ "$target" =~ ^[A-Za-z0-9_-]+:[A-Za-z0-9._/-]+$ && "$target" != *..* ]] || { warn '要写成 网盘名:目录。'; return 1; }
+  rclone lsd "${target%%:*}:" > /dev/null 2>&1 || { warn "连不上 ${target%%:*}：先用 rclone lsd ${target%%:*}: 检查。"; return 1; }
+  databackup_conf_write type=rclone "repo=rclone:$target"
+}
+
+databackup_ask_local() {
+  local dir
+  read -r -p '备份到本机哪个目录 [/var/backups/vps-data]: ' dir || dir=''
+  dir="${dir:-/var/backups/vps-data}"
+  dir="${dir%/}"
+  [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ && "$dir" != *..* ]] || { warn '目录要写绝对路径。'; return 1; }
+  warn '备份和数据在同一台机器上：只能防误删，机器出事、被黑或硬盘坏了会一起没。'
+  confirm_yes '仍然只备份到本机吗？' || return 1
+  install -d -m 700 -- "$dir" || { warn "没能创建 $dir。"; return 1; }
+  databackup_conf_write type=local "repo=$dir"
+}
+
+databackup_ask_target() {
+  local choice
+  echo '备份到哪里？'
+  echo '  1) 另一台 VPS（SFTP，推荐：不额外花钱，最好是另一家服务商）'
+  echo '  2) 对象存储（S3 兼容：Cloudflare R2、Backblaze B2、AWS S3 等）'
+  echo '  3) 网盘（用 rclone，要先自己运行 rclone config 配好）'
+  echo '  4) 本机目录（只防误删；机器出事会一起没）'
+  read -r -p '备份目标 [1-4，直接回车取消]: ' choice || choice=''
+  case "$choice" in
+    1) databackup_ask_sftp ;;
+    2) databackup_ask_s3 ;;
+    3) databackup_ask_rclone ;;
+    4) databackup_ask_local ;;
+    *) return 1 ;;
+  esac
+}
+
+# True once the password is saved here and the user says it is kept elsewhere too.
+databackup_password() {
+  local d="$STATE_ROOT/databackup" one two temp
+  if [[ -s "$d/password" ]]; then return 0; fi
+  echo '备份会用一个密码加密：没有这个密码，谁也恢复不了，包括你自己。'
+  read -r -s -p '备份密码（输入时不显示，直接回车自动生成一个）: ' one || return 1
+  echo
+  if [[ -z "$one" ]]; then
+    one="$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | cut -c1-32)"
+    # On the terminal only: everything else printed also goes to the run's log.
+    if [[ -z "${UI_TTY_FD:-}" ]]; then warn '没有终端，显示不了自动生成的密码：已取消。'; return 1; fi
+    printf '\n自动生成的备份密码（只显示这一次）：%s\n\n' "$one" >&"$UI_TTY_FD"
+  else
+    read -r -s -p '再输入一次: ' two || return 1
+    echo
+    [[ "$one" == "$two" ]] || { warn '两次输入的不一样。'; return 1; }
+    ((${#one} >= 8)) || { warn '密码至少 8 位。'; return 1; }
+  fi
+  confirm_yes '已经把这个密码存到这台机器以外的地方了吗？（丢了它，备份就恢复不了）' || return 1
+  temp="$(mktemp "$d/.password.XXXXXX")" || return 1
+  if ! printf '%s\n' "$one" > "$temp" || ! chmod 600 -- "$temp" || ! mv -fT -- "$temp" "$d/password"; then rm -f -- "$temp"; return 1; fi
+}
+
+databackup_stage() {
+  say '数据备份'
+  local d="$STATE_ROOT/databackup"
+  if [[ "${DATABACKUP_CHOICE:-}" != 1 ]]; then ok '按你的选择不开启数据备份。'; module_result databackup declined 'not requested'; return 0; fi
+  state_secure_dir "$d"
+  if ! installed restic && ! install_pkgs restic; then warn 'restic 没能安装，备份没有开启。'; module_result databackup failed 'restic missing'; return 0; fi
+  command -v restic >/dev/null || { warn '找不到 restic 命令，备份没有开启。'; module_result databackup failed 'restic missing'; return 0; }
+  if [[ ! -s "$d/conf" ]] || ! confirm_default_yes "沿用上次的备份目标吗？（$(databackup_conf repo)）"; then
+    if ! databackup_ask_target; then ok '没有设置备份目标，备份没有开启。'; module_result databackup declined 'no target'; return 0; fi
+  fi
+  if ! databackup_password; then ok '没有设好密码，备份没有开启。'; module_result databackup declined 'no password'; return 0; fi
+  echo "要备份的目录：$(param_value backup_paths)（可以在「调整参数」里改）"
+  if ! databackup_restic cat config > /dev/null 2>&1; then
+    if ! databackup_restic init > "$d/last.log" 2>&1; then
+      warn '没能在备份目标上建好仓库（已经有仓库的话，可能是密码不对）：'
+      tail -n 3 -- "$d/last.log" | audit_clean_text | sed 's/^/  /'
+      module_result databackup failed 'repository not ready'; return 0
+    fi
+  fi
+  echo '先试着备份一次，成功了才保存设置；第一次可能要几分钟……'
+  if ! databackup_run; then
+    warn "第一次备份没有成功，备份没有开启：$(cut -f3 "$d/last" 2>/dev/null || echo '详情见日志')"
+    echo "完整输出：$d/last.log"
+    module_result databackup failed 'first backup failed'; return 0
+  fi
+  ok "备份成功：$(cut -f3 "$d/last")"
+  if ! databackup_units_write; then module_result databackup failed 'timer'; return 0; fi
+  if [[ "$(param_value backup_time)" == manual ]]; then ok '数据备份已开启：只手动备份（vps backup now）。'
+  else ok "数据备份已开启：每天 $(param_value backup_time) 左右（服务器时间）自动备份。"; fi
+  module_result databackup applied "$(databackup_conf type)"
+}
+
+# Restores into a new directory: what is on the machine now is never touched.
+databackup_restore() {
+  local id what target
+  local -a args=()
+  databackup_restic snapshots --compact || { warn '读不到备份列表。'; return 0; }
+  read -r -p '恢复哪一次？输入 ID（直接回车用最新的）: ' id || id=''
+  id="${id:-latest}"
+  [[ "$id" == latest || "$id" =~ ^[0-9a-f]{8,64}$ ]] || { warn 'ID 不对。'; return 0; }
+  read -r -p '恢复哪个文件或目录？（例如 /etc/nginx，直接回车恢复全部）: ' what || what=''
+  if [[ -n "$what" ]]; then
+    [[ "$what" =~ ^/[A-Za-z0-9._/@+-]*$ ]] || { warn '要写绝对路径。'; return 0; }
+    args+=(--include "$what")
+  fi
+  target="/root/vps-restore-$(date +%Y%m%d-%H%M%S)"
+  confirm_yes "恢复到 $target 吗？（不会动现在的文件，要用哪些你自己拷过去）" || { ok '已取消。'; return 0; }
+  if databackup_restic restore "$id" --target "$target" "${args[@]}"; then ok "已恢复到 $target。"
+  else warn '恢复没有成功，看上面的提示。'; fi
+}
+
+databackup_now() {
+  local d="$STATE_ROOT/databackup"
+  [[ -s "$d/conf" ]] || { warn '还没有设置备份目标：先开启数据备份。'; return 0; }
+  local rc=0
+  echo '正在备份……'
+  databackup_run || rc=$?
+  case "$rc" in
+    0) ok "备份完成：$(cut -f3 "$d/last")" ;;
+    75) warn '另一次备份正在运行，等它结束再试。' ;;
+    *) warn "备份没有成功：$(cut -f3 "$d/last" 2>/dev/null || echo '详情见日志')（完整输出：$d/last.log）" ;;
+  esac
+}
+
+databackup_menu() {
+  local choice
+  if [[ ! -s "$STATE_ROOT/databackup/conf" ]]; then warn '还没有设置备份目标：先选 1 开启。'; return 0; fi
+  read -r -p '1) 立即备份   2) 查看有哪些备份   3) 恢复   回车返回: ' choice || return 0
+  case "$choice" in
+    1) databackup_now ;;
+    2) databackup_restic snapshots --compact || warn '读不到备份列表。' ;;
+    3) databackup_restore ;;
+  esac
+}
+
+# vps backup [now|list]
+databackup_main() {
+  [[ $EUID -eq 0 ]] || die '数据备份需要 root：请用 sudo vps backup。'
+  case "${MODE_ARGS[0]:-}" in
+    '') MODE_ARGS=(databackup); item_main ;;
+    now) databackup_now ;;
+    list) databackup_restic snapshots --compact || warn '读不到备份列表。' ;;
+    *) die '用法：vps backup [now|list]' ;;
+  esac
+}
+
+# The menu's line: the last backup did not work.
+menu_backup_alert() {
+  local when status note
+  [[ -f "$BACKUP_SERVICE_FILE" && -s "$STATE_ROOT/databackup/last" ]] || return 0
+  IFS=$'\t' read -r when status note < "$STATE_ROOT/databackup/last" || return 0
+  [[ "$status" == fail ]] || return 0
+  printf '%s%s 上次数据备份失败（%s）：%s。选 9 看看，或者运行 vps backup now 再试。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "$(date -d "@$when" '+%m-%d %H:%M' 2>/dev/null || echo '?')" "$note" "${C_RESET-}"
+}
+
+# A timer that is on, and a last backup that worked and is not too old.
+check_databackup() {
+  local d="$STATE_ROOT/databackup" time when status note now
+  [[ -s "$d/conf" ]] || { verify_set fail '备份的设置不见了'; return 0; }
+  time="$(param_value backup_time)"
+  if [[ "$time" != manual ]] && ! systemctl is-active -q vps-stable-backup.timer 2>/dev/null; then verify_set fail '定时备份没有运行'; return 0; fi
+  if [[ ! -s "$d/last" ]]; then verify_set pass '已开启，还没有备份过'; return 0; fi
+  IFS=$'\t' read -r when status note < "$d/last" || true
+  now="$(date +%s)"
+  if [[ "$status" != ok ]]; then verify_set fail "上次备份失败（$(audit_when "$when")）：$note"
+  elif [[ "$time" != manual ]] && ((now - when > 259200)); then verify_set fail "超过 3 天没有备份了（上次：$(audit_when "$when")）"
+  else verify_set pass "上次备份：$(audit_when "$when")，$note"; fi
 }
 
 # TG notifications and the monthly traffic alert share one check: a script
@@ -7880,7 +8614,8 @@ menu_entries() {
     5 'SSH 和防火墙' \
     6 '安全排查和登录记录' \
     7 '端口管理' \
-    8 '磁盘清理'
+    8 '磁盘清理' \
+    9 '数据备份'
 }
 
 # The menu for a terminal WIDTH columns wide: up to three columns as far as they
@@ -8000,13 +8735,14 @@ menu() {
     if menu_alert_on reboot; then menu_pending_reboot_hint; fi
     if menu_alert_on login; then menu_login_alert; fi
     if menu_alert_on quota; then menu_quota_alert; fi
+    if menu_alert_on backup; then menu_backup_alert; fi
     if setup_tmux_running; then printf '%s%s %s%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" '一键开荒正在 tmux 里运行（可能是之前 SSH 断线了）：选 2 回到那个界面。' "${C_RESET-}"; fi
     echo
     menu_render "$width"
     if [[ ! -d "$STATE_ROOT/modules" ]]; then
       printf '\n第一次用：先选 1 体检，再选 2 一键开荒，重启后选 3 验收。以后单独改哪一项选 4。\n'
     fi
-    if ! read -r -p $'\n请输入选项 [1-8 或字母，0 退出]: ' choice; then printf '\n'; return 0; fi
+    if ! read -r -p $'\n请输入选项 [1-9 或字母，0 退出]: ' choice; then printf '\n'; return 0; fi
     action='' arg=''
     case "$choice" in
       0) return 0 ;;
@@ -8022,6 +8758,7 @@ menu() {
         case "$choice" in 1) action=audit ;; 2) action=logins ;; *) continue ;; esac ;;
       7) action=port ;;
       8) action=clean ;;
+      9) action=item arg=databackup ;;
       r|R) action=reboot ;;
       l|L) action=records ;;
       z|Z)
@@ -8029,7 +8766,7 @@ menu() {
         case "$choice" in 1) action=rollback ;; 2) action=uninstall ;; *) continue ;; esac ;;
       u|U) action=update ;;
       h|H) /bin/bash -- "$self" help ;;
-      *) echo '无效选项，请输入 1 至 8，或 r、l、z、u、h，0 退出。'; continue ;;
+      *) echo '无效选项，请输入 1 至 9，或 r、l、z、u、h，0 退出。'; continue ;;
     esac
     if [[ "$action" == update ]]; then before="$(sha256sum -- "$self" 2>/dev/null || true)"; fi
     if [[ -n "$action" ]]; then menu_action "$self" "$action" ${arg:+"$arg"}; fi
@@ -8508,6 +9245,9 @@ tool_uninstall() {
   echo '已安装的软件、/etc 下的优化配置和当前调优效果保留；系统自身日志保留。'
   echo '删除回退资料后，重新安装工具也不能找回机器原来的设置；需要时先自行保存备份。'
   echo '你手工上传或下载的脚本、压缩包、安装器副本不属于安装目录，不会被删除。'
+  if [[ -s "$STATE_ROOT/databackup/password" ]]; then
+    warn '数据备份的设置和密码也会删除：备份还在目标上，以后要恢复得用你另存的密码。'
+  fi
   if ! confirm '确认卸载本工具及其数据？' UNINSTALL; then
     ok '已取消卸载。'; return 0
   fi
@@ -8522,6 +9262,19 @@ tool_uninstall() {
   if [[ -f "$LOGIN_PROFILE_FILE" && "$(cat -- "$LOGIN_PROFILE_FILE")" == "$(login_profile_text)" ]]; then rm -f -- "$LOGIN_PROFILE_FILE"; fi
   rm -rf --one-file-system -- "$LOGIN_NOTE_DIR"
   if [[ -e "$CHECK_TIMER_FILE" ]]; then check_remove; ok 'TG 通知和流量提醒已停止（它们的脚本随本工具一起删除）。'; fi
+  # Both need this tool's script to run.
+  if [[ -f "$DOCKER_FW_PATH_FILE" || -f "$DOCKER_FW_SERVICE_FILE" ]]; then
+    dockerfw_off
+    rm -f -- "$DOCKER_FW_SERVICE_FILE" "$DOCKER_FW_PATH_FILE"
+    ok 'Docker 端口不再受防火墙管（规则随本工具一起删除）。'
+  fi
+  if [[ -f "$BACKUP_SERVICE_FILE" ]]; then
+    systemctl disable --now vps-stable-backup.timer >/dev/null 2>&1 || true
+    systemctl stop vps-stable-backup.service >/dev/null 2>&1 || true
+    rm -f -- "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"
+    ok '定时备份已停止，已经备份的数据还在目标上。'
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
   # Each recursive target is a literal member of the fixed allowlist and was
   # validated twice. --one-file-system adds protection if a mount races us.
   for directory in /var/log/vps-stable-opt /var/backups/vps-stable-opt /var/lib/vps-stable-opt; do
@@ -8553,111 +9306,110 @@ RESTORE_PARTIAL=0
 # Set once this run removed systemd-zram-generator (see restore_zram_settle).
 ZRAM_PACKAGE_REMOVED=0
 
+# Every setting tracked for rollback, one per line, in the order they are put
+# back within a group: ID|GROUP|STAGES THAT CHANGE IT|WHERE|LABEL. WHERE is the
+# name of the variable holding a file, @NAME a file under STATE_ROOT, /PATH a
+# file, unit:NAME a service, or empty for a value restore_value reads. A new
+# setting is one more line here; everything below reads this table.
+restore_table() {
+  cat <<'TABLE'
+bbr_file|bbr|bbr|BBR_FILE|BBR 配置文件
+bbr_module|bbr|bbr|MODULE_FILE|BBR 模块加载配置
+cc|bbr|bbr||TCP 拥塞算法
+qdisc|bbr|bbr||默认队列算法
+sysctl_file|sysctl|sysctl|SYSCTL_HARDENING_FILE|内核网络安全参数
+tcp_file|tcp|tcp|TCP_BUFFER_FILE|TCP 缓冲区上限
+zram_file|zram|zram|ZRAM_FILE|ZRAM 配置
+zram_swap|zram|zram||ZRAM 交换空间
+zram_sysctl_file|zram|zram swap|ZRAM_SYSCTL_FILE|ZRAM 配套内存参数
+swap_unit|swap|swap|SWAP_UNIT_FILE|硬盘 Swap 的启动配置
+swap_file|swap|swap||硬盘 Swap 文件
+conntrack_file|conntrack|conntrack|CONNTRACK_FILE|连接跟踪参数
+conntrack_module|conntrack|conntrack|CONNTRACK_MODULE_FILE|连接跟踪模块的开机加载
+ping_file|ping|ping|PING_FILE|禁止 ping 的参数
+ping_ufw|ping|ping|PING_UFW_FILE|UFW 启动后重新禁止 ping
+keepalive_file|keepalive|keepalive|KEEPALIVE_FILE|SSH 保活配置
+gai_file|ipv4|ipv4|GAI_FILE|地址优先顺序（/etc/gai.conf）
+journal_file|journal|journal|JOURNAL_FILE|日志限制配置
+apt_auto_file|updates|apt_upgrade|/etc/apt/apt.conf.d/20auto-upgrades|自动更新开关（20auto-upgrades）
+apt_file|updates|updates|APT_FILE|自动更新策略文件
+apt_time_file|updates|updates|APT_TIME_FILE|每天自动更新的时间
+apt_reboot_file|autoreboot|autoreboot|APT_REBOOT_FILE|自动更新的重启时间
+ntp|ntp|ntp apt_upgrade||时间同步开关
+svc_timesync|ntp|ntp apt_upgrade|unit:systemd-timesyncd.service|时间同步服务
+svc_trim|trim|trim apt_upgrade|unit:fstrim.timer|TRIM 定时任务
+svc_apt_daily|updates|updates apt_upgrade|unit:apt-daily.timer|APT 每日更新定时器
+svc_apt_upgrade|updates|updates apt_upgrade|unit:apt-daily-upgrade.timer|APT 每日升级定时器
+tz|timezone|timezone||时区
+hosts_file|hosts|hosts|/etc/hosts|/etc/hosts 主机名
+hostname|hostname|hostname||主机名
+cloud_hostname_file|hostname|hostname|CLOUD_HOSTNAME_FILE|cloud-init 的主机名设置
+ssh_dropin|ssh|ssh|SSH_DROPIN|SSH 仅密钥登录配置
+ssh_pubkey_dropin|ssh|ssh|SSH_PUBKEY_DROPIN|SSH 公钥登录开关
+ufw_runtime|firewall|firewall apt_upgrade||防火墙开关
+ufw_policy_in|firewall|firewall apt_upgrade||防火墙入站默认策略
+ufw_policy_out|firewall|firewall apt_upgrade||防火墙出站默认策略
+ufw_ipv6|firewall|firewall||防火墙 IPv6 防护开关
+svc_ufw|firewall|firewall apt_upgrade|unit:ufw.service|防火墙服务
+f2b_jail|fail2ban|fail2ban|F2B_FILE|Fail2ban SSH 规则
+f2b_action|fail2ban|fail2ban|F2B_ACTION_FILE|Fail2ban 封禁动作
+f2b_db_file|fail2ban|fail2ban|F2B_DB_FILE|Fail2ban 封禁历史的保留时间
+svc_fail2ban|fail2ban|fail2ban apt_upgrade|unit:fail2ban.service|Fail2ban 服务
+login_pam|login|login||登录记录（common-session 里的那一行）
+login_pam_file|login|login|LOGIN_PAM_FILE|登录记录的 PAM 设置
+login_hook_file|login|login|@login-hook|登录记录脚本
+login_profile_file|login|login|LOGIN_PROFILE_FILE|登录时显示提示的脚本
+notify_conf|notify|notify|@notify.conf|TG 通知的设置
+quota_conf|quota|quota|@quota.conf|月流量提醒的设置
+check_timer|check|notify quota||检查定时任务（开关）
+check_service_file|check|notify quota|CHECK_SERVICE_FILE|检查定时任务的服务
+check_timer_file|check|notify quota|CHECK_TIMER_FILE|检查定时任务的时间
+check_script_file|check|notify quota|@notify-check|检查脚本
+dockerlog_file|dockerlog|dockerlog|DOCKER_DAEMON_FILE|Docker 的 daemon.json
+sshport_dropin|sshport|sshport|SSH_PORT_DROPIN|SSH 端口
+dockerfw_units|dockerfw|dockerfw||Docker 端口受防火墙管（开关）
+dockerfw_service|dockerfw|dockerfw|DOCKER_FW_SERVICE_FILE|Docker 端口规则的开机加载
+dockerfw_path|dockerfw|dockerfw|DOCKER_FW_PATH_FILE|Docker 端口规则跟随防火墙
+databackup_timer|databackup|databackup||定时备份（开关）
+databackup_service|databackup|databackup|BACKUP_SERVICE_FILE|数据备份的服务
+databackup_timer_file|databackup|databackup|BACKUP_TIMER_FILE|数据备份的时间
+TABLE
+}
+
+# STAGE: the settings that stage changes.
 restore_ids() {
-  case "$1" in
-    # Package installation can create UFW defaults, so the stage tracks them too.
-    apt_upgrade) printf '%s\n' apt_auto_file svc_timesync svc_trim svc_apt_daily svc_apt_upgrade svc_ufw svc_fail2ban ntp ufw_policy_in ufw_policy_out ufw_runtime ;;
-    bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
-    zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
-    swap) printf '%s\n' swap_unit swap_file zram_sysctl_file ;;
-    conntrack) printf '%s\n' conntrack_file conntrack_module ;;
-    ping) printf '%s\n' ping_file ping_ufw ;;
-    keepalive) printf '%s\n' keepalive_file ;;
-    ipv4) printf '%s\n' gai_file ;;
-    login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
-    notify) printf '%s\n' notify_conf check_timer check_service_file check_timer_file check_script_file ;;
-    quota) printf '%s\n' quota_conf check_timer check_service_file check_timer_file check_script_file ;;
-    dockerlog) printf '%s\n' dockerlog_file ;;
-    sshport) printf '%s\n' sshport_dropin ;;
-    ntp) printf '%s\n' ntp svc_timesync ;;
-    journal) printf '%s\n' journal_file ;;
-    trim) printf '%s\n' svc_trim ;;
-    updates) printf '%s\n' apt_file apt_time_file svc_apt_daily svc_apt_upgrade ;;
-    autoreboot) printf '%s\n' apt_reboot_file ;;
-    timezone) printf '%s\n' tz ;;
-    sysctl) printf '%s\n' sysctl_file ;;
-    tcp) printf '%s\n' tcp_file ;;
-    hosts) printf '%s\n' hosts_file ;;
-    hostname) printf '%s\n' hostname cloud_hostname_file ;;
-    ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
-    firewall) printf '%s\n' ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw ;;
-    fail2ban) printf '%s\n' f2b_jail f2b_action f2b_db_file svc_fail2ban ;;
-  esac
-  return 0
+  restore_table | awk -F'|' -v s=" $1 " 'index(" " $3 " ", s) {print $1}'
 }
 
 restore_all_ids() {
-  printf '%s\n' bbr_file bbr_module cc qdisc sysctl_file tcp_file zram_file zram_swap zram_sysctl_file swap_unit swap_file conntrack_file conntrack_module ping_file ping_ufw keepalive_file gai_file apt_time_file journal_file apt_auto_file apt_file apt_reboot_file ntp svc_timesync svc_trim svc_apt_daily svc_apt_upgrade tz hosts_file hostname cloud_hostname_file ssh_dropin ssh_pubkey_dropin ufw_policy_in ufw_policy_out ufw_ipv6 ufw_runtime svc_ufw f2b_jail f2b_action f2b_db_file svc_fail2ban login_pam login_pam_file login_hook_file login_profile_file notify_conf quota_conf check_timer check_service_file check_timer_file check_script_file dockerlog_file sshport_dropin
+  restore_table | awk -F'|' '{print $1}'
 }
 
+# ID: what it is called (the ID itself when it is not in the table).
 restore_label() {
-  case "$1" in
-    bbr_file) echo 'BBR 配置文件' ;; bbr_module) echo 'BBR 模块加载配置' ;;
-    cc) echo 'TCP 拥塞算法' ;; qdisc) echo '默认队列算法' ;;
-    zram_file) echo 'ZRAM 配置' ;; zram_swap) echo 'ZRAM 交换空间' ;; zram_sysctl_file) echo 'ZRAM 配套内存参数' ;;
-    swap_unit) echo '硬盘 Swap 的启动配置' ;; swap_file) echo '硬盘 Swap 文件' ;;
-    conntrack_file) echo '连接跟踪参数' ;; conntrack_module) echo '连接跟踪模块的开机加载' ;; ping_file) echo '禁止 ping 的参数' ;;
-    ping_ufw) echo 'UFW 启动后重新禁止 ping' ;;
-    keepalive_file) echo 'SSH 保活配置' ;; gai_file) echo '地址优先顺序（/etc/gai.conf）' ;; apt_time_file) echo '每天自动更新的时间' ;;
-    login_pam) echo '登录记录（common-session 里的那一行）' ;; login_pam_file) echo '登录记录的 PAM 设置' ;; login_hook_file) echo '登录记录脚本' ;; login_profile_file) echo '登录时显示提示的脚本' ;;
-    notify_conf) echo 'TG 通知的设置' ;; quota_conf) echo '月流量提醒的设置' ;; check_timer) echo '检查定时任务（开关）' ;;
-    check_service_file) echo '检查定时任务的服务' ;; check_timer_file) echo '检查定时任务的时间' ;; check_script_file) echo '检查脚本' ;;
-    dockerlog_file) echo 'Docker 的 daemon.json' ;; sshport_dropin) echo 'SSH 端口' ;;
-    journal_file) echo '日志限制配置' ;; apt_auto_file) echo '自动更新开关（20auto-upgrades）' ;;
-    apt_file) echo '自动更新策略文件' ;; ntp) echo '时间同步开关' ;;
-    svc_timesync) echo '时间同步服务' ;; svc_trim) echo 'TRIM 定时任务' ;;
-    svc_apt_daily) echo 'APT 每日更新定时器' ;; svc_apt_upgrade) echo 'APT 每日升级定时器' ;;
-    tz) echo '时区' ;; ssh_dropin) echo 'SSH 仅密钥登录配置' ;; ssh_pubkey_dropin) echo 'SSH 公钥登录开关' ;;
-    ufw_policy_in) echo '防火墙入站默认策略' ;; ufw_policy_out) echo '防火墙出站默认策略' ;;
-    ufw_runtime) echo '防火墙开关' ;; svc_ufw) echo '防火墙服务' ;;
-    f2b_jail) echo 'Fail2ban SSH 规则' ;; f2b_action) echo 'Fail2ban 封禁动作' ;; f2b_db_file) echo 'Fail2ban 封禁历史的保留时间' ;;
-    svc_fail2ban) echo 'Fail2ban 服务' ;; sysctl_file) echo '内核网络安全参数' ;;
-    tcp_file) echo 'TCP 缓冲区上限' ;;
-    apt_reboot_file) echo '自动更新的重启时间' ;; hosts_file) echo '/etc/hosts 主机名' ;;
-    hostname) echo '主机名' ;; cloud_hostname_file) echo 'cloud-init 的主机名设置' ;;
-    ufw_ipv6) echo '防火墙 IPv6 防护开关' ;; *) printf '%s\n' "$1" ;;
-  esac
+  local label
+  label="$(restore_table | awk -F'|' -v id="$1" '$1 == id {print $5}')"
+  printf '%s\n' "${label:-$1}"
 }
 
+# ID: the file behind it; fails for a value or a service.
 restore_path() {
-  case "$1" in
-    bbr_file) printf '%s\n' "$BBR_FILE" ;; bbr_module) printf '%s\n' "$MODULE_FILE" ;;
-    zram_file) printf '%s\n' "$ZRAM_FILE" ;; journal_file) printf '%s\n' "$JOURNAL_FILE" ;;
-    zram_sysctl_file) printf '%s\n' "$ZRAM_SYSCTL_FILE" ;;
-    apt_file) printf '%s\n' "$APT_FILE" ;; f2b_jail) printf '%s\n' "$F2B_FILE" ;;
-    apt_auto_file) echo /etc/apt/apt.conf.d/20auto-upgrades ;;
-    f2b_action) printf '%s\n' "$F2B_ACTION_FILE" ;;
-    f2b_db_file) printf '%s\n' "$F2B_DB_FILE" ;;
-    ssh_dropin) printf '%s\n' "$SSH_DROPIN" ;;
-    ssh_pubkey_dropin) printf '%s\n' "$SSH_PUBKEY_DROPIN" ;;
-    sysctl_file) printf '%s\n' "$SYSCTL_HARDENING_FILE" ;;
-    tcp_file) printf '%s\n' "$TCP_BUFFER_FILE" ;;
-    apt_reboot_file) printf '%s\n' "$APT_REBOOT_FILE" ;;
-    hosts_file) echo /etc/hosts ;;
-    cloud_hostname_file) printf '%s\n' "$CLOUD_HOSTNAME_FILE" ;;
-    swap_unit) printf '%s\n' "$SWAP_UNIT_FILE" ;;
-    conntrack_file) printf '%s\n' "$CONNTRACK_FILE" ;; conntrack_module) printf '%s\n' "$CONNTRACK_MODULE_FILE" ;;
-    ping_file) printf '%s\n' "$PING_FILE" ;;
-    ping_ufw) printf '%s\n' "$PING_UFW_FILE" ;;
-    keepalive_file) printf '%s\n' "$KEEPALIVE_FILE" ;; gai_file) printf '%s\n' "$GAI_FILE" ;;
-    login_pam_file) printf '%s\n' "$LOGIN_PAM_FILE" ;; login_hook_file) printf '%s\n' "$STATE_ROOT/login-hook" ;;
-    login_profile_file) printf '%s\n' "$LOGIN_PROFILE_FILE" ;;
-    notify_conf) printf '%s\n' "$STATE_ROOT/notify.conf" ;; quota_conf) printf '%s\n' "$STATE_ROOT/quota.conf" ;;
-    check_service_file) printf '%s\n' "$CHECK_SERVICE_FILE" ;; check_timer_file) printf '%s\n' "$CHECK_TIMER_FILE" ;;
-    check_script_file) printf '%s\n' "$STATE_ROOT/notify-check" ;; dockerlog_file) printf '%s\n' "$DOCKER_DAEMON_FILE" ;;
-    sshport_dropin) printf '%s\n' "$SSH_PORT_DROPIN" ;;
-    apt_time_file) printf '%s\n' "$APT_TIME_FILE" ;;
-    *) return 1 ;;
+  local where
+  where="$(restore_table | awk -F'|' -v id="$1" '$1 == id {print $4}')"
+  case "$where" in
+    ''|unit:*) return 1 ;;
+    @*) printf '%s\n' "$STATE_ROOT/${where#@}" ;;
+    /*) printf '%s\n' "$where" ;;
+    *) printf '%s\n' "${!where}" ;;
   esac
 }
 
+# ID: the systemd unit behind it; fails for anything else.
 restore_unit() {
-  case "$1" in
-    svc_timesync) echo systemd-timesyncd.service ;; svc_trim) echo fstrim.timer ;;
-    svc_apt_daily) echo apt-daily.timer ;; svc_apt_upgrade) echo apt-daily-upgrade.timer ;;
-    svc_ufw) echo ufw.service ;; svc_fail2ban) echo fail2ban.service ;;
-    *) return 1 ;;
-  esac
+  local where
+  where="$(restore_table | awk -F'|' -v id="$1" '$1 == id {print $4}')"
+  [[ "$where" == unit:* ]] || return 1
+  printf '%s\n' "${where#unit:}"
 }
 
 restore_data_safe() {
@@ -8726,6 +9478,8 @@ restore_value() {
         [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]] || return 1; printf '%s\n' "$value" ;;
     login_pam) if login_pam_enabled; then echo enabled; else echo absent; fi ;;
     check_timer) if [[ "$(systemctl is-enabled vps-stable-check.timer 2>/dev/null || true)" == enabled ]]; then echo enabled; else echo absent; fi ;;
+    dockerfw_units) if [[ "$(systemctl is-enabled vps-stable-docker-fw.path 2>/dev/null || true)" == enabled ]]; then echo enabled; else echo absent; fi ;;
+    databackup_timer) if [[ "$(systemctl is-enabled vps-stable-backup.timer 2>/dev/null || true)" == enabled ]]; then echo enabled; else echo absent; fi ;;
     ufw_policy_in) ufw_policy_value INPUT ;;
     ufw_policy_out) ufw_policy_value OUTPUT ;;
     ufw_ipv6)
@@ -9092,6 +9846,13 @@ restore_apply_one() {
     check_timer)
       [[ "$value" == absent ]] || return 1
       systemctl disable --now vps-stable-check.timer >/dev/null 2>&1 || return 1 ;;
+    dockerfw_units)
+      [[ "$value" == absent ]] || return 1
+      dockerfw_off ;;
+    databackup_timer)
+      [[ "$value" == absent ]] || return 1
+      systemctl disable --now vps-stable-backup.timer >/dev/null 2>&1 || return 1
+      systemctl stop vps-stable-backup.service >/dev/null 2>&1 || true ;;
     login_pam)
       [[ "$value" == absent ]] || return 1
       pam-auth-update --package --remove vps-stable-login || return 1
@@ -9310,6 +10071,24 @@ restore_firewall_group() {
   fi
   # A reload above (IPv6 filtering put back) applied UFW's sysctl.conf again.
   ping_ufw_reapply
+}
+
+# The table goes first: from then on only widening is left.
+restore_dockerfw_group() {
+  local id
+  dockerfw_off
+  while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids dockerfw)
+  dockerfw_rules_undo
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# Only what runs it goes: the backups stay at the target, the settings and the
+# password here (turned on again, they can be used as they are).
+restore_databackup_group() {
+  local id
+  while IFS= read -r id; do restore_resource "$id"; done < <(restore_group_ids databackup)
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  echo '已经备份的数据留在目标上；备份目标和密码还保存在本机，再次开启时可以沿用。'
 }
 
 # Both SSH drop-ins (key-only, and the key-login switch for images that had it
@@ -9631,57 +10410,54 @@ restore_packages_record() {
 # Rollback groups, shared by the full rollback, per-item rollback and the
 # single-item menu. Each group lists the tracked resources it restores.
 # Order matters: Fail2ban lifts its UFW bans before the firewall is undone.
+# The rollback groups in the order a full rollback takes them (Fail2ban lifts
+# its UFW bans before the firewall is undone): GROUP|LABEL.
+restore_group_table() {
+  cat <<'TABLE'
+fail2ban|Fail2ban 防爆破
+sshport|SSH 端口（回到原来的端口）
+firewall|防火墙（本工具加的规则、默认策略、开关）
+dockerfw|Docker 端口受防火墙管
+ssh|SSH 登录加固（恢复密码和 root 登录）
+keepalive|SSH 保活
+login|登录记录和提醒（记录本身保留）
+notify|TG 通知
+quota|月流量提醒
+check|检查定时任务（TG 通知和流量提醒共用）
+dockerlog|Docker 容器日志上限（重启 Docker 后恢复）
+databackup|数据备份（已备份的数据留在目标上）
+zram|ZRAM 内存缓冲
+swap|硬盘 Swap
+bbr|BBR 网络加速
+sysctl|内核网络安全参数
+tcp|TCP 缓冲区上限
+conntrack|连接跟踪容量
+ping|禁止 ping
+ipv4|优先使用 IPv4
+journal|日志空间限制
+updates|自动安全更新
+autoreboot|更新后自动重启时间
+ntp|时间同步
+trim|定期 TRIM
+timezone|时区
+hostname|主机名（恢复原来的名字）
+hosts|/etc/hosts 主机名
+TABLE
+}
+
 restore_groups() {
-  printf '%s\n' fail2ban sshport firewall ssh keepalive login notify quota check dockerlog zram swap bbr sysctl tcp conntrack ping ipv4 journal updates autoreboot ntp trim timezone hostname hosts
+  restore_group_table | awk -F'|' '{print $1}'
 }
 
 restore_group_label() {
-  case "$1" in
-    firewall) echo '防火墙（本工具加的规则、默认策略、开关）' ;; fail2ban) echo 'Fail2ban 防爆破' ;;
-    ssh) echo 'SSH 登录加固（恢复密码和 root 登录）' ;; zram) echo 'ZRAM 内存缓冲' ;; swap) echo '硬盘 Swap' ;;
-    conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;;
-    keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; login) echo '登录记录和提醒（记录本身保留）' ;;
-    notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; check) echo '检查定时任务（TG 通知和流量提醒共用）' ;;
-    dockerlog) echo 'Docker 容器日志上限（重启 Docker 后恢复）' ;;
-    sshport) echo 'SSH 端口（回到原来的端口）' ;;
-    bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; tcp) echo 'TCP 缓冲区上限' ;;
-    journal) echo '日志空间限制' ;;
-    updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启时间' ;; ntp) echo '时间同步' ;;
-    trim) echo '定期 TRIM' ;; timezone) echo '时区' ;; hosts) echo '/etc/hosts 主机名' ;;
-    hostname) echo '主机名（恢复原来的名字）' ;;
-    *) printf '%s\n' "$1" ;;
-  esac
+  local label
+  label="$(restore_group_table | awk -F'|' -v g="$1" '$1 == g {print $2}')"
+  printf '%s\n' "${label:-$1}"
 }
 
+# GROUP: its settings, in the order they are put back.
 restore_group_ids() {
-  case "$1" in
-    firewall) printf '%s\n' ufw_runtime ufw_policy_in ufw_policy_out ufw_ipv6 svc_ufw ;;
-    fail2ban) printf '%s\n' f2b_jail f2b_action f2b_db_file svc_fail2ban ;;
-    ssh) printf '%s\n' ssh_dropin ssh_pubkey_dropin ;;
-    zram) printf '%s\n' zram_file zram_swap zram_sysctl_file ;;
-    swap) printf '%s\n' swap_unit swap_file ;;
-    conntrack) printf '%s\n' conntrack_file conntrack_module ;;
-    ping) printf '%s\n' ping_file ping_ufw ;;
-    keepalive) printf '%s\n' keepalive_file ;;
-    ipv4) printf '%s\n' gai_file ;;
-    login) printf '%s\n' login_pam login_pam_file login_hook_file login_profile_file ;;
-    notify) printf '%s\n' notify_conf ;;
-    quota) printf '%s\n' quota_conf ;;
-    check) printf '%s\n' check_timer check_service_file check_timer_file check_script_file ;;
-    dockerlog) printf '%s\n' dockerlog_file ;;
-    sshport) printf '%s\n' sshport_dropin ;;
-    bbr) printf '%s\n' bbr_file bbr_module cc qdisc ;;
-    sysctl) printf '%s\n' sysctl_file ;;
-    tcp) printf '%s\n' tcp_file ;;
-    journal) printf '%s\n' journal_file ;;
-    updates) printf '%s\n' apt_auto_file apt_file apt_time_file svc_apt_daily svc_apt_upgrade ;;
-    autoreboot) printf '%s\n' apt_reboot_file ;;
-    ntp) printf '%s\n' ntp svc_timesync ;;
-    trim) printf '%s\n' svc_trim ;;
-    timezone) printf '%s\n' tz ;;
-    hosts) printf '%s\n' hosts_file ;;
-    hostname) printf '%s\n' hostname cloud_hostname_file ;;
-  esac
+  restore_table | awk -F'|' -v g="$1" '$2 == g {print $1}'
 }
 
 # True when something in the group differs from its state before this tool's
@@ -9713,6 +10489,8 @@ restore_group_apply() {
   case "$group" in
     firewall) restore_firewall_group ;;
     fail2ban) restore_fail2ban_group ;;
+    dockerfw) restore_dockerfw_group ;;
+    databackup) restore_databackup_group ;;
     sshport) restore_sshport_group ;;
     ssh) restore_ssh_group ;;
     zram) restore_zram_group ;;
@@ -9963,7 +10741,7 @@ verify_module() {
   if ! info="$(module_expect "$module")"; then
     # One-click setup never turns these on: "no setup record" would mislead.
     case "$module" in
-      hostname|conntrack|ping|notify|quota|dockerlog|sshport) verify_line na "$label" '没有开启（一键开荒不管这一项，需要时在单项设置里开启）' ;;
+      hostname|conntrack|ping|notify|quota|dockerlog|sshport|dockerfw|databackup) verify_line na "$label" '没有开启（一键开荒不管这一项，需要时在单项设置里开启）' ;;
       *) verify_line na "$label" '没有开荒记录（还没运行过一键开荒或对应功能）' ;;
     esac
     return 0
@@ -10556,6 +11334,8 @@ verify_checks() {
   verify_module notify 'TG 通知' check_notify
   verify_module quota '月流量提醒' check_quota
   verify_module dockerlog 'Docker 容器日志上限' check_dockerlog
+  verify_module dockerfw 'Docker 端口受防火墙管' check_dockerfw
+  verify_module databackup '数据备份' check_databackup
   verify_module sshport 'SSH 端口' check_sshport
   verify_module ntp '时间同步' check_ntp
   verify_module journal '日志限制' check_journal
@@ -10570,7 +11350,7 @@ verify_checks() {
   verify_module ssh 'SSH 登录加固' check_ssh
   verify_module firewall '防火墙' check_firewall
   verify_module fail2ban 'Fail2ban 防爆破' check_fail2ban
-  if docker_present; then verify_line unknown 'Docker' '已安装：用 -p 发布的容器端口会绕过防火墙，请确认这些端口确实需要对外'; fi
+  if docker_present && ! dockerfw_on; then verify_line unknown 'Docker' '已安装：用 -p 发布的容器端口会绕过防火墙，请确认这些端口确实需要对外'; fi
   verify_ufw_route
   verify_conntrack_usage
   verify_health
@@ -11091,7 +11871,7 @@ port_main() {
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
 item_keys() {
-  printf '%s\n' upgrade updates autoreboot kernel bbr tcp conntrack ipv4 sysctl zram swap journal trim ssh sshport keepalive firewall fail2ban ports login notify quota dockerlog ntp timezone hosts hostname tools vnstat ping general
+  printf '%s\n' upgrade updates autoreboot kernel bbr tcp conntrack ipv4 sysctl zram swap journal trim databackup ssh sshport keepalive firewall fail2ban dockerfw ports login notify quota dockerlog ntp timezone hosts hostname tools vnstat ping general
 }
 
 # The heading a single item is listed under (item_keys holds them in order).
@@ -11099,8 +11879,8 @@ item_group() {
   case "$1" in
     upgrade|updates|autoreboot|kernel) echo '系统更新' ;;
     bbr|tcp|conntrack|ipv4|sysctl) echo '网络' ;;
-    zram|swap|journal|trim) echo '内存和硬盘' ;;
-    ssh|sshport|keepalive|firewall|fail2ban|ports|login) echo 'SSH 和安全' ;;
+    zram|swap|journal|trim|databackup) echo '内存、硬盘和备份' ;;
+    ssh|sshport|keepalive|firewall|fail2ban|dockerfw|ports|login) echo 'SSH 和安全' ;;
     notify|quota|dockerlog) echo '通知和监控' ;;
     ntp|timezone|hosts|hostname|tools) echo '基础设置' ;;
     *) echo '高级' ;;
@@ -11146,6 +11926,8 @@ item_label() {
     notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; dockerlog) echo 'Docker 容器日志上限' ;; sshport) echo 'SSH 端口' ;;
     firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
     tcp) echo 'TCP 窗口和缓冲区上限' ;;
+    dockerfw) echo 'Docker 端口受防火墙管' ;;
+    databackup) echo '数据备份' ;;
     general) echo '本工具的通用设置' ;;
     *) printf '%s\n' "$1" ;;
   esac
@@ -11241,6 +12023,18 @@ item_status() {
         if [[ "$value" == no ]]; then echo '只允许密钥登录，root 不能直接登录'; else echo '只允许密钥登录'; fi
       else echo '允许密码登录'; fi ;;
     ports) echo '放行或关闭端口' ;;
+    dockerfw)
+      if ! docker_present; then echo '没装 Docker'
+      elif ! dockerfw_on; then echo '未开启（容器端口绕过防火墙）'
+      elif ! grep -qsx 'ENABLED=yes' "$UFW_CONF"; then echo '已开启，但防火墙没开，暂时不起作用'
+      else echo '已开启'; fi ;;
+    databackup)
+      if ! databackup_on; then echo '未开启'
+      elif [[ -s "$STATE_ROOT/databackup/last" ]]; then
+        IFS=$'\t' read -r value dump _ < "$STATE_ROOT/databackup/last" || true
+        if [[ "$dump" == ok ]]; then echo "已开启，上次备份 $(date -d "@$value" '+%m-%d %H:%M' 2>/dev/null || echo '?')"
+        else echo "已开启，上次备份失败（$(date -d "@$value" '+%m-%d %H:%M' 2>/dev/null || echo '?')）"; fi
+      else echo '已开启，还没备份过'; fi ;;
     general) echo "防失联确认 $(param_value guard_seconds) 秒，保留 $(param_value run_keep) 次运行记录$(if [[ "$(param_value setup_skip)" != none ]]; then echo "，开荒跳过 $(param_value setup_skip)"; fi)" ;;
     *) echo '未知' ;;
   esac
@@ -11358,6 +12152,11 @@ item_turn_on() {
     ssh) SSH_CHOICE=1 ADMIN_CHOICE='' ADMIN_NAME=''
       stage_run ssh ssh_harden_stage ;;
     ports) port_menu ;;
+    dockerfw) DOCKERFW_CHOICE=1
+      stage_run dockerfw dockerfw_stage ;;
+    databackup) DATABACKUP_CHOICE=1
+      apt_index_ready || return 0
+      stage_run databackup databackup_stage ;;
     # Only parameters: nothing to turn on.
     general) param_adjust general ;;
   esac
@@ -11423,6 +12222,8 @@ item_action() {
     fail2ban:5) f2b_allowlist_menu ;;
     login:5) logins_show 30 ;;
     tcp:5) tcp_bdp_menu ;;
+    dockerfw:5) dockerfw_show ;;
+    databackup:5) databackup_menu ;;
     hostname:5) display_name_ask ;;
     upgrade:1|kernel:1) item_turn_on "$key" ;;
     upgrade:*|kernel:*) return 0 ;;
@@ -11466,6 +12267,8 @@ item_actions() {
     fail2ban) a+=('5. 管理白名单（不会被封的 IP）') ;;
     login) a+=('5. 查看登录记录') ;;
     tcp) a+=('5. 按带宽和延迟计算') ;;
+    dockerfw) a+=('5. 看看哪些容器端口放行了') ;;
+    databackup) a+=('5. 备份操作（立即备份、查看、恢复）') ;;
   esac
   for status in "${a[@]}"; do line+="$status   "; done
   printf '%s回车返回\n' "$line"
@@ -11765,6 +12568,9 @@ main() {
     check) verify_main; exit "$VERIFY_EXIT" ;;
     plan) plan; return 0 ;;
     report) report_main; return 0 ;;
+    backup) databackup_main; return 0 ;;
+    databackup-run) if databackup_run; then exit 0; else exit 1; fi ;;
+    docker-fw-sync) dockerfw_sync; return 0 ;;
     clean) clean_main; return 0 ;;
     perf) perf_main; return 0 ;;
     resources) resources_main; return 0 ;;
@@ -11827,7 +12633,7 @@ main() {
   say '本次流程已完成，请逐项处理上方的注意事项。'
   printf '注意/跳过/未知提示累计：%s（不等于故障数量）\n' "$WARNINGS"
   printf '配置快照：%s\n运行记录：%s\n' "$RUN_BACKUP_DIR" "$RUN_STATE_DIR"
-  echo '备份建议：服务商快照只能整机还原；重要数据另外做异地备份（例如用 restic 或 borg 备份到另一台机器或对象存储），并定期试着恢复一次。'
+  echo '备份建议：服务商快照只能整机还原；重要数据另外做异地备份（主菜单 9「数据备份」可以定时加密备份到另一台机器或对象存储），并定期试着恢复一次。'
   echo '本工具的配置备份只保存系统配置，不包含业务数据。'
   offer_reboot
 }

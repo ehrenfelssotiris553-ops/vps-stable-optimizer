@@ -29,8 +29,8 @@ while IFS='=' read -r name value; do
 done < <(grep -E '^[A-Z][A-Z0-9_]*=/[^ ]*$' "$TEST_SCRIPT")
 ((${#PATHS[@]} >= 13)) || fail "only ${#PATHS[@]} managed file paths found"
 
-# Stages with rollback tracking: the case labels of restore_ids.
-mapfile -t STAGES < <(source_of restore_ids | sed -n 's/^    \([a-z0-9_]*\)) .*/\1/p')
+# Stages with rollback tracking: every name in the table's third column.
+mapfile -t STAGES < <(restore_table | awk -F'|' '{n = split($3, a, " "); for (i = 1; i <= n; i++) print a[i]}' | sort -u)
 ((${#STAGES[@]} >= 10)) || fail "only ${#STAGES[@]} tracked stages found"
 mapfile -t IDS < <(restore_all_ids)
 mapfile -t RB_GROUPS < <(restore_groups)

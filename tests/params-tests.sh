@@ -179,12 +179,12 @@ for pair in 'guard_seconds 119' 'guard_seconds 901' 'setup_skip apt_index' 'setu
 done
 # Every name of the name lists, one by one and all together (found here: under
 # LC_ALL=C the descriptions in brackets were cut off only for some names).
-notify_names='boot login console account sudo oom package key port autostart cpu disk memory reboot service traffic'
+notify_names='boot login console account sudo oom package key port autostart cpu disk memory reboot service backup traffic'
 [[ "$(LC_ALL=C notify_event_names | LC_ALL=C names_only)" == "$notify_names" ]] || fail "notification names: $(LC_ALL=C notify_event_names | LC_ALL=C names_only)"
-[[ "$(LC_ALL=C menu_alert_names | LC_ALL=C names_only)" == 'verify reboot login quota' ]] || fail "menu alert names: $(LC_ALL=C menu_alert_names | LC_ALL=C names_only)"
+[[ "$(LC_ALL=C menu_alert_names | LC_ALL=C names_only)" == 'verify reboot login quota backup' ]] || fail "menu alert names: $(LC_ALL=C menu_alert_names | LC_ALL=C names_only)"
 for name in $notify_names; do LC_ALL=C param_check notify_events "$name" > /dev/null || fail "notification name rejected: $name"; done
 LC_ALL=C param_check notify_events "$notify_names" > /dev/null || fail 'all notification names together rejected'
-for name in verify reboot login quota; do LC_ALL=C param_check menu_alerts "$name" > /dev/null || fail "menu alert name rejected: $name"; done
+for name in verify reboot login quota backup; do LC_ALL=C param_check menu_alerts "$name" > /dev/null || fail "menu alert name rejected: $name"; done
 for name in $(setup_skippable); do LC_ALL=C param_check setup_skip "$name" > /dev/null || fail "setup step rejected: $name"; done
 LC_ALL=C param_check setup_skip "$(setup_skippable | tr '\n' ' ')" > /dev/null || fail 'all setup steps together rejected'
 for name in $(sysctl_hardening_all | sed 's/=.*//'); do LC_ALL=C param_check sysctl_hardening_skip "$name" > /dev/null || fail "hardening key rejected: $name"; done

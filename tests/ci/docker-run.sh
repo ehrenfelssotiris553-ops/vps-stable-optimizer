@@ -81,13 +81,129 @@ sudo ufw status 2>/dev/null | grep -Fx 'Status: active' > /dev/null || fail 'the
 container_ok 'with the firewall on again'
 endgroup
 
+group 'Published ports behind the firewall: measured from outside the machine'
+# This machine's own connections never pass FORWARD, so the client sits in a
+# network namespace of its own, with two addresses (for the rules on one source).
+sudo ip netns add ci-outside
+sudo ip link add ci-host type veth peer name ci-peer
+sudo ip link set ci-peer netns ci-outside
+sudo ip addr add 198.18.0.1/24 dev ci-host
+sudo ip link set ci-host up
+sudo ip netns exec ci-outside ip addr add 198.18.0.2/24 dev ci-peer
+sudo ip netns exec ci-outside ip addr add 198.18.0.3/24 dev ci-peer
+sudo ip netns exec ci-outside ip link set ci-peer up
+sudo ip netns exec ci-outside ip link set lo up
+sudo ip netns exec ci-outside ip route add default via 198.18.0.1
+from_outside() { [[ "$(sudo ip netns exec ci-outside curl -s -m 3 --interface "${1:-198.18.0.2}" http://198.18.0.1:8081/ 2>/dev/null || true)" == ok ]]; }
+# SOURCE: up to some seconds, for the path unit to have followed UFW.
+opens() { local i; for ((i = 0; i < 12; i++)); do if from_outside "${1:-198.18.0.2}"; then return 0; fi; sleep 1; done; return 1; }
+closes() { local i; for ((i = 0; i < 12; i++)); do if ! from_outside "${1:-198.18.0.2}"; then return 0; fi; sleep 1; done; return 1; }
+in_set() { sudo nft list set inet vps-stable-docker open_tcp 2>/dev/null | grep -Eq "[ ,{]$1[ ,}]"; }
+table_there() { sudo nft list table inet vps-stable-docker > /dev/null 2>&1; }
+opens || fail 'the baseline is wrong: the published port should answer from outside, past the firewall'
+dockerfw_index="$(item_index dockerfw)" || fail 'no single item dockerfw'
+# NAME CHOICE RULE...
+dockerfw_item() {
+  local name="$1" choice="$2"
+  shift 2
+  { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> %s\n' "$dockerfw_index" "$choice"
+    if (($#)); then printf '%s\n' "$@"; fi
+    cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/$name.rules"
+  drive "$LOGS/$name.rules" "$name" sudo vps item || fail "Docker ports ($name) exited with $?"
+}
+# Not confirmed: as it was.
+dockerfw_item dockerfw-no 1 '继续让外面访问这些端口吗 ==> n' '从外面打开你的网站 ==> n'
+has dockerfw-no '这次没有确认'
+if table_there; then fail 'the rules stayed without a confirmation'; fi
+opens || fail 'the port stayed closed without a confirmation'
+# On, with the running port not kept open.
+dockerfw_item dockerfw-on 1 '继续让外面访问这些端口吗 ==> n' '从外面打开你的网站 ==> CONNECTED'
+has dockerfw-on '已开启：容器端口放行了才能从外面连'
+closes || fail 'a port the firewall does not allow still answers from outside'
+web_ok || fail 'this machine lost its own access to the container'
+egress_ok || fail 'the container lost its Internet access'
+# UFW is the one list: following it, within seconds, port by port and by source.
+sudo ufw allow 8081/tcp > /dev/null
+opens || fail 'allowed in UFW, still closed from outside'
+sudo ufw delete allow 8081/tcp > /dev/null
+closes || fail 'taken out of UFW, still open from outside'
+sudo ufw allow from 198.18.0.2 to any port 8081 proto tcp > /dev/null
+opens 198.18.0.2 || fail 'allowed for one source, closed for it'
+closes 198.18.0.3 || fail 'allowed for one source, open for another'
+sudo ufw delete allow from 198.18.0.2 to any port 8081 proto tcp > /dev/null
+closes || fail 'source rule taken out, still open'
+# Several commands in a row: the last ones are not lost.
+sudo ufw allow 18082/tcp > /dev/null; sudo ufw allow 18083/tcp > /dev/null; sudo ufw allow 18084/tcp > /dev/null
+for ((i = 0; i < 15; i++)); do if in_set 18082 && in_set 18083 && in_set 18084; then break; fi; sleep 1; done
+if ! { in_set 18082 && in_set 18083 && in_set 18084; }; then fail "rules added in a row went missing: $(sudo nft list set inet vps-stable-docker open_tcp)"; fi
+for port in 18082 18083 18084; do sudo ufw delete allow "$port/tcp" > /dev/null; done
+# Docker restarted: still held back. The firewall paused: nothing is.
+sudo systemctl restart docker
+sudo docker start web > /dev/null
+for ((i = 0; i < 15; i++)); do if web_ok; then break; fi; sleep 2; done
+closes || fail 'open from outside after Docker restarted'
+drive "$LOGS/fw-pause.rules" dockerfw-fw-pause sudo vps item || fail "pausing the firewall exited with $?"
+opens || fail 'still closed with the firewall off'
+if table_there; then fail 'the rules stayed with the firewall off'; fi
+drive "$LOGS/fw-on.rules" dockerfw-fw-on sudo vps item || fail "turning the firewall on again exited with $?"
+closes || fail 'not closed again with the firewall back on'
+# Off: as without the switch. The check tells the state.
+dockerfw_item dockerfw-off 2
+if table_there; then fail 'the rules stayed after switching off'; fi
+opens || fail 'still closed after switching off'
+# On again, keeping the running port open: the check passes, the rollback below takes the rule back.
+dockerfw_item dockerfw-on-again 1 '继续让外面访问这些端口吗 ==> y' '从外面打开你的网站 ==> CONNECTED'
+sudo ufw show added | grep -Fxq 'ufw allow 8081/tcp' || fail 'the running port was not added to the firewall'
+opens || fail 'kept open as asked, closed from outside'
+rc=0; drive check.rules check-dockerfw sudo vps check || rc=$?
+[[ "$rc" == 0 || "$rc" == 3 ]] || fail "check exited with $rc"
+passed check-dockerfw 'Docker 端口受防火墙管'
+lacks check-dockerfw '绕过防火墙'
+endgroup
+
+group 'Data backup to S3-compatible storage (a local MinIO)'
+sudo docker run -d --name minio -p 127.0.0.1:9000:9000 -e MINIO_ROOT_USER=ciaccesskey -e MINIO_ROOT_PASSWORD=cisecretvalue123 minio/minio:RELEASE.2024-01-16T16-07-38Z server /data > /dev/null
+for ((i = 0; i < 30; i++)); do if curl -sf -m 2 http://127.0.0.1:9000/minio/health/live > /dev/null; then break; fi; sleep 2; done
+sudo mkdir -p /srv/ci-s3
+echo 'object storage payload' | sudo tee /srv/ci-s3/file.txt > /dev/null
+printf 'backup_paths=/srv/ci-s3\nbackup_drill_days=1\n' > "$LOGS/backup-params.txt"
+drive params.rules backup-params sudo vps params import "$LOGS/backup-params.txt" || fail "params import exited with $?"
+backup_index="$(item_index databackup)" || fail 'no single item databackup'
+{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> 1\n' "$backup_index"
+  printf '%s\n' '备份目标 \[1-4 ==> 2' '对象存储的地址 ==> http://127.0.0.1:9000' '存储桶的名字 ==> ci-bucket' '桶里的目录 ==> vps/one' '区域 ==> us-east-1' 'Access Key ==> ciaccesskey' 'Secret Key ==> cisecretvalue123' '备份密码（输入时不显示 ==>' '已经把这个密码存到 ==> y'
+  cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3.rules"
+drive "$LOGS/backup-s3.rules" backup-s3 sudo vps item || fail "data backup to S3 exited with $?"
+has backup-s3 '数据备份已开启'
+has backup-s3 '恢复演练通过'
+sudo docker exec minio ls /data/ci-bucket/vps/one | grep -Fxq config || fail 'nothing arrived in the bucket'
+lacks backup-s3 'cisecretvalue123'
+if sudo grep -rlF --exclude=conf -- cisecretvalue123 /var/lib/vps-stable-opt /var/backups/vps-stable-opt | grep .; then fail 'the storage secret is in a log or backup of the tool'; fi
+[[ "$(sudo stat -c %a /var/lib/vps-stable-opt/databackup/conf)" == 600 ]] || fail 'the settings with the storage secret are readable by others'
+{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> 5\n' "$backup_index"
+  printf '%s\n' '回车返回: ==> 3' '恢复哪一次 ==>' '恢复哪个文件或目录 ==>' '恢复到 /root/vps-restore ==> y'
+  cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3-restore.rules"
+drive "$LOGS/backup-s3-restore.rules" backup-s3-restore sudo vps item || fail "restore from S3 exited with $?"
+target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | head -n 1)"
+[[ "$(sudo cat "$target/srv/ci-s3/file.txt")" == 'object storage payload' ]] || fail 'not restored from the bucket'
+sudo rm -rf -- "$target" /srv/ci-s3
+sudo docker rm -f minio > /dev/null
+sudo docker rmi minio/minio:RELEASE.2024-01-16T16-07-38Z > /dev/null
+endgroup
+
 group 'Rollback and uninstall'
 drive rollback.rules rollback sudo vps rollback || fail "rollback exited with $?"
 has rollback '撤销完成'
+if sudo nft list table inet vps-stable-docker > /dev/null 2>&1; then fail 'the rollback left the rules for the Docker ports'; fi
+if sudo test -e /etc/systemd/system/vps-stable-docker-fw.path; then fail 'the rollback left the unit that follows UFW'; fi
+if sudo test -e /etc/systemd/system/vps-stable-backup.service; then fail 'the rollback left the backup service'; fi
+opens || fail 'the rollback left the published port closed from outside'
 [[ "$(forward)" == "$before_forward" ]] || fail "the rollback left FORWARD at '$(forward)', Docker had '$before_forward'"
 container_ok 'after the rollback'
 drive uninstall.rules uninstall sudo vps uninstall || fail "uninstall exited with $?"
 endgroup
+
+sudo ip netns del ci-outside
+sudo ip link del ci-host 2> /dev/null || true
 
 group 'Nothing left behind: everything compared with before the install'
 # shellcheck disable=SC2024

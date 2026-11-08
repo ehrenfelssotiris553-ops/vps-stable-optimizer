@@ -796,9 +796,113 @@ cat "$LOGS/ufw-added.log"
 if grep -Eq '8080|9000:9100' "$LOGS/ufw-added.log"; then fail 'a closed port is still open'; fi
 endgroup
 
+group 'Data backup: a local directory, then another machine over SFTP, restored for real'
+# Small on purpose: a runner's own /home is large.
+backup_dir=/var/lib/vps-stable-opt/databackup
+backup_tested=1
+sudo mkdir -p /srv/ci-data/sub
+echo 'precious data' | sudo tee /srv/ci-data/sub/keep.txt > /dev/null
+echo 'scratch' | sudo tee /srv/ci-data/skip.tmp > /dev/null
+printf '%s\n' 'backup_paths=/srv/ci-data /nonexistent/not-there' 'backup_drill_days=1' > "$LOGS/backup-params.txt"
+drive params.rules backup-params sudo vps params import "$LOGS/backup-params.txt" || fail "params import exited with $?"
+backup_index="$(item_index databackup)" || fail 'no single item databackup'
+# NAME CHOICE RULE...: `vps item`, data backup, CHOICE on its page.
+backup_item() {
+  local name="$1" choice="$2"
+  shift 2
+  { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> %s\n' "$backup_index" "$choice"
+    if (($#)); then printf '%s\n' "$@"; fi
+    cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/$name.rules"
+  drive "$LOGS/$name.rules" "$name" sudo vps item || fail "data backup ($name) exited with $?"
+}
+# Independently of the tool: restic itself, with the tool's password.
+restic_ci() { sudo restic --no-cache --password-file "$backup_dir/password" "$@"; }
+backup_last() { sudo cut -f"$1" "$backup_dir/last"; }
+
+# Enter at the password question: one is generated.
+backup_item backup-local 1 '备份目标 \[1-4 ==> 4' '备份到本机哪个目录 ==> /var/backups/vps-data-ci' '仍然只备份到本机吗 ==> y' '备份密码（输入时不显示 ==>' '已经把这个密码存到 ==> y'
+has backup-local '数据备份已开启'
+sudo systemctl is-active vps-stable-backup.timer > /dev/null || fail 'the backup timer is not running'
+[[ "$(sudo stat -c %a "$backup_dir")" == 700 && "$(sudo stat -c %a "$backup_dir/password")" == 600 && "$(sudo stat -c %a "$backup_dir/conf")" == 600 ]] || fail 'backup settings readable by others'
+# The generated password: on the terminal once, in no file but its own.
+pw="$(sudo cat "$backup_dir/password")"
+has backup-local "$pw"
+if sudo grep -rlF --exclude=password -- "$pw" /var/lib/vps-stable-opt /var/backups/vps-stable-opt | grep .; then fail 'the generated backup password is in a log or backup of the tool'; fi
+restic_ci -r /var/backups/vps-data-ci ls latest > "$LOGS/backup-ls.txt" || fail 'restic cannot read what the tool wrote'
+grep -Fxq /srv/ci-data/sub/keep.txt "$LOGS/backup-ls.txt" || fail "file not in the backup: $(cat "$LOGS/backup-ls.txt")"
+if grep -Fq skip.tmp "$LOGS/backup-ls.txt"; then fail 'an excluded file is in the backup'; fi
+if sudo grep -rqF 'precious data' /var/backups/vps-data-ci; then fail 'the backup is not encrypted'; fi
+
+# A file added later is in the next backup; the time follows the parameter.
+echo 'added later' | sudo tee /srv/ci-data/later.txt > /dev/null
+# shellcheck disable=SC2024
+sudo vps backup now > "$LOGS/backup-now.log" 2>&1 || fail "vps backup now exited with $?"
+has backup-now '备份完成'
+restic_ci -r /var/backups/vps-data-ci ls latest | grep -Fxq /srv/ci-data/later.txt || fail 'a new file is not in the next backup'
+# shellcheck disable=SC2024
+sudo vps backup list > "$LOGS/backup-list.log" 2>&1 || fail "vps backup list exited with $?"
+has backup-list '/srv/ci-data'
+printf 'backup_time=05:00\n' > "$LOGS/backup-time.txt"
+drive params.rules backup-time sudo vps params import "$LOGS/backup-time.txt" || fail "params import exited with $?"
+sudo grep -Fxq 'OnCalendar=*-*-* 05:00:00' /etc/systemd/system/vps-stable-backup.timer || fail 'the timer does not follow the parameter'
+sudo systemctl is-active vps-stable-backup.timer > /dev/null || fail 'the timer stopped after the change'
+
+# Through the timer's own service, with the restore drill due.
+sudo rm -f "$backup_dir/drill-last"
+sudo systemctl start vps-stable-backup.service || fail 'the backup service failed'
+[[ "$(backup_last 2)" == ok ]] || fail "service: $(sudo cat "$backup_dir/last")"
+[[ "$(backup_last 3)" == *恢复演练通过* ]] || fail "no drill: $(sudo cat "$backup_dir/last")"
+sudo test -s "$backup_dir/drill-last" || fail 'drill not recorded'
+if sudo find /var/tmp -maxdepth 1 -name 'vps-backup-drill.*' | grep .; then fail 'the restored sample was left behind'; fi
+
+# The target gone: said so; back: works again.
+sudo mv /var/backups/vps-data-ci /var/backups/vps-data-ci.away
+# shellcheck disable=SC2024
+sudo vps backup now > "$LOGS/backup-broken.log" 2>&1 || fail "vps backup now exited with $?"
+has backup-broken '备份没有成功'
+[[ "$(backup_last 2)" == fail ]] || fail "a failed backup recorded as $(backup_last 2)"
+sudo mv /var/backups/vps-data-ci.away /var/backups/vps-data-ci
+# shellcheck disable=SC2024
+sudo vps backup now > "$LOGS/backup-repaired.log" 2>&1 || fail "vps backup now exited with $?"
+has backup-repaired '备份完成'
+
+# Restored for real: to a new directory, the file as it was.
+echo 'changed since' | sudo tee /srv/ci-data/sub/keep.txt > /dev/null
+backup_item backup-restore 5 '回车返回: ==> 3' '恢复哪一次 ==>' '恢复哪个文件或目录 ==> /srv/ci-data/sub/keep.txt' '恢复到 /root/vps-restore ==> y'
+has backup-restore '已恢复到 /root/vps-restore-'
+target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | head -n 1)"
+[[ "$(sudo cat "$target/srv/ci-data/sub/keep.txt")" == 'precious data' ]] || fail "restored: $(sudo cat "$target/srv/ci-data/sub/keep.txt")"
+[[ "$(sudo cat /srv/ci-data/sub/keep.txt)" == 'changed since' ]] || fail 'the restore touched the file in place'
+sudo rm -rf -- "$target"
+
+# Another machine: this one, as a user of its own over SFTP. The old password
+# stays; the key that logs in is added at the moment the tool asks for it.
+sudo useradd -m -s /bin/bash cibackup
+sftp_port="$(sudo sshd -T | awk '$1 == "port" {print $2; exit}')"
+printf 'install -d -o cibackup -g cibackup -m 700 /home/cibackup/.ssh\ninstall -o cibackup -g cibackup -m 600 %s/id_ed25519.pub /home/cibackup/.ssh/authorized_keys\n' "$backup_dir" > "$LOGS/backup-add-key.sh"
+backup_item backup-sftp 1 '沿用上次的备份目标吗 ==> n' '备份目标 \[1-4 ==> 1' '对方的地址 ==> 127.0.0.1' "对方的 SSH 端口 ==> $sftp_port" '对方的账户名 ==> cibackup' '对方保存备份的目录 ==> backups/ci' '指纹对得上吗 ==> y' "加好了按回车 ==> !!sudo bash $LOGS/backup-add-key.sh"
+has backup-sftp '数据备份已开启'
+sudo test -f /home/cibackup/backups/ci/config || fail 'no repository on the other machine'
+[[ "$(sudo stat -c %U /home/cibackup/backups/ci/config)" == cibackup ]] || fail 'repository not written as that user'
+if sudo grep -rqF 'precious data' /home/cibackup/backups; then fail 'the backup is not encrypted on the other machine'; fi
+sudo rm -f "$backup_dir/drill-last"
+# shellcheck disable=SC2024
+sudo vps backup now > "$LOGS/backup-sftp-now.log" 2>&1 || fail "vps backup now exited with $?"
+has backup-sftp-now '恢复演练通过'
+# A host key that changed: refused, not accepted.
+ssh-keygen -q -t ed25519 -N '' -f "$LOGS/other-host-key"
+sudo cp -- "$backup_dir/known_hosts" "$LOGS/known-hosts-keep"
+sudo awk -v k="$(cut -d' ' -f2 "$LOGS/other-host-key.pub")" '{print $1, "ssh-ed25519", k}' "$LOGS/known-hosts-keep" | sort -u | sudo tee "$backup_dir/known_hosts" > /dev/null
+# shellcheck disable=SC2024
+sudo vps backup now > "$LOGS/backup-hostkey.log" 2>&1 || fail "vps backup now exited with $?"
+has backup-hostkey '备份没有成功'
+sudo cp -- "$LOGS/known-hosts-keep" "$backup_dir/known_hosts"
+endgroup
+
 group 'Acceptance check after the single items'
 check_all check-again
 passed check-again '自动安全更新'
+passed check-again '数据备份'
 apt_readable 'after the single items'
 # Colours are for the screen: the tool's logs and saved reports are plain text.
 coloured="$(sudo grep -rlF $'\x1b[' /var/lib/vps-stable-opt/logs 2>/dev/null || true)"
@@ -840,7 +944,8 @@ for f in /etc/sysctl.d/98-vps-stable-hardening.conf /etc/sysctl.d/99-vps-stable-
     /etc/apt/apt.conf.d/53-vps-stable-auto-reboot \
     /etc/sysctl.d/99-vps-stable-conntrack.conf /etc/sysctl.d/99-vps-stable-noping.conf /etc/systemd/system/ufw.service.d/99-vps-stable-noping.conf \
     /etc/ssh/sshd_config.d/00-vps-stable-keepalive.conf /usr/share/pam-configs/vps-stable-login /etc/profile.d/zz-vps-stable-login.sh \
-    /etc/systemd/system/vps-stable-check.timer /etc/systemd/system/vps-stable-check.service; do
+    /etc/systemd/system/vps-stable-check.timer /etc/systemd/system/vps-stable-check.service \
+    /etc/systemd/system/vps-stable-backup.timer /etc/systemd/system/vps-stable-backup.service; do
   if sudo test -e "$f"; then fail "$f left after rollback"; fi
 done
 if grep -Fq login-hook /etc/pam.d/common-session; then fail 'the login record is still in common-session after the rollback'; fi
@@ -855,6 +960,13 @@ if command -v vps >/dev/null; then fail 'vps command left after uninstall'; fi
 for d in /usr/local/lib/vps-stable-opt /var/lib/vps-stable-opt /var/backups/vps-stable-opt; do
   [[ ! -e "$d" ]] || fail "$d left after uninstall"
 done
+# The backups stay where they are; then what this run made for them goes.
+if [[ -n "${backup_tested:-}" ]]; then
+  sudo test -f /var/backups/vps-data-ci/config || fail 'the rollback or uninstall touched the backups'
+  sudo test -f /home/cibackup/backups/ci/config || fail 'the rollback or uninstall touched the backups on the other machine'
+  sudo rm -rf /var/backups/vps-data-ci /srv/ci-data
+  sudo userdel -r cibackup 2>/dev/null || true
+fi
 endgroup
 
 group 'Nothing left behind: everything compared with before the install'
