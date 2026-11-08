@@ -72,14 +72,27 @@ check_facts() {
 
 # The newest commit on origin/main whose tool has another version than
 # VERSION, printed as "COMMIT VERSION" (needs the git history).
+# VERSION: the release before it on origin/main, as "COMMIT VERSION": the commit
+# that set the version before VERSION. Work towards a release keeps the old
+# number until the release commit sets the new one, so the newest commit with
+# the old number is work in progress (after 2.9.0 a 2.9 work commit, already
+# banning with nftables sets, was taken for 2.8.0); the first one is the release.
 previous_release() {
-  local commit other
+  local commit other found='' release=''
   git -C "$ROOT" fetch -q --no-tags origin main 2>/dev/null || true
   for commit in $(git -C "$ROOT" rev-list origin/main -- vps-stable-opt.sh); do
     other="$(git -C "$ROOT" show "$commit:vps-stable-opt.sh" | sed -n 's/^SCRIPT_VERSION=//p' || true)"
-    if [[ -n "$other" && "$other" != "$1" ]]; then printf '%s %s\n' "$commit" "$other"; return 0; fi
+    [[ -n "$other" ]] || continue
+    if [[ -z "$found" ]]; then
+      [[ "$other" != "$1" ]] || continue
+      found="$other"
+    elif [[ "$other" != "$found" ]]; then
+      break
+    fi
+    release="$commit"
   done
-  return 1
+  [[ -n "$found" ]] || return 1
+  printf '%s %s\n' "$release" "$found"
 }
 
 # The menu number of single item KEY, from the tool's own list (item_keys).
