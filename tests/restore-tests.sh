@@ -526,6 +526,7 @@ value_baseline() {
       'reset-failed systemd-zram-setup@zram0.service dev-zram0.swap') printf 'reset-failed\n' >> "$TRACE" ;;
       'mask --runtime dev-zram0.swap systemd-zram-setup@zram0.service') printf 'mask\n' >> "$TRACE" ;;
       'unmask --runtime dev-zram0.swap systemd-zram-setup@zram0.service') printf 'unmask\n' >> "$TRACE" ;;
+      'start dev-zram0.swap') return 1 ;;
       *) die "unexpected systemctl $*" ;;
     esac
   }

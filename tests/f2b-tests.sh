@@ -135,8 +135,9 @@ passed 'custom jail preserved without installation/restart'
 new_case inactive
 UFW_ACTIVE=0
 fail2ban_stage
-[[ ! -e "$F2B_FILE" && ! -s "$CASE_DIR/events" ]] || fail 'inactive UFW still configured/installed Fail2ban'
-passed 'inactive UFW makes no changes'
+# The bans are Fail2ban's own nftables set: UFW being off does not matter.
+grep -Fxq 'fail2ban applied' "$CASE_DIR/results" || fail "Fail2ban left out because UFW is off: $(cat "$CASE_DIR/results")"
+passed 'inactive UFW does not stop Fail2ban'
 
 new_case fresh
 fail2ban_stage

@@ -481,10 +481,12 @@ if ct_before="$(ct_max)"; then
   item_do item-conntrack-on conntrack 1
   [[ "$(ct_max)" == "$ct_want" ]] || fail "connection tracking on: nf_conntrack_max is $(ct_max), not $ct_want"
   if ((ct_want > ct_before)); then
-    # The hash table with it: what the file says is what the kernel took.
-    grep -E '^net\.netfilter\.nf_conntrack_buckets = ' /etc/sysctl.d/99-vps-stable-conntrack.conf > /dev/null || fail 'connection tracking on: the hash table was not raised'
-    [[ "$(sysctl -n net.netfilter.nf_conntrack_buckets)" == "$(awk '$1 == "net.netfilter.nf_conntrack_buckets" {print $3}' /etc/sysctl.d/99-vps-stable-conntrack.conf)" ]] ||
-      fail "connection tracking on: the kernel has $(sysctl -n net.netfilter.nf_conntrack_buckets) buckets, not what the file says"
+    # With 16 GB the kernel's own table is already the largest it makes by
+    # itself (262144): nothing to raise here. The small VMs of vm-run check it.
+    buckets_set="$(awk '$1 == "net.netfilter.nf_conntrack_buckets" {print $3}' /etc/sysctl.d/99-vps-stable-conntrack.conf)"
+    if [[ -n "$buckets_set" && "$(sysctl -n net.netfilter.nf_conntrack_buckets)" != "$buckets_set" ]]; then
+      fail "connection tracking on: the kernel has $(sysctl -n net.netfilter.nf_conntrack_buckets) buckets, the file says $buckets_set"
+    fi
     sudo grep -Fxq nf_conntrack /etc/modules-load.d/99-vps-stable-conntrack.conf || fail 'connection tracking on: the module is not loaded at boot'
   fi
   item_do item-conntrack-off conntrack 2

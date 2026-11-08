@@ -500,6 +500,20 @@ vm_drive "$WORK/ping.rules" ping-on vps item || fail "ping on exited with $?"
 [[ "$(vm 'ufw status | head -n 1')" == 'Status: active' ]] || fail 'the firewall is not on for the ping check'
 endgroup
 
+# Left on through the reboot and the full rollback: on a small machine the
+# limit and its hash table both grow, and the file must say what the kernel took
+# (it rounds the table up to whole pages); vps check after the reboot compares them.
+group 'Connection tracking: the limit and its hash table'
+buckets_before="$(vm 'sysctl -n net.netfilter.nf_conntrack_buckets')"
+index="$(item_index conntrack)" || fail 'no single item conntrack'
+printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' > "$WORK/conntrack.rules"
+vm_drive "$WORK/conntrack.rules" conntrack-on vps item || fail "connection tracking on exited with $?"
+buckets_now="$(vm 'sysctl -n net.netfilter.nf_conntrack_buckets')"
+((buckets_now > buckets_before)) || fail "the hash table stayed at $buckets_now buckets (was $buckets_before)"
+[[ "$(vm "awk '\$1 == \"net.netfilter.nf_conntrack_buckets\" {print \$3}' /etc/sysctl.d/99-vps-stable-conntrack.conf")" == "$buckets_now" ]] ||
+  fail "the kernel has $buckets_now buckets, not what the file says"
+endgroup
+
 group 'Reboot'
 # Across the reboot a ban Fail2ban runs comes back into the set; what the
 # kernel held besides (as a ban that ran out while the machine was down,
