@@ -210,6 +210,16 @@ ZRAM_OURS=1 ZRAM_ON=0; reset; STATE=([swap_unit]=applied); item_turn_off swap
 if grep -q zram_tune "$TEST_ROOT/trace"; then fail 'tuned without a ZRAM running'; fi
 ZRAM_ON=1; reset; STATE=([bbr_file]=applied); item_turn_off bbr
 if grep -q zram_tune "$TEST_ROOT/trace"; then fail 'another item tuned ZRAM'; fi
+# The login record off: TG, still on, stops telling about logins; said then.
+(
+  STATE_ROOT="$TEST_ROOT/login-state"; mkdir -p "$STATE_ROOT"
+  printf 'x\n' > "$STATE_ROOT/notify.conf"
+  reset; STATE=([login_pam]=applied); item_turn_off login > "$TEST_ROOT/out"
+  grep -Fq '收不到登录提醒' "$TEST_ROOT/out" || fail "TG not mentioned: $(cat "$TEST_ROOT/out")"
+  rm -f "$STATE_ROOT/notify.conf"
+  reset; STATE=([login_pam]=applied); item_turn_off login > "$TEST_ROOT/out"
+  if grep -Fq '收不到登录提醒' "$TEST_ROOT/out"; then fail 'TG mentioned without TG'; fi
+)
 unset -f restore_file_ours zram_swap_active stage_run
 if [[ -n "$real_stage_run" ]]; then eval "$real_stage_run"; fi
 if grep -q '^result ' "$TEST_ROOT/trace"; then fail 'a group still pending was recorded as undone'; fi

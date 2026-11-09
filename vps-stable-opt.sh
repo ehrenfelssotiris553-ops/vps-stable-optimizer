@@ -1720,7 +1720,7 @@ zram_stage() {
     fi
     module_result zram unsupported 'kernel has no zram module'; return 0
   fi
-  if swap_exists; then
+  if [[ "${ZRAM_OVER_SWAP:-0}" != 1 ]] && swap_exists; then
     # The package default is replaced by this tool's own file when asked for
     # explicitly, or when it runs no swap at all (Ubuntu installs it unstarted).
     if zram_vendor_default_only && { [[ "${ZRAM_CHOICE:-}" == 1 ]] || ! swapon --noheadings 2>/dev/null | grep . > /dev/null; }; then
@@ -8037,6 +8037,7 @@ notify_stage() {
   if check_reconcile; then
     ok "测试消息已发出，TG 通知已开启（每 $(param_value check_minutes_tg) 分钟检查一次）。Token 只有 root 能读；万一泄露，在 @BotFather 里发 /revoke 作废它，再回这里重新开启。"
     module_result notify applied 'telegram'
+    if ! login_pam_enabled; then echo '提示：登录提醒要开着「登录记录和提醒」才有；现在它没开，TG 的其他提醒不受影响。'; fi
   else module_result notify failed 'check timer'; fi
 }
 
@@ -9997,6 +9998,11 @@ restore_fw_rules_apply() {
       warn "忽略格式异常的规则记录：$rule"; RESTORE_PARTIAL=1; continue
     fi
     if ! grep -Fxq -- "$rule" <<< "$current"; then ok "规则已不存在：$rule"; continue; fi
+    # A container port let through for the Docker switch goes with that switch:
+    # while it is on, the firewall coming back must not cut the container off.
+    if dockerfw_on && grep -Fxqs -- "$rule" "$RESTORE_ROOT/dockerfw_rules"; then
+      ok "保留给 Docker 开关的规则（关闭那一项时一起删除）：$rule"; remaining+=("$rule"); continue
+    fi
     # One address's exemption from the rate limit is not the SSH access itself.
     if ((ufw_on)) && [[ -z "$src" && "$proto" == tcp && "$ssh_ports" == *" $port "* ]]; then
       warn "防火墙仍处于开启状态，保留 SSH 端口规则：$rule"; remaining+=("$rule"); RESTORE_PARTIAL=1; continue
@@ -10054,7 +10060,7 @@ restore_databackup_group() {
 # Both SSH drop-ins (key-only, and the key-login switch for images that had it
 # off) go back to their original state, then sshd reloads once.
 restore_ssh_group() {
-  local id pending=0 failed=0
+  local id pending=0 failed=0 keep_pubkey=0
   local -a files=()
   for id in ssh_dropin ssh_pubkey_dropin; do
     if restore_needed "$id"; then pending=1; fi
@@ -10066,10 +10072,12 @@ restore_ssh_group() {
   if ((${#files[@]})); then pending=1; fi
   ((pending)) || return 0
   if restore_needed ssh_pubkey_dropin; then
-    warn 'SSH 公钥登录会恢复成原来的关闭状态，之后只能用密码登录；请确认你记得密码。'
+    warn '这台机器原来是关着公钥登录的：恢复之后现在的密钥就登不上了，只能用密码，请确认你记得密码。'
+    if ! confirm_yes '公钥登录也恢复成关闭吗？（选 n：只恢复密码登录，公钥登录继续开着，密钥和密码都能登录）'; then keep_pubkey=1; fi
   fi
   for id in ssh_dropin ssh_pubkey_dropin; do
     [[ -d "$RESTORE_ROOT/$id" ]] || continue
+    if [[ "$id" == ssh_pubkey_dropin ]] && ((keep_pubkey)); then ok '公钥登录继续开着；以后要关，再撤销一次这一项。'; continue; fi
     restore_resource "$id"
     # Still "applied" means this restore failed; "clean" was never changed.
     if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then failed=1; fi
@@ -10788,6 +10796,10 @@ check_notify() {
   last="$(cat -- "$STATE_ROOT/notify/last-run" 2>/dev/null || echo 0)"
   waiting="$(grep -c . "$STATE_ROOT/notify/queue" 2>/dev/null || true)"
   every="$(param_value check_minutes_tg)" now="$(date +%s)"
+  # Just turned on: the timer has not come round yet.
+  if [[ ! -s "$STATE_ROOT/notify/last-run" ]] && ((now - $(stat -c %Y -- "$STATE_ROOT/notify.conf") <= (every + 9) * 60)); then
+    verify_set pass "刚开启，第一次检查最多要等 $every 分钟"; return 0
+  fi
   # Failing since then, and why (what Telegram said; nothing means no answer).
   if [[ -s "$STATE_ROOT/notify/send-error" ]]; then IFS=$'\t' read -r since why < "$STATE_ROOT/notify/send-error" || true; fi
   [[ "$since" =~ ^[0-9]+$ ]] || since=''
@@ -12065,7 +12077,13 @@ item_turn_on() {
       stage_run sysctl sysctl_hardening_stage ;;
     tcp) TCP_BUFFER_CHOICE=1
       stage_run tcp tcp_buffer_stage ;;
-    zram) ZRAM_CHOICE=1
+    zram) ZRAM_CHOICE=1 ZRAM_OVER_SWAP=0
+      # A disk swap is no reason to refuse it when asked for by name (the other
+      # way round has always worked): ZRAM is used first, the disk when it is full.
+      if ! zram_swap_active && swapon --noheadings --show=NAME 2>/dev/null | grep -v '^/dev/zram' > /dev/null; then
+        confirm_yes '已经有硬盘 Swap：ZRAM 会排在前面先用，满了才用硬盘。仍然开启 ZRAM 吗？' || return 0
+        ZRAM_OVER_SWAP=1
+      fi
       # Without the kernel module the stage only explains why: no index update.
       if zram_module_available; then apt_index_ready || return 0; fi
       stage_run zram zram_stage ;;
@@ -12163,6 +12181,7 @@ item_turn_off() {
   else
     ok "已撤销本工具对「$(item_label "$key")」的修改。"
     if [[ "$key" == ssh ]]; then f2b_password_note; fi
+    if [[ "$key" == login && -s "${STATE_ROOT:-}/notify.conf" ]]; then echo 'TG 的登录提醒靠登录记录：从现在起收不到登录提醒了，TG 的其他提醒不受影响。'; fi
     # The disk swap had taken ZRAM's values away; alone again, it gets them back.
     if [[ "$key" == swap ]] && restore_file_ours zram_file && zram_swap_active; then stage_run zram zram_tune; fi
     # Without the policy the package only keeps a shutdown helper running.

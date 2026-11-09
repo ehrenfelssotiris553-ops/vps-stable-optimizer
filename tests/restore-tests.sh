@@ -384,7 +384,9 @@ value_baseline() {
   printf '# comment\nnet/ipv4/conf/all/accept_redirects=0\n#net/ipv4/tcp_fin_timeout=30\n net/ipv6/conf/default/accept_redirects = 0\n' > "$TMP/ufw-keys/sysctl.conf"
   printf 'IPV6=yes\nIPT_SYSCTL="%s"\n' "$TMP/ufw-keys/sysctl.conf" > "$TMP/ufw-keys/default"
   expect "$(ufw_sysctl_keys "$TMP/ufw-keys/default" | tr '\n' ' ')" 'net.ipv4.conf.all.accept_redirects net.ipv6.conf.default.accept_redirects '
-  expect "$(ufw_sysctl_keys "$TMP/ufw-keys/absent" | wc -l)" 0
+  # (Without a defaults file it is UFW's usual path, there on a machine with UFW.)
+  printf 'IPT_SYSCTL="%s"\n' "$TMP/ufw-keys/no-such-file" > "$TMP/ufw-keys/default2"
+  expect "$(ufw_sysctl_keys "$TMP/ufw-keys/default2" | wc -l)" 0
 )
 
 # Rollback never turns a firewall on and never narrows a live firewall's defaults.
@@ -579,6 +581,8 @@ value_baseline() {
   systemctl() { [[ "$*" == 'start dev-zram0.swap' ]] || die "unexpected systemctl $*"; printf 'start\n' >> "$TRACE"; SWAP=/dev/zram0:1:100; }
   module_result() { printf 'result %s %s\n' "$1" "$2" >> "$TRACE"; }
   warn() { printf 'WARN %s\n' "$*" >> "$TRACE"; }
+  # (The real one reads /proc/swaps, which on a machine with a ZRAM has one.)
+  zram_swap_active() { [[ "$SWAP" == /dev/zram0* ]]; }
   restore_zram_settle
   grep -Fxq start "$TRACE" || die 'kept package default ZRAM not started'
   grep -q '^WARN 保留了 systemd-zram-generator' "$TRACE" || die 'kept package default ZRAM not explained'
@@ -766,6 +770,18 @@ printf 'PASS: Fail2ban rollback unbans the UFW bans of 2.8 first, takes the nfta
   printf 'PasswordAuthentication no\n' > "$SSH_DROPIN"
   restore_mark ssh_dropin applied; restore_mark ssh_pubkey_dropin applied
   ssh_reload() { printf 'reload\n' >> "$TMP/ssh2/trace"; }
+  confirm_yes() { printf 'asked\n' >> "$TMP/ssh2/asked"; ((PUBKEY_OFF)); }
+  # Said no: password login is back, key login stays on, and it stays to do.
+  PUBKEY_OFF=0
+  restore_ssh_group > "$TMP/ssh2/out"
+  [[ ! -e "$SSH_DROPIN" && -e "$SSH_PUBKEY_DROPIN" ]] || die 'the answer no: key login not kept'
+  expect "$(restore_read ssh_pubkey_dropin state)" applied
+  expect "$(restore_read ssh_dropin state)" restored
+  expect "$(cat "$TMP/ssh2/asked")" asked
+  restore_needed ssh_pubkey_dropin || die 'key login no longer offered for undoing'
+  expect "$RESTORE_PARTIAL" 0
+  : > "$TMP/ssh2/trace"
+  PUBKEY_OFF=1
   restore_ssh_group > "$TMP/ssh2/out"
   [[ ! -e "$SSH_DROPIN" && ! -e "$SSH_PUBKEY_DROPIN" ]] || die 'SSH drop-ins survived rollback'
   expect "$(cat "$TMP/ssh2/trace")" reload

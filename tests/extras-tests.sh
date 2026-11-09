@@ -803,6 +803,29 @@ printf 'PASS: setup questions are asked once and stored; steps left out ask noth
   zram_stage > /dev/null
   grep -q '^result zram unsupported' "$TEST_ROOT/trace" || fail 'own config on a kernel without zram not explained'
   if grep -Fxq 'zram start' "$TEST_ROOT/trace"; then fail 'tried to start ZRAM without the module'; fi
+  # Asked for by name over a disk swap: set up, ZRAM first and the disk behind it.
+  reset; rm -f "$ZRAM_FILE"; SWAP_ON=1 VENDOR_ONLY=0 OURS=0 MODULE=1; ZRAM_OVER_SWAP=1
+  zram_stage > /dev/null
+  grep -Fxq 'zram start' "$TEST_ROOT/trace" && grep -q '^result zram applied' "$TEST_ROOT/trace" || fail "ZRAM over a disk swap: $(cat "$TEST_ROOT/trace")"
+  ZRAM_OVER_SWAP=0; rm -f "$ZRAM_FILE"
+  # The way in: asked first, and only when a disk swap runs without a ZRAM.
+  (
+    load_optimizer_functions item_turn_on
+    zram_module_available() { return 1; }
+    stage_run() { record "stage $1 over=${ZRAM_OVER_SWAP:-0}"; }
+    confirm_yes() { record 'asked'; ((ANSWER)); }
+    SWAPS='/swapfile' ACTIVE=1 ANSWER=1
+    swapon() { printf '%s\n' "$SWAPS"; }
+    zram_swap_active() { ((ACTIVE)); }
+    reset; ACTIVE=0 ANSWER=0; item_turn_on zram
+    [[ "$(cat "$TEST_ROOT/trace")" == asked ]] || fail "said no: $(cat "$TEST_ROOT/trace")"
+    reset; ANSWER=1; item_turn_on zram
+    [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'asked stage zram over=1 ' ]] || fail "said yes: $(cat "$TEST_ROOT/trace")"
+    reset; ACTIVE=1; item_turn_on zram
+    [[ "$(cat "$TEST_ROOT/trace")" == 'stage zram over=0' ]] || fail "a ZRAM running: $(cat "$TEST_ROOT/trace")"
+    reset; ACTIVE=0 SWAPS='/dev/zram0'; item_turn_on zram
+    [[ "$(cat "$TEST_ROOT/trace")" == 'stage zram over=0' ]] || fail "only a ZRAM swap: $(cat "$TEST_ROOT/trace")"
+  )
   # zram_file_packaged: only the unchanged packaged file counts.
   printf '[zram0]\n' > "$ZRAM_FILE"
   zram_file_packaged || fail 'unchanged packaged default not recognised'

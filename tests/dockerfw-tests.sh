@@ -307,6 +307,32 @@ printf 'PASS: the stage keeps running ports open when asked, has a way back befo
   called 'ufw --force delete allow 7000:7010/tcp' || fail "range not deleted by the rollback: $(cat "$CALLS")"
   ((RESTORE_PARTIAL == 0)) || fail 'a range reported as not undone'
 )
+# Undoing the firewall with the switch on: the rule for a container stays (the
+# firewall coming back would cut it off); with the switch off it goes.
+(
+  load_optimizer_functions restore_data_safe state_path_safe port_source_valid restore_fw_rules_apply ssh_candidates
+  ssh_candidates() { echo 22; }
+  ufw() {
+    case "$1 ${2:-}" in
+      'show added') printf '%s\n' 'ufw allow 8081/tcp' 'ufw allow 80/tcp' ;;
+      'status '*) echo 'Status: inactive' ;;
+      '--force delete') record "ufw $*" ;;
+    esac
+  }
+  printf 'ufw allow 8081/tcp\n' > "$RESTORE_ROOT/dockerfw_rules"
+  printf '%s\n' 'ufw allow 8081/tcp' 'ufw allow 80/tcp' > "$RESTORE_ROOT/fw_rules"
+  dockerfw_on() { return 0; }
+  RESTORE_PARTIAL=0; : > "$CALLS"; restore_fw_rules_apply > /dev/null
+  called 'ufw --force delete allow 80/tcp' || fail "another rule not deleted: $(cat "$CALLS")"
+  if called 'ufw --force delete allow 8081/tcp'; then fail 'the rule of a container deleted with the switch on'; fi
+  [[ "$(cat "$RESTORE_ROOT/fw_rules")" == 'ufw allow 8081/tcp' ]] || fail "record: $(cat "$RESTORE_ROOT/fw_rules")"
+  ((RESTORE_PARTIAL == 0)) || fail 'a kept rule reported as not undone'
+  printf '%s\n' 'ufw allow 8081/tcp' > "$RESTORE_ROOT/fw_rules"
+  dockerfw_on() { return 1; }
+  : > "$CALLS"; restore_fw_rules_apply > /dev/null
+  called 'ufw --force delete allow 8081/tcp' || fail "the rule stayed with the switch off: $(cat "$CALLS")"
+  rm -f -- "$RESTORE_ROOT/dockerfw_rules" "$RESTORE_ROOT/fw_rules"
+)
 # Rules added for the switch still count when its units are already gone.
 (
   load_optimizer_functions restore_group_pending restore_needed restore_at_origin restore_read restore_data_safe state_path_safe sshd_off_files

@@ -328,6 +328,12 @@ grep -Fq "ExecStart=/usr/bin/timeout 110 /bin/bash $STATE_ROOT/notify-check" "$C
 # vps check: the check has stopped when it missed its interval and 9 minutes
 # more (10 minutes every minute; 39 every 30 minutes).
 : > "$D/queue"
+# Just turned on, the timer not come round yet: no alarm; long after that, one.
+rm -f "$D/last-run"; printf 'x\n' > "$STATE_ROOT/notify.conf"; check_notify
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'刚开启'* ]] || fail "just turned on: $VERIFY_STATUS $VERIFY_TEXT"
+touch -d '2 hours ago' "$STATE_ROOT/notify.conf"; check_notify
+[[ "$VERIFY_STATUS" == fail ]] || fail "never ran, turned on 2 hours ago: $VERIFY_STATUS $VERIFY_TEXT"
+touch "$STATE_ROOT/notify.conf"
 printf '%s\n' "$(($(date +%s) - 300))" > "$D/last-run"; check_notify
 [[ "$VERIFY_STATUS" == pass ]] || fail "a check 5 minutes ago: $VERIFY_STATUS $VERIFY_TEXT"
 printf '%s\n' "$(($(date +%s) - 1200))" > "$D/last-run"; check_notify
@@ -390,6 +396,8 @@ tg_call() { record "tg $3 $(cat)"; case "$3" in getUpdates) echo "$TG_UPDATES" ;
 # The test containers have no curl: TG needs it to be there (tg_call answers).
 curl() { :; }
 check_reconcile() { record reconcile; }
+LOGIN_ON=1
+login_pam_enabled() { ((LOGIN_ON)); }
 reset; NOTIFY_CHOICE=1
 printf 'not-a-token\n' | notify_stage
 grep -q '^result notify failed bad token' "$TEST_ROOT/trace" && [[ ! -e "$STATE_ROOT/notify.conf" ]] || fail 'a bad token accepted'
@@ -398,6 +406,11 @@ grep -Fxq 'chat=987654' "$STATE_ROOT/notify.conf" && grep -Fxq 'token=123456789:
   grep -q '^result notify applied' "$TEST_ROOT/trace" && grep -Fxq reconcile "$TEST_ROOT/trace" || fail "TG on: $(cat "$TEST_ROOT/trace")"
 [[ "$(stat -c %a "$STATE_ROOT/notify.conf")" == 600 ]] || [[ "$(uname -o 2>/dev/null)" == Msys ]] || fail 'the TG settings are readable by others'
 if grep -Fq AAbbccdd "$T/out"; then fail 'the token was shown'; fi
+if grep -Fq '登录提醒要开着' "$T/out"; then fail 'the login alerts mentioned with the login record on'; fi
+LOGIN_ON=0; rm -f "$STATE_ROOT/notify.conf"; reset
+printf '123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq\n\n' | notify_stage > "$T/out"
+grep -Fq '登录提醒要开着' "$T/out" || fail "no word about the login record being off: $(cat "$T/out")"
+LOGIN_ON=1
 # The chat is found in any JSON layout.
 rm -f "$STATE_ROOT/notify.conf"; TG_UPDATES='{"ok": true, "result": [{"update_id": 2, "message": {"chat": {"id": -100123, "type": "group"}}}]}'
 reset; printf '123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq\n\n' | notify_stage > /dev/null
