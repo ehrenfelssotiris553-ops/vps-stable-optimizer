@@ -23,7 +23,7 @@ reset() { : > "$TEST_ROOT/trace"; : > "$TEST_ROOT/log"; }
 P="$TEST_ROOT/proc" Z="$TEST_ROOT/zram0"
 mkdir -p "$P" "$Z" "$TEST_ROOT/state"
 # The functions that read /proc or /sys work on fixtures here.
-for fn in swapoff_safe swap_file_active swap_stage check_swap restore_swap_group zram_stage check_zram restore_value restore_apply_one; do
+for fn in zram_module_package zram_module_offerable zram_module_offer swapoff_safe swap_file_active swap_stage check_swap restore_swap_group zram_stage check_zram restore_value restore_apply_one; do
   eval "$(awk -v n="$fn" '$0 == n "() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT" |
     sed -e "s#/proc/swaps#$P/swaps#g" -e "s#/proc/meminfo#$P/meminfo#g" -e "s#/proc/sys/kernel/random/boot_id#$P/boot_id#g" -e "s#/sys/block/zram0#$Z#g")"
 done

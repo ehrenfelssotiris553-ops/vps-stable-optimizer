@@ -7,7 +7,7 @@ umask 077
 
 # Download location and the main script's hash; update the hash on every release.
 RELEASE_BASE_URL='https://raw.githubusercontent.com/ehrenfelssotiris553-ops/vps-stable-optimizer/main'
-EXPECTED_SHA256='03066cf04dbfd91035a36001d7aa969172e13e7fef4a3848d2301b705fbed0d7'
+EXPECTED_SHA256='a95e9b24314084d01427f760dd92e68558c347e7ba5dc7b3dbe8d8d9590c8665'
 PAYLOAD_NAME='vps-stable-opt.sh'
 INSTALL_DIR=/usr/local/lib/vps-stable-opt
 INSTALL_FILE="$INSTALL_DIR/vps-stable-opt.sh"

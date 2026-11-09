@@ -738,6 +738,18 @@ printf 'PASS: UFW is installed only when the setup will use it.\n'
     grep -Fq '约占内存 60% 的' "$TEST_ROOT/zram-question" || fail "ZRAM question ignores the parameter: $(cat "$TEST_ROOT/zram-question")" )
   grep -Fq '空闲后不重新慢启动' "$TEST_ROOT/tcp-question" || fail 'TCP question does not name the two switches'
   grep -Fq '需要你在场' "$TEST_ROOT/q-out" || fail 'user not told the end needs them'
+  # No zram in this kernel, the package there: asked instead of the ZRAM question.
+  (
+    zram_module_offerable() { return 0; }
+    zram_module_offer() { printf 'offered\n' > "$TEST_ROOT/zram-offer"; }
+    rm -f "$TEST_ROOT/zram-offer" "$TEST_ROOT/zram-question"
+    setup_questions < "$TEST_ROOT/q-input" > /dev/null
+    [[ -s "$TEST_ROOT/zram-offer" && ! -e "$TEST_ROOT/zram-question" ]] || fail 'module offer in the questions'
+    rm -f "$TEST_ROOT/zram-offer"
+    swap_exists() { return 0; }
+    setup_questions < "$TEST_ROOT/q-input" > /dev/null
+    [[ ! -e "$TEST_ROOT/zram-offer" ]] || fail 'offered with a swap already there'
+  )
   # Steps left out of one-click setup (setup_skip) ask nothing.
   load_optimizer_functions setup_skipped
   printf 'setup_skip=sysctl tcp ssh firewall autoreboot\n' > "$TEST_ROOT/params-q"; PARAMS_FILE="$TEST_ROOT/params-q"
@@ -750,6 +762,17 @@ printf 'PASS: UFW is installed only when the setup will use it.\n'
   setup_questions < "$TEST_ROOT/q-input" > "$TEST_ROOT/q-out2"
   [[ "$F2B_CHOICE" == 0 ]] || fail 'Fail2ban asked about although it is left out'
   [[ ! -e "$TEST_ROOT/tcp-question" && -z "${AUTO_REBOOT_TIME:-}" ]] || fail 'a question of a step left out was asked'
+  (
+    zram_module_offerable() { return 0; }
+    zram_module_offer() { printf 'offered\n' > "$TEST_ROOT/zram-offer"; }
+    rm -f "$TEST_ROOT/zram-offer"
+    printf 'setup_skip=zram\n' > "$TEST_ROOT/params-q"
+    setup_questions < "$TEST_ROOT/q-input" > /dev/null
+    [[ ! -e "$TEST_ROOT/zram-offer" ]] || fail 'offered with ZRAM left out of the setup'
+    printf '' > "$TEST_ROOT/params-q"; RECOMMENDED=1
+    setup_questions < "$TEST_ROOT/q-input" > /dev/null
+    [[ ! -e "$TEST_ROOT/zram-offer" ]] || fail 'offered in the recommended set'
+  )
 )
 printf 'PASS: setup questions are asked once and stored; steps left out ask nothing.\n'
 
@@ -811,7 +834,8 @@ printf 'PASS: setup questions are asked once and stored; steps left out ask noth
   # The way in: asked first, and only when a disk swap runs without a ZRAM.
   (
     load_optimizer_functions item_turn_on
-    zram_module_available() { return 1; }
+    zram_module_available() { return 0; }
+    apt_index_ready() { :; }
     stage_run() { record "stage $1 over=${ZRAM_OVER_SWAP:-0}"; }
     confirm_yes() { record 'asked'; ((ANSWER)); }
     SWAPS='/swapfile' ACTIVE=1 ANSWER=1
@@ -849,6 +873,83 @@ printf 'PASS: setup questions are asked once and stored; steps left out ask noth
     zram_vendor_default_only --asked || fail 'a disk swap running, asked for: not the package default'
     swapon() { printf '%s\n' /dev/zram0; }
     zram_vendor_default_only || fail 'only the package default running'
+  )
+  # The kernel has no zram: the module package only with a yes, and it must work.
+  (
+    load_optimizer_functions zram_module_package zram_module_offerable zram_module_offer
+    rm -f "$ZRAM_FILE"; SWAP_ON=0 VENDOR_ONLY=0 OURS=0 ZRAM_OVER_SWAP=0
+    PKG="linux-modules-extra-$(uname -r)" INSTALL_OK=1 HAS_ZRAM=1
+    install_pkgs() { record "install $*"; [[ "$1" != "$PKG" ]] || { ((INSTALL_OK)) || return 1; MODULE=$HAS_ZRAM; return 0; }; [[ -e "$ZRAM_FILE" ]] || printf '[zram0]\n' > "$ZRAM_FILE"; }
+    # Not asked for: nothing installed, explained as before.
+    reset; MODULE=0 ZRAM_MODULE_CHOICE=0
+    zram_stage > /dev/null
+    grep -q '^result zram unsupported' "$TEST_ROOT/trace" && ! grep -q '^install' "$TEST_ROOT/trace" || fail "not asked for: $(cat "$TEST_ROOT/trace")"
+    # Asked for: installed, then ZRAM set up and started.
+    reset; rm -f "$ZRAM_FILE"; MODULE=0 ZRAM_MODULE_CHOICE=1 ZRAM_CHOICE=1
+    zram_start() { record 'zram start'; SWAP_ON=1; }
+    zram_stage > /dev/null
+    [[ "$(head -n 1 "$TEST_ROOT/trace")" == "install $PKG" ]] && grep -Fxq 'zram start' "$TEST_ROOT/trace" && grep -q '^result zram applied' "$TEST_ROOT/trace" || fail "asked for: $(cat "$TEST_ROOT/trace")"
+    # Started, but no ZRAM swap to be seen: not called working.
+    reset; rm -f "$ZRAM_FILE"; MODULE=0 SWAP_ON=0
+    zram_start() { record 'zram start'; }
+    zram_stage > /dev/null
+    grep -q '^result zram failed' "$TEST_ROOT/trace" || fail "no swap after the start: $(cat "$TEST_ROOT/trace")"
+    # The package cannot be installed, or has no zram in it: no ZRAM, said so.
+    reset; rm -f "$ZRAM_FILE"; MODULE=0 INSTALL_OK=0
+    zram_stage > /dev/null
+    grep -q '^result zram failed module package not installed' "$TEST_ROOT/trace" && ! grep -Fxq 'zram start' "$TEST_ROOT/trace" || fail "install failed: $(cat "$TEST_ROOT/trace")"
+    reset; MODULE=0 INSTALL_OK=1 HAS_ZRAM=0
+    zram_stage > /dev/null
+    grep -q '^result zram failed no zram after the package' "$TEST_ROOT/trace" || fail "no zram in the package: $(cat "$TEST_ROOT/trace")"
+    # The offer: on offer only without a module and with the package there.
+    MODULE=0; available() { [[ "$1" == "$PKG" ]]; }
+    zram_module_offerable || fail 'not on offer'
+    MODULE=1; if zram_module_offerable; then fail 'on offer with a module'; fi
+    MODULE=0; available() { return 1; }; if zram_module_offerable; then fail 'on offer without a package'; fi
+    apt-cache() { printf 'Package: x\nInstalled-Size: 110176\n'; }
+    ZRAM_MODULE_CHOICE=0 ZRAM_CHOICE=0; confirm_yes() { return 1; }
+    if zram_module_offer > "$TEST_ROOT/out"; then fail 'a no taken for a yes'; fi
+    [[ "$ZRAM_MODULE_CHOICE" == 0 && "$ZRAM_CHOICE" == 0 ]] || fail 'a no still chose it'
+    grep -Fq "$PKG" "$TEST_ROOT/out" && grep -Fq '约 107 MiB' "$TEST_ROOT/out" || fail "the offer: $(cat "$TEST_ROOT/out")"
+    confirm_yes() { return 0; }
+    zram_module_offer > /dev/null && [[ "$ZRAM_MODULE_CHOICE" == 1 && "$ZRAM_CHOICE" == 1 ]] || fail 'a yes did not choose it'
+    # The single item: offered, then the stage; refused, the stage explains.
+    load_optimizer_functions item_turn_on
+    apt_index_ready() { :; }
+    stage_run() { record "stage $1 module=$ZRAM_MODULE_CHOICE"; }
+    swapon() { :; }; zram_swap_active() { return 1; }
+    zram_module_available() { return 1; }
+    zram_module_offerable() { return 0; }
+    zram_module_offer() { record offer; ZRAM_MODULE_CHOICE=$ANSWER; ((ANSWER)); }
+    ANSWER=1; reset; item_turn_on zram
+    [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'offer stage zram module=1 ' ]] || fail "item, yes: $(cat "$TEST_ROOT/trace")"
+    ANSWER=0; reset; item_turn_on zram
+    [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'offer stage zram module=0 ' ]] || fail "item, no: $(cat "$TEST_ROOT/trace")"
+    zram_module_offerable() { return 1; }
+    reset; item_turn_on zram
+    [[ "$(cat "$TEST_ROOT/trace")" == 'stage zram module=0' ]] || fail "item, no package: $(cat "$TEST_ROOT/trace")"
+    # No ZRAM coming: nothing to ask about the disk swap next to it.
+    swapon() { printf '/swapfile\n'; }; confirm_yes() { record 'asked about the disk'; return 0; }
+    reset; item_turn_on zram
+    [[ "$(cat "$TEST_ROOT/trace")" == 'stage zram module=0' ]] || fail "asked about a disk swap with no ZRAM coming: $(cat "$TEST_ROOT/trace")"
+    swapon() { :; }
+    zram_module_available() { return 0; }
+    zram_module_offerable() { record 'offered with a module'; return 1; }
+    reset; item_turn_on zram
+    if grep -q 'offer' "$TEST_ROOT/trace"; then fail "offered with a module: $(cat "$TEST_ROOT/trace")"; fi
+  )
+  # vps check after a kernel upgrade took the module away.
+  (
+    load_optimizer_functions check_zram verify_set
+    ZRAM_SYSCTL_FILE=/nonexistent
+    swaps_empty=1
+    awk() { if [[ "$*" == *'/proc/swaps'* ]]; then :; else command awk "$@"; fi; }
+    zram_module_available() { return 1; }
+    check_zram 'zram0 = ram / 2' boot-1
+    [[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'重新应用'* ]] || fail "no module: $VERIFY_STATUS $VERIFY_TEXT"
+    zram_module_available() { return 0; }
+    check_zram 'zram0 = ram / 2' boot-1
+    [[ "$VERIFY_STATUS" == fail && "$VERIFY_TEXT" == *'没有找到正在使用的'* ]] || fail "module, no swap: $VERIFY_STATUS $VERIFY_TEXT"
   )
   # zram_file_packaged: only the unchanged packaged file counts.
   printf '[zram0]\n' > "$ZRAM_FILE"

@@ -99,6 +99,7 @@ AUTO_REBOOT_TIME=''
 KERNEL_CLEAN_CHOICE=''
 VNSTAT_CHOICE=''
 ZRAM_CHOICE=''
+ZRAM_MODULE_CHOICE=0
 SWAP_CHOICE=''
 HOSTS_CHOICE=''
 HOSTNAME_CHOICE=''
@@ -956,7 +957,9 @@ setup_questions() {
         warn '时间格式不对，按不自动重启处理。'; AUTO_REBOOT_TIME=''
       fi
     fi
-    if ((MEM_MIB >= $(param_value auto_swap_below_mib))) && ! setup_skipped zram && ! swap_exists; then
+    if ! setup_skipped zram && ! swap_exists && zram_module_offerable; then
+      zram_module_offer || true
+    elif ((MEM_MIB >= $(param_value auto_swap_below_mib))) && ! setup_skipped zram && ! swap_exists; then
       if confirm_yes "没有 Swap：要配一个约占内存 $(param_value zram_percent)% 的 ZRAM 作为应急缓冲吗？（防止内存突然用尽时进程被杀）"; then ZRAM_CHOICE=1; else ZRAM_CHOICE=0; fi
     fi
     if ! setup_skipped sysctl && confirm_default_yes '启用内核网络安全参数吗？（不接受 ICMP 重定向和源路由、开启 SYN Cookies 等；不影响代理和 Docker）'; then SYSCTL_CHOICE=1; else SYSCTL_CHOICE=0; fi
@@ -1710,15 +1713,45 @@ swap_stage() {
   fi
 }
 
+# Ubuntu's small cloud kernels keep zram.ko in a package of its own, one for
+# each kernel: offered by name and size, never installed without a yes.
+zram_module_package() {
+  printf 'linux-modules-extra-%s\n' "$(uname -r)"
+}
+
+zram_module_offerable() {
+  ! zram_module_available && available "$(zram_module_package)"
+}
+
+# Yes: the choice is set for zram_stage. No, or not on offer: returns 1.
+zram_module_offer() {
+  local pkg mib
+  pkg="$(zram_module_package)"
+  mib="$(apt-cache show "$pkg" 2>/dev/null | awk '$1 == "Installed-Size:" {printf "%d", $2 / 1024; exit}' || true)"
+  echo "这个内核没有 zram 模块，它在软件包 $pkg 里（约 ${mib:-100} MiB，每个内核一份）。"
+  echo '以后升级内核要再装一次（单项设置 → ZRAM 内存缓冲 → 重新应用）；没装的话重启后只是没有 ZRAM，机器不受影响。'
+  confirm_yes '安装这个软件包并开启 ZRAM 吗？' || return 1
+  ZRAM_MODULE_CHOICE=1 ZRAM_CHOICE=1
+}
+
 zram_stage() {
   step 4 '内存与 ZRAM（在系统升级前配置）'
   local size vendor=0
+  # The module asked for: installed first, and there must be one afterwards.
+  if [[ "${ZRAM_MODULE_CHOICE:-0}" == 1 ]] && ! zram_module_available; then
+    if ! install_pkgs "$(zram_module_package)"; then
+      warn 'zram 模块的软件包没能安装，这次不开 ZRAM。'; module_result zram failed 'module package not installed'; return 0
+    fi
+    if ! zram_module_available; then
+      warn '软件包装好了，但还是找不到 zram 模块，这次不开 ZRAM。'; module_result zram failed 'no zram after the package'; return 0
+    fi
+  fi
   # Without the module nothing below applies, whatever swap there is.
   if ! zram_module_available; then
     if restore_file_ours zram_file; then
-      warn '本工具的 ZRAM 配置还在，但这个内核没有 zram 模块，ZRAM 无法启动；可以在撤销里撤销 ZRAM。'
+      warn '本工具的 ZRAM 配置还在，但这个内核没有 zram 模块（升级内核后要重新安装）：到单项设置 → ZRAM 内存缓冲 → 重新应用，或者在撤销里撤销 ZRAM。'
     else
-      warn '这个内核没有 zram 模块，跳过 ZRAM（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里，占几百 MB，且每次升级内核都要跟着装，本工具不自动安装）。'
+      warn '这个内核没有 zram 模块，跳过 ZRAM（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里，每个内核约 100 MB，升级内核要跟着装，本工具不自动安装；想用的话，单项设置里开启 ZRAM 时可以选择安装）。'
     fi
     module_result zram unsupported 'kernel has no zram module'; return 0
   fi
@@ -1776,7 +1809,7 @@ zram_stage() {
       ok "已写入本工具的 ZRAM 配置（$size），重启后按这个大小生效；现在先保留正在使用的 ZRAM。"
       zram_tune
       module_result zram applied "zram0 = $size (from next boot)"
-    elif zram_start; then zram_tune; module_result zram applied "zram0 = $size"
+    elif zram_start && { [[ "${ZRAM_MODULE_CHOICE:-0}" != 1 ]] || zram_swap_active; }; then zram_tune; module_result zram applied "zram0 = $size"
     else warn 'ZRAM 没有启动，请检查服务。'; module_result zram failed 'dev-zram0.swap did not start'; fi
   else
     module_result zram preserved 'zram config conflict'
@@ -8895,7 +8928,7 @@ decision_report() {
   elif ((MEM_MIB >= $(param_value auto_swap_below_mib))); then
     decision_line '保留现状' '内存缓冲（ZRAM）' "内存不少于 $(mib_text "$(param_value auto_swap_below_mib)")，默认不新增 ZRAM。"
   elif ! zram_module_available; then
-    decision_line '保留现状' '内存缓冲（ZRAM）' '这个内核没有 zram 模块（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里），不配置 ZRAM。'
+    decision_line '保留现状' '内存缓冲（ZRAM）' '这个内核没有 zram 模块（Ubuntu 云镜像的精简内核把它放在 linux-modules-extra 包里）：默认不配置 ZRAM，开荒时可以选择安装这个包。'
   elif available systemd-zram-generator; then
     decision_line '准备调整' '内存缓冲（ZRAM）' "内存低于 $(mib_text "$(param_value auto_swap_below_mib)")，未发现 Swap/ZRAM；计划配置约内存$(if (($(param_value zram_percent) == 50)); then echo 一半; else echo " $(param_value zram_percent)% "; fi)大小的 ZRAM（$(param_value zram_algorithm) 压缩，并配好适合 ZRAM 的 swappiness 和 page-cluster），不创建硬盘 Swap。"
   else
@@ -10934,7 +10967,11 @@ check_bbr() {
 check_zram() {
   local size line bad='' algorithm want
   size="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
-  [[ -n "$size" ]] || { verify_set fail '没有找到正在使用的 /dev/zram0'; return 0; }
+  if [[ -z "$size" ]]; then
+    if zram_module_available; then verify_set fail '没有找到正在使用的 /dev/zram0'
+    else verify_set fail '这个内核没有 zram 模块（升级内核后要重新安装）：到单项设置 → ZRAM 内存缓冲 → 重新应用'; fi
+    return 0
+  fi
   if [[ -f "$ZRAM_SYSCTL_FILE" ]]; then
     while IFS= read -r line; do
       case "$line" in 'bad '*) bad+=" ${line#bad }" ;; esac
@@ -11955,7 +11992,7 @@ item_status() {
       value="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
       if [[ -n "$value" ]]; then echo "已开启，约 ${value} MiB"
       elif swapon --noheadings 2>/dev/null | grep . > /dev/null; then echo '已有其他 Swap'
-      elif ! zram_module_available; then echo '内核不支持（没有 zram 模块）'
+      elif ! zram_module_available; then echo '没有 zram 模块'
       else echo '未开启'; fi ;;
     journal)
       if [[ -f "$JOURNAL_FILE" ]]; then
@@ -12080,15 +12117,17 @@ item_turn_on() {
       stage_run sysctl sysctl_hardening_stage ;;
     tcp) TCP_BUFFER_CHOICE=1
       stage_run tcp tcp_buffer_stage ;;
-    zram) ZRAM_CHOICE=1 ZRAM_OVER_SWAP=0
+    zram) ZRAM_CHOICE=1 ZRAM_OVER_SWAP=0 ZRAM_MODULE_CHOICE=0
+      # No module in this kernel: its package is offered (that needs the index).
+      if ! zram_module_available && apt_index_ready && zram_module_offerable; then zram_module_offer || true; fi
       # A disk swap is no reason to refuse it when asked for by name (the other
       # way round has always worked): ZRAM is used first, the disk when it is full.
-      if ! zram_swap_active && swapon --noheadings --show=NAME 2>/dev/null | grep -v '^/dev/zram' > /dev/null; then
+      if { zram_module_available || ((ZRAM_MODULE_CHOICE)); } && ! zram_swap_active && swapon --noheadings --show=NAME 2>/dev/null | grep -v '^/dev/zram' > /dev/null; then
         confirm_yes '已经有硬盘 Swap：ZRAM 会排在前面先用，满了才用硬盘。仍然开启 ZRAM 吗？' || return 0
         ZRAM_OVER_SWAP=1
       fi
       # Without the kernel module the stage only explains why: no index update.
-      if zram_module_available; then apt_index_ready || return 0; fi
+      if zram_module_available || ((ZRAM_MODULE_CHOICE)); then apt_index_ready || return 0; fi
       stage_run zram zram_stage ;;
     journal) JOURNAL_FORCE=1
       stage_run journal journal_stage ;;

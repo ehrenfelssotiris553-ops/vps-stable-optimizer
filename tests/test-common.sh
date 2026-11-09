@@ -50,6 +50,8 @@ journal_settle() { "$@"; }
 # The switch for published Docker ports is off, unless a test says otherwise;
 # dockerfw-tests loads the real one.
 dockerfw_on() { return 1; }
+# A zram module to offer only where a test says so; extras-tests loads the real one.
+zram_module_offerable() { return 1; }
 # The rollback tables, which every restore_* lookup reads.
 load_optimizer_functions restore_table restore_group_table 2>/dev/null || true
 F2B_ACTION_FILE="${F2B_ACTION_FILE:-/nonexistent/vps-test-f2b-action}"

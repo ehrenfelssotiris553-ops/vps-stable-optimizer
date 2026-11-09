@@ -622,7 +622,7 @@ vps port list
 
 - **`/var/log` 归 `root:syslog`、组可写**：本工具的运行日志放在只有 root 能写的 `/var/lib/vps-stable-opt/logs/`，不放在 `/var/log` 下。
 - **系统自带 `/etc/sysctl.d/10-bufferbloat.conf`（fq_codel）**：没被改过时算系统默认值，不会因此跳过 BBR；改过的照旧当作你自己的设置保留。
-- **云镜像的精简内核没有 zram 模块**：ZRAM 自动跳过并说明原因；本工具不会为此额外安装几百 MB 的 `linux-modules-extra`。
+- **云镜像的精简内核没有 zram 模块**：默认跳过 ZRAM 并说明原因。这个模块在 `linux-modules-extra` 包里（每个内核约 100 MB），工具不会自动安装；开荒时或在单项设置里开启 ZRAM 时会问你要不要装，选装的话会确认模块能加载、ZRAM 真的跑起来。以后升级内核要再装一次（单项设置 → ZRAM 内存缓冲 → 重新应用，`vps check` 会提示），没装的话重启后只是没有 ZRAM，机器不受影响。
 - **SSH 按需启动（ssh.socket）**、**系统自带 UFW 和自动更新**：SSH 加固、防火墙、撤销都按原有设置正确处理，系统自带的软件包不会被卸载。
 
 ## Ubuntu 26.04 说明
