@@ -350,5 +350,5 @@ if apt_lock_listed <<< '/var/lib/dpkg/lock-frontend.bak'; then fail 'unrelated p
   [[ -z "$(record_exit 1)" ]] || fail 'the interruption message after another failure'
 )
 # All of it undone leaves no setup on record (restore_main needs a terminal).
-[[ "$(awk '/^restore_main\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" == *'then rm -f -- "$STATE_ROOT"/modules/*; fi'* ]] || fail 'setup records stay after a full rollback'
+[[ "$(awk '/^restore_main\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" == *'then rm -f -- "$STATE_ROOT"/modules/* "$LOG_DIR"/verify-*.txt; fi'* ]] || fail 'setup records stay after a full rollback'
 printf 'PASS: lock holder note cleanup, kernel listing and APT lock pattern.\n'
