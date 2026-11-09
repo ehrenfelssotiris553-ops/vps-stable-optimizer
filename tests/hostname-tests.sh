@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions hostname_valid hostname_ask hostname_resolves append_line_safely restore_record_hosts_line \
+load_optimizer_functions record_line_remove hostname_valid hostname_ask hostname_resolves append_line_safely restore_record_hosts_line \
   restore_hosts_lines_apply restore_data_safe state_path_safe display_name_get display_name_ask param_store ui_width verify_set
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT

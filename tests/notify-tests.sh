@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions check_after_rollback notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove restore_path tg_call notify_stage \
+load_optimizer_functions quota_gb_text check_after_rollback notify_check_text check_service_text check_timer_text check_file_write check_reconcile check_remove restore_path tg_call notify_stage \
   quota_status menu_quota_alert dockerlog_text dockerlog_merge check_dockerlog check_notify check_quota check_timer_ok verify_set audit_when audit_clean_text \
   param_list param_kind param_recommended param_check param_read param_value param_caution
 TEST_ROOT="$(mktemp -d)"
@@ -111,7 +111,7 @@ printf '%s.1 host useradd[1]: new user: name=backup, UID=0\n%s.2 host passwd[2]:
 printf '%s.3 host sudo[3]: ops : TTY=pts/0 ; PWD=/root ; USER=root ; COMMAND=/usr/bin/mysql -pHunter2\n' "$now" >> "$T/journal"
 printf '%s.4 host sshd[4]: Failed password for root from 192.0.2.9 port 1 ssh2\n%s.5 host sshd[5]: Invalid user x from 192.0.2.9 port 2\n' "$now" "$now" >> "$T/journal"
 printf '%s.6 host kernel: Out of memory: Killed process 777 (java) total-vm:1kB\n' "$now" >> "$T/journal"
-printf '2026-11-02 10:00:00 install nmap:amd64 <none> 7\n2026-11-02 10:00:01 upgrade bash:amd64 5.1 5.2\n2026-11-02 10:00:02 remove telnet:amd64 1 <none>\n' >> "$F/dpkg.log"
+printf '2026-11-02 09:59:58 install nmap:amd64 <none> 6\n2026-11-02 10:00:00 install nmap:amd64 <none> 7\n2026-11-02 10:00:01 upgrade bash:amd64 5.1 5.2\n2026-11-02 10:00:02 remove telnet:amd64 1 <none>\n' >> "$F/dpkg.log"
 printf '256 SHA256:newkey laptop (ED25519)\n' > "$T/keys"; : > "$T/home/root/.ssh/authorized_keys"
 printf 'tcp LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("nginx",pid=9,fd=3))\n' > "$T/ss"
 printf '[Service]\n' > "$F/systemd/miner.service"
@@ -121,6 +121,7 @@ for want in '新建了账户：backup' '改了密码：账户 root' 'sudo：ops 
   sent | grep -Fq "$want" || fail "missing: $want in $(sent)"
 done
 if sent | grep -Fq Hunter2; then fail 'a sudo argument (a password) was sent'; fi
+if sent | grep -Fq 'nmap nmap'; then fail "a package named twice: $(sent)"; fi
 if sent | grep -Fq 'Failed password'; then fail 'failed logins were sent one by one'; fi
 [[ "$(cat "$D/failed")" == 2 ]] || fail "failed logins not counted: $(cat "$D/failed")"
 if sent | grep -Fq bash; then fail 'an upgrade was sent as a new package'; fi
@@ -236,6 +237,10 @@ printf 'notify_summary_time=00:00\n' >> "$PARAMS_FILE"; printf '1999-01-01\n' > 
 sent | grep -Fq '每日汇总（过去 24 小时）' && sent | grep -Fq '失败的登录：5 次；Fail2ban 正在封禁 1 个 IP' || fail "summary: $(sent)"
 : > "$T/sent"; run
 if sent | grep -Fq 每日汇总; then fail 'a second summary the same day'; fi
+# No Fail2ban running: not "banned 0".
+stub fail2ban-client 'exit 255'; printf '1999-01-01\n' > "$D/summary-date"; printf '5\n' > "$D/failed"; : > "$T/sent"; run
+sent | grep -Fxq '失败的登录：5 次' || fail "summary without Fail2ban: $(sent)"
+stub fail2ban-client "echo '192.0.2.9'"
 printf 'PASS: the daily summary carries the failed logins, once a day.\n'
 
 # The summary with the acceptance check: by default only when an item failed
@@ -505,3 +510,12 @@ rm -f "$STATE_ROOT/notify.conf" "$STATE_ROOT/quota.conf"; param_timer check_minu
 reset; check_after_rollback
 [[ ! -e "$CHECK_TIMER_FILE" ]] || fail 'the timer stayed after the last one was undone'
 printf 'PASS: vps rollback handles TG and the traffic alert together: the timer follows the one still on and goes with the last.\n'
+
+# Everywhere the traffic is shown: below 10 GB with one decimal.
+check_timer_ok() { return 0; }
+[[ "$(quota_gb_text 830)" == 0.8 && "$(quota_gb_text 9999)" == 10.0 && "$(quota_gb_text 10000)" == 10 && "$(quota_gb_text 312000)" == 312 ]] ||
+  fail "traffic in GB: $(quota_gb_text 830) $(quota_gb_text 9999) $(quota_gb_text 10000) $(quota_gb_text 312000)"
+mkdir -p "$STATE_ROOT/notify"; printf 'quota_mb=1000\n' > "$STATE_ROOT/quota.conf"; printf '830\n' > "$STATE_ROOT/notify/traffic-used"
+check_quota
+[[ "$VERIFY_STATUS" == pass && "$VERIFY_TEXT" == *'已用 0.8 GB / 额度 1 GB'* ]] || fail "vps check, small numbers: $VERIFY_TEXT"
+printf 'PASS: the traffic is shown with a decimal below 10 GB, also in vps check.\n'

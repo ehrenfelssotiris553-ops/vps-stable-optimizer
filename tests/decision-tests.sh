@@ -29,6 +29,7 @@ WARNINGS=0
 warn() { WARNINGS=$((WARNINGS+1)); printf '%s\n' "$*"; }
 JOURNAL_FILE="$TEST_ROOT/managed-journal.conf"
 BBR_FILE="$TEST_ROOT/bbr.conf"
+STATE_ROOT="$TEST_ROOT/state"
 MODULE_FILE="$TEST_ROOT/module.conf"
 F2B_FILE="$TEST_ROOT/99-vps-stable-sshd.local"
 printf '%s\n' '[Journal]' 'SystemMaxUse=100M' 'RuntimeMaxUse=50M' 'MaxRetentionSec=90day' > "$TEST_ROOT/exact.conf"
@@ -103,6 +104,17 @@ assert_contains() { grep -Fq -- "$1" "$TEST_ROOT/report" || fail "missing report
 restore_file_ours() { [[ "$1" == bbr_file ]] && ((${BBR_OURS:-0})); }
 assert_absent() { if grep -Fq -- "$1" "$TEST_ROOT/report"; then fail "unexpected report text: $1"; fi; }
 
+# vps plan is no run (RESTORE_ROOT is empty there): the file this tool wrote
+# with another queue is still known as its own, and will be written again.
+(
+  STATE_ROOT="$TEST_ROOT/plan-state" RESTORE_READY=0 RESTORE_ROOT=''
+  restore_file_ours() { [[ "$1" == bbr_file && "$RESTORE_READY" == 1 && "$RESTORE_ROOT" == "$STATE_ROOT/restore-v2" ]]; }
+  printf 'net.core.default_qdisc = cake\nnet.ipv4.tcp_congestion_control = bbr\n' > "$BBR_FILE"
+  decision_report 0 0 > "$TEST_ROOT/report"
+  assert_absent '本工具使用的配置路径已有不同内容'
+  [[ "$RESTORE_READY" == 0 && -z "$RESTORE_ROOT" ]] || fail 'the plan changed the rollback state'
+  rm -f "$BBR_FILE"
+)
 BBR_ELSEWHERE=1 BBR_AVAILABLE='reno cubic bbr'
 decision_report 0 0 > "$TEST_ROOT/report"
 assert_contains '开机时也会由别的配置文件设置，不再重复写入'

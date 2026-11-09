@@ -661,6 +661,9 @@ has ssh-drop '已关闭 SSH 密码登录'
 has ssh-drop '00-aaa-provider.conf 第 2 行：PasswordAuthentication yes'
 # The guard timer (240 s) undoes it; ops logs in with the key all along.
 drop_at=$SECONDS undone=0
+# A daemon-reload meanwhile: systemd reads the transient unit again from its
+# file then, where 252 had turned a ";" of the command into "\\;".
+vm_ops_sudo 'systemctl daemon-reload' || fail 'daemon-reload during the guard'
 for ((i = 0; i < 120; i++)); do
   if vm_ops "[ ! -e $KEYONLY ]" 2>/dev/null; then undone=1; break; fi
   sleep 5

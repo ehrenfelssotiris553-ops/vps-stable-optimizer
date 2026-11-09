@@ -5,11 +5,12 @@
 set -Eeuo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
-load_optimizer_functions ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_since guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt ssh_limit_exempt_one f2b_allowlist firewall_stage fail2ban_stage ufw_forward_record ufw_forward_restore ufw_forward_restore_cmd ping_ufw_reapply
+load_optimizer_functions record_line_remove port_rule_parse port_item_covers firewall_blocked_listeners ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_since guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt ssh_limit_exempt_one f2b_allowlist firewall_stage fail2ban_stage ufw_forward_record ufw_forward_restore ufw_forward_restore_cmd ping_ufw_reapply
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 say() { :; }
+STATE_ROOT="$TEST_ROOT/state"; mkdir -p "$STATE_ROOT"
 ok() { printf 'OK %s\n' "$*" >> "$CASE_DIR/messages"; }
 warn() { printf 'WARN %s\n' "$*" >> "$CASE_DIR/messages"; }
 die() { fail "$*"; }
@@ -165,7 +166,7 @@ systemctl() {
 }
 systemd-run() {
   record "systemd-run $*"
-  [[ "$*" == *'/usr/sbin/ufw --force disable'* ]] || fail 'unexpected rollback command'
+  [[ "$(cat "${*: -1}")" == '/usr/sbin/ufw --force disable'* ]] || fail "unexpected rollback command: $*"
   [[ "$*" == *'--timer-property=RemainAfterElapse=no'* ]] || fail 'guard timer would stay loaded after firing'
   printf '1\n' > "$CASE_DIR/timer-active"
 }
@@ -561,3 +562,13 @@ printf 'PASS: the SSH rate limit follows its switch, for a new firewall and for 
   rm -rf -- "$CASE_DIR"
 )
 printf 'PASS: vps firewall installs UFW itself on a machine that never ran the setup.\n'
+
+# A listener inside a range that is let in already is not about to be blocked.
+(
+  SSH_PORTS=(22)
+  ss() { printf '%s\n' 'tcp LISTEN 0 128 0.0.0.0:8050 0.0.0.0:* users:(("app",pid=1,fd=3))' 'udp UNCONN 0 0 0.0.0.0:8050 0.0.0.0:* users:(("app",pid=1,fd=4))' 'tcp LISTEN 0 128 0.0.0.0:9000 0.0.0.0:* users:(("other",pid=2,fd=3))'; }
+  ufw() { [[ "$*" == 'show added' ]] && printf '%s\n' 'Added user rules' 'ufw allow 8000:8100/tcp'; }
+  out="$(firewall_blocked_listeners | sort -u)"
+  [[ "$out" == $'8050/udp\tapp\n9000/tcp\tother' ]] || fail "listeners and a range rule: $out"
+)
+printf 'PASS: a listener inside a range rule is not listed as about to be blocked.\n'

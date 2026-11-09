@@ -70,8 +70,6 @@ check_facts() {
   if on_target "getent hosts \"\$(hostname)\" >/dev/null"; then has "$1" "主机名 $host 可以正常解析"; fi
 }
 
-# The newest commit on origin/main whose tool has another version than
-# VERSION, printed as "COMMIT VERSION" (needs the git history).
 # VERSION: the release before it on origin/main, as "COMMIT VERSION": the commit
 # that set the version before VERSION. Work towards a release keeps the old
 # number until the release commit sets the new one, so the newest commit with

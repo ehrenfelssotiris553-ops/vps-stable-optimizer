@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions verify_line audit_known audit_flag audit_heading audit_owned_paths audit_unowned audit_when audit_clean_text \
+load_optimizer_functions audit_still_accounts verify_line audit_known audit_flag audit_heading audit_owned_paths audit_unowned audit_when audit_clean_text \
   audit_passwd_state audit_logins audit_integrity audit_mark_menu login_recent audit_cloud_init_file
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -41,6 +41,19 @@ grep -Fq '✔ 正常  登录：1 个 IP 以前就登录过或标记过正常' "$
 if grep -Fq 192.0.2.1 "$TEST_ROOT/out"; then fail 'a login older than 30 days was reported'; fi
 grep -Fq '过去 24 小时 2 次' "$TEST_ROOT/out" && grep -Fq '正在封禁 2 个 IP' "$TEST_ROOT/out" || fail 'failures and bans not counted'
 [[ "${#AUDIT_MARKS[@]}" == 1 && "${AUDIT_MARKS[0]%%$'\t'*}" == ip ]] || fail "marks: ${AUDIT_MARKS[*]}"
+# Fail2ban not running: no "banned 0".
+(
+  fail2ban-client() { return 255; }
+  reset_report; audit_logins > "$TEST_ROOT/out"
+  grep -Fq '过去 24 小时 2 次' "$TEST_ROOT/out" || fail "failures: $(cat "$TEST_ROOT/out")"
+  if grep -Fq '正在封禁' "$TEST_ROOT/out"; then fail "bans mentioned without Fail2ban: $(cat "$TEST_ROOT/out")"; fi
+)
+# In the order they happened, whatever order they were written in.
+(
+  printf '%s\ta\t1\tp\tssh\t0\n' 300 100 200 > "$TEST_ROOT/x"
+  STATE_ROOT="$TEST_ROOT/lr"; mkdir -p "$STATE_ROOT"; cp "$TEST_ROOT/x" "$STATE_ROOT/logins"
+  [[ "$(login_recent 3 | cut -f1 | tr '\n' ' ')" == '100 200 300 ' ]] || fail "login order: $(login_recent 3)"
+)
 printf 'ip 198.51.100.66\n' > "$STATE_ROOT/known"
 reset_report; audit_logins > "$TEST_ROOT/out"
 if grep -Fq '198.51.100.66' "$TEST_ROOT/out"; then fail 'an address marked as normal was reported'; fi
@@ -61,18 +74,18 @@ printf 'PASS: the audit covers the number of days the parameter asks for.\n'
 # 2. Accounts and keys: a second UID 0 and an empty password are suspect; a key
 # not marked as normal is listed, a marked one is not.
 mkdir -p "$F/home/ops/.ssh" "$F/root/.ssh" "$F/etc/sudoers.d"
-getent() { printf 'root:x:0:0::%s:/bin/bash\nops:x:1000:1000::%s:/bin/bash\nbackup:x:0:0::/nonexistent:/bin/sh\nwww:x:33:33::/var/www:/usr/sbin/nologin\n' "$F/root" "$F/home/ops"; }
+getent() { if (($# == 2)); then [[ "$2" != gone ]]; return; fi; printf 'root:x:0:0::%s:/bin/bash\nops:x:1000:1000::%s:/bin/bash\nbackup:x:0:0::/nonexistent:/bin/sh\nwww:x:33:33::/var/www:/usr/sbin/nologin\n' "$F/root" "$F/home/ops"; }
 passwd() { case "$2" in root) echo 'root P 2026-01-01 0 99999 7 -1' ;; ops) echo 'ops NP 2026-01-01 0 99999 7 -1' ;; *) echo "$2 L" ;; esac; }
 : > "$F/home/ops/.ssh/authorized_keys"
 ssh-keygen() { echo '256 SHA256:abcdef ops@laptop (ED25519)'; }
 printf 'ops ALL=(ALL) NOPASSWD:ALL\n' > "$F/etc/sudoers.d/90-cloud"
-journalctl() { echo 'new user: name=backup, UID=0, GID=0, home=/nonexistent, shell=/bin/sh'; }
+journalctl() { printf '%s\n' 'new user: name=backup, UID=0, GID=0, home=/nonexistent, shell=/bin/sh' 'new user: name=gone, UID=1005, GID=1005, home=/home/gone, shell=/bin/sh'; }
 reset_report
 audit_accounts_keys > "$TEST_ROOT/out"
 grep -Fq '✖ 可疑  UID 0 账户：除了 root 还有：backup' "$TEST_ROOT/out" || fail "a second UID 0: $(cat "$TEST_ROOT/out")"
 grep -Fq '✖ 可疑  账户 ops：没有密码' "$TEST_ROOT/out" || fail 'an empty password not suspect'
 grep -Fq '⚠ 注意  账户 ops 的公钥：SHA256:abcdef（ops@laptop (ED25519)）' "$TEST_ROOT/out" || fail "key not listed: $(cat "$TEST_ROOT/out")"
-grep -Fq '⚠ 注意  新建的账户：最近 30 天：backup' "$TEST_ROOT/out" || fail 'a new account not listed'
+grep -Fxq '⚠ 注意  新建的账户：最近 30 天：backup。不是你建的要查一下' "$TEST_ROOT/out" || fail "new accounts (one since removed): $(grep -F 新建 "$TEST_ROOT/out")"
 grep -Fq 'sudo 免密码' "$TEST_ROOT/out" || fail 'NOPASSWD not listed'
 grep -Fq '能登录的账户：root ops backup' "$TEST_ROOT/out" || fail "accounts: $(cat "$TEST_ROOT/out")"
 printf 'key SHA256:abcdef\nfile %s\n' "$F/etc/sudoers.d/90-cloud" > "$STATE_ROOT/known"
@@ -85,14 +98,15 @@ printf 'PASS: the audit flags a second UID 0 and empty passwords, and lists unma
 # no package in system directories, programs in temporary directories.
 mkdir -p "$F/var/log" "$F/usr/local/bin" "$F/opt/xray" "$F/usr/bin" "$F/usr/sbin" "$F/tmp" "$F/var/tmp" "$F/dev/shm" "$STATE_ROOT/restore-v2/packages"
 d="$(date +%F)"
-printf '%s 10:00:00 install fail2ban:all <none> 1.0\n%s 10:01:00 install nmap:amd64 <none> 7.9\n%s 10:02:00 upgrade bash:amd64 5.1 5.2\n' "$d" "$d" "$d" > "$F/var/log/dpkg.log"
+printf '%s 10:00:00 install fail2ban:all <none> 1.0\n%s 10:01:00 install nmap:amd64 <none> 7.9\n%s 10:01:30 install gonepkg:amd64 <none> 1\n%s 10:02:00 upgrade bash:amd64 5.1 5.2\n' "$d" "$d" "$d" "$d" > "$F/var/log/dpkg.log"
+dpkg-query() { printf 'installed %s\n' fail2ban nmap bash; printf 'config-files gonepkg\n'; }
 printf 'fail2ban\n' > "$STATE_ROOT/restore-v2/packages/installed"
 printf '#!/bin/sh\n' | tee "$F/opt/xray/xray" "$F/usr/local/bin/vps" "$F/usr/bin/ls" "$F/usr/bin/evil" "$F/tmp/.x" > /dev/null
 chmod +x "$F/opt/xray/xray" "$F/usr/local/bin/vps" "$F/usr/bin/ls" "$F/usr/bin/evil" "$F/tmp/.x"
 printf '%s\n' "$F/usr/bin/ls" | LC_ALL=C sort > "$AUDIT_OWNED"
 reset_report
 audit_software > "$TEST_ROOT/out"
-grep -Fq '⚠ 注意  新装的软件包：最近 30 天（不算本工具装的）：nmap' "$TEST_ROOT/out" || fail "new packages: $(cat "$TEST_ROOT/out")"
+grep -Fxq '⚠ 注意  新装的软件包：最近 30 天（不算本工具装的）：nmap' "$TEST_ROOT/out" || fail "new packages (one since removed): $(cat "$TEST_ROOT/out")"
 if grep -Fq 'bash' "$TEST_ROOT/out"; then fail 'an upgrade counted as a new package'; fi
 grep -Fq "自己装的程序：$F/opt/xray/xray" "$TEST_ROOT/out" || fail 'an own program not listed'
 if grep -Fq "$F/usr/local/bin/vps" "$TEST_ROOT/out"; then fail "this tool's own command listed"; fi
@@ -196,6 +210,10 @@ printf 'a\n' | audit_mark_menu > /dev/null
 [[ "$(wc -l < "$STATE_ROOT/known")" == 3 ]] || fail 'all not marked once each'
 printf 'u\n1\n' | audit_mark_menu > /dev/null
 [[ "$(cat "$STATE_ROOT/known")" == $'exe /opt/x\nkey SHA256:abc' ]] || fail "taken back: $(cat "$STATE_ROOT/known")"
-printf '\n' | audit_mark_menu > /dev/null
+out="$(ok() { echo "$*"; }; printf '\n' | audit_mark_menu)"
 [[ "$(wc -l < "$STATE_ROOT/known")" == 2 ]] || fail 'Enter changed the marks'
+if grep -q 已标记为正常 <<< "$out"; then fail "Enter said something was marked: $out"; fi
+out="$(ok() { echo "$*"; }; warn() { echo "$*"; }; printf '99\n' | audit_mark_menu)"
+grep -q '没有这个编号' <<< "$out" && ! grep -q 已标记为正常 <<< "$out" || fail "an unknown number: $out"
+grep -q 已标记为正常 <<< "$(ok() { echo "$*"; }; printf '1\n' | audit_mark_menu)" || fail 'a real mark not said'
 printf 'PASS: findings are marked as normal by number or all, and marks can be taken back.\n'

@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions dockerfw_ufw_state dockerfw_on dockerfw_unsupported dockerfw_published dockerfw_rules dockerfw_open dockerfw_text dockerfw_load dockerfw_sync dockerfw_off \
+load_optimizer_functions record_line_remove dockerfw_settle dockerfw_ufw_state dockerfw_on dockerfw_unsupported dockerfw_published dockerfw_rules dockerfw_open dockerfw_text dockerfw_load dockerfw_sync dockerfw_off \
   dockerfw_rules_undo dockerfw_show dockerfw_stage check_dockerfw docker_firewall_note dockerfw_service_text dockerfw_path_text port_rule_parse nft_ruleset_has_policy \
   ufw_active restore_ids restore_group_ids restore_groups restore_dockerfw_group item_keys item_label
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -350,7 +350,7 @@ printf 'PASS: the check tells working, not let through and broken apart.\n'
 # 8. The list of ports, and its way back in the rollback.
 out="$(dockerfw_show)"
 grep -Eq '^  6081/tcp +web（放行）$' <<< "$out" || fail "show: $out"
-(UFW_ADDED="Added user rules (see 'ufw status' for running firewall):"; out="$(dockerfw_show)"; grep -Fq 'vps port open 7000:7010 tcp' <<< "$out" || fail "show, range blocked: $out")
+(UFW_ADDED="Added user rules (see 'ufw status' for running firewall):"; out="$(dockerfw_show)"; grep -Fq 'vps port open 7000-7010 tcp' <<< "$out" || fail "show, range blocked: $out")
 (DOCKER_PS=''; [[ "$(dockerfw_show)" == *没有容器* ]] || fail 'show with nothing published')
 [[ "$(restore_ids dockerfw | tr '\n' ' ')" == 'dockerfw_units dockerfw_service dockerfw_path ' ]] || fail "tracked: $(restore_ids dockerfw | tr '\n' ' ')"
 grep -Fxq dockerfw <<< "$(restore_groups)" || fail 'no rollback group'
@@ -376,3 +376,23 @@ grep -Fxq 'Before=docker.service' <<< "$service" || fail 'must be in place befor
 grep -Fxq 'ExecStart=/bin/bash /usr/local/lib/vps-stable-opt/vps-stable-opt.sh docker-fw-sync' <<< "$service" || fail 'ExecStart'
 for file in user.rules user6.rules ufw.conf; do grep -Fxq "PathChanged=/etc/ufw/$file" <<< "$path" || fail "does not follow $file"; done
 printf 'PASS: the rules are there before Docker starts and follow every change of UFW.\n'
+
+# The session lost before the confirmation: the timer took the switch away, the
+# firewall rules added for it go with the next run; not while a timer counts.
+(
+  T2="$(mktemp -d)"; RESTORE_ROOT="$T2"; PENDING_TIMER=1
+  warned="$T2/warned" deleted="$T2/deleted"
+  warn() { printf '%s\n' "$*" >> "$warned"; }
+  ufw() { printf '%s\n' "$*" >> "$deleted"; }
+  tool_no_pending_firewall() { ((PENDING_TIMER == 0)); }
+  printf 'ufw allow 8081/tcp\n' > "$T2/dockerfw_rules"; printf 'ufw allow 8081/tcp\nufw allow 22/tcp\n' > "$T2/fw_rules"
+  dockerfw_settle
+  [[ -s "$T2/dockerfw_rules" && ! -e "$deleted" ]] || fail 'settled while a timer still counts'
+  PENDING_TIMER=0; dockerfw_settle
+  grep -Fxq -- '--force delete allow 8081/tcp' "$deleted" || fail "the rule stayed: $(cat "$deleted" 2>&1)"
+  [[ ! -e "$T2/dockerfw_rules" ]] || fail 'the record of the rules stayed'
+  [[ "$(cat "$T2/fw_rules")" == 'ufw allow 22/tcp' ]] || fail "the firewall record: $(cat "$T2/fw_rules")"
+  grep -q '没有等到确认' "$warned" || fail 'not said'
+  rm -rf -- "$T2"
+)
+printf 'PASS: a Docker switch lost before its confirmation leaves no firewall rules behind.\n'

@@ -7,7 +7,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions databackup_on databackup_conf databackup_conf_write databackup_restic databackup_notify databackup_finish databackup_drill databackup_run \
+load_optimizer_functions databackup_timer_off databackup_on databackup_conf databackup_conf_write databackup_restic databackup_notify databackup_finish databackup_drill databackup_run \
   databackup_service_text databackup_timer_text databackup_units_write databackup_ask_sftp databackup_ask_s3 databackup_ask_rclone databackup_ask_local databackup_ask_target \
   databackup_password databackup_stage databackup_restore databackup_now databackup_menu databackup_main menu_backup_alert check_databackup audit_clean_text audit_when \
   restore_ids restore_group_ids restore_databackup_group restore_groups item_keys item_label
@@ -540,3 +540,13 @@ grep -Fq 留在目标上 <<< "$out" || fail 'does not say the backups stay'
 [[ -s "$D/password" && -s "$D/conf" ]] || fail 'the settings and password went with the rollback: the backups could not be used again'
 [[ -z "$(calls_of forget)" ]] || fail 'the backups were touched by the rollback'
 printf 'PASS: the rollback stops the schedule and leaves the backups and what opens them.\n'
+
+# Stopped for good: no note of the last run, or a timer made later catches up at once.
+(
+  load_optimizer_functions databackup_timer_off
+  systemctl() { [[ "$*" == 'disable --now vps-stable-backup.timer' ]]; }
+  rm() { printf '%s\n' "$*" > "$TEST_ROOT/rm-args"; }
+  databackup_timer_off
+  [[ "$(cat "$TEST_ROOT/rm-args")" == '-f -- /var/lib/systemd/timers/stamp-vps-stable-backup.timer' ]] || fail "stamp: $(cat "$TEST_ROOT/rm-args")"
+)
+printf 'PASS: the backup timer leaves no note of its last run.\n'

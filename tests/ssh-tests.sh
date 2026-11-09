@@ -441,7 +441,7 @@ tag="$(sed -n 's/^#vps-stable-off(ssh,\([0-9-]*\)): PasswordAuthentication yes$/
 [[ "$(sed -n 2p "$CASE/sshd_config.d/00-ppflight-cloud.conf")" == "#vps-stable-off(ssh,$tag): PasswordAuthentication yes" ]] || fail 'provider drop-in not commented out'
 cmp -s "$CASE/sshd_config.d/50-cloud-init.conf" "$CASE/before/50-cloud-init.conf" || fail 'cloud-init'"'"'s file, read later, was changed'
 arm="$(grep '^arm ' "$CASE/trace")"
-[[ "$arm" == "arm vps-stable-ssh-revert-$tag /bin/sh -c rm -f -- '$SSH_DROPIN'; sed -i 's/^#vps-stable-off(ssh,$tag): //' "* ]] || fail "guard does not put the lines back: $arm"
+[[ "$arm" == "arm vps-stable-ssh-revert-$tag rm -f -- '$SSH_DROPIN'; sed -i 's/^#vps-stable-off(ssh,$tag): //' "* ]] || fail "guard does not put the lines back: $arm"
 [[ "$arm" == *"'$CASE/ppflight-login.conf'"* && "$arm" == *"'$CASE/sshd_config.d/00-ppflight-cloud.conf'"* ]] || fail "guard misses a file: $arm"
 grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail "hardening not applied: $(cat "$CASE/trace")"
 grep -q '注释掉的行保持注释' "$CASE/out" || fail 'what stays commented out was not said'
@@ -526,7 +526,7 @@ printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and
   OURS=1 GUARD_OK=1
   PARAMS_FILE="$P" ssh_dropin_refresh > "$CASE/out"
   [[ "$(cat "$SSH_DROPIN")" == "$text" ]] || fail "new limits not written: $(cat "$SSH_DROPIN")"
-  grep -q "^arm vps-stable-ssh-revert-[0-9-]* /bin/sh -c cp -pf '$STATE_ROOT/ssh-dropin-previous' '$SSH_DROPIN'" "$CASE/trace" || fail "no guard: $(cat "$CASE/trace")"
+  grep -q "^arm vps-stable-ssh-revert-[0-9-]* cp -pf '$STATE_ROOT/ssh-dropin-previous' '$SSH_DROPIN'" "$CASE/trace" || fail "no guard: $(cat "$CASE/trace")"
   grep -Fxq 'result ssh applied key-only user=alice root-ssh=off' "$CASE/trace" || fail "result after the refresh: $(cat "$CASE/trace")"
   # No key login: the previous drop-in back, reloaded.
   cp "$CASE/old" "$SSH_DROPIN"; : > "$CASE/trace"; GUARD_OK=0
@@ -542,10 +542,21 @@ printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and
   load_optimizer_functions guard_arm
   systemd-run() { printf '%s\n' "$*" > "$CASE/run"; }
   active() { return 0; }
+  STATE_ROOT="$CASE/state"; mkdir -p "$STATE_ROOT"
   printf 'guard_seconds=300\n' > "$P"
   PARAMS_FILE="$P" guard_arm unit-a /bin/true
   grep -Fq -- '--on-active=360s' "$CASE/run" || fail "guard timer with 300 s: $(cat "$CASE/run")"
   PARAMS_FILE=/nonexistent guard_arm unit-b /bin/true
   grep -Fq -- '--on-active=240s' "$CASE/run" || fail "guard timer by default: $(cat "$CASE/run")"
+  # What systemd is given is one plain path: a ";" on its command line came back
+  # as "\\;" after a daemon-reload on systemd 252, and nothing was put back.
+  PARAMS_FILE=/nonexistent guard_arm unit-c "rm -f -- 'a b'; systemctl try-reload-or-restart ssh.service"
+  if grep -Eq '[;]| -c ' "$CASE/run"; then fail "commands on systemd's command line: $(cat "$CASE/run")"; fi
+  [[ "$(cat "$CASE/state/guard/unit-c.sh")" == "rm -f -- 'a b'; systemctl try-reload-or-restart ssh.service" ]] || fail "guard file: $(cat "$CASE/state/guard/unit-c.sh")"
+  grep -Fq "/bin/sh $CASE/state/guard/unit-c.sh" "$CASE/run" || fail "guard file not run: $(cat "$CASE/run")"
+  # A file whose timer is gone goes at the next arming; one still counting stays.
+  active() { [[ "$1" != unit-a.timer ]]; }
+  PARAMS_FILE=/nonexistent guard_arm unit-d true
+  [[ ! -e "$CASE/state/guard/unit-a.sh" && -e "$CASE/state/guard/unit-b.sh" ]] || fail "guard files: $(ls "$CASE/state/guard" | tr '\n' ' ')"
 )
 printf 'PASS: the SSH session limits and the guard time are parameters; changed limits are applied under a guard.\n'

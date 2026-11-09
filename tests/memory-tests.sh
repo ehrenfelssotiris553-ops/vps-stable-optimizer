@@ -73,6 +73,18 @@ reset; MEM_MIB=8192; swap_stage
 grep -q '^result swap skipped RAM >= 8GiB' "$TEST_ROOT/trace" || fail "8 GiB not skipped: $(cat "$TEST_ROOT/trace")"
 : > "$PARAMS_FILE"; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"; MEM_MIB=1024
 OTHER_SWAP=0
+# It could not start: the file does not stay on the disk, and the next try
+# (the unit file is this tool's) makes it again.
+real_systemctl="$(declare -f systemctl)"
+systemctl() { record "systemctl $*"; [[ "$*" != 'enable --now swapfile.swap' ]]; }
+reset; swap_stage
+[[ ! -e "$SWAP_FILE" && -e "$SWAP_UNIT_FILE" ]] || fail 'a swap file that could not start stayed on the disk'
+grep -q '^result swap failed' "$TEST_ROOT/trace" || fail "not recorded as failed: $(cat "$TEST_ROOT/trace")"
+eval "$real_systemctl"
+OURS=1; reset; swap_stage
+[[ -f "$SWAP_FILE" ]] && grep -q '^result swap applied' "$TEST_ROOT/trace" || fail "no second try after a failed start: $(cat "$TEST_ROOT/trace")"
+: > "$PARAMS_FILE"; swaps_drop; rm -f "$SWAP_FILE" "$SWAP_UNIT_FILE"; OURS=0 ENABLED=0
+printf 'PASS: a disk swap that could not start leaves no file behind, and can be tried again.\n'
 reset; VIRT=openvz; swap_stage
 grep -q '^result swap unsupported openvz' "$TEST_ROOT/trace" || fail 'a container got a swap file'
 reset; VIRT=kvm ROOT_FS=btrfs; swap_stage

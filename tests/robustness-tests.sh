@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions restore_ids restore_before_stage preflight_block preflight_report audit_disk_risks coreutils_selfcheck admin_prepare item_main ssh_key_count apt_lock_listed apt_locks_held apt_wait_idle boot_kernels reboot_reason reboot_main \
+load_optimizer_functions unconfirmed_settle restore_ids restore_before_stage preflight_block preflight_report coreutils_selfcheck admin_prepare item_main ssh_key_count apt_lock_listed apt_locks_held apt_wait_idle boot_kernels reboot_reason reboot_main \
   run_records_prune on_exit
 T="$(mktemp -d)"
 trap 'rm -rf -- "$T"' EXIT
@@ -71,7 +71,6 @@ preflight_report > "$T/out"
 [[ "$PREFLIGHT_BLOCKERS" == 0 ]] || fail 'a busy package lock blocked setup instead of being waited for'
 grep -Fq '等它结束' "$T/log" || fail 'busy package lock not explained'
 LOCKS=''
-[[ -z "$(printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\n/dev/vda2 0 0 0 - /\n' | audit_disk_risks inode)" ]] || fail 'btrfs inode line reported as unknown or full'
 unset -f df
 if [[ "$(uname -o 2>/dev/null)" == Msys ]]; then
   printf 'SKIP: coreutils self-check on btrfs needs Linux permissions (Windows Git Bash cannot chmod).\n'
@@ -151,6 +150,16 @@ reset; U=0 K=0; item_main > /dev/null
 grep -Fxq 'stage sshport ssh_port_settle' "$T/trace" || fail "the unconfirmed port change not finished: $(tr '\n' ' ' < "$T/trace")"
 rm -f "$T/sshport-pending"; reset; item_main > /dev/null
 if grep -q ssh_port_settle "$T/trace"; then fail 'settled with nothing pending'; fi
+# The Docker switch lost the same way; not while it is on.
+RESTORE_ROOT="$T"; printf 'ufw allow 8081/tcp\n' > "$T/dockerfw_rules"
+dockerfw_on() { return 1; }
+reset; item_main > /dev/null
+grep -Fxq 'stage dockerfw dockerfw_settle' "$T/trace" || fail "the unconfirmed Docker switch not finished: $(tr '\n' ' ' < "$T/trace")"
+dockerfw_on() { return 0; }
+reset; item_main > /dev/null
+if grep -q dockerfw_settle "$T/trace"; then fail 'settled with the switch on'; fi
+dockerfw_on() { return 1; }
+rm -f "$T/dockerfw_rules"; unset RESTORE_ROOT
 stage_run() { :; }; unset STATE_ROOT
 printf 'PASS: single-item menu offers a reboot only after its own upgrade.\n'
 
@@ -222,6 +231,18 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
   [[ "$(find "$STATE_ROOT" -maxdepth 1 -name 'run-*' | grep -c .)" == 6 ]] || fail "not pruned to the first plus the newest 5: $(ls "$STATE_ROOT")"
   [[ -d "$STATE_ROOT/run-20261001T000000Z-1-abcdef" && -d "$STATE_ROOT/run-20261006T000000Z-1-abcdef" && ! -e "$STATE_ROOT/run-20261005T000000Z-1-abcdef" ]] ||
     fail "the wrong runs kept: $(ls "$STATE_ROOT")"
+)
+# The newest one-click setup stays, though older than the newest few: the menu
+# says from it whether this machine went through one.
+(
+  STATE_ROOT="$T/prune6/state" BACKUP_ROOT="$T/prune6/backups"
+  mkdir -p "$STATE_ROOT" "$BACKUP_ROOT"
+  for i in $(seq -w 1 10); do mkdir -p "$STATE_ROOT/run-202610${i}T000000Z-1-abcdef"; done
+  printf 'setup\n' | tee "$STATE_ROOT/run-20261002T000000Z-1-abcdef/mode" "$STATE_ROOT/run-20261003T000000Z-1-abcdef/mode" > /dev/null
+  printf 'run_keep=5\n' > "$T/params-keep"; PARAMS_FILE="$T/params-keep"
+  run_records_prune
+  [[ -d "$STATE_ROOT/run-20261003T000000Z-1-abcdef" && ! -e "$STATE_ROOT/run-20261002T000000Z-1-abcdef" && ! -e "$STATE_ROOT/run-20261004T000000Z-1-abcdef" ]] ||
+    fail "the newest setup among the runs kept: $(ls "$STATE_ROOT")"
 )
 # Wrong clocks can leave names that sort after the current run: it stays anyway.
 (
@@ -320,4 +341,14 @@ mkdir -p "$T/kernels"
 [[ -z "$(boot_kernels "$T/no-such-dir")" ]] || fail 'missing /boot listed kernels'
 apt_lock_listed <<< '/var/lib/dpkg/lock-frontend' || fail 'dpkg lock not recognised'
 if apt_lock_listed <<< '/var/lib/dpkg/lock-frontend.bak'; then fail 'unrelated path taken for a dpkg lock'; fi
+# Ctrl+C says where things stand; other ends do not.
+(
+  load_optimizer_functions record_exit
+  RUN_STATE_DIR="$T/ctrlc"; mkdir -p "$RUN_STATE_DIR"; printf 'running\n' > "$RUN_STATE_DIR/status"
+  record_failure() { :; }; state_write() { :; }
+  grep -q '已中断' <<< "$(record_exit 130)" || fail 'nothing said after Ctrl+C'
+  [[ -z "$(record_exit 1)" ]] || fail 'the interruption message after another failure'
+)
+# All of it undone leaves no setup on record (restore_main needs a terminal).
+[[ "$(awk '/^restore_main\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" == *'then rm -f -- "$STATE_ROOT"/modules/*; fi'* ]] || fail 'setup records stay after a full rollback'
 printf 'PASS: lock holder note cleanup, kernel listing and APT lock pattern.\n'

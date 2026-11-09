@@ -7,7 +7,7 @@ set -Eeuo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 HERE="$PWD"
 source ./test-common.sh
-load_optimizer_functions sysctl_vendor_default sysctl_config_files bbr_config_conflict bbr_stage bbr_report sysctl_boot_value bbr_set_elsewhere conffile_unchanged
+load_optimizer_functions bbr_qdisc_note bbr_file_is_ours sysctl_vendor_default sysctl_config_files bbr_config_conflict bbr_stage bbr_report sysctl_boot_value bbr_set_elsewhere conffile_unchanged
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 BBR_FILE="$TEST_ROOT/99-vps-stable-bbr.conf"
@@ -60,6 +60,18 @@ sysctl_vendor_default() { [[ "$1" == "$TEST_ROOT/vendor/"* ]]; }
 if bbr_config_conflict "$TEST_ROOT/vendor/50-default.conf"; then fail 'distribution fq_codel default still blocks BBR'; fi
 cp "$TEST_ROOT/vendor/50-default.conf" "$TEST_ROOT/admin.conf"
 bbr_config_conflict "$TEST_ROOT/admin.conf" || fail 'the same line from an administrator file no longer blocks BBR'
+# This tool's own file with another queue is no policy of someone else's: once
+# on cake the tool could neither apply it again nor go back to fq.
+for q in fq fq_codel cake; do
+  printf 'net.core.default_qdisc = %s\nnet.ipv4.tcp_congestion_control = bbr\n' "$q" > "$BBR_FILE"
+  if bbr_config_conflict "$BBR_FILE"; then fail "this tool's own file with $q counted as a conflict"; fi
+done
+# The same name with other content, and another file with cake, still count.
+printf 'net.core.default_qdisc = fq_codel\nnet.ipv4.tcp_congestion_control = cubic\n' > "$BBR_FILE"
+bbr_config_conflict "$BBR_FILE" || fail 'a changed file of that name no longer blocks BBR'
+printf 'net.core.default_qdisc = cake\nnet.ipv4.tcp_congestion_control = bbr\n' > "$TEST_ROOT/admin-cake.conf"
+bbr_config_conflict "$TEST_ROOT/admin-cake.conf" || fail 'another file with cake no longer blocks BBR'
+rm -f "$BBR_FILE" "$TEST_ROOT/admin-cake.conf"
 eval "$(declare -f real_vendor_default | sed '1s/real_vendor_default/sysctl_vendor_default/')"
 
 # Found on a real Ubuntu 24.04 VPS: procps ships the fq_codel line as
@@ -175,6 +187,8 @@ if command grep -q '^write ' "$CALLS"; then fail 'module persistence failure cha
 bbr_stage
 command grep -q '^write -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr$' "$CALLS" || fail 'confirmed persistence did not apply defaults'
 command grep -qx 'result bbr applied' "$CALLS" || fail 'applied BBR result not recorded'
+command grep -q '现在的队列是 fq_codel，下次重启才换成 fq' <<< "$(ip() { echo 'default dev eth0'; }; tc() { echo 'qdisc fq_codel 0: root'; }; : > "$CALLS"; rm -f "$BBR_FILE"; bbr_stage)" || fail 'a new queue without the note about the card'
+rm -f "$BBR_FILE"; : > "$CALLS"; bbr_stage
 command grep -qx 'net.core.default_qdisc = fq' "$BBR_FILE" || fail 'persistent fq line missing'
 command grep -qx 'net.ipv4.tcp_congestion_control = bbr' "$BBR_FILE" || fail 'persistent bbr line missing'
 # Another default queue (bbr_qdisc): this tool's own file is written again
@@ -204,3 +218,18 @@ bbr_report > "$TEST_ROOT/report"
 command grep -q 'fq_codel' "$TEST_ROOT/report" || fail 'actual tc queues missing'
 if command grep -q 'BBR + fq currently active' "$TEST_ROOT/report" "$LOG"; then fail 'false active claim'; fi
 printf 'PASS: BBR parser, persistence gating, all scan directories, and honest reporting.\n'
+
+# The card keeps its queue until it is next brought up: said when it differs.
+(
+  ip() { printf 'default via 192.0.2.1 dev ens3 proto dhcp\n'; }
+  tc() { [[ "$*" == 'qdisc show dev ens3' ]] && printf '%s\n' "$TC_OUT"; }
+  TC_OUT='qdisc fq_codel 0: root refcnt 2'
+  [[ "$(bbr_qdisc_note fq)" == *'网卡 ens3 现在的队列是 fq_codel，下次重启才换成 fq'* ]] || fail "queue note: $(bbr_qdisc_note fq)"
+  TC_OUT='qdisc fq 0: root refcnt 2'
+  [[ -z "$(bbr_qdisc_note fq)" ]] || fail 'queue note for the queue in use'
+  TC_OUT=$'qdisc mq 0: root\nqdisc fq_codel 0: parent :1'
+  [[ "$(bbr_qdisc_note fq)" == *'现在的队列是 fq_codel'* ]] || fail "queue note behind mq: $(bbr_qdisc_note fq)"
+  ip() { return 1; }
+  [[ -z "$(bbr_qdisc_note fq)" ]] || fail 'queue note without a route'
+)
+printf 'PASS: a card that keeps its old queue until the next boot is mentioned.\n'

@@ -78,6 +78,12 @@ state_report > "$TEST_ROOT/report"
 after_report="$(find "$STATE_ROOT" -type f -exec sha256sum {} + | sort)"
 [[ "$before_report" == "$after_report" ]]
 grep -q '还没有重启过' "$TEST_ROOT/report"
+# In words: no raw key=value, and a stage only when there was one.
+if grep -q 'active_stage\|当时正在做的步骤' "$TEST_ROOT/report"; then cat "$TEST_ROOT/report"; exit 1; fi
+state_write active_stage apt_upgrade
+state_report > "$TEST_ROOT/report2"
+grep -Fq '当时正在做的步骤：apt_upgrade' "$TEST_ROOT/report2" || { cat "$TEST_ROOT/report2"; exit 1; }
+state_write active_stage none
 printf '%s\n' 'PASS: direct successful stage recorded; state report is read only'
 
 # Each negative path runs in a fresh Bash process, preserving real errexit.

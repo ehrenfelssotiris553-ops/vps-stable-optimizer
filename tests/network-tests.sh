@@ -201,10 +201,15 @@ reset; keepalive_stage
 [[ ! -e "$KEEPALIVE_FILE" ]] && ! grep -q 'ssh reload' "$TEST_ROOT/trace" && grep -q '^result keepalive failed' "$TEST_ROOT/trace" ||
   fail 'a configuration sshd refused stayed or was reloaded'
 SSHD_OK=1
-# An interval set elsewhere stays.
+# An interval set elsewhere stays, unless a value was chosen here.
+param_store ssh_keepalive_seconds ''
 printf 'ClientAliveInterval 120\n' > "$S/sshd_config"
 reset; keepalive_stage
 [[ ! -e "$KEEPALIVE_FILE" ]] && grep -q '^result keepalive preserved ClientAliveInterval 120' "$TEST_ROOT/trace" || fail 'an interval set elsewhere was overridden'
+param_store ssh_keepalive_seconds 45
+reset; keepalive_stage
+[[ "$(sshd -T)" == 'clientaliveinterval 45' ]] && grep -q '^result keepalive applied 45 s' "$TEST_ROOT/trace" || fail "a value chosen here was ignored: $(sshd -T), $(cat "$TEST_ROOT/trace")"
+rm -f "$KEEPALIVE_FILE"
 : > "$S/sshd_config"; param_store ssh_keepalive_seconds ''
 # The SSH hardening of earlier versions set 300 seconds in its own drop-in
 # (01-): not "set elsewhere", and the keepalive file comes first for sshd.

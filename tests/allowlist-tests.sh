@@ -8,7 +8,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions f2b_jail_text f2b_jail_values_text param_value param_read param_recommended param_check f2b_jail_legacy_text f2b_jail_is_ours f2b_allowlist f2b_allow_valid f2b_allowlist_stage \
+load_optimizer_functions record_line_remove f2b_jail_text f2b_jail_values_text param_value param_read param_recommended param_check f2b_jail_legacy_text f2b_jail_is_ours f2b_allowlist f2b_allow_valid f2b_allowlist_stage \
   f2b_allowlist_menu ssh_limit_exempt ssh_limit_exempt_one ssh_limit_unexempt port_source_valid restore_record_fw_rule f2b_replace_owned_file
 TEST_ROOT="$(mktemp -d)"
 PARAMS_FILE="$TEST_ROOT/params"

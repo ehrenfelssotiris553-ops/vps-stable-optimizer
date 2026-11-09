@@ -164,6 +164,18 @@ reset; printf '9\n' > "$TEST_ROOT/pick"
 restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
 [[ ! -s "$TEST_ROOT/trace" ]] || fail 'invalid pick changed something'
 printf 'PASS: rollback groups keep the safe order and per-item rollback touches one group.\n'
+# vps rollback, the disk swap alone: no run there to write ZRAM's values in, so
+# it says how to get them back; nothing to say without a ZRAM.
+ZRAM_ON=1
+zram_swap_active() { ((ZRAM_ON)); }
+confirm_yes() { return 0; }
+reset; STATE=([swap_unit]=applied); printf '1\n' > "$TEST_ROOT/pick"
+restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
+grep -Fq 'ZRAM 还在用' "$TEST_ROOT/out" || fail "no word about ZRAM's values: $(cat "$TEST_ROOT/out")"
+ZRAM_ON=0; reset; STATE=([swap_unit]=applied)
+restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
+if grep -Fq 'ZRAM 还在用' "$TEST_ROOT/out"; then fail 'ZRAM mentioned without a ZRAM'; fi
+unset -f zram_swap_active
 
 # TG or the traffic alert undone: inside a run the timer is written the usual
 # way; `vps rollback` is no run and goes the direct way.
@@ -341,6 +353,9 @@ if [[ -n "$(for key in $(item_keys); do item_group "$key"; done | uniq | sort | 
   ufw_active() { fail 'the list ran ufw'; }
   command() { [[ "$2" != ufw ]] || return 0; builtin command "$@"; }
   [[ "$(item_status firewall)" == 已开启 ]] || fail "firewall in the list: $(item_status firewall)"
+  load_optimizer_functions quota_gb_text
+  quota_status() { printf '830 1000\n'; }
+  [[ "$(item_status quota)" == '本周期已用 0.8 GB / 1 GB' ]] || fail "traffic in the list: $(item_status quota)"
 )
 printf 'PASS: the list of single items is grouped, aligned and does not run the expensive checks for every item.\n'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'

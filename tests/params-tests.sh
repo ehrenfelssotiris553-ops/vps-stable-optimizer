@@ -123,12 +123,34 @@ printf 'tcp_buffer_mib=48\nzram_percent=auto\n\n' | params_import > /dev/null
 [[ ! -s "$TEST_ROOT/applied" ]] || fail "unchanged values applied again: $(cat "$TEST_ROOT/applied")"
 module_expect() { [[ "$1" == quota || "$1" == notify ]] && printf 'applied\tboot\tx\n'; }
 out="$(printf 'quota_alerts=50 100\nnotify_summary_time=21:00\n\n' | params_import)"
-[[ ! -s "$TEST_ROOT/applied" && "$out" == *'下次检查时就会用新的参数'* && "$(param_value quota_alerts)" == '50 100' ]] ||
+[[ ! -s "$TEST_ROOT/applied" && "$out" == *'下次检查时'* && "$(param_value quota_alerts)" == '50 100' ]] ||
   fail "TG or the traffic alert turned on again: $(cat "$TEST_ROOT/applied") $out"
 [[ "$(param_apply quota)" == *'下次检查时'* && ! -s "$TEST_ROOT/applied" ]] || fail 'adjusting the traffic alert turned it on again'
 param_store quota_alerts ''; param_store notify_summary_time ''; param_store tcp_buffer_mib ''
 module_expect() { [[ "$1" == tcp && -n "$MODULE" ]] && printf '%s\t%s\t%s\n' "$MODULE" boot '32 MiB'; }
 printf 'PASS: an import applies only what changed, and never turns TG or the traffic alert on again.\n'
+
+# Checked as typed: a * the shell would expand is no list of directories, and
+# noglob does not outlive the check.
+if param_check backup_paths '/*' > /dev/null; then fail 'backup_paths accepted /*'; fi
+[[ $- != *f* ]] || fail 'param_check left noglob on'
+param_check backup_exclude '*.tmp /root/.cache' > /dev/null || fail 'an exclude rule with * refused'
+[[ $- != *f* ]] || fail 'param_check left noglob on after a rule with *'
+printf 'PASS: parameter values are checked as typed.\n'
+
+# An import takes the way of a change in the menu: a timer's interval is
+# written again, and an item that is on goes through param_apply.
+CONFIRM=y; : > "$TEST_ROOT/applied"; : > "$TEST_ROOT/reconcile"
+check_reconcile() { printf 'reconcile\n' >> "$TEST_ROOT/reconcile"; }
+printf 'x\n' > "$STATE_ROOT/quota.conf"
+module_expect() { [[ "$1" == quota ]] && printf 'applied\tboot\tx\n'; }
+printf 'check_minutes_quota=7\n\n' | params_import > /dev/null
+[[ -s "$TEST_ROOT/reconcile" ]] || fail "an imported interval did not reach the timer"
+[[ ! -s "$TEST_ROOT/applied" ]] || fail 'an import turned the traffic alert on again'
+: > "$TEST_ROOT/reconcile"; rm -f "$STATE_ROOT/quota.conf"; param_store check_minutes_quota ''
+module_expect() { [[ "$1" == tcp && -n "$MODULE" ]] && printf '%s\t%s\t%s\n' "$MODULE" boot '32 MiB'; }
+unset -f check_reconcile
+printf 'PASS: an import changes what a change in the menu changes.\n'
 
 # vps check: an applied cap that is no longer the one wanted is "可更新".
 TCP_BUFFER_FILE="$TEST_ROOT/tcp.conf"; : > "$TCP_BUFFER_FILE"

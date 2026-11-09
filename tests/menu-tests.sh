@@ -6,7 +6,7 @@ export LC_ALL=C
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width ui_bar display_name_get menu_login_alert login_recent menu_quota_alert quota_status menu_backup_alert menu_stale_check_hint
+load_optimizer_functions menu_setup_state quota_gb_text menu_action records_report state_path_safe menu menu_entries menu_render menu_header menu_ip ui_width ui_bar display_name_get menu_login_alert login_recent menu_quota_alert quota_status menu_backup_alert menu_stale_check_hint
 TEST_ROOT="$(mktemp -d)"
 # No data backup set up, unless a test says so.
 BACKUP_SERVICE_FILE="$TEST_ROOT/backup.service"
@@ -109,8 +109,22 @@ printf '%s\n' 'PASS: menu numbers and letters reach what they say.'
   wide="$(menu_header 100)" narrow="$(menu_header 50)"
   grep -Fq '内存 ' <<< "$wide" && grep -Fq '负载 ' <<< "$wide" || fail "no load on the header: $wide"
   [[ "$(grep -c '内存 .*硬盘 ' <<< "$wide")" == 1 && "$(grep -c '内存 .*硬盘 ' <<< "$narrow" || true)" == 0 ]] || fail "not one line when wide, several when narrow: $narrow"
+  # 已开荒 is a one-click setup that finished, and only until all of it is undone.
+  setup_state() { grep -Fq "$1" <<< "$(menu_header 100)" || fail "header, $2: $(menu_header 100)"; }
+  mkdir -p "$STATE_ROOT/modules" "$STATE_ROOT/run-1" "$STATE_ROOT/run-2"
+  setup_state '还没开荒' 'nothing done'
+  : > "$STATE_ROOT/modules/bbr"; printf 'item\n' > "$STATE_ROOT/run-1/mode"; printf 'completed\n' > "$STATE_ROOT/run-1/status"
+  setup_state '还没开荒' 'a single item'
+  printf 'setup\n' > "$STATE_ROOT/run-2/mode"; printf 'running\n' > "$STATE_ROOT/run-2/status"
+  setup_state '开荒没做完' 'a setup still running'
+  printf 'completed\n' > "$STATE_ROOT/run-2/status"
+  setup_state '已开荒' 'a setup that finished'
+  rm -f "$STATE_ROOT/modules/bbr"
+  setup_state '还没开荒' 'all of it undone'
   mkdir -p "$STATE_ROOT/notify"; printf 'quota_mb=1000000\n' > "$STATE_ROOT/quota.conf"; printf '312000\n' > "$STATE_ROOT/notify/traffic-used"
   grep -Fq '流量 312/1000 GB' <<< "$(menu_header 100)" || fail "traffic not on the header: $(menu_header 100)"
+  printf '830\n' > "$STATE_ROOT/notify/traffic-used"
+  grep -Fq '流量 0.8/1000 GB' <<< "$(menu_header 100)" || fail "small traffic on the header: $(menu_header 100)"
   rm -rf "$STATE_ROOT"
 )
 printf '%s\n' 'PASS: the header shows memory, disk, load and traffic, on one line only when it fits.'

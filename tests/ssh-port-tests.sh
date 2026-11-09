@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions ssh_port_settle ssh_port_text ssh_port_reload ssh_port_login_seen ssh_port_restore_previous ssh_port_fw_close ssh_port_stage \
+load_optimizer_functions record_line_remove ssh_port_settle ssh_port_text ssh_port_reload ssh_port_login_seen ssh_port_restore_previous ssh_port_fw_close ssh_port_stage \
   restore_sshport_group check_sshport ufw_rule restore_record_fw_rule port_source_valid verify_set audit_clean_text \
   sshd_line_value sshd_config_walk sshd_include_args sshd_reads sshd_port_lines sshd_lines_show sshd_lines_off sshd_lines_on \
   sshd_lines_on_cmd sshd_off_files restore_record_sshd_file ipv4_private ipv4_behind_nat

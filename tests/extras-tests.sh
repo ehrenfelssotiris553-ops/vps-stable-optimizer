@@ -704,6 +704,7 @@ printf 'PASS: UFW is installed only when the setup will use it.\n'
     case "$1" in
       *常用工具*|*SSH\ 登录*|*管理员*|*内核网络安全*) return 0 ;;
       *TCP\ 缓冲区*) printf '%s\n' "$1" > "$TEST_ROOT/tcp-question"; return 1 ;;
+      *ZRAM*) printf '%s\n' "$1" > "$TEST_ROOT/zram-question"; return 1 ;;
       *) return 1 ;;
     esac
   }
@@ -732,6 +733,9 @@ printf 'PASS: UFW is installed only when the setup will use it.\n'
   [[ "$WEB_CHOICE" == 0 && "$F2B_IGNORE_CHOICE" == none && "$TZ_CHOICE" == Asia/Shanghai && "$TZ_ASKED" == 1 ]] || fail 'web/allowlist/timezone choices'
   [[ "$TCP_BUFFER_CHOICE" == 0 ]] || fail 'TCP buffers chosen without a yes'
   grep -Fq '64 MiB' "$TEST_ROOT/tcp-question" || fail 'TCP buffer question does not name the ceiling for this RAM'
+  grep -Fq '约占内存 25% 的' "$TEST_ROOT/zram-question" || fail "ZRAM question: $(cat "$TEST_ROOT/zram-question")"
+  ( printf 'zram_percent=60\n' > "$TEST_ROOT/params-z"; PARAMS_FILE="$TEST_ROOT/params-z"; setup_questions < "$TEST_ROOT/q-input" > /dev/null
+    grep -Fq '约占内存 60% 的' "$TEST_ROOT/zram-question" || fail "ZRAM question ignores the parameter: $(cat "$TEST_ROOT/zram-question")" )
   grep -Fq '空闲后不重新慢启动' "$TEST_ROOT/tcp-question" || fail 'TCP question does not name the two switches'
   grep -Fq '需要你在场' "$TEST_ROOT/q-out" || fail 'user not told the end needs them'
   # Steps left out of one-click setup (setup_skip) ask nothing.
