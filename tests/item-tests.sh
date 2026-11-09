@@ -177,6 +177,19 @@ restore_pick_group < "$TEST_ROOT/pick" > "$TEST_ROOT/out"
 if grep -Fq 'ZRAM 还在用' "$TEST_ROOT/out"; then fail 'ZRAM mentioned without a ZRAM'; fi
 unset -f zram_swap_active
 
+# Key login kept on when the SSH hardening was undone: still to do in the list,
+# but vps check calls the hardening undone, not broken.
+(
+  module_result() { record "result $1 $2"; }
+  restore_group_pending() { return 0; }
+  restore_ssh_group() { RESTORE_SSH_KEPT=1; }
+  reset; restore_group_apply ssh
+  grep -Fxq 'result ssh reverted' "$TEST_ROOT/trace" || fail "the hardening not recorded as undone: $(cat "$TEST_ROOT/trace")"
+  restore_ssh_group() { :; }
+  reset; restore_group_apply ssh
+  if grep -q '^result ssh' "$TEST_ROOT/trace"; then fail 'recorded as undone with something left'; fi
+)
+
 # TG or the traffic alert undone: inside a run the timer is written the usual
 # way; `vps rollback` is no run and goes the direct way.
 saved_ready="${RESTORE_READY:-0}"

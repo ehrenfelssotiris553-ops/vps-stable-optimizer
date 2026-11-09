@@ -1508,6 +1508,8 @@ zram_vendor_default_only() {
   done
   if systemctl is-enabled zramswap.service >/dev/null 2>&1; then return 1; fi
   if awk '$1 !~ /^#/ && $3=="swap" {found=1} END{exit !found}' /etc/fstab 2>/dev/null; then return 1; fi
+  # (--asked: a disk swap next to it does not make this ZRAM anybody else's.)
+  [[ "${1:-}" != --asked ]] || return 0
   ! swapon --noheadings --show=NAME 2>/dev/null | grep -v '^/dev/zram' > /dev/null
 }
 
@@ -1723,7 +1725,8 @@ zram_stage() {
   if [[ "${ZRAM_OVER_SWAP:-0}" != 1 ]] && swap_exists; then
     # The package default is replaced by this tool's own file when asked for
     # explicitly, or when it runs no swap at all (Ubuntu installs it unstarted).
-    if zram_vendor_default_only && { [[ "${ZRAM_CHOICE:-}" == 1 ]] || ! swapon --noheadings 2>/dev/null | grep . > /dev/null; }; then
+    if { [[ "${ZRAM_CHOICE:-}" == 1 ]] && zram_vendor_default_only --asked; } ||
+       { zram_vendor_default_only && ! swapon --noheadings 2>/dev/null | grep . > /dev/null; }; then
       vendor=1
       echo '现在只有 systemd-zram-generator 软件包自带的默认 ZRAM 配置（约内存一半），改用本工具的配置。'
     elif restore_file_ours zram_file && ! swapon --noheadings 2>/dev/null | grep . > /dev/null; then
@@ -10077,7 +10080,7 @@ restore_ssh_group() {
   fi
   for id in ssh_dropin ssh_pubkey_dropin; do
     [[ -d "$RESTORE_ROOT/$id" ]] || continue
-    if [[ "$id" == ssh_pubkey_dropin ]] && ((keep_pubkey)); then ok '公钥登录继续开着；以后要关，再撤销一次这一项。'; continue; fi
+    if [[ "$id" == ssh_pubkey_dropin ]] && ((keep_pubkey)); then RESTORE_SSH_KEPT=1; ok '公钥登录继续开着；以后要关，再撤销一次这一项。'; continue; fi
     restore_resource "$id"
     # Still "applied" means this restore failed; "clean" was never changed.
     if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then failed=1; fi
@@ -10453,7 +10456,7 @@ restore_group_pending() {
 
 restore_group_apply() {
   local group="$1" id pending was_pending=0 partial="${RESTORE_PARTIAL:-0}"
-  RESTORE_PARTIAL=0
+  RESTORE_PARTIAL=0 RESTORE_SSH_KEPT=0
   if restore_group_pending "$group"; then was_pending=1; fi
   case "$group" in
     firewall) restore_firewall_group ;;
@@ -10513,7 +10516,7 @@ restore_group_apply() {
   esac
   restore_created_dirs
   # Group names are module names: vps check then reports it as undone, not broken.
-  if ((was_pending && RESTORE_PARTIAL == 0)) && ! restore_group_pending "$group"; then
+  if ((was_pending && RESTORE_PARTIAL == 0)) && { ! restore_group_pending "$group" || ((RESTORE_SSH_KEPT)); }; then
     module_result "$group" reverted '由撤销功能恢复'
   fi
   if ((partial)); then RESTORE_PARTIAL=1; fi

@@ -826,6 +826,30 @@ printf 'PASS: setup questions are asked once and stored; steps left out ask noth
     reset; ACTIVE=0 SWAPS='/dev/zram0'; item_turn_on zram
     [[ "$(cat "$TEST_ROOT/trace")" == 'stage zram over=0' ]] || fail "only a ZRAM swap: $(cat "$TEST_ROOT/trace")"
   )
+  # Asked for by name, the package's default ZRAM is replaced with a disk swap
+  # running too; not asked for, it stays.
+  (
+    zram_vendor_default_only() { record "vendor ${1:-plain}"; ((VENDOR_ONLY)); }
+    reset; rm -f "$ZRAM_FILE"; printf '[zram0]\n' > "$ZRAM_FILE"; VENDOR_ONLY=1 SWAP_ON=1 ZRAM_CHOICE=1 ZRAM_OVER_SWAP=0
+    zram_file_packaged() { return 0; }
+    zram_stage > /dev/null
+    grep -Fxq 'vendor --asked' "$TEST_ROOT/trace" || fail "not asked: $(cat "$TEST_ROOT/trace")"
+    grep -Fxq 'compression-algorithm = zstd' "$ZRAM_FILE" || fail "the package's default not replaced: $(cat "$ZRAM_FILE")"
+    reset; printf '[zram0]\n' > "$ZRAM_FILE"; ZRAM_CHOICE=0
+    zram_stage > /dev/null
+    if grep -Fxq 'vendor --asked' "$TEST_ROOT/trace"; then fail 'taken as asked for'; fi
+    rm -f "$ZRAM_FILE"
+  )
+  (
+    load_optimizer_functions zram_vendor_default_only
+    ZRAM_VENDOR_FILE="$TEST_ROOT/zram/vendor"; printf '[zram0]\n' > "$ZRAM_VENDOR_FILE"; rm -f "$ZRAM_FILE"
+    systemctl() { return 1; }
+    swapon() { printf '%s\n' /dev/zram0 /swapfile; }
+    if zram_vendor_default_only; then fail 'a disk swap running, not asked for: taken for the package default alone'; fi
+    zram_vendor_default_only --asked || fail 'a disk swap running, asked for: not the package default'
+    swapon() { printf '%s\n' /dev/zram0; }
+    zram_vendor_default_only || fail 'only the package default running'
+  )
   # zram_file_packaged: only the unchanged packaged file counts.
   printf '[zram0]\n' > "$ZRAM_FILE"
   zram_file_packaged || fail 'unchanged packaged default not recognised'
