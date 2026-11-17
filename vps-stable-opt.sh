@@ -130,6 +130,9 @@ DOCKER_FW_PATH_FILE=/etc/systemd/system/vps-stable-docker-fw.path
 # Data backup: what runs it, and when.
 BACKUP_SERVICE_FILE=/etc/systemd/system/vps-stable-backup.service
 BACKUP_TIMER_FILE=/etc/systemd/system/vps-stable-backup.timer
+# There only while a change waits for its confirmation: undoes it at the next
+# boot (the timer that would have is gone with a reboot).
+GUARD_BOOT_SERVICE_FILE=/etc/systemd/system/vps-stable-guard-boot.service
 NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE='' SSHPORT_CHOICE=''
 
 # The command line of a direct run: an unknown mode, --version and help end here.
@@ -4359,16 +4362,103 @@ guard_since() {
 # `sh -c`, older systemd (252) keeps a ";" as "\;" in the transient unit's file,
 # and after any daemon-reload before the timer fires that file is what runs: the
 # shell took it for part of a word and nothing was put back (seen on Debian 12).
+# The file is also what a reboot runs: a transient timer does not survive one,
+# and up to 3.1.4 a change nobody had confirmed then stayed for good (someone
+# locked out reboots from the provider's panel first). While a file waits, a
+# unit of this tool runs it at the next boot (guard_boot_on). Each file ends by
+# removing itself and, as the last one, that unit: run once, by whoever comes
+# first. A run that settles the change itself takes the file away first
+# (guard_cancel), so nothing undoes a confirmed change later.
 guard_arm() {
   local unit="$1" dir="$STATE_ROOT/guard" old
   mkdir -p -- "$dir" || return 1
   for old in "$dir"/*.sh; do
     if [[ -f "$old" ]] && ! active "$(basename -- "$old" .sh).timer"; then rm -f -- "$old"; fi
   done
-  printf '%s\n' "$2" > "$dir/$unit.sh" || return 1
-  systemd-run --quiet --unit="$unit" --on-active="$(($(param_value guard_seconds) + 60))s" --timer-property=AccuracySec=1s \
-    --timer-property=RemainAfterElapse=no /bin/sh "$dir/$unit.sh" || return 1
+  printf '%s\n' "$2" "$(guard_script_end "$unit")" > "$dir/$unit.sh" || return 1
+  guard_boot_on || warn '没能准备好重启后的自动撤销：确认结束之前不要重启这台机器（计时器照常有效）。'
+  if ! systemd-run --quiet --unit="$unit" --on-active="$(($(param_value guard_seconds) + 60))s" --timer-property=AccuracySec=1s \
+       --timer-property=RemainAfterElapse=no /bin/sh "$dir/$unit.sh"; then
+    rm -f -- "$dir/$unit.sh"; guard_boot_off; return 1
+  fi
   active "$unit.timer"
+}
+
+# UNIT: the last lines of its file. The file goes once it has run, and with
+# the last file the boot unit and its script.
+guard_script_end() {
+  local dir="$STATE_ROOT/guard"
+  printf '%s\n' "rm -f -- '$dir/$1.sh'" \
+    "ls '$dir'/*.sh >/dev/null 2>&1 || { systemctl disable vps-stable-guard-boot.service >/dev/null 2>&1; rm -f -- '$GUARD_BOOT_SERVICE_FILE' '$dir/replay'; }"
+}
+
+# What the boot unit runs: every file still waiting (one whose timer is alive
+# is left to the timer), noted for the menu to tell the user.
+guard_boot_replay_text() {
+  local dir="$STATE_ROOT/guard"
+  printf '%s\n' '#!/bin/sh' '# VPS Stable Optimizer: after a reboot, undoes a change that was waiting for its confirmation.' \
+    "for f in '$dir'/*.sh; do" \
+    '  [ -f "$f" ] || continue' \
+    '  unit="$(basename "$f" .sh)"' \
+    '  if systemctl is-active -q "$unit.timer" 2>/dev/null; then continue; fi' \
+    "  printf '%s\\n' \"\$unit\" >> '$dir/replayed'" \
+    '  /bin/sh "$f"' \
+    'done' 'exit 0'
+}
+
+guard_boot_service_text() {
+  printf '%s\n' '# VPS Stable Optimizer: after a reboot, undoes a change that was waiting for its confirmation' '[Unit]' \
+    'Description=VPS Stable Optimizer: undo an unconfirmed change after a reboot' "ConditionPathExistsGlob=$STATE_ROOT/guard/*.sh" \
+    'After=network.target ufw.service ssh.service ssh.socket vps-stable-docker-fw.service' \
+    '[Service]' 'Type=oneshot' "ExecStart=/bin/sh $STATE_ROOT/guard/replay" '[Install]' 'WantedBy=multi-user.target'
+}
+
+# The boot unit in place and enabled (written again only when it differs).
+guard_boot_on() {
+  local dir="$STATE_ROOT/guard"
+  [[ ! -L "$GUARD_BOOT_SERVICE_FILE" && ! -L "$dir/replay" ]] || return 1
+  guard_boot_replay_text > "$dir/replay" || return 1
+  if [[ "$(cat -- "$GUARD_BOOT_SERVICE_FILE" 2>/dev/null || true)" != "$(guard_boot_service_text)" ]]; then
+    guard_boot_service_text > "$GUARD_BOOT_SERVICE_FILE" && chmod 644 -- "$GUARD_BOOT_SERVICE_FILE" || return 1
+  fi
+  systemctl enable vps-stable-guard-boot.service >/dev/null 2>&1
+}
+
+# Nothing waits any more: the boot unit and its script leave the system.
+guard_boot_off() {
+  local dir="${STATE_ROOT:-/nonexistent}/guard" file
+  for file in "$dir"/*.sh; do
+    if [[ -f "$file" ]]; then return 0; fi
+  done
+  [[ -e "$GUARD_BOOT_SERVICE_FILE" || -L "$GUARD_BOOT_SERVICE_FILE" || -e "$dir/replay" ]] || return 0
+  systemctl disable vps-stable-guard-boot.service >/dev/null 2>&1 || true
+  rm -f -- "$GUARD_BOOT_SERVICE_FILE" "$dir/replay"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# UNIT: this run has settled the change itself (confirmed, or put back here).
+# Its file goes first: after that neither the timer nor a reboot can run it.
+guard_cancel() {
+  rm -f -- "${STATE_ROOT:-/nonexistent}/guard/$1.sh"
+  systemctl stop "$1.timer" >/dev/null 2>&1 || true
+  guard_boot_off
+}
+
+# Changes that were undone at boot since the last look: told once.
+guard_replayed_hint() {
+  local file="${STATE_ROOT:-/nonexistent}/guard/replayed" unit names=''
+  [[ -s "$file" && ! -L "$file" ]] || return 0
+  while IFS= read -r unit; do
+    case "$unit" in
+      vps-stable-ufw-rollback-docker-*) names+='「Docker 端口受防火墙管」 ' ;;
+      vps-stable-ufw-rollback-*) names+='防火墙 ' ;;
+      vps-stable-ssh-revert-*) names+='SSH 设置 ' ;;
+    esac
+  done < "$file"
+  if [[ -n "$names" ]]; then
+    printf '%s%s 上次有修改没有等到确认机器就重启了，开机时已经自动撤销：%s。需要的话重新设置一次。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "${names% }" "${C_RESET-}"
+  fi
+  if ((EUID == 0)); then rm -f -- "$file"; fi
 }
 
 # An SSH login accepted since SINCE (epoch seconds), optionally only for USER
@@ -4430,9 +4520,12 @@ guard_confirm() {
   fi
   # A transient service that never ran may already be unloaded once its timer
   # stops; "not loaded" is not an error here.
+  # The way back goes first: from here on neither the timer nor a reboot runs it.
+  rm -f -- "${STATE_ROOT:-/nonexistent}/guard/$unit.sh"
   systemctl stop "$unit.timer" >/dev/null 2>&1 || true
   systemctl stop "$unit.service" >/dev/null 2>&1 || true
   if active "$unit.timer"; then warn "已收到确认，但无法停止自动撤销计时器（$unit.timer）。"; return 1; fi
+  guard_boot_off
   # An unloaded unit reports 0 or nothing; a start time means the undo ran.
   started="$(systemctl show "$unit.service" --property=ExecMainStartTimestampMonotonic --value 2>/dev/null || true)"
   if [[ -n "$started" && "$started" != 0 ]]; then warn '已收到确认，但自动撤销已经执行过。'; return 1; fi
@@ -4667,7 +4760,7 @@ dockerfw_stage() {
   fi
   deadline=$((SECONDS + $(param_value guard_seconds)))
   if ! systemctl enable vps-stable-docker-fw.service >/dev/null 2>&1 || ! systemctl enable --now vps-stable-docker-fw.path >/dev/null 2>&1 || ! dockerfw_sync; then
-    dockerfw_off; systemctl stop "$unit.timer" 2>/dev/null || true
+    dockerfw_off; guard_cancel "$unit"
     warn '规则没能加载，这一项没有开启。'; module_result dockerfw failed 'rules not loaded'; return 0
   fi
   echo "规则已生效。$(param_value guard_seconds) 秒内没有确认就自动恢复原样。"
@@ -4681,7 +4774,7 @@ dockerfw_stage() {
   GUARD_HINT=''
   warn '这次没有确认：已经恢复原样。'
   dockerfw_off
-  systemctl stop "$unit.timer" 2>/dev/null || true
+  guard_cancel "$unit"
   dockerfw_rules_undo
   module_result dockerfw failed 'not confirmed; reverted'
 }
@@ -5130,7 +5223,7 @@ firewall_stage() {
   module_result firewall failed 'second SSH login not confirmed; UFW disabled'
   if ufw --force disable; then
     ufw_forward_restore
-    systemctl stop "$unit.timer" || true
+    guard_cancel "$unit"
   else
     warn '立即关闭防火墙失败，保留或重新启用自动撤销计时器。'
     if ! active "$unit.timer"; then
@@ -5188,7 +5281,7 @@ ssh_dropin_refresh() {
   fi
   warn '这次没有确认：放回原来的 SSH 设置。'
   cp -pf -- "$previous" "$SSH_DROPIN"
-  if ssh_reload; then systemctl stop "$unit.timer" 2>/dev/null || true
+  if ssh_reload; then guard_cancel "$unit"
   else warn 'sshd 重新加载失败：自动撤销计时器保留，到期时会再试一次。'; fi
 }
 
@@ -5805,7 +5898,7 @@ ssh_harden_stage() {
   rm -f -- "$SSH_DROPIN"
   sshd_lines_on ssh "$tag" "${off_files[@]}" || true
   # The guard reloads sshd again when it fires: keep it unless this reload worked.
-  if ssh_reload; then systemctl stop "$unit.timer" 2>/dev/null || true
+  if ssh_reload; then guard_cancel "$unit"
   else warn 'sshd 重新加载失败：自动撤销计时器保留，到期时会再重新加载一次。'; fi
   module_result ssh failed 'second login not confirmed; reverted'
 }
@@ -6017,7 +6110,7 @@ ssh_port_stage() {
   if ! port_listening "$new" || ! port_listening "$old"; then
     ssh_port_restore_previous "$tag" "${off_files[@]}"; ssh_port_reload || true
     if ((fw)); then ssh_port_fw_close "$new" || true; fi
-    systemctl stop "$unit.timer" 2>/dev/null || true
+    guard_cancel "$unit"
     rm -f -- "$STATE_ROOT/sshport-pending"
     warn "SSH 没能同时在 $old 和 $new 上监听，已恢复原样。"; module_result sshport failed 'not listening'; return 0
   fi
@@ -6047,7 +6140,7 @@ ssh_port_stage() {
   fi
   warn '这次没有确认：正在恢复原来的 SSH 端口。'
   ssh_port_restore_previous "$tag" "${off_files[@]}"
-  if ssh_port_reload; then systemctl stop "$unit.timer" 2>/dev/null || true
+  if ssh_port_reload; then guard_cancel "$unit"
   else warn 'SSH 重新加载失败：自动撤销计时器保留，到期时会再试一次。'; fi
   if ((fw)); then ssh_port_fw_close "$new" || true; fi
   ssh_port_follow
@@ -6119,6 +6212,7 @@ restore_sshport_group() {
 # Called at the start of a run: changes whose session ended before they were
 # confirmed (the timers only put back what keeps the machine reachable).
 unconfirmed_settle() {
+  guard_boot_off
   if [[ -s "${STATE_ROOT:-}/sshport-pending" ]]; then stage_run sshport ssh_port_settle; fi
   if [[ -s "${RESTORE_ROOT:-}/dockerfw_rules" ]] && ! dockerfw_on; then stage_run dockerfw dockerfw_settle; fi
 }
@@ -8756,6 +8850,7 @@ menu() {
     menu_header "$width"
     # The alerts: what is waiting for the user.
     # (Each can be switched off in the general settings, menu_alerts.)
+    guard_replayed_hint
     if menu_alert_on verify; then menu_reboot_hint; menu_stale_check_hint; fi
     if menu_alert_on reboot; then menu_pending_reboot_hint; fi
     if menu_alert_on login; then menu_login_alert; fi
@@ -9299,6 +9394,9 @@ tool_uninstall() {
     rm -f -- "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"
     ok '定时备份已停止，已经备份的数据还在目标上。'
   fi
+  # The unit that would undo an unconfirmed change at boot runs a file of this tool's data.
+  systemctl disable vps-stable-guard-boot.service >/dev/null 2>&1 || true
+  rm -f -- "$GUARD_BOOT_SERVICE_FILE"
   systemctl daemon-reload >/dev/null 2>&1 || true
   # Each recursive target is a literal member of the fixed allowlist and was
   # validated twice. --one-file-system adds protection if a mount races us.
@@ -10773,6 +10871,8 @@ restore_main() {
   state_path_safe "$RESTORE_ROOT" || die '回退记录目录不安全。'
   [[ -d "$RESTORE_ROOT" && -O "$RESTORE_ROOT" ]] || { warn '没有本工具记录的恢复基线；无法推断运行前设置。'; return 0; }
   start_logging
+  # Left idle by a timer that ran with nobody there.
+  guard_boot_off
   say '撤销本工具的设置'
   while IFS= read -r id; do
     [[ -d "$RESTORE_ROOT/$id" ]] || continue
@@ -12557,7 +12657,7 @@ reboot_main() {
   say '重启服务器'
   reboot_reason
   if ! tool_no_pending_firewall; then
-    die '防火墙或 SSH 加固的防失联确认还没结束（或无法确认它的状态）。现在重启会让保护计时器失效，没确认的修改会被永久保留；请先回到那个窗口完成确认，或等计时结束后再重启。'
+    die '防火墙或 SSH 加固的防失联确认还没结束（或无法确认它的状态）。现在重启的话，没确认的修改会在开机时被自动撤销；请先回到那个窗口完成确认，或等计时结束后再重启。'
   fi
   apt_wait_idle
   if apt_locks_held; then die '仍有程序在安装或更新软件，现在重启可能损坏软件包；请等它结束后再重启。'; fi

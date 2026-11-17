@@ -53,6 +53,11 @@ load_optimizer_functions notify_event_names setup_skippable menu_alert_names men
 # Which Fail2ban ban action is in place (the check, the plan, the firewall
 # pause and the resources read it); none unless a test writes the file.
 load_optimizer_functions f2b_action_text f2b_action_legacy_text f2b_action_kind 2>/dev/null || true
+# What settles a change made under a guard, and the unit that undoes one after
+# a reboot: the real functions. The unit's file is nowhere unless a test names
+# a place of its own (firewall-tests and ssh-tests look at what is written).
+GUARD_BOOT_SERVICE_FILE="${GUARD_BOOT_SERVICE_FILE:-/nonexistent/vps-test-guard-boot.service}"
+load_optimizer_functions guard_script_end guard_boot_replay_text guard_boot_service_text guard_boot_on guard_boot_off guard_cancel guard_replayed_hint 2>/dev/null || true
 # One look in the (mocked) journal; ssh-tests loads the real one to test it.
 journal_settle() { "$@"; }
 # The switch for published Docker ports is off, unless a test says otherwise;

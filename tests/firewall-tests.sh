@@ -7,6 +7,7 @@ HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source "$HERE/test-common.sh"
 load_optimizer_functions record_line_remove port_rule_parse port_item_covers firewall_blocked_listeners ufw_active firewall_conflict nft_ruleset_has_policy iptables_save_has_policy ufw_boot_enable ufw_rule ufw_stored_rules_safe port_source_valid guard_leftovers guard_since guard_arm guard_confirm web_ports_wanted firewall_blocked_listeners f2b_ignore_address ssh_allowlist_decide ssh_limit_exempt ssh_limit_exempt_one f2b_allowlist firewall_stage fail2ban_stage ufw_forward_record ufw_forward_restore ufw_forward_restore_cmd ping_ufw_reapply
 TEST_ROOT="$(mktemp -d)"
+GUARD_BOOT_SERVICE_FILE="$TEST_ROOT/guard-boot.service"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 say() { :; }
@@ -153,6 +154,8 @@ systemctl() {
       cat "$CASE_DIR/ufw-boot"
       [[ "$(cat "$CASE_DIR/ufw-boot")" == enabled ]] ;;
     enable)
+      # The unit that undoes an unconfirmed change after a reboot (guard_boot_on).
+      if [[ "$*" == 'enable vps-stable-guard-boot.service' ]]; then return 0; fi
       [[ "$*" == 'enable ufw.service' ]] || fail "unmocked systemctl enable: $*"
       if ((BOOT_ENABLE_FAIL)); then return 1; fi
       printf 'enabled\n' > "$CASE_DIR/ufw-boot" ;;
@@ -161,6 +164,9 @@ systemctl() {
       [[ "$*" == 'start ufw.service' ]] || fail "unmocked systemctl start: $*"
       [[ "$(cat "$CASE_DIR/ufw-active")" == 1 ]] || fail 'ufw.service started while UFW was off'
       printf 'active\n' > "$CASE_DIR/ufw-service" ;;
+    # The boot unit leaves again with the last pending change (guard_boot_off).
+    disable) [[ "$*" == 'disable vps-stable-guard-boot.service' ]] || fail "unmocked systemctl disable: $*" ;;
+    daemon-reload) ;;
     *) fail "unmocked systemctl command: $*" ;;
   esac
 }
@@ -438,7 +444,7 @@ printf '1\n' > "$CASE_DIR/ufw-active"
 printf 'enabled\n' > "$CASE_DIR/ufw-boot"
 WEB_YES=0
 firewall_stage < "$CASE_DIR/input"
-if grep -q '^systemctl enable' "$CASE_DIR/calls"; then fail 'ufw.service enabled again although it already was'; fi
+if grep -q '^systemctl enable ufw' "$CASE_DIR/calls"; then fail 'ufw.service enabled again although it already was'; fi
 [[ "$(cat "$CASE_DIR/ufw-service")" == active ]] || fail 'running UFW with an inactive ufw.service was not started'
 
 reset_case boot_enable_failure
@@ -461,7 +467,7 @@ reset_case static_boot_state
 printf 'static\n' > "$CASE_DIR/ufw-boot"
 printf 'CONNECTED\n' > "$CASE_DIR/input"
 firewall_stage < "$CASE_DIR/input"
-if grep -q '^systemctl enable' "$CASE_DIR/calls"; then fail 'tried to enable a static ufw.service'; fi
+if grep -q '^systemctl enable ufw' "$CASE_DIR/calls"; then fail 'tried to enable a static ufw.service'; fi
 grep -Fq 'static' "$CASE_DIR/messages" || fail 'static ufw.service not explained'
 
 printf 'PASS: firewall confirmation, guard timers, SSH rule choice, optional web ports, services that would be blocked, boot loading and conservative takeover.\n'

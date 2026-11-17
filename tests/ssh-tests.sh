@@ -543,6 +543,7 @@ printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and
   systemd-run() { printf '%s\n' "$*" > "$CASE/run"; }
   active() { return 0; }
   STATE_ROOT="$CASE/state"; mkdir -p "$STATE_ROOT"
+  GUARD_BOOT_SERVICE_FILE="$CASE/guard-boot.service"
   printf 'guard_seconds=300\n' > "$P"
   PARAMS_FILE="$P" guard_arm unit-a /bin/true
   grep -Fq -- '--on-active=360s' "$CASE/run" || fail "guard timer with 300 s: $(cat "$CASE/run")"
@@ -552,7 +553,7 @@ printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and
   # as "\\;" after a daemon-reload on systemd 252, and nothing was put back.
   PARAMS_FILE=/nonexistent guard_arm unit-c "rm -f -- 'a b'; systemctl try-reload-or-restart ssh.service"
   if grep -Eq '[;]| -c ' "$CASE/run"; then fail "commands on systemd's command line: $(cat "$CASE/run")"; fi
-  [[ "$(cat "$CASE/state/guard/unit-c.sh")" == "rm -f -- 'a b'; systemctl try-reload-or-restart ssh.service" ]] || fail "guard file: $(cat "$CASE/state/guard/unit-c.sh")"
+  [[ "$(head -n 1 "$CASE/state/guard/unit-c.sh")" == "rm -f -- 'a b'; systemctl try-reload-or-restart ssh.service" ]] || fail "guard file: $(cat "$CASE/state/guard/unit-c.sh")"
   grep -Fq "/bin/sh $CASE/state/guard/unit-c.sh" "$CASE/run" || fail "guard file not run: $(cat "$CASE/run")"
   # A file whose timer is gone goes at the next arming; one still counting stays.
   active() { [[ "$1" != unit-a.timer ]]; }
