@@ -2294,7 +2294,17 @@ stage_run_isolated() {
   if [[ -n "$(trap -p ERR)" ]]; then trapped=1; trap - ERR; fi
   set +e
   (
-    if ((trapped)); then trap 'on_error "$?" "$LINENO"' ERR; fi
+    # A subshell starts without this shell's traps. Without one for Ctrl+C it
+    # would go on with the step whenever the command running at that moment
+    # took the signal itself and ended normally (Bash only stops by itself
+    # when that command died of the signal): the run ended only after the
+    # whole step, however long that took.
+    if ((trapped)); then
+      trap 'on_error "$?" "$LINENO"' ERR
+      trap 'exit 129' HUP
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+    fi
     set -e; STAGE_ISOLATED=1; stage_run "$@"; printf '%s\n' "$WARNINGS" > "$count"
   )
   rc=$?

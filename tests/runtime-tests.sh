@@ -60,6 +60,8 @@ run_setup() {
     boom() { record "$1 starts"; false; record "$1 went on after the error"; }
     fine() { record "$1 done"; }
     interrupted() { record "$1 starts"; exit 130; }
+    # Ctrl+C while a command runs that takes the signal itself and ends normally.
+    swallowing() { record "$1 starts"; bash -c 'trap "" INT; kill -INT "$PPID"; sleep 0.3'; record "$1 went on after Ctrl+C"; }
     WARNINGS=0 LOCK_OWNER_FILE="$TEST_ROOT/lock-owner"
     runtime_traps
     for step in "$@"; do setup_run "${step%%:*}" "${step#*:}" "${step%%:*}"; done
@@ -95,4 +97,9 @@ set +e; run_setup "$OUT" journal:interrupted bbr:fine; rc=$?; set -e
 [[ "$rc" == 130 ]] || fail "Ctrl+C inside a small step ended the run with $rc"
 [[ "$(tr '\n' '|' < "$OUT")" == 'journal starts|run exit 130|' ]] || fail "Ctrl+C inside a small step: $(tr '\n' '|' < "$OUT")"
 if grep -Fq '出错' "$OUT.screen"; then fail "Ctrl+C inside a small step is shown as an error: $(cat "$OUT.screen")"; fi
+# Also when the command running at that moment swallows the signal: the step
+# does not go on to its end first (it did, without a trap of the subshell's own).
+OUT="$TEST_ROOT/swallowed"; : > "$OUT"
+set +e; run_setup "$OUT" journal:swallowing bbr:fine; rc=$?; set -e
+[[ "$rc" == 130 && "$(tr '\n' '|' < "$OUT")" == 'journal starts|run exit 130|' ]] || fail "Ctrl+C taken by the running command: exit $rc, $(tr '\n' '|' < "$OUT")"
 printf 'PASS: Ctrl+C inside a small step ends the run and is no error of the step.\n'
