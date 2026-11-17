@@ -131,10 +131,12 @@ printf 'PASS: an empty package index is refreshed once before sudo is reported m
 
 # Single-item menu: a reboot is offered only for an upgrade made in this session.
 eval "$(declare -f item_main | sed '/EUID/d')"
-validate_vm() { :; }; start_logging() { :; }; prepare_run_state() { :; }; stage_run() { :; }
-restore_prepare() { :; }; finish_run_state() { :; }
-run_latest_id() { :; }; run_state_mark_start() { :; }; run_state_changed() { return 0; }; run_state_discard() { :; }
+load_optimizer_functions item_session_begin item_session_end
+validate_vm() { :; }; start_logging() { record logging; }; prepare_run_state() { record 'run state'; }; stage_run() { :; }
+restore_prepare() { :; }; finish_run_state() { record finish; }
+run_latest_id() { :; }; run_state_mark_start() { :; }; run_state_changed() { return 0; }; run_state_discard() { record discard; }
 offer_reboot() { record offer; }
+STATE_ROOT="$T"
 item_menu() { record menu; UPGRADE_APPROVED="$U" KERNEL_UPDATE="$K"; }
 reset; UPGRADE_APPROVED=0 KERNEL_UPDATE=0 U=1 K=1
 item_main > /dev/null
@@ -142,16 +144,32 @@ item_main > /dev/null
 reset; U=0 K=0
 item_main > /dev/null
 if grep -Fxq offer "$T/trace"; then fail 'reboot offered although nothing was upgraded in this session'; fi
+# Only looking: no lock, no log, no run record and no backup of the
+# configuration (up to 3.1.4 opening the list did all of it, and another
+# window could not run vps port or vps update meanwhile).
+[[ "$(cat "$T/trace")" == menu ]] || fail "only looking at the single items began a run: $(tr '\n' ' ' < "$T/trace")"
+# The first thing that may change something begins the run, once; its record
+# stays when something changed and goes when nothing did.
+item_menu() { record menu; item_session_begin; item_session_begin; }
+reset; item_main > /dev/null
+[[ "$(tr '\n' ' ' < "$T/trace")" == 'menu logging run state finish ' ]] || fail "a run that changed something: $(tr '\n' ' ' < "$T/trace")"
+run_state_changed() { return 1; }
+reset; item_main > /dev/null
+[[ "$(tr '\n' ' ' < "$T/trace")" == 'menu logging run state discard ' ]] || fail "a run that changed nothing after all: $(tr '\n' ' ' < "$T/trace")"
+run_state_changed() { return 0; }
+item_menu() { record menu; }
 # A change of the SSH port whose session was lost is finished first (a real VPS
-# kept the firewall rule for the new port); nothing pending, nothing happens.
-STATE_ROOT="$T"; printf 'new=1\n' > "$T/sshport-pending"
+# kept the firewall rule for the new port), before the menu; nothing pending,
+# nothing happens.
+printf 'new=1\n' > "$T/sshport-pending"
 stage_run() { record "stage $*"; }
 reset; U=0 K=0; item_main > /dev/null
-grep -Fxq 'stage sshport ssh_port_settle' "$T/trace" || fail "the unconfirmed port change not finished: $(tr '\n' ' ' < "$T/trace")"
+[[ "$(grep -n -x 'stage sshport ssh_port_settle' "$T/trace" | cut -d: -f1)" -lt "$(grep -n -x menu "$T/trace" | cut -d: -f1)" ]] ||
+  fail "the unconfirmed port change not finished before the menu: $(tr '\n' ' ' < "$T/trace")"
 rm -f "$T/sshport-pending"; reset; item_main > /dev/null
-if grep -q ssh_port_settle "$T/trace"; then fail 'settled with nothing pending'; fi
+if grep -q 'ssh_port_settle\|logging' "$T/trace"; then fail "settled, or a run begun, with nothing pending: $(tr '\n' ' ' < "$T/trace")"; fi
 # The Docker switch lost the same way; not while it is on.
-RESTORE_ROOT="$T"; printf 'ufw allow 8081/tcp\n' > "$T/dockerfw_rules"
+mkdir -p "$T/restore-v2"; RESTORE_ROOT="$T/restore-v2"; printf 'ufw allow 8081/tcp\n' > "$T/restore-v2/dockerfw_rules"
 dockerfw_on() { return 1; }
 reset; item_main > /dev/null
 grep -Fxq 'stage dockerfw dockerfw_settle' "$T/trace" || fail "the unconfirmed Docker switch not finished: $(tr '\n' ' ' < "$T/trace")"
@@ -159,9 +177,10 @@ dockerfw_on() { return 0; }
 reset; item_main > /dev/null
 if grep -q dockerfw_settle "$T/trace"; then fail 'settled with the switch on'; fi
 dockerfw_on() { return 1; }
-rm -f "$T/dockerfw_rules"; unset RESTORE_ROOT
+rm -rf "$T/restore-v2"; unset RESTORE_ROOT
 stage_run() { :; }; unset STATE_ROOT
-printf 'PASS: single-item menu offers a reboot only after its own upgrade.\n'
+item_session_begin() { :; }
+printf 'PASS: single-item menu offers a reboot only after its own upgrade, and begins a run only to change something.\n'
 
 # Menu 11 / vps reboot: says why a reboot is (not) needed, refuses while an SSH
 # protection timer or a package installation is still running, asks first.
@@ -317,8 +336,12 @@ printf 'PASS: reboot explains the need, waits for or refuses busy states, and as
 # Pruned when a run finishes: a session taken back must not have pushed one out.
 [[ "$(awk '/^prepare_run_state\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" != *run_records_prune* ]] || fail 'old records pruned when a run starts'
 [[ "$(awk '/^finish_run_state\(\) \{$/,/^\}$/' "$TEST_SCRIPT")" == *run_records_prune* ]] || fail 'old records not pruned when a run finishes'
-for fn in item_main params_main; do
-  [[ "$(awk -v n="$fn" '$0 == n "() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT")" == *run_state_mark_start*'run_state_changed'*'run_state_discard'* ]] ||
+# vps item begins its run only when something may change (item_session_begin)
+# and ends it in item_session_end; vps params import does both itself.
+fn_text() { awk -v n="$1" '$0 == n "() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT"; }
+for fn in 'item_session_begin item_session_end' params_main; do
+  # shellcheck disable=SC2086
+  [[ "$(for part in $fn; do fn_text "$part"; done)" == *run_state_mark_start*'run_state_changed'*'run_state_discard'* ]] ||
     fail "$fn does not take back the record of a session that changed nothing"
 done
 printf 'PASS: a menu session that only looked leaves no record, backup or log; a change of /etc, a package or the tool'"'"'s state keeps them.\n'

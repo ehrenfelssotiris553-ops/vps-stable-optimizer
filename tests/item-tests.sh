@@ -307,8 +307,16 @@ reset; item_firewall_pause
   out="$(item_firewall_pause)"
   [[ "$out" == *'Fail2ban 的封禁照常'* && "$out" != *不起作用* ]] || fail "pause with the nftables bans: $out"
 )
+# The pages and the menus of the single items (two levels since 3.2).
+load_optimizer_functions item_page item_group_menu item_overview item_status
+ui_columns() { printf '%s\n' "${COLUMNS:-80}"; }
+say() { printf '\n[%s]\n' "$*"; }
+SYM_OK='+' SYM_HAVE='=' SYM_SKIP='-' SYM_WARN='!' C_OK='' C_DIM='' C_WARN='' C_BOLD='' C_RESET=''
 item_turn_on() { record "on $1"; }
-item_status() { echo status; }
+# The state of an item is what the test says here; what it is read from is
+# tested further down, with the real item_probe.
+PROBE=$'on\t已开启'
+item_probe() { printf '%s\n' "$PROBE"; }
 port_menu() { record 'port menu'; }
 reset; printf '5\n' | item_action firewall > /dev/null; UFW_ON=1
 item_action firewall < <(printf '1\n') > /dev/null
@@ -335,52 +343,141 @@ item_action ports < /dev/null > /dev/null
   done
   [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'adjust general reset general adjust ssh reset ssh on ssh off firewall adjust firewall reset firewall pause adjust fail2ban reset fail2ban allowlist adjust login logins adjust tcp bdp on hostname off hostname display ' ]] ||
     fail "the numbers of a page: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+  # Only looking (the login record, the list of container ports, leaving the
+  # page) begins no run; anything that may change something does.
+  item_session_begin() { record begin; }
+  reset
+  dockerfw_show() { record shown; }
+  for pair in 'login 5' 'dockerfw 5' 'bbr 0' 'bbr ' 'bbr 9'; do item_action "${pair% *}" <<< "${pair#* }" > /dev/null; done
+  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'logins shown begin ' ]] || fail "what begins a run on the page of an item: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
 )
-printf 'PASS: a number on the page of a single item means the same on every page.\n'
-# What a page offers follows the state of the item.
-param_names() { [[ "$1" == bbr ]] && return 0; [[ "$1" == fail2ban ]] && echo f2b_maxretry; return 0; }
-page="$(item_actions bbr '未开启（当前 cubic）')"
-[[ "$page" == *'1. 开启'* && "$page" != *'2.'* && "$page" == *回车返回* ]] || fail "a page of an item that is off: $page"
-page="$(item_actions bbr '已开启')"
+printf 'PASS: a number on the page of a single item means the same on every page; only looking begins no run.\n'
+# What a page offers follows the state of the item and whose doing it is.
+param_names() { [[ "$1" == fail2ban ]] && echo f2b_maxretry; return 0; }
+page="$(item_actions bbr off system '未开启（当前 cubic）')"
+[[ "$page" == *'1. 开启'* && "$page" != *'2.'* && "$page" == *'0. 返回'* ]] || fail "a page of an item that is off: $page"
+page="$(item_actions bbr on tool '已开启')"
 [[ "$page" == *'1. 重新应用'* && "$page" == *'2. 关闭'* ]] || fail "a page of an item that is on: $page"
-page="$(item_actions fail2ban '已开启')"
-[[ "$page" == *'3. 调整参数'* && "$page" == *'4. 恢复推荐值'* && "$page" == *'5. 管理白名单'* ]] || fail "the page of Fail2ban: $page"
-for pair in 'updates:未开启:off' 'autoreboot:不自动重启:off' 'ping:回应 ping（默认）:off' 'ping:不回应 ping:on' 'sshport:22 （默认）:off' 'sshport:2244 （原来是 22）:on' 'conntrack:默认（上限 8192 条，用了 3 条）:off' 'upgrade:进入后检查:none' 'tools:已安装 3/8:none'; do
-  IFS=: read -r key status want <<< "$pair"
-  [[ "$(item_state "$key" "$status")" == "$want" ]] || fail "state of $key with <$status>: $(item_state "$key" "$status")"
-done
+# In force as the system came: nothing of this tool's to undo, and none is
+# offered (up to 3.1.4 "2. 关闭" was, and then said there was nothing).
+page="$(item_actions bbr on system '已开启')"
+[[ "$page" == *'1. 重新应用'* && "$page" != *'2.'* ]] || fail "a page of an item the system came with: $page"
+page="$(item_actions fail2ban on tool '已开启')"
+[[ "$page" == *'3. 调整参数'* && "$page" != *'4.'* && "$page" == *'5. 管理白名单'* ]] || fail "the page of Fail2ban with nothing adjusted: $page"
+PARAMS_FILE="$TEST_ROOT/page-params"; printf 'f2b_maxretry=3\n' > "$PARAMS_FILE"
+page="$(item_actions fail2ban on tool '已开启')"
+[[ "$page" == *'4. 恢复推荐值'* ]] || fail "the page of Fail2ban with a parameter adjusted: $page"
+PARAMS_FILE=/nonexistent/vps-test-params
+# Every choice on a line of its own (one line of some 100 columns up to 3.1.4).
+[[ "$(grep -c '^  [0-9]\. [^0-9]*$' <<< "$page")" == "$(grep -o '[0-9]\. ' <<< "$page" | wc -l | tr -d ' ')" ]] || fail "choices sharing a line: $page"
+# Key-only already (as many cloud images come) with root still allowed in:
+# going on to forbid root is offered, which the page did not show before.
+page="$(item_actions ssh on system '只允许密钥登录')"
+[[ "$page" == *'1. 再禁止 root 直接登录'* && "$page" != *'2.'* ]] || fail "the SSH page of a key-only image: $page"
+page="$(item_actions ssh on tool '只允许密钥登录，root 不能直接登录')"
+[[ "$page" != *'1.'* && "$page" == *'2. 撤销'* ]] || fail "the SSH page after the full hardening: $page"
+page="$(item_actions firewall off system '未开启')"
+[[ "$page" == *'1. 开启'* && "$page" != *'5.'* ]] || fail "the firewall page while it is off: $page"
+# The page itself: what the item is for, how it stands and whose doing that is.
+PROBE=$'on\t已开启'
+page="$(item_action fail2ban <<< 0)"
+[[ "$page" == *' 作用：同一个 IP 连续输错 SSH 密码'* && "$page" == *' 现在：'*'已开启（系统原来就是这样，不是本工具设的）'* && "$page" == *' 参数：1 个'* ]] || fail "the page of an item: $page"
+item_owner() { echo tool; }
+page="$(item_action fail2ban <<< 0)"
+[[ "$page" == *'已开启（本工具设的，可以撤销）'* ]] || fail "the page of an item this tool set up: $page"
+item_owner() { echo system; }
+# The state is the first field of what was read, whatever the text says.
+PROBE=$'off\t已开启（文字和状态无关）'
+[[ "$(item_state bbr)" == off && "$(item_status bbr)" == '已开启（文字和状态无关）' ]] || fail "state and text of an item: $(item_state bbr) / $(item_status bbr)"
+[[ "$(item_mark on tool)" == + && "$(item_mark on system)" == = && "$(item_mark off system)" == - && "$(item_mark warn tool)" == '!' && -z "$(item_mark none system)" ]] ||
+  fail "marks: $(item_mark on tool) $(item_mark on system) $(item_mark off system) $(item_mark warn tool) <$(item_mark none system)>"
 unset -f param_names; load_optimizer_functions param_names
-printf 'PASS: the page of a single item offers what fits its state.\n'
-reset; item_action() { record "action $1"; }
-printf '5\n0\n' | item_menu > "$TEST_ROOT/out"
-[[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail 'menu number did not map to the item'
-grep -q '^ 网络$' "$TEST_ROOT/out" && grep -q '^ 高级$' "$TEST_ROOT/out" || fail "no groups in the list: $(cat "$TEST_ROOT/out")"
-# Status column lined up by display width, whatever the labels are.
-starts="$(sed -n 's/^ *[0-9]*\. \(.*\)  status$/\1/p' "$TEST_ROOT/out" | while IFS= read -r line; do ui_width "$line"; done | sort -u)"
-[[ -n "$starts" && "$(wc -l <<< "$starts")" == 1 ]] || fail "status column not aligned: $(tr '\n' ' ' <<< "$starts")"
+printf 'PASS: the page of a single item says what it is for and offers what fits its state.\n'
+
+# The page comes again after each thing done there, until the user leaves.
+PROBE=$'off\t未开启'
+load_optimizer_functions item_page
+reset; item_page bbr < <(printf '1\n1\n0\n') > "$TEST_ROOT/out"
+[[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'on bbr on bbr ' && "$(grep -c '^ 作用：' "$TEST_ROOT/out")" == 3 ]] || fail "the page of an item after an action: $(tr '\n' ' ' < "$TEST_ROOT/trace") / $(grep -c '^ 作用：' "$TEST_ROOT/out")"
+
+# Two levels: the groups with all their items at a glance, then one group.
+PROBE=$'on\t已开启'
+reset; item_action() { record "action $1"; ITEM_LEAVE=1; }
+printf '2\n1\n0\n0\n' | COLUMNS=80 item_menu > "$TEST_ROOT/out"
+[[ "$(cat "$TEST_ROOT/trace")" == 'action bbr' ]] || fail "group 2, item 1 did not open BBR: $(cat "$TEST_ROOT/trace")"
+first="$(awk '/单项设置：/ {exit} {print}' "$TEST_ROOT/out")"
+grep -q '^  2\. 网络 ' <<< "$first" && grep -q '^  7\. 高级 ' <<< "$first" || fail "no groups in the overview: $first"
+for key in $(item_keys); do
+  grep -Fq -- "$(item_brief "$key" '')" <<< "$first" || fail "$key is missing in the overview: $first"
+done
+# It fits one screen of 24 lines and 80 columns (the flat list had 43 lines).
+(($(wc -l <<< "$first") <= 22)) || fail "the overview has $(wc -l <<< "$first") lines"
+while IFS= read -r line; do
+  ui_width w "$line"
+  ((w <= 80)) || fail "a line of the overview is $w columns wide: $line"
+done <<< "$first"
+# A narrow terminal: the items go under the name of their group.
+narrow="$(COLUMNS=44 item_menu <<< 0)"
+while IFS= read -r line; do
+  ui_width w "$line"
+  ((w <= 44)) || fail "a line of the overview on a narrow terminal is $w columns wide: $line"
+done <<< "$narrow"
+# The group: its items one on a line, the status column lined up by display width.
+second="$(awk '/单项设置：/ {on = 1} on' "$TEST_ROOT/out")"
+grep -q '单项设置：网络' <<< "$second" || fail "the group page has no title: $second"
+starts="$(sed -n 's/^ *[0-9]*\. \(.*\)  = 已开启$/\1/p' <<< "$second" | while IFS= read -r line; do ui_width "$line"; done | sort -u)"
+[[ -n "$starts" && "$(wc -l <<< "$starts")" == 1 ]] || fail "status column not aligned: $(tr '\n' ' ' <<< "$starts") in $second"
+# (The page comes again after the item was left: the first one is counted.)
+[[ "$(awk '/单项设置：网络/ {n++} n == 1' <<< "$second" | grep -c '^ *[0-9]*[.] .*已开启$')" == "$(item_group_keys 网络 | wc -l | tr -d ' ')" ]] || fail "the group page does not list its items: $second"
 [[ "$(item_keys | wc -l | tr -d ' ')" == 33 ]] || fail 'item count'
-# Each group is one run of items: no heading appears twice.
-if [[ -n "$(for key in $(item_keys); do item_group "$key"; done | uniq | sort | uniq -d)" ]]; then fail 'the items of a group are not next to each other'; fi
+# Every item is in exactly one group, and the groups are those listed.
+[[ "$(while IFS= read -r group; do item_group_keys "$group"; done < <(item_groups) | sort)" == "$(item_keys | sort)" ]] || fail 'the groups do not hold every item once'
 (
-  # Drawing the list does not simulate an upgrade or ask sshd for every item.
-  load_optimizer_functions item_status
+  # Drawing the lists does not simulate an upgrade or ask sshd for every item.
+  load_optimizer_functions item_status item_probe
   apt-get() { fail 'the list ran apt-get'; }
   ITEM_LIST_MODE=1
   [[ "$(item_status upgrade)" == 进入后检查 ]] || fail "upgrade in the list: $(item_status upgrade)"
   ITEM_SSHD_T=$'clientaliveinterval 60\npasswordauthentication no\nkbdinteractiveauthentication no\npermitrootlogin no'
   sshd() { fail 'the list asked sshd again'; }
   [[ "$(item_status keepalive)" == '每 60 秒' ]] || fail "keepalive in the list: $(item_status keepalive)"
-  [[ "$(item_status ssh)" == '只允许密钥登录，root 不能直接登录' ]] || fail "SSH in the list: $(item_status ssh)"
+  [[ "$(item_status ssh)" == '只允许密钥登录，root 不能直接登录' && "$(item_state ssh)" == on ]] || fail "SSH in the list: $(item_status ssh)"
   UFW_CONF="$TEST_ROOT/ufw.conf"; printf 'ENABLED=yes\n' > "$UFW_CONF"
   ufw() { fail 'the list ran ufw'; }
   ufw_active() { fail 'the list ran ufw'; }
   command() { [[ "$2" != ufw ]] || return 0; builtin command "$@"; }
-  [[ "$(item_status firewall)" == 已开启 ]] || fail "firewall in the list: $(item_status firewall)"
+  [[ "$(item_status firewall)" == 已开启 && "$(item_state firewall)" == on ]] || fail "firewall in the list: $(item_status firewall)"
+  printf 'ENABLED=no\n' > "$UFW_CONF"
+  [[ "$(item_state firewall)" == off ]] || fail "a firewall that is off: $(item_state firewall)"
   load_optimizer_functions quota_gb_text
   quota_status() { printf '830 1000\n'; }
   [[ "$(item_status quota)" == '本周期已用 0.8 GB / 1 GB' ]] || fail "traffic in the list: $(item_status quota)"
+  # The state comes from the system: a file of this tool, a running value.
+  SYSCTL_HARDENING_FILE="$TEST_ROOT/hardening.conf"
+  [[ "$(item_state sysctl)" == off ]] || fail 'kernel parameters without the file'
+  : > "$SYSCTL_HARDENING_FILE"
+  [[ "$(item_state sysctl)" == on ]] || fail 'kernel parameters with the file'
+  sysctl() { echo "${PING_VALUE:-0}"; }
+  [[ "$(item_state ping)" == off ]] || fail 'ping answered'
+  PING_VALUE=1
+  [[ "$(item_state ping)" == on && "$(item_state upgrade)" == none ]] || fail 'ping not answered, or the upgrade taken for a switch'
 )
-printf 'PASS: the list of single items is grouped, aligned and does not run the expensive checks for every item.\n'
+(
+  # Whose doing an item is: read from the rollback record alone.
+  unset -f item_owner; load_optimizer_functions item_owner
+  STATE_ROOT="$TEST_ROOT/owner-state"; mkdir -p "$STATE_ROOT/restore-v2/bbr_file" "$STATE_ROOT/restore-v2/cc" "$STATE_ROOT/restore-v2/packages"
+  [[ "$(item_owner bbr)" == system ]] || fail 'an item without a record of a change counted as the tool'"'"'s'
+  printf 'clean\n' > "$STATE_ROOT/restore-v2/cc/state"; printf 'restored\n' > "$STATE_ROOT/restore-v2/bbr_file/state"
+  [[ "$(item_owner bbr)" == system ]] || fail 'an item whose change was undone counted as the tool'"'"'s'
+  printf 'applied\n' > "$STATE_ROOT/restore-v2/bbr_file/state"
+  [[ "$(item_owner bbr)" == tool && "$(item_owner sysctl)" == system && "$(item_owner general)" == system ]] || fail "owner: $(item_owner bbr) $(item_owner sysctl) $(item_owner general)"
+  TOOLS_PACKAGES=(curl htop)
+  printf 'curl\nvnstat\n' > "$STATE_ROOT/restore-v2/packages/installed"; printf 'curl\n' > "$STATE_ROOT/restore-v2/packages/before"
+  [[ "$(item_owner tools)" == system && "$(item_owner vnstat)" == tool ]] || fail "owner of packages: $(item_owner tools) $(item_owner vnstat)"
+  printf 'htop\n' >> "$STATE_ROOT/restore-v2/packages/installed"
+  [[ "$(item_owner tools)" == tool ]] || fail 'a tool package this tool installed'
+)
+printf 'PASS: the single items are two levels deep, fit a screen, are aligned and do not run the expensive checks for every item.\n'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'
 # Found on a real VPS: 4:30 was refused although it is a plain time.
 item_ask_reboot_time <<< '4:30' > /dev/null 2>&1 || fail 'reboot time without a leading zero rejected'

@@ -175,7 +175,7 @@ VPS 机器管家 V3.1.4 — Debian 12/13、Ubuntu 22.04/24.04/26.04
   NOCONSOLE  没有控制台密码时仍要关闭 SSH 密码登录（不推荐）。
   UNINSTALL  卸载本工具（会删除全部备份）。
 一键开荒会先问要不要在 tmux 里运行（回车就是要）：SSH 断线也不中断，重新登录输入 vps 选 2 就能回去。
-符号：✔ 正常  ⚠ 注意  ✖ 失败  ○ 没做。显示成乱码时用 VPS_ASCII=1 vps 打开；不要颜色用 NO_COLOR=1 vps。
+符号：✔ 正常  ⚠ 注意  ✖ 失败  ○ 没做  ● 系统原来就有（单项设置里）。显示成乱码时用 VPS_ASCII=1 vps 打开；不要颜色用 NO_COLOR=1 vps。
 默认保留 SSH 端口、root 登录、DNS、IPv6、MTU；不自动重启整机。
 回退只会放宽访问（关防火墙、恢复密码登录），不会把你锁在外面。
 系统升级和新内核无法回退；需要整机还原请使用服务商快照。
@@ -186,7 +186,7 @@ fi
 }
 
 # Text interface. One symbol per state: ✔ done, ⚠ needs a look, ✖ failed,
-# ○ not done. Colour only on a terminal, never in logs or saved reports
+# ○ not done, ● in force as the system came (the single items). Colour only on a terminal, never in logs or saved reports
 # (NO_COLOR or TERM=dumb turn it off); plain ASCII with VPS_ASCII=1 where a
 # terminal draws these symbols badly. CJK terminals (Xshell and others) draw
 # ambiguous-width symbols two columns wide, so nothing is aligned after one.
@@ -194,9 +194,9 @@ UI_COLOR=0
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then UI_COLOR=1; fi
 # VPS_ASCII=0 or 1 wins over the setting saved from the single-item menu.
 if [[ "${VPS_ASCII:-}" == 1 ]] || { [[ -z "${VPS_ASCII:-}" ]] && grep -qsx 'ui_ascii=1' "$PARAMS_FILE" 2>/dev/null; }; then
-  SYM_OK='[OK]' SYM_WARN='[!]' SYM_FAIL='[X]' SYM_SKIP='[-]' SYM_NEXT='>' UI_OPEN='== ' UI_CLOSE=' =='
+  SYM_OK='[OK]' SYM_WARN='[!]' SYM_FAIL='[X]' SYM_SKIP='[-]' SYM_HAVE='[=]' SYM_NEXT='>' UI_OPEN='== ' UI_CLOSE=' =='
 else
-  SYM_OK='✔' SYM_WARN='⚠' SYM_FAIL='✖' SYM_SKIP='○' SYM_NEXT='›' UI_OPEN='【' UI_CLOSE='】'
+  SYM_OK='✔' SYM_WARN='⚠' SYM_FAIL='✖' SYM_SKIP='○' SYM_HAVE='●' SYM_NEXT='›' UI_OPEN='【' UI_CLOSE='】'
 fi
 C_OK='' C_WARN='' C_FAIL='' C_TITLE='' C_DIM='' C_BOLD='' C_RESET=''
 if ((UI_COLOR)); then
@@ -2938,41 +2938,80 @@ param_info() {
   return 1
 }
 
-# KEY: true when the single item is on (its last result was applied).
+# KEY: true when the single item is in force now, read from the system
+# (item_state): changed parameters are then applied at once. An item this tool
+# had set up and the user has since switched off by hand is left off; up to
+# 3.1.4 the record of the setup decided, and a new parameter switched it on
+# again. An item that is not switched on or off goes by its last result.
 param_item_on() {
   local info
+  case "$(item_state "$1")" in on|warn) return 0 ;; off) return 1 ;; esac
   info="$(module_expect "$1" 2>/dev/null)" || return 1
   [[ "${info%%$'\t'*}" == applied || "${info%%$'\t'*}" == present ]]
 }
 
-# KEY: asks for each parameter of a single item. When the item is on it is
-# applied again; otherwise the next "开启" uses the new values.
-param_adjust() {
-  local key="$1" name label unit value answer note changed=0
-  local -a names=()
-  # Read first: inside the loop, read must get the user's answers.
-  mapfile -t names < <(param_names "$key")
-  for name in "${names[@]}"; do
-    IFS=$'\t' read -r label unit <<< "$(param_info "$name")"
-    value="$(param_value "$name")"
-    printf '%s：现在 %s%s（%s），本机推荐 %s%s。\n' "$label" "$value" "${unit:+ $unit}" "$(param_mode "$name")" "$(param_recommended "$name")" "${unit:+ $unit}"
-    param_reason "$name"
-    while :; do
-      read -r -p '新的值（直接回车不改，输入 auto 用推荐值）: ' answer || return 0
-      answer="$(tr -s ' \t' ' ' <<< "$answer")" answer="${answer# }" answer="${answer% }"
-      if [[ -z "$answer" ]]; then break; fi
-      if [[ "$answer" == auto ]]; then param_store "$name" '' || die '无法保存参数。'; changed=1; break; fi
-      if ! note="$(param_check "$name" "$answer")"; then echo "$note"; continue; fi
-      if [[ "$(param_kind "$name")" == int ]]; then answer="$((10#$answer))"; fi
-      note="$(param_caution "$name" "$answer")"
-      if [[ -n "$note" ]]; then
-        warn "$note"
-        confirm_yes "仍然用 $answer${unit:+ $unit} 吗？" || continue
-      fi
-      param_store "$name" "$answer" || die '无法保存参数。'
-      changed=1; break
-    done
+# NAME: shows one parameter with its reason and asks for a new value; true
+# when the value was changed.
+param_ask() {
+  local name="$1" label unit value answer note
+  IFS=$'\t' read -r label unit <<< "$(param_info "$name")"
+  value="$(param_value "$name")"
+  printf '%s：现在 %s%s（%s），本机推荐 %s%s。\n' "$label" "$value" "${unit:+ $unit}" "$(param_mode "$name")" "$(param_recommended "$name")" "${unit:+ $unit}"
+  param_reason "$name"
+  while :; do
+    read -r -p '新的值（直接回车不改，输入 auto 用推荐值）: ' answer || return 1
+    answer="$(tr -s ' \t' ' ' <<< "$answer")" answer="${answer# }" answer="${answer% }"
+    if [[ -z "$answer" ]]; then return 1; fi
+    if [[ "$answer" == auto ]]; then param_store "$name" '' || die '无法保存参数。'; return 0; fi
+    if ! note="$(param_check "$name" "$answer")"; then echo "$note"; continue; fi
+    if [[ "$(param_kind "$name")" == int ]]; then answer="$((10#$answer))"; fi
+    note="$(param_caution "$name" "$answer")"
+    if [[ -n "$note" ]]; then
+      warn "$note"
+      confirm_yes "仍然用 $answer${unit:+ $unit} 吗？" || continue
+    fi
+    param_store "$name" "$answer" || die '无法保存参数。'
+    return 0
   done
+}
+
+# KEY: the parameters of a single item, listed with their values: one is
+# picked and changed, as often as wanted (a goes through all of them in turn,
+# as up to 3.1.4, when changing the last of twelve took eleven times Enter).
+# When the item is on it is applied again at the end; otherwise the next
+# "开启" uses the new values.
+param_adjust() {
+  local key="$1" name label unit choice changed=0 i
+  local -a names=()
+  # Read first: inside the loops, read must get the user's answers.
+  mapfile -t names < <(param_names "$key")
+  ((${#names[@]})) || return 0
+  if ((${#names[@]} == 1)); then
+    if param_ask "${names[0]}"; then changed=1; fi
+  else
+    while :; do
+      say "调整参数：$(item_label "$key")"
+      i=0
+      for name in "${names[@]}"; do
+        i=$((i + 1))
+        IFS=$'\t' read -r label unit <<< "$(param_info "$name")"
+        printf '%3s. %s：%s%s（%s）\n' "$i" "$label" "$(param_value "$name")" "${unit:+ $unit}" "$(param_mode "$name")"
+      done
+      printf '  a. 逐个过一遍\n  0. 返回\n'
+      read -r -p "要改哪个参数 [1-$i，a，0 返回]: " choice || break
+      case "$choice" in
+        ''|0) break ;;
+        a|A)
+          for name in "${names[@]}"; do
+            if param_ask "$name"; then changed=1; fi
+          done ;;
+        *)
+          if [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= i)); then
+            if param_ask "${names[10#$choice - 1]}"; then changed=1; fi
+          else echo '无效选项。'; fi ;;
+      esac
+    done
+  fi
   ((changed)) || { ok '参数没有改动。'; return 0; }
   param_apply "$key"
 }
@@ -4396,6 +4435,8 @@ guard_script_end() {
 # is left to the timer), noted for the menu to tell the user.
 guard_boot_replay_text() {
   local dir="$STATE_ROOT/guard"
+  # The text of a script: its "$f" and "$unit" are for the shell that runs it.
+  # shellcheck disable=SC2016
   printf '%s\n' '#!/bin/sh' '# VPS Stable Optimizer: after a reboot, undoes a change that was waiting for its confirmation.' \
     "for f in '$dir'/*.sh; do" \
     '  [ -f "$f" ] || continue' \
@@ -4446,17 +4487,17 @@ guard_cancel() {
 
 # Changes that were undone at boot since the last look: told once.
 guard_replayed_hint() {
-  local file="${STATE_ROOT:-/nonexistent}/guard/replayed" unit names=''
+  local file="${STATE_ROOT:-/nonexistent}/guard/replayed" unit undone=''
   [[ -s "$file" && ! -L "$file" ]] || return 0
   while IFS= read -r unit; do
     case "$unit" in
-      vps-stable-ufw-rollback-docker-*) names+='「Docker 端口受防火墙管」 ' ;;
-      vps-stable-ufw-rollback-*) names+='防火墙 ' ;;
-      vps-stable-ssh-revert-*) names+='SSH 设置 ' ;;
+      vps-stable-ufw-rollback-docker-*) undone+='「Docker 端口受防火墙管」 ' ;;
+      vps-stable-ufw-rollback-*) undone+='防火墙 ' ;;
+      vps-stable-ssh-revert-*) undone+='SSH 设置 ' ;;
     esac
   done < "$file"
-  if [[ -n "$names" ]]; then
-    printf '%s%s 上次有修改没有等到确认机器就重启了，开机时已经自动撤销：%s。需要的话重新设置一次。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "${names% }" "${C_RESET-}"
+  if [[ -n "$undone" ]]; then
+    printf '%s%s 上次有修改没有等到确认机器就重启了，开机时已经自动撤销：%s。需要的话重新设置一次。%s\n' "${C_WARN-}" "${SYM_WARN-⚠}" "${undone% }" "${C_RESET-}"
   fi
   if ((EUID == 0)); then rm -f -- "$file"; fi
 }
@@ -10004,7 +10045,8 @@ restore_keep_replaced() {
   state_path_safe "$dir" || return 1
   mkdir -p -- "$dir" && chmod 700 -- "$dir" || return 1
   copy="$dir/$id.$(date -u +%Y%m%dT%H%M%SZ)"
-  cp -p -- "$path" "$copy" || return 1
+  # Never writable by others: the uninstall refuses to clear a tree that has such files.
+  cp -p -- "$path" "$copy" && chmod go-w -- "$copy" || return 1
   echo "$path 在本工具上次写入之后被改过：现在的内容先另存到 $copy，再恢复成本工具运行前的样子。"
 }
 
@@ -12161,26 +12203,62 @@ item_group() {
   esac
 }
 
-# KEY STATUS: on, off, or none for an item that is not switched on or off.
-item_state() {
-  case "$1" in upgrade|ports|general|timezone|hostname|kernel|tools) echo none; return 0 ;; esac
-  case "$2" in
-    未*|默认*|不自动*|没*|允许密码*|回应*|内核不支持*|系统盘不支持*|无法解析*|已有其他*|已安装，未运行|*（默认）) echo off ;;
-    *) echo on ;;
-  esac
-}
-
-# KEY STATUS: the mark in front of a status in the list.
-item_mark() {
-  case "$2" in *失败*|*暂时不起作用*) printf '%s%s%s ' "${C_WARN-}" "${SYM_WARN-⚠}" "${C_RESET-}"; return 0 ;; esac
-  case "$(item_state "$1" "$2")" in
-    on) printf '%s%s%s ' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}" ;;
-    off) printf '%s%s%s ' "${C_DIM-}" "${SYM_SKIP-○}" "${C_RESET-}" ;;
-  esac
-}
-
 # What the list of items reads once per drawing instead of once per item.
 ITEM_LIST_MODE=0 ITEM_SSHD_T='' ITEM_APT_DUMP=''
+# The page of an item was left (item_action); a `vps item` run has begun to
+# change things (item_session_begin), and the run record from before it.
+ITEM_LEAVE=0 ITEM_SESSION=0 ITEM_PREVIOUS=''
+# STATE TEXT: what item_probe prints for one item.
+item_put() {
+  printf '%s\t%s\n' "$1" "$2"
+}
+
+# KEY: the state of an item, without its text: on, off, warn (in force, but
+# something is wrong with it) or none (not something switched on or off). It
+# comes from what item_probe found in the system, never from the wording of
+# the text: up to 3.1.4 the first characters of the Chinese status decided it
+# ("未…" was off), and a reworded status would have changed what the menu does.
+item_state() {
+  local probe
+  probe="$(item_probe "$1")"
+  printf '%s\n' "${probe%%$'\t'*}"
+}
+
+# KEY: "tool" when this tool has changed the item and not undone it (so there
+# is something to undo), else "system". Read from the rollback record alone,
+# cheaply and without changing anything: the menu draws this for every item.
+item_owner() {
+  local root="${STATE_ROOT:-/nonexistent}/restore-v2" id pkg
+  local -a pkgs=()
+  if [[ ! -d "$root" || -L "$root" ]]; then echo system; return 0; fi
+  case "$1" in
+    upgrade|kernel|ports|general) echo system; return 0 ;;
+    tools|vnstat)
+      if [[ ! -f "$root/packages/installed" || -L "$root/packages/installed" ]]; then echo system; return 0; fi
+      if [[ "$1" == vnstat ]]; then pkgs=(vnstat); else pkgs=("${TOOLS_PACKAGES[@]}"); fi
+      for pkg in "${pkgs[@]}"; do
+        if grep -Fxq -- "$pkg" "$root/packages/installed" && ! grep -Fxqs -- "$pkg" "$root/packages/before"; then echo tool; return 0; fi
+      done
+      echo system; return 0 ;;
+  esac
+  while IFS= read -r id; do
+    if [[ -f "$root/$id/state" && ! -L "$root/$id/state" && "$(cat -- "$root/$id/state" 2>/dev/null || true)" == applied ]]; then echo tool; return 0; fi
+  done < <(restore_group_ids "$1")
+  echo system
+}
+
+# STATE OWNER: the mark of an item. In force and this tool's doing (it can be
+# undone), in force as the system came, off, or in force with something wrong;
+# nothing for an item that is not switched on or off.
+item_mark() {
+  case "$1:$2" in
+    warn:*) printf '%s%s%s' "${C_WARN-}" "${SYM_WARN-⚠}" "${C_RESET-}" ;;
+    on:tool) printf '%s%s%s' "${C_OK-}" "${SYM_OK-✔}" "${C_RESET-}" ;;
+    on:*) printf '%s%s%s' "${C_DIM-}" "${SYM_HAVE-●}" "${C_RESET-}" ;;
+    off:*) printf '%s%s%s' "${C_DIM-}" "${SYM_SKIP-○}" "${C_RESET-}" ;;
+  esac
+}
+
 item_status_prepare() {
   ITEM_APT_DUMP="$(apt-config dump 2>/dev/null || true)"
   ITEM_SSHD_T=''
@@ -12208,110 +12286,188 @@ item_label() {
   esac
 }
 
-# Read-only, one line per item.
+# KEY TEXT: how an item reads in the overview: a short name, with the value
+# itself where that says more than a mark would.
+item_brief() {
+  case "$1" in
+    upgrade) echo '系统升级' ;; updates) echo '自动更新' ;; autoreboot) echo '自动重启' ;; kernel) echo '旧内核' ;;
+    bbr) echo 'BBR' ;; tcp) echo 'TCP 调优' ;; conntrack) echo '连接跟踪' ;; ipv4) echo '优先 IPv4' ;; sysctl) echo '内核参数' ;;
+    zram) echo 'ZRAM' ;; swap) echo '硬盘 Swap' ;; journal) echo '日志上限' ;; trim) echo 'TRIM' ;; databackup) echo '数据备份' ;;
+    ssh) echo 'SSH 加固' ;; sshport) echo "SSH 端口 ${2%% *}" ;; keepalive) echo 'SSH 保活' ;; firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban' ;;
+    dockerfw) echo 'Docker 端口' ;; ports) echo '端口管理' ;; login) echo '登录记录' ;;
+    notify) echo 'TG 通知' ;; quota) echo '流量提醒' ;; dockerlog) echo 'Docker 日志' ;;
+    ntp) echo '时间同步' ;; timezone) echo "时区 $2" ;; hosts) echo '主机名解析' ;; hostname) echo "主机名 ${2%%，*}" ;;
+    tools) echo "常用工具 ${2#已安装 }" ;; vnstat) echo 'vnStat' ;; ping) echo '禁止 ping' ;; general) echo '通用设置' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# KEY: what the item is for, in one sentence (the first line of its page).
+item_about() {
+  case "$1" in
+    upgrade) echo '把已经装着的软件升级到最新（只在当前大版本内，不删任何软件包）。' ;;
+    updates) echo '每天自动装安全更新，漏洞补丁不用自己盯。' ;;
+    autoreboot) echo '安全更新需要重启时，在你定的时间自动重启；不设就不会自动重启。' ;;
+    kernel) echo '删掉不再需要的旧内核，腾出 /boot 和硬盘空间（保留正在用的和上一个）。' ;;
+    bbr) echo '换用 BBR 拥塞算法：线路有丢包时，下载和代理的速度更稳。' ;;
+    tcp) echo '提高 TCP 缓冲区上限：跨洲代理、远距离传大文件时单个连接更快。' ;;
+    conntrack) echo '加大防火墙能同时记住的连接数：连接特别多的机器不会因为表满而丢包。' ;;
+    ipv4) echo '域名同时有 IPv4 和 IPv6 时先连 IPv4：IPv6 不通的机器不再卡几秒。' ;;
+    sysctl) echo '一组内核网络安全参数：不接受 ICMP 重定向和源路由、开启 SYN Cookies 等。' ;;
+    zram) echo '把一部分内存压缩起来当 Swap 用：内存突然不够时，进程不会马上被杀。' ;;
+    swap) echo '在硬盘上建一个 Swap 文件：用不了 ZRAM 的小内存机器的应急缓冲。' ;;
+    journal) echo '给系统日志定一个空间上限和保留天数，免得日志把小硬盘写满。' ;;
+    trim) echo '每周通知一次硬盘哪些空间已经不用了（SSD 和云硬盘需要）。' ;;
+    databackup) echo '每天把选定的目录加密备份到另一台机器、对象存储或网盘，并定期试着恢复。' ;;
+    ssh) echo '只允许用密钥登录 SSH，可以再禁止 root 直接登录：猜密码的攻击从此无效。' ;;
+    sshport) echo '把 SSH 换到别的端口：挡不住真正的攻击者，但日志里的自动扫描会少很多。' ;;
+    keepalive) echo 'SSH 连接空着不动时定时探测一下，不会被路由器悄悄断掉后卡死。' ;;
+    firewall) echo '只放行你允许的端口（SSH、网站和你自己加的），其余从外面连不进来。' ;;
+    fail2ban) echo '同一个 IP 连续输错 SSH 密码，就封它一段时间。' ;;
+    dockerfw) echo '让 Docker 用 -p 发布的容器端口也归防火墙管（默认它们会绕过防火墙）。' ;;
+    ports) echo '在防火墙上放行或关闭端口。' ;;
+    login) echo '每次登录记一行，登录时显示上次是谁从哪里登录的，第一次出现的 IP 标红。' ;;
+    notify) echo '有人登录、服务停了、硬盘快满这类事，发一条 Telegram 消息给你。' ;;
+    quota) echo '按月统计流量，用到额度的几成时提醒你（菜单顶部，开了 TG 也发消息）。' ;;
+    dockerlog) echo '给每个容器的日志定一个上限：Docker 默认不限，日志能把硬盘写满。' ;;
+    ntp) echo '让系统时间自动对准：时间差太多，装软件和 HTTPS 都会出错。' ;;
+    timezone) echo '系统显示时间用的时区；定时任务（自动更新、备份）也按它算。' ;;
+    hosts) echo '让本机的主机名能解析：解析不了时 sudo 每次都会多等几秒并报错。' ;;
+    hostname) echo '改系统的主机名，或者只给这台机器起一个显示名（菜单和通知里用）。' ;;
+    tools) echo '装上常用的小工具（curl、vim、htop、tmux 等，清单可以调）。' ;;
+    vnstat) echo '装 vnStat 按天按月统计网卡流量，用 vnstat 命令查看。' ;;
+    ping) echo '不回应 ping：只挡最粗的扫描，代价是你自己也没法用 ping 检查这台机器。' ;;
+    general) echo '本工具自己的设置：防失联确认等多久、保留几次运行记录、菜单提醒等。' ;;
+    *) echo '' ;;
+  esac
+}
+
+# The groups of the single items, in the order they are listed (item_group
+# says which one an item belongs to).
+item_groups() {
+  printf '%s\n' '系统更新' '网络' '内存、硬盘和备份' 'SSH 和安全' '通知和监控' '基础设置' '高级'
+}
+
+# GROUP: its items, in the order of item_keys.
+item_group_keys() {
+  local key
+  while IFS= read -r key; do
+    if [[ "$(item_group "$key")" == "$1" ]]; then printf '%s\n' "$key"; fi
+  done < <(item_keys)
+}
+
+# Read-only: the text of one item, as its page and the lists show it.
 item_status() {
+  local probe
+  probe="$(item_probe "$1")"
+  printf '%s\n' "${probe#*$'\t'}"
+}
+
+# KEY: one item as it is now, read-only: its state (see item_state) and the
+# text shown for it, as "STATE<TAB>TEXT".
+item_probe() {
   local value count=0 total=0 pkg dump
   case "$1" in
     upgrade)
       # Simulating an upgrade reads the whole package index: only when asked.
-      if ((${ITEM_LIST_MODE:-0})); then echo '进入后检查'; return 0; fi
+      if ((${ITEM_LIST_MODE:-0})); then item_put none '进入后检查'; return 0; fi
       value="$(apt-get -s upgrade --with-new-pkgs 2>/dev/null | grep -c '^Inst ' || true)"
-      if [[ "${value:-0}" == 0 ]]; then echo '已是最新（按当前软件索引）'; else echo "有 $value 个可升级"; fi ;;
+      if [[ "${value:-0}" == 0 ]]; then item_put none '已是最新（按当前软件索引）'; else item_put none "有 $value 个可升级"; fi ;;
     updates)
       dump="${ITEM_APT_DUMP:-$(apt-config dump 2>/dev/null || true)}"
-      if grep -Fq 'APT::Periodic::Unattended-Upgrade "1";' <<< "$dump" && active apt-daily-upgrade.timer; then echo '已开启'; else echo '未开启'; fi ;;
+      if grep -Fq 'APT::Periodic::Unattended-Upgrade "1";' <<< "$dump" && active apt-daily-upgrade.timer; then item_put on '已开启'; else item_put off '未开启'; fi ;;
     autoreboot)
       dump="${ITEM_APT_DUMP:-$(apt-config dump 2>/dev/null || true)}"
       value="$(awk -F'"' '$1 ~ /^Unattended-Upgrade::Automatic-Reboot-Time / {print $2}' <<< "$dump" | tail -n 1)"
-      if grep -Fq 'Unattended-Upgrade::Automatic-Reboot "true";' <<< "$dump"; then echo "每天 ${value:-02:00} 自动重启"; else echo '不自动重启'; fi ;;
+      if grep -Fq 'Unattended-Upgrade::Automatic-Reboot "true";' <<< "$dump"; then item_put on "每天 ${value:-02:00} 自动重启"; else item_put off '不自动重启'; fi ;;
     bbr)
       value="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-      if [[ "$value" == bbr ]]; then echo '已开启'; else echo "未开启（当前 ${value:-未知}）"; fi ;;
-    sysctl) if [[ -f "$SYSCTL_HARDENING_FILE" ]]; then echo '已开启'; else echo '未开启'; fi ;;
+      if [[ "$value" == bbr ]]; then item_put on '已开启'; else item_put off "未开启（当前 ${value:-未知}）"; fi ;;
+    sysctl) if [[ -f "$SYSCTL_HARDENING_FILE" ]]; then item_put on '已开启'; else item_put off '未开启'; fi ;;
     tcp)
       value="$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{printf "%d", $3 / 1048576}' || true)"
-      if [[ -f "$TCP_BUFFER_FILE" ]]; then echo "已开启（接收上限 ${value:-?} MiB）"; else echo "未开启（系统接收上限 ${value:-?} MiB）"; fi ;;
+      if [[ -f "$TCP_BUFFER_FILE" ]]; then item_put on "已开启（接收上限 ${value:-?} MiB）"; else item_put off "未开启（系统接收上限 ${value:-?} MiB）"; fi ;;
     zram)
       value="$(awk 'NR > 1 && $1 == "/dev/zram0" {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
-      if [[ -n "$value" ]]; then echo "已开启，约 ${value} MiB"
-      elif swapon --noheadings 2>/dev/null | grep . > /dev/null; then echo '已有其他 Swap'
-      elif ! zram_module_available; then echo '没有 zram 模块'
-      else echo '未开启'; fi ;;
+      if [[ -n "$value" ]]; then item_put on "已开启，约 ${value} MiB"
+      elif swapon --noheadings 2>/dev/null | grep . > /dev/null; then item_put off '已有其他 Swap'
+      elif ! zram_module_available; then item_put off '没有 zram 模块'
+      else item_put off '未开启'; fi ;;
     journal)
       if [[ -f "$JOURNAL_FILE" ]]; then
-        echo "已限制（$(awk -F= '$1 == "SystemMaxUse" {print $2}' "$JOURNAL_FILE" 2>/dev/null)，$(awk -F= '$1 == "MaxRetentionSec" {print $2}' "$JOURNAL_FILE" 2>/dev/null)）"
-      else echo '默认设置'; fi ;;
-    trim) if ! trim_support; then echo '系统盘不支持'; elif systemctl is-enabled -q fstrim.timer 2>/dev/null; then echo '已开启'; else echo '未开启'; fi ;;
-    ntp) if ntp_synced; then echo '已同步'; else echo '未同步'; fi ;;
-    timezone) timedatectl show -p Timezone --value 2>/dev/null || echo '未知' ;;
-    hosts) if hostname_resolves; then echo '正常'; else echo '无法解析'; fi ;;
+        item_put on "已限制（$(awk -F= '$1 == "SystemMaxUse" {print $2}' "$JOURNAL_FILE" 2>/dev/null)，$(awk -F= '$1 == "MaxRetentionSec" {print $2}' "$JOURNAL_FILE" 2>/dev/null)）"
+      else item_put off '默认设置'; fi ;;
+    trim) if ! trim_support; then item_put off '系统盘不支持'; elif systemctl is-enabled -q fstrim.timer 2>/dev/null; then item_put on '已开启'; else item_put off '未开启'; fi ;;
+    ntp) if ntp_synced; then item_put on '已同步'; else item_put off '未同步'; fi ;;
+    timezone) item_put none "$(timedatectl show -p Timezone --value 2>/dev/null || echo '未知')" ;;
+    hosts) if hostname_resolves; then item_put on '正常'; else item_put off '无法解析'; fi ;;
     conntrack)
       value="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
-      if [[ -z "$value" ]]; then echo '没用到（防火墙没开）'
-      elif [[ -f "$CONNTRACK_FILE" ]]; then echo "已调整（上限 $value 条，用了 $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo ?) 条）"
-      else echo "默认（上限 $value 条，用了 $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo ?) 条）"; fi ;;
-    ping) if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" == 1 ]]; then echo '不回应 ping'; else echo '回应 ping（默认）'; fi ;;
+      if [[ -z "$value" ]]; then item_put off '没用到（防火墙没开）'
+      elif [[ -f "$CONNTRACK_FILE" ]]; then item_put on "已调整（上限 $value 条，用了 $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo ?) 条）"
+      else item_put off "默认（上限 $value 条，用了 $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo ?) 条）"; fi ;;
+    ping) if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" == 1 ]]; then item_put on '不回应 ping'; else item_put off '回应 ping（默认）'; fi ;;
     keepalive)
       if [[ -n "${ITEM_SSHD_T:-}" ]]; then value="$(awk '$1 == "clientaliveinterval" {print $2}' <<< "$ITEM_SSHD_T")"
       else sshd_runtime_dir; value="$(sshd -T 2>/dev/null | awk '$1 == "clientaliveinterval" {print $2}')"; fi
-      if [[ -n "$value" && "$value" != 0 ]]; then echo "每 $value 秒"; else echo '未开启'; fi ;;
-    ipv4) if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' "$GAI_FILE" 2>/dev/null; then echo '已优先 IPv4'; else echo '默认（IPv6 优先）'; fi ;;
-    login) if login_pam_enabled; then echo "已开启，记下了 $(grep -c . "$STATE_ROOT/logins" 2>/dev/null || true) 次登录"; else echo '未开启'; fi ;;
-    notify) if [[ -s "$STATE_ROOT/notify.conf" ]]; then echo '已开启'; else echo '未开启'; fi ;;
+      if [[ -n "$value" && "$value" != 0 ]]; then item_put on "每 $value 秒"; else item_put off '未开启'; fi ;;
+    ipv4) if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' "$GAI_FILE" 2>/dev/null; then item_put on '已优先 IPv4'; else item_put off '默认（IPv6 优先）'; fi ;;
+    login) if login_pam_enabled; then item_put on "已开启，记下了 $(grep -c . "$STATE_ROOT/logins" 2>/dev/null || true) 次登录"; else item_put off '未开启'; fi ;;
+    notify) if [[ -s "$STATE_ROOT/notify.conf" ]]; then item_put on '已开启'; else item_put off '未开启'; fi ;;
     quota)
-      if read -r value total < <(quota_status); then echo "本周期已用 $(quota_gb_text "$value") GB / $((total / 1000)) GB"
-      elif [[ -s "$STATE_ROOT/quota.conf" ]]; then echo '已开启，还没统计'; else echo '未开启'; fi ;;
+      if read -r value total < <(quota_status); then item_put on "本周期已用 $(quota_gb_text "$value") GB / $((total / 1000)) GB"
+      elif [[ -s "$STATE_ROOT/quota.conf" ]]; then item_put on '已开启，还没统计'; else item_put off '未开启'; fi ;;
     sshport)
-      if [[ -f "$SSH_PORT_DROPIN" ]]; then echo "$(sed -n 's/^Port //p' "$SSH_PORT_DROPIN" | tr '\n' ' ')（原来是 $(sed -n 's/^port=//p' "$STATE_ROOT/restore-v2/sshport" 2>/dev/null || echo '?')）"
-      else echo "$(ssh_candidates | sort -n -u | tr '\n' ' ')（默认）"; fi ;;
+      if [[ -f "$SSH_PORT_DROPIN" ]]; then item_put on "$(sed -n 's/^Port //p' "$SSH_PORT_DROPIN" | tr '\n' ' ')（原来是 $(sed -n 's/^port=//p' "$STATE_ROOT/restore-v2/sshport" 2>/dev/null || echo '?')）"
+      else item_put off "$(ssh_candidates | sort -n -u | tr '\n' ' ')（默认）"; fi ;;
     dockerlog)
-      if ! command -v dockerd >/dev/null; then echo '没装 Docker'
-      elif grep -q '"max-size"' "$DOCKER_DAEMON_FILE" 2>/dev/null; then echo "已设置（$(sed -n 's/.*"max-size": *"\([^"]*\)".*/\1/p' "$DOCKER_DAEMON_FILE" | head -n 1)）"
-      else echo '未设置（Docker 默认不限）'; fi ;;
+      if ! command -v dockerd >/dev/null; then item_put off '没装 Docker'
+      elif grep -q '"max-size"' "$DOCKER_DAEMON_FILE" 2>/dev/null; then item_put on "已设置（$(sed -n 's/.*"max-size": *"\([^"]*\)".*/\1/p' "$DOCKER_DAEMON_FILE" | head -n 1)）"
+      else item_put off '未设置（Docker 默认不限）'; fi ;;
     swap)
       value="$(awk -v n="$SWAP_FILE" 'NR > 1 && $1 == n {printf "%d", $3 / 1024}' /proc/swaps 2>/dev/null || true)"
-      if [[ -n "$value" ]]; then echo "已开启，${value} MiB"; else echo '未开启'; fi ;;
+      if [[ -n "$value" ]]; then item_put on "已开启，${value} MiB"; else item_put off '未开启'; fi ;;
     hostname)
       value="$(hostname 2>/dev/null || echo 未知)"
-      if dump="$(display_name_get)"; then echo "$value，显示名 $dump"; else echo "$value，没设显示名"; fi ;;
+      if dump="$(display_name_get)"; then item_put none "$value，显示名 $dump"; else item_put none "$value，没设显示名"; fi ;;
     tools)
       for pkg in "${TOOLS_PACKAGES[@]}"; do total=$((total + 1)); if installed "$pkg"; then count=$((count + 1)); fi; done
-      echo "已安装 $count/$total" ;;
+      item_put none "已安装 $count/$total" ;;
     vnstat)
-      if active vnstat; then echo '已开启'; elif installed vnstat; then echo '已安装，未运行'; else echo '未安装'; fi ;;
+      if active vnstat; then item_put on '已开启'; elif installed vnstat; then item_put off '已安装，未运行'; else item_put off '未安装'; fi ;;
     kernel)
       count="$(boot_kernels | grep -c . || true)"
-      echo "已安装 $count 个内核" ;;
+      item_put none "已安装 $count 个内核" ;;
     firewall)
-      if ! command -v ufw >/dev/null; then echo '未安装'
-      elif ((${ITEM_LIST_MODE:-0})); then if grep -qsx 'ENABLED=yes' "$UFW_CONF"; then echo '已开启'; else echo '未开启'; fi
-      elif ufw_active; then echo '已开启'; else echo '未开启'; fi ;;
-    fail2ban) if active fail2ban; then echo '已开启'; else echo '未开启'; fi ;;
+      if ! command -v ufw >/dev/null; then item_put off '未安装'
+      elif ((${ITEM_LIST_MODE:-0})); then if grep -qsx 'ENABLED=yes' "$UFW_CONF"; then item_put on '已开启'; else item_put off '未开启'; fi
+      elif ufw_active; then item_put on '已开启'; else item_put off '未开启'; fi ;;
+    fail2ban) if active fail2ban; then item_put on '已开启'; else item_put off '未开启'; fi ;;
     ssh)
       # The list reads sshd's settings once; the page of the item looks closer.
       if ((${ITEM_LIST_MODE:-0})) && [[ -n "${ITEM_SSHD_T:-}" ]]; then
         if grep -Fxq 'passwordauthentication no' <<< "$ITEM_SSHD_T" && grep -Fxq 'kbdinteractiveauthentication no' <<< "$ITEM_SSHD_T"; then
-          if grep -Fxq 'permitrootlogin no' <<< "$ITEM_SSHD_T"; then echo '只允许密钥登录，root 不能直接登录'; else echo '只允许密钥登录'; fi
-        else echo '允许密码登录'; fi
+          if grep -Fxq 'permitrootlogin no' <<< "$ITEM_SSHD_T"; then item_put on '只允许密钥登录，root 不能直接登录'; else item_put on '只允许密钥登录'; fi
+        else item_put off '允许密码登录'; fi
       elif ssh_password_disabled; then
         value="$(ssh_effective_value "$(ssh_effective root || true)" permitrootlogin)"
-        if [[ "$value" == no ]]; then echo '只允许密钥登录，root 不能直接登录'; else echo '只允许密钥登录'; fi
-      else echo '允许密码登录'; fi ;;
-    ports) echo '放行或关闭端口' ;;
+        if [[ "$value" == no ]]; then item_put on '只允许密钥登录，root 不能直接登录'; else item_put on '只允许密钥登录'; fi
+      else item_put off '允许密码登录'; fi ;;
+    ports) item_put none '放行或关闭端口' ;;
     dockerfw)
-      if ! docker_present; then echo '没装 Docker'
-      elif ! dockerfw_on; then echo '未开启（容器端口绕过防火墙）'
-      elif ! grep -qsx 'ENABLED=yes' "$UFW_CONF"; then echo '已开启，但防火墙没开，暂时不起作用'
-      else echo '已开启'; fi ;;
+      if ! docker_present; then item_put off '没装 Docker'
+      elif ! dockerfw_on; then item_put off '未开启（容器端口绕过防火墙）'
+      elif ! grep -qsx 'ENABLED=yes' "$UFW_CONF"; then item_put warn '已开启，但防火墙没开，暂时不起作用'
+      else item_put on '已开启'; fi ;;
     databackup)
-      if ! databackup_on; then echo '未开启'
+      if ! databackup_on; then item_put off '未开启'
       elif [[ -s "$STATE_ROOT/databackup/last" ]]; then
         IFS=$'\t' read -r value dump _ < "$STATE_ROOT/databackup/last" || true
-        if [[ "$dump" == ok ]]; then echo "已开启，上次备份 $(date -d "@$value" '+%m-%d %H:%M' 2>/dev/null || echo '?')"
-        else echo "已开启，上次备份失败（$(date -d "@$value" '+%m-%d %H:%M' 2>/dev/null || echo '?')）"; fi
-      else echo '已开启，还没备份过'; fi ;;
-    general) echo "防失联确认 $(param_value guard_seconds) 秒，保留 $(param_value run_keep) 次运行记录$(if [[ "$(param_value setup_skip)" != none ]]; then echo "，开荒跳过 $(param_value setup_skip)"; fi)" ;;
-    *) echo '未知' ;;
+        if [[ "$dump" == ok ]]; then item_put on "已开启，上次备份 $(date -d "@$value" '+%m-%d %H:%M' 2>/dev/null || echo '?')"
+        else item_put warn "已开启，上次备份失败（$(date -d "@$value" '+%m-%d %H:%M' 2>/dev/null || echo '?')）"; fi
+      else item_put on '已开启，还没备份过'; fi ;;
+    general) item_put none "防失联确认 $(param_value guard_seconds) 秒，保留 $(param_value run_keep) 次运行记录$(if [[ "$(param_value setup_skip)" != none ]]; then echo "，开荒跳过 $(param_value setup_skip)"; fi)" ;;
+    *) item_put none '未知' ;;
   esac
 }
 
@@ -12493,17 +12649,42 @@ item_firewall_pause() {
   ok '防火墙已临时关闭。重新开启：单项设置 → 防火墙 → 开启。'
 }
 
+# KEY: the page of one single item: what it is for, how it stands, what can
+# be done, then one choice. ITEM_LEAVE is 1 when the user left the page.
 item_action() {
-  local key="$1" choice='' status
-  if [[ "$key" == ports ]]; then port_menu; return 0; fi
+  local key="$1" choice='' probe state text owner note='' name total=0 changed=0
+  ITEM_LEAVE=0
+  if [[ "$key" == ports ]]; then item_session_begin; port_menu; ITEM_LEAVE=1; return 0; fi
   say "$(item_label "$key")"
-  status="$(item_status "$key")"
-  printf '当前状态：%s\n' "$status"
-  item_actions "$key" "$status"
-  read -r -p '请选择: ' choice || return 0
+  probe="$(item_probe "$key")"
+  state="${probe%%$'\t'*}" text="${probe#*$'\t'}"
+  owner="$(item_owner "$key")"
+  case "$state:$owner" in
+    on:tool|warn:tool) note='（本工具设的，可以撤销）' ;;
+    on:system|warn:system) note='（系统原来就是这样，不是本工具设的）' ;;
+    off:tool) note='（本工具改过的还有一部分在，可以撤销）' ;;
+  esac
+  printf ' 作用：%s\n' "$(item_about "$key")"
+  if [[ "$state" == none ]]; then printf ' 现在：%s\n' "$text"
+  else printf ' 现在：%s %s%s\n' "$(item_mark "$state" "$owner")" "$text" "$note"; fi
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    total=$((total + 1))
+    if param_read "$name" > /dev/null; then changed=$((changed + 1)); fi
+  done < <(param_names "$key")
+  if ((total && changed)); then printf ' 参数：%s 个，其中 %s 个你调过（选 3 查看和调整）\n' "$total" "$changed"
+  elif ((total)); then printf ' 参数：%s 个，现在都是推荐值（选 3 查看和调整）\n' "$total"; fi
+  echo
+  item_actions "$key" "$state" "$owner" "$text"
+  read -r -p '请选择: ' choice || { ITEM_LEAVE=1; return 0; }
+  # Only looking needs no lock, no run record and no backup of the configuration.
+  case "$key:$choice" in
+    *:|*:0) ITEM_LEAVE=1; return 0 ;;
+    login:5|dockerfw:5) ;;
+    *) item_session_begin ;;
+  esac
   # The numbers mean the same on every page (see item_actions).
   case "$key:$choice" in
-    *:|*:0) return 0 ;;
     firewall:5) item_firewall_pause ;;
     fail2ban:5) f2b_allowlist_menu ;;
     login:5) logins_show 30 ;;
@@ -12512,125 +12693,251 @@ item_action() {
     databackup:5) databackup_menu ;;
     hostname:5) display_name_ask ;;
     upgrade:1|kernel:1) item_turn_on "$key" ;;
-    upgrade:*|kernel:*) return 0 ;;
-    *:3) if [[ -n "$(param_names "$key")" ]]; then param_adjust "$key"; fi ;;
-    *:4) if [[ -n "$(param_names "$key")" ]]; then param_reset "$key"; fi ;;
-    general:*) return 0 ;;
+    upgrade:*|kernel:*) echo '无效选项。' ;;
+    *:3) if [[ -n "$(param_names "$key")" ]]; then param_adjust "$key"; else echo '这一项没有可以调的参数。'; fi ;;
+    *:4) if [[ -n "$(param_names "$key")" ]]; then param_reset "$key"; else echo '这一项没有可以调的参数。'; fi ;;
+    general:*) echo '无效选项。' ;;
     *:1) item_turn_on "$key" ;;
     *:2) item_turn_off "$key" ;;
-    *) return 0 ;;
+    *) echo '无效选项。' ;;
   esac
 }
 
-# KEY STATUS: what can be done with a single item. A number means the same on
-# every page: 1 turn on (or apply again), 2 turn off or undo, 3 adjust the
-# parameters, 4 back to the recommended values, 5 what only this item has.
+# KEY: the page of one item until the user leaves it. After each thing done
+# there the page comes again, with the state as it is then (up to 3.1.4 the
+# whole list of 33 items was drawn again and pushed the result off the screen).
+item_page() {
+  while :; do
+    item_action "$1"
+    if ((ITEM_LEAVE)); then return 0; fi
+  done
+}
+
+# KEY STATE OWNER TEXT: what can be done with a single item, one choice on a
+# line. A number means the same on every page: 1 turn on (or apply again),
+# 2 turn off or undo, 3 adjust the parameters, 4 back to the recommended
+# values, 5 what only this item has. Undoing is offered only where this tool
+# has something to undo.
 item_actions() {
-  local key="$1" status="$2" state line=''
+  local key="$1" state="$2" owner="$3" text="${4:-}" name line
   local -a a=()
-  state="$(item_state "$key" "$status")"
   case "$key" in
     upgrade|kernel) a+=('1. 立即执行') ;;
-    tools|vnstat) a+=('1. 安装' '2. 卸载（只卸载本工具装的）') ;;
-    timezone) a+=('1. 修改时区' '2. 恢复成原来的时区') ;;
-    hostname) a+=('1. 修改主机名' '2. 撤销主机名修改（恢复原来的名字）' '5. 修改显示名') ;;
-    autoreboot) a+=('1. 设置自动重启时间' '2. 取消（撤销本工具的设置）') ;;
-    sshport) a+=('1. 修改端口（新旧端口先同时开着，新端口能登录才关旧的）' '2. 恢复原来的端口') ;;
+    tools|vnstat)
+      a+=('1. 安装')
+      if [[ "$owner" == tool ]]; then a+=('2. 卸载（只卸载本工具装的）'); fi ;;
+    timezone)
+      a+=('1. 修改时区')
+      if [[ "$owner" == tool ]]; then a+=('2. 恢复成原来的时区'); fi ;;
+    hostname)
+      a+=('1. 修改主机名')
+      if [[ "$owner" == tool ]]; then a+=('2. 撤销主机名修改（恢复原来的名字）'); fi ;;
+    autoreboot)
+      a+=('1. 设置自动重启时间')
+      if [[ "$owner" == tool ]]; then a+=('2. 取消（撤销本工具的设置）'); fi ;;
+    sshport)
+      a+=('1. 修改端口（新旧端口先同时开着，新端口能登录才关旧的）')
+      if [[ "$owner" == tool ]]; then a+=('2. 恢复原来的端口'); fi ;;
     general) ;;
     ssh)
-      if [[ "$state" == on ]]; then a+=('2. 撤销（恢复密码和 root 登录）')
-      else a+=('1. 加固（只允许密钥登录，可选禁止 root）'); fi ;;
+      if [[ "$state" != on ]]; then a+=('1. 加固（只允许密钥登录，可选禁止 root）')
+      elif [[ "$text" != *'root 不能直接登录'* ]]; then a+=('1. 再禁止 root 直接登录（新建或改用普通管理员账户）'); fi
+      if [[ "$owner" == tool ]]; then a+=('2. 撤销（恢复密码和 root 登录）'); fi ;;
     firewall)
       if [[ "$state" == on ]]; then a+=('1. 重新应用'); else a+=('1. 开启（需要新开 SSH 窗口确认）'); fi
-      a+=('2. 撤销本工具的防火墙设置') ;;
+      if [[ "$owner" == tool ]]; then a+=('2. 撤销本工具的防火墙设置'); fi ;;
     *)
-      if [[ "$state" == on ]]; then a+=('1. 重新应用' '2. 关闭（撤销本工具的修改）')
-      else a+=('1. 开启'); fi ;;
+      if [[ "$state" == on || "$state" == warn ]]; then a+=('1. 重新应用'); else a+=('1. 开启'); fi
+      if [[ "$owner" == tool ]]; then
+        if [[ "$state" == off ]]; then a+=('2. 撤销本工具的修改'); else a+=('2. 关闭（撤销本工具的修改）'); fi
+      fi ;;
   esac
-  if [[ -n "$(param_names "$key")" ]]; then a+=('3. 调整参数' '4. 恢复推荐值'); fi
+  if [[ -n "$(param_names "$key")" ]]; then
+    a+=('3. 调整参数')
+    while IFS= read -r name; do
+      if [[ -n "$name" ]] && param_read "$name" > /dev/null; then a+=('4. 恢复推荐值'); break; fi
+    done < <(param_names "$key")
+  fi
   case "$key" in
-    firewall) a+=('5. 临时关闭') ;;
+    firewall) if [[ "$state" == on ]]; then a+=('5. 临时关闭'); fi ;;
     fail2ban) a+=('5. 管理白名单（不会被封的 IP）') ;;
     login) a+=('5. 查看登录记录') ;;
     tcp) a+=('5. 按带宽和延迟计算') ;;
     dockerfw) a+=('5. 看看哪些容器端口放行了') ;;
     databackup) a+=('5. 备份操作（立即备份、查看、恢复）') ;;
+    hostname) a+=('5. 修改显示名') ;;
   esac
-  for status in "${a[@]}"; do line+="$status   "; done
-  printf '%s回车返回\n' "$line"
+  for line in "${a[@]}"; do printf '  %s\n' "$line"; done
+  printf '  0. 返回\n'
 }
 
 # The symbols for terminals that cannot draw them: a saved setting (VPS_ASCII
 # on the command line still wins), in force from the next start.
 item_symbols() {
   if grep -qsx 'ui_ascii=1' "$PARAMS_FILE"; then
-    confirm_yes '改回 ✔ ⚠ ✖ ○ 这套符号吗？' || return 0
+    confirm_yes '改回 ✔ ⚠ ✖ ○ ● 这套符号吗？' || return 0
     param_store ui_ascii '' || die '无法保存设置。'
   else
-    confirm_yes '改用纯 ASCII 符号（[OK] [!] [X] [-]）吗？终端把 ✔ ⚠ 显示成乱码或方框时用。' || return 0
+    confirm_yes '改用纯 ASCII 符号（[OK] [!] [X] [-] [=]）吗？终端把 ✔ ⚠ 显示成乱码或方框时用。' || return 0
     param_store ui_ascii 1 || die '无法保存设置。'
   fi
   ok '已保存，下次打开时生效。'
 }
 
-item_menu() {
-  local choice i key group last label status width=0 w
-  local -a keys=()
+# How wide the terminal is (80 when nothing says).
+ui_columns() {
+  local width
+  width="$({ stty size < /dev/tty; } 2>/dev/null | awk '{print $2}' || true)"
+  [[ "$width" =~ ^[0-9]+$ ]] || width="${COLUMNS:-80}"
+  printf '%s\n' "$width"
+}
+
+# WIDTH: every group on a line or two, its items by their short names with
+# their marks: the whole machine at a glance, on one screen.
+item_overview() {
+  local width="$1" group key probe state text owner name frag mark sep n=0 used w indent=24
+  local -a keys=() rows=()
   mapfile -t keys < <(item_keys)
+  item_status_prepare
+  ITEM_LIST_MODE=1
   for key in "${keys[@]}"; do
-    ui_width w "$(item_label "$key")"
-    if ((w > width)); then width=$w; fi
+    probe="$(item_probe "$key")"
+    state="${probe%%$'\t'*}" text="${probe#*$'\t'}" owner=system
+    if [[ "$state" == on || "$state" == warn ]]; then owner="$(item_owner "$key")"; fi
+    rows+=("$key"$'\t'"$state"$'\t'"$owner"$'\t'"$text")
   done
+  ITEM_LIST_MODE=0 ITEM_SSHD_T='' ITEM_APT_DUMP=''
+  # A narrow terminal (a phone): the items under the name of their group.
+  if ((width < 64)); then indent=6; fi
+  while IFS= read -r group; do
+    n=$((n + 1))
+    printf -v name '%3s. %s' "$n" "$group"
+    ui_width w "$name"
+    if ((indent == 6)); then printf '%s%s%s\n%*s' "${C_BOLD-}" "$name" "${C_RESET-}" "$indent" ''
+    else printf '%s%s%s%*s' "${C_BOLD-}" "$name" "${C_RESET-}" "$((indent - w))" ''; fi
+    used="$indent" sep=''
+    for probe in "${rows[@]}"; do
+      IFS=$'\t' read -r key state owner text <<< "$probe"
+      [[ "$(item_group "$key")" == "$group" ]] || continue
+      frag="$(item_brief "$key" "$text")"
+      mark="$(item_mark "$state" "$owner")"
+      ui_width w "$frag"
+      if [[ -n "$mark" ]]; then w=$((w + 2)); fi
+      if ((used > indent && used + w > width)); then printf '\n%*s' "$indent" ''; used="$indent" sep=''; fi
+      printf '%s%s%s' "$sep" "$frag" "${mark:+ $mark}"
+      used=$((used + w + 3)) sep='   '
+    done
+    printf '\n'
+  done < <(item_groups)
+  if ((width >= 64)); then
+    printf '  %s 本工具设的  %s 系统原来就有  %s 没开  %s 有问题\n' "$(item_mark on tool)" "$(item_mark on system)" "$(item_mark off system)" "$(item_mark warn system)"
+  else
+    printf '  %s 本工具设的  %s 系统原来就有\n  %s 没开  %s 有问题\n' "$(item_mark on tool)" "$(item_mark on system)" "$(item_mark off system)" "$(item_mark warn system)"
+  fi
+}
+
+# GROUP: its items, one on a line with the whole status; one is picked by its
+# number and its page opens.
+item_group_menu() {
+  local group="$1" choice key probe state text owner label mark width w i
+  local -a keys=()
+  mapfile -t keys < <(item_group_keys "$group")
   while :; do
-    say '单项设置（选一项看详情）'
+    say "单项设置：$group"
+    width=0
+    for key in "${keys[@]}"; do
+      ui_width w "$(item_label "$key")"
+      if ((w > width)); then width=$w; fi
+    done
     item_status_prepare
     ITEM_LIST_MODE=1
-    i=0 last=''
+    i=0
     for key in "${keys[@]}"; do
       i=$((i + 1))
-      group="$(item_group "$key")"
-      if [[ "$group" != "$last" ]]; then printf ' %s%s%s\n' "${C_BOLD-}" "$group" "${C_RESET-}"; last="$group"; fi
-      label="$(item_label "$key")" status="$(item_status "$key")"
+      probe="$(item_probe "$key")"
+      state="${probe%%$'\t'*}" text="${probe#*$'\t'}" owner=system
+      if [[ "$state" == on || "$state" == warn ]]; then owner="$(item_owner "$key")"; fi
+      label="$(item_label "$key")" mark="$(item_mark "$state" "$owner")"
       ui_width w "$label"
-      printf '%3s. %s%*s  %s%s\n' "$i" "$label" "$((width - w))" '' "$(item_mark "$key" "$status")" "$status"
+      printf '%3s. %s%*s  %s %s\n' "$i" "$label" "$((width - w))" '' "${mark:- }" "$text"
     done
     ITEM_LIST_MODE=0 ITEM_SSHD_T='' ITEM_APT_DUMP=''
-    printf '  p. 参数总览（现在的值、推荐值和理由）   e. 导出参数   i. 导入参数\n'
-    printf '  u. 界面符号（现在：%s）   回车返回\n' "$(if [[ "${SYM_OK-}" == '[OK]' ]]; then echo '纯 ASCII'; else echo '✔ ⚠ ✖ ○'; fi)"
-    read -r -p "请选择要修改的项目 [1-$i，p/e/i/u，0 返回]: " choice || return 0
+    printf '  0. 返回\n'
+    read -r -p "请选择要修改的项目 [1-$i，0 返回]: " choice || return 0
     if [[ -z "$choice" || "$choice" == 0 ]]; then return 0; fi
-    case "$choice" in
-      p|P) params_overview; continue ;;
-      e|E) say '导出参数'; params_export; continue ;;
-      i|I) say '导入参数'; params_import; continue ;;
-      u|U) item_symbols; continue ;;
-    esac
-    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= i)); then
-      item_action "${keys[choice - 1]}"
-    else
-      echo '无效选项。'
-    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= i)); then item_page "${keys[10#$choice - 1]}"
+    else echo '无效选项。'; fi
   done
 }
 
-item_main() {
-  local previous
-  [[ $EUID -eq 0 ]] || die '单项设置需要 root：请用 sudo vps item。'
-  validate_vm
+# The single items, two levels deep: the groups with all their items at a
+# glance (one screen; the flat list of 33 lines up to 3.1.4 did not fit one),
+# then the items of the group chosen, then the page of one item.
+item_menu() {
+  local choice width symbols
+  local -a groups=()
+  mapfile -t groups < <(item_groups)
+  while :; do
+    say '单项设置（先选一组）'
+    width="$(ui_columns)"
+    item_overview "$width"
+    if [[ "${SYM_OK-}" == '[OK]' ]]; then symbols='纯 ASCII'; else symbols='✔ ⚠ ✖ ○ ●'; fi
+    if ((width >= 64)); then
+      printf '  p. 参数总览（现在的值、推荐值和理由）   e. 导出参数   i. 导入参数\n'
+      printf '  u. 界面符号（现在：%s）   0. 返回\n' "$symbols"
+    else
+      printf '  p. 参数总览   e. 导出参数   i. 导入参数\n  u. 界面符号（现在：%s）\n  0. 返回\n' "$symbols"
+    fi
+    read -r -p "请选择分组 [1-${#groups[@]}，p/e/i/u，0 返回]: " choice || return 0
+    case "$choice" in
+      ''|0) return 0 ;;
+      p|P) params_overview; continue ;;
+      e|E) say '导出参数'; params_export; continue ;;
+      i|I) item_session_begin; say '导入参数'; params_import; continue ;;
+      u|U) item_session_begin; item_symbols; continue ;;
+    esac
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#groups[@]})); then item_group_menu "${groups[10#$choice - 1]}"
+    else echo '无效选项。'; fi
+  done
+}
+
+# The first thing of a `vps item` run that may change something: from here on
+# the run holds the lock and has its log, its record, its backup of the
+# configuration and the rollback baseline, as every changing run has. Looking
+# at the menus needs none of it: up to 3.1.4 opening the list took the lock
+# (no vps port or vps update in another window meanwhile) and copied some 70
+# configuration files, only to delete the copies again on the way out.
+item_session_begin() {
+  ((ITEM_SESSION == 0)) || return 0
   start_logging
-  previous="$(run_latest_id)"
+  ITEM_PREVIOUS="$(run_latest_id)"
   prepare_run_state
   stage_run backup backup_configs
   restore_prepare
   run_state_mark_start
   unconfirmed_settle
+  ITEM_SESSION=1
+}
+
+# The end of such a run: its record stays when something changed.
+item_session_end() {
+  ((ITEM_SESSION)) || return 0
+  if run_state_changed; then finish_run_state; else run_state_discard "$ITEM_PREVIOUS"; fi
+}
+
+item_main() {
+  [[ $EUID -eq 0 ]] || die '单项设置需要 root：请用 sudo vps item。'
+  validate_vm
+  ITEM_SESSION=0
   if [[ -n "${MODE_ARGS[0]:-}" ]]; then
     grep -Fxq -- "${MODE_ARGS[0]}" <<< "$(item_keys)" || die "没有这一项：${MODE_ARGS[0]}。"
-    item_action "${MODE_ARGS[0]}"
-  else
-    item_menu
   fi
-  if run_state_changed; then finish_run_state; else run_state_discard "$previous"; fi
+  # What an earlier run left unfinished (a port change or a Docker switch that
+  # never got its confirmation) is finished first: that changes things.
+  if [[ -s "$STATE_ROOT/sshport-pending" ]] || { [[ -s "$STATE_ROOT/restore-v2/dockerfw_rules" ]] && ! dockerfw_on; }; then item_session_begin; fi
+  if [[ -n "${MODE_ARGS[0]:-}" ]]; then item_page "${MODE_ARGS[0]}"
+  else item_menu; fi
+  item_session_end
   # Offer a reboot only for an upgrade made in this session; an older pending
   # reboot is just mentioned.
   if ((UPGRADE_APPROVED)) && { ((KERNEL_UPDATE)) || [[ -e /var/run/reboot-required ]]; }; then offer_reboot

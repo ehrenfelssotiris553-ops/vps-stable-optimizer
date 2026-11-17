@@ -27,6 +27,9 @@ done < <(grep -E '^[A-Z][A-Z0-9_]*(_FILE|_DROPIN)=/etc/' "$TEST_SCRIPT")
 while IFS='=' read -r name value; do
   [[ -n "${PATHS[$name]:-}" ]] || printf -v "$name" '%s' "$value"
 done < <(grep -E '^[A-Z][A-Z0-9_]*=/[^ ]*$' "$TEST_SCRIPT")
+# There only while a change waits for its confirmation, and taken away by
+# whoever settles the change (guard-tests): no setting to back up or roll back.
+unset 'PATHS[GUARD_BOOT_SERVICE_FILE]'
 ((${#PATHS[@]} >= 13)) || fail "only ${#PATHS[@]} managed file paths found"
 
 # Stages with rollback tracking: every name in the table's third column.
@@ -91,7 +94,7 @@ while IFS= read -r check; do
 done < <(grep -oE "verify_module [a-z0-9_]+ '[^']*' [a-z0-9_]+" "$TEST_SCRIPT" | awk '{print $NF}')
 printf 'PASS: every recorded module is verified by an existing check.\n'
 
-status="$(source_of item_status)"
+status="$(source_of item_probe)"
 on="$(source_of item_turn_on)"
 while IFS= read -r key; do
   [[ "$(item_label "$key")" != "$key" ]] || fail "item without a label: $key"
@@ -137,8 +140,8 @@ raw="$(awk '/^login_hook_text\(\) \{$/ {skip = 1} !skip {print NR ":" $0} $0 == 
 # The check script's text is left out too: its messages go to Telegram, not
 # to a terminal.
 symbols="$(awk '/<<.(HELP|CHECK).$/ {skip = 1} !skip {print NR ":" $0} $0 == "HELP" || $0 == "CHECK" {skip = 0}' "$TEST_SCRIPT" |
-  grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vF "SYM_OK='" | grep -vF '✔ ⚠' |
-  sed -E 's/\$\{SYM_[A-Z]+-[^}]*\}//g' | grep -E '✔|⚠|✖|○|✅|❌|➖|⏳|❓' || true)"
+  grep -E '✔|⚠|✖|○|●|✅|❌|➖|⏳|❓' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vF "SYM_OK='" | grep -vF '✔ ⚠' |
+  sed -E 's/\$\{SYM_[A-Z]+-[^}]*\}//g' | grep -E '✔|⚠|✖|○|●|✅|❌|➖|⏳|❓' || true)"
 [[ -z "$symbols" ]] || fail "a state symbol written out instead of a SYM_ variable: $symbols"
 # Every question drops what was typed before it was shown (found on a VM: the
 # screen redrawn after reconnecting to tmux sent answers to old questions, and

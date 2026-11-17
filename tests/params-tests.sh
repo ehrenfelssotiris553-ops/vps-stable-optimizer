@@ -53,42 +53,78 @@ MEM_MIB=2048
   fail 'cautions for extreme values'
 printf 'PASS: parameters are stored strictly, follow the recommendation when automatic and warn about extreme values.\n'
 
-# Adjusting: Enter keeps, a bad value asks again, an extreme one needs a yes,
-# "auto" resets; the item is applied again only when it is on.
+# Adjusting: the parameters of the item are listed with their values and one
+# is picked by its number ("a" goes through all of them in turn). Enter keeps,
+# a bad value asks again, an extreme one needs a yes, "auto" resets; the item
+# is applied again only when it is on.
 : > "$PARAMS_FILE"; : > "$TEST_ROOT/applied"
 CONFIRM=n
 confirm_yes() { printf 'ASK %s\n' "$1"; [[ "$CONFIRM" == y ]]; }
-# (tcp asks for three: the buffer cap, the two switches, the limit of what waits to be sent.)
-out="$(printf '\n\n\n' | param_adjust tcp)"
+load_optimizer_functions param_ask
+# Whether the item is in force is read from the system (item_probe); the test says what is found there.
+STATE=on
+item_probe() { printf '%s\t状态\n' "$STATE"; }
+# (tcp has three: the buffer cap, the two switches, the limit of what waits to be sent.)
+out="$(printf '\n' | param_adjust tcp)"
+[[ "$out" == *'  1. '*'  2. '*'  3. '*'a. 逐个过一遍'*'参数没有改动'* && ! -s "$TEST_ROOT/applied" ]] || fail "leaving the list changed something, or the list is not there: $out"
+[[ "$(grep -c '^ *[0-9]\. ' <<< "$out")" == 4 ]] || fail "the list of the parameters of tcp: $out"
+out="$(printf '%s\n' a '' '' '' 0 | param_adjust tcp)"
 [[ "$out" == *'参数没有改动'* && ! -s "$TEST_ROOT/applied" ]] || fail "Enter changed something: $out"
-out="$(printf '%s\n' 500 abc 64 '' '' | param_adjust tcp)"
+out="$(printf '%s\n' a 500 abc 64 '' '' 0 | param_adjust tcp)"
 [[ "$out" == *'请输入 4 到 256 之间的整数'* ]] || fail 'out-of-range value not refused'
 [[ "$(param_value tcp_buffer_mib)" == 64 ]] || fail "adjusted value not kept: $(cat "$PARAMS_FILE")"
 grep -Fxq 'apply tcp' "$TEST_ROOT/applied" || fail 'an item that is on was not applied again'
+# One picked by its number: only that one is asked for and changed (up to
+# 3.1.4 every parameter of the item was asked in turn, twelve for TG).
+: > "$TEST_ROOT/applied"
+out="$(printf '%s\n' 3 256 0 | param_adjust tcp)"
+[[ "$(param_value tcp_notsent_kib)" == 256 && "$(param_value tcp_buffer_mib)" == 64 && "$(grep -c '新的值' <<< "$out")" == 0 ]] || fail "picking the third parameter: $(cat "$PARAMS_FILE") / $out"
+[[ "$(grep -c '本机推荐' <<< "$out")" == 1 ]] || fail "more than the picked parameter was asked for: $out"
+[[ "$(grep -c '^apply tcp$' "$TEST_ROOT/applied")" == 1 ]] || fail 'the item was not applied once after the list was left'
+out="$(printf '%s\n' 9 x 0 | param_adjust tcp)"
+[[ "$(grep -c '无效选项' <<< "$out")" == 2 ]] || fail "a number that is no parameter: $out"
+param_store tcp_notsent_kib ''
 : > "$TEST_ROOT/applied"; CONFIRM=n
-out="$(printf '%s\n' 200 '' | param_adjust tcp)"
+out="$(printf '%s\n' 1 200 '' 0 | param_adjust tcp)"
 [[ "$out" == *'ASK 仍然用 200 MiB 吗？'* && "$(param_value tcp_buffer_mib)" == 64 ]] || fail 'an extreme value was taken without a yes'
 CONFIRM=y
-printf '%s\n' 200 | param_adjust tcp > /dev/null
+printf '%s\n' 1 200 0 | param_adjust tcp > /dev/null
 [[ "$(param_value tcp_buffer_mib)" == 200 ]] || fail 'a confirmed extreme value was not kept'
-printf 'auto\n' | param_adjust tcp > /dev/null
+printf '%s\n' 1 auto 0 | param_adjust tcp > /dev/null
 [[ "$(param_mode tcp_buffer_mib)" == 自动 ]] || fail 'auto did not reset'
-# An item that is off keeps the value for when it is turned on.
-: > "$TEST_ROOT/applied"; MODULE='declined'
-out="$(printf '16\n\n\n' | param_adjust tcp)"
-[[ "$out" == *'开启时就会用新的参数'* && ! -s "$TEST_ROOT/applied" ]] || fail 'an item that is off was applied'
+# An item that is off keeps the value for when it is turned on. Also one this
+# tool once set up (the record still says so) that was switched off by hand
+# since: up to 3.1.4 the record decided, and a new parameter switched it on again.
+: > "$TEST_ROOT/applied"; STATE=off MODULE='applied'
+out="$(printf '%s\n' 1 16 0 | param_adjust tcp)"
+[[ "$out" == *'开启时就会用新的参数'* && ! -s "$TEST_ROOT/applied" ]] || fail "an item that is off in the system was applied because of its record: $out"
+# In force although the record knows nothing of it (set up by hand): applied.
+STATE=on MODULE=''
+printf '%s\n' 1 24 0 | param_adjust tcp > /dev/null
+grep -Fxq 'apply tcp' "$TEST_ROOT/applied" || fail 'an item in force without a record was not applied again'
+# Not something switched on or off: the record of its last result decides.
+: > "$TEST_ROOT/applied"; STATE=none MODULE='declined'
+printf '%s\n' 1 16 0 | param_adjust tcp > /dev/null
+[[ ! -s "$TEST_ROOT/applied" ]] || fail 'an item without a state and without a result was applied'
 MODULE='applied'
+printf '%s\n' 1 32 0 | param_adjust tcp > /dev/null
+grep -Fxq 'apply tcp' "$TEST_ROOT/applied" || fail 'an item without a state was not applied by its record'
+STATE=on
 param_reset tcp > /dev/null
 [[ "$(param_mode tcp_buffer_mib)" == 自动 ]] || fail 'reset to recommended'
-printf 'PASS: adjusting and resetting from the single item, applied again only when the item is on.\n'
+printf 'PASS: parameters are picked from a list; applied again only when the item is in force in the system.\n'
 
-# The single item offers both; items without parameters do not.
-item_status() { echo '已开启'; }
+# The page of the item offers both (the reset once something was adjusted);
+# items without parameters do not.
 item_turn_off() { :; }
 port_menu() { :; }
-[[ "$(printf '0\n' | item_action tcp)" == *'3. 调整参数   4. 恢复推荐值'* ]] || fail 'tcp item lacks adjust and reset'
+load_optimizer_functions item_status
+page="$(printf '0\n' | item_action tcp)"
+[[ "$page" == *'  3. 调整参数'* && "$page" != *'恢复推荐值'* && "$page" == *'参数：3 个，现在都是推荐值'* ]] || fail "tcp page with nothing adjusted: $page"
 [[ "$(printf '0\n' | item_action trim)" != *'调整参数'* ]] || fail 'an item without parameters offers to adjust'
 param_store tcp_buffer_mib 48
+page="$(printf '0\n' | item_action tcp)"
+[[ "$page" == *'  3. 调整参数'*'  4. 恢复推荐值'* && "$page" == *'参数：3 个，其中 1 个你调过'* ]] || fail "tcp page with one adjusted: $page"
 printf '4\n' | item_action tcp > /dev/null
 [[ "$(param_mode tcp_buffer_mib)" == 自动 ]] || fail '4 in the item menu did not reset'
 printf 'PASS: the single-item menu offers adjust and reset where an item has parameters.\n'

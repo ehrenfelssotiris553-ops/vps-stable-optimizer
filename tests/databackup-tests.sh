@@ -448,7 +448,7 @@ printf 'PASS: imported backup parameters reach the schedule without setting anyt
 # Turned on again with restic there: no package index needed. The list marks a
 # backup that failed differently from one that works.
 (
-  load_optimizer_functions item_turn_on item_mark item_state
+  load_optimizer_functions item_turn_on item_probe item_status
   apt_index_ready() { printf 'index\n' >> "$CALLS"; return 1; }
   stage_run() { printf 'stage %s\n' "$1" >> "$CALLS"; }
   : > "$CALLS"
@@ -459,10 +459,24 @@ printf 'PASS: imported backup parameters reach the schedule without setting anyt
   installed() { return 1; }
   item_turn_on databackup
   [[ "$(cat "$CALLS")" == 'index' ]] || fail "without restic: $(cat "$CALLS")"
-  SYM_OK=OK SYM_WARN=WARN SYM_SKIP=SKIP
-  [[ "$(item_mark databackup '已开启，上次备份失败（11-08 03:30）')" == 'WARN ' ]] || fail "failed backup marked: $(item_mark databackup '已开启，上次备份失败')"
-  [[ "$(item_mark databackup '已开启，上次备份 11-08 03:30')" == 'OK ' ]] || fail 'working backup marked wrongly'
-  [[ "$(item_mark dockerfw '已开启，但防火墙没开，暂时不起作用')" == 'WARN ' ]] || fail 'a switch that does nothing marked as working'
+  # The state comes from the backup's own record of its last run, not from
+  # the wording of the status.
+  SYM_OK=OK SYM_WARN=WARN SYM_SKIP=SKIP SYM_HAVE=HAVE C_OK='' C_WARN='' C_DIM='' C_RESET=''
+  databackup_on() { return 0; }
+  mkdir -p "$STATE_ROOT/databackup"
+  printf '1762572600\tfail\tno route to host\n' > "$STATE_ROOT/databackup/last"
+  [[ "$(item_state databackup)" == warn && "$(item_status databackup)" == '已开启，上次备份失败'* ]] || fail "a backup that failed: $(item_probe databackup)"
+  [[ "$(item_mark "$(item_state databackup)" tool)" == WARN ]] || fail "failed backup marked: $(item_mark "$(item_state databackup)" tool)"
+  printf '1762572600\tok\t12 files\n' > "$STATE_ROOT/databackup/last"
+  [[ "$(item_state databackup)" == on && "$(item_mark "$(item_state databackup)" tool)" == OK ]] || fail "a backup that works: $(item_probe databackup)"
+  databackup_on() { return 1; }
+  [[ "$(item_state databackup)" == off && "$(item_mark off system)" == SKIP ]] || fail "no backup set up: $(item_probe databackup)"
+  docker_present() { return 0; }
+  dockerfw_on() { return 0; }
+  UFW_CONF="$STATE_ROOT/ufw.conf"; printf 'ENABLED=no\n' > "$UFW_CONF"
+  [[ "$(item_state dockerfw)" == warn ]] || fail "a switch that does nothing while the firewall is off: $(item_probe dockerfw)"
+  printf 'ENABLED=yes\n' > "$UFW_CONF"
+  [[ "$(item_state dockerfw)" == on ]] || fail "the Docker switch with the firewall on: $(item_probe dockerfw)"
 )
 printf 'PASS: turning the backup on again needs no package index; a failure is marked as one.\n'
 

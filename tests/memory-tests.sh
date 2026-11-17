@@ -210,7 +210,8 @@ param_store zram_percent ''; param_store zram_algorithm ''
 param_item_on() { return 1; }
 item_label() { echo ZRAM; }
 confirm_yes() { return 0; }
-printf '%s\n' '' 'gzip' 'lz4' | param_adjust zram > "$TEST_ROOT/out"
+load_optimizer_functions param_ask
+printf '%s\n' a '' 'gzip' 'lz4' | param_adjust zram > "$TEST_ROOT/out"
 [[ "$(param_value zram_algorithm)" == lz4 ]] || fail "algorithm: $(cat "$TEST_ROOT/out")"
 grep -q '请输入 zstd、lz4 或 lzo-rle' "$TEST_ROOT/out" || fail 'a wrong algorithm was not refused'
 printf 'zram_algorithm=zstd\nzram_algorithm=gzip\nzram_percent=040\n\n' | params_import > "$TEST_ROOT/out"
