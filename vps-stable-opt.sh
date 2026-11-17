@@ -3226,7 +3226,8 @@ ipv6_broken() {
 # on). A precedence policy set by someone else is kept.
 ipv4_stage() {
   step 12 '优先使用 IPv4'
-  local line='precedence ::ffff:0:0/96  100'
+  local line note
+  line="$(gai_prefer_line)" note="$(gai_note_line)"
   if [[ "${IPV4_CHOICE:-}" != 1 ]]; then ok '按你的选择不修改地址优先顺序。'; module_result ipv4 declined 'not requested'; return 0; fi
   if [[ -f "$GAI_FILE" ]] && grep -Eq '^[[:space:]]*precedence[[:space:]]' "$GAI_FILE"; then
     if grep -Fxq "$line" "$GAI_FILE"; then ok '已经优先使用 IPv4。'; module_result ipv4 present 'precedence set'
@@ -3236,8 +3237,8 @@ ipv4_stage() {
   if [[ -L "$GAI_FILE" ]]; then warn "$GAI_FILE 是链接，保持不变。"; module_result ipv4 preserved 'gai.conf is a link'; return 0; fi
   backup_config_path "$GAI_FILE" || die "无法备份 $GAI_FILE"
   if [[ ! -e "$GAI_FILE" ]]; then
-    put_file "$GAI_FILE" "# VPS Stable Optimizer v2.8: prefer IPv4 (IPv6 stays on)"$'\n'"$line" || { module_result ipv4 preserved 'gai.conf conflict'; return 0; }
-  elif ! append_line_safely "$GAI_FILE" '# VPS Stable Optimizer v2.8: prefer IPv4 (IPv6 stays on)' || ! append_line_safely "$GAI_FILE" "$line"; then
+    put_file "$GAI_FILE" "$note"$'\n'"$line" || { module_result ipv4 preserved 'gai.conf conflict'; return 0; }
+  elif ! append_line_safely "$GAI_FILE" "$note" || ! append_line_safely "$GAI_FILE" "$line"; then
     warn "没能写入 $GAI_FILE。"; module_result ipv4 failed 'gai.conf not written'; return 0
   fi
   record_config_change "$GAI_FILE" line-appended || die '无法记录这次配置变更。'
@@ -8181,7 +8182,10 @@ dockerlog_stage() {
   printf '  合计 %s MiB\n' "$((total / 1048576))"
   if [[ -e "$DOCKER_DAEMON_FILE" || -L "$DOCKER_DAEMON_FILE" ]]; then
     current="$(cat -- "$DOCKER_DAEMON_FILE" 2>/dev/null || true)"
-    if restore_file_ours dockerlog_file || [[ "$current" == "$(dockerlog_text)" ]]; then
+    # Also once the owner has added to the file: the log settings in it are
+    # still this tool's, and follow its parameters.
+    if restore_file_ours dockerlog_file || [[ "$current" == "$(dockerlog_text)" ]] ||
+       { [[ "$(restore_read dockerlog_file state 2>/dev/null || true)" == applied ]] && restore_shared_present dockerlog_file; }; then
       dockerlog_merge || { module_result dockerlog failed 'daemon.json not written'; return 0; }
     elif grep -Eq '"log-(driver|opts)"' <<< "$current"; then
       ok "$DOCKER_DAEMON_FILE 里已经有日志设置，保持不变。"; module_result dockerlog preserved 'own log settings'; return 0
@@ -9793,7 +9797,117 @@ restore_needed() {
   local id="$1"
   [[ -d "$RESTORE_ROOT/$id" ]] || return 1
   if [[ "$id" == hosts_file && -e "$RESTORE_ROOT/hosts_line" ]]; then restore_hosts_line_present; return; fi
+  # A shared file: only while this tool's own part is in it, and not undone yet.
+  if restore_shared "$id"; then
+    if restore_at_origin "$id"; then return 1; fi
+    [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]] && restore_shared_present "$id"
+    return
+  fi
   ! restore_at_origin "$id"
+}
+
+# ID: a file this tool shares with its owner. It adds its own part there (two
+# keys in Docker's daemon.json, two lines in /etc/gai.conf) and leaves the
+# rest; the rollback takes only that part out again. Up to 3.1.4 the whole
+# file came back as it was before this tool, and whatever its owner had added
+# since was lost without a word (a data-root in daemon.json, say).
+restore_shared() {
+  [[ "$1" == dockerlog_file || "$1" == gai_file ]]
+}
+
+# The two lines this tool adds to /etc/gai.conf (ipv4_stage), and takes out again.
+gai_note_line() {
+  printf '%s\n' '# VPS Stable Optimizer v2.8: prefer IPv4 (IPv6 stays on)'
+}
+gai_prefer_line() {
+  printf '%s\n' 'precedence ::ffff:0:0/96  100'
+}
+
+# ID: this tool's part is in the shared file.
+restore_shared_present() {
+  local path
+  path="$(restore_path "$1")" || return 1
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  case "$1" in
+    dockerlog_file) grep -q '"log-opts"' -- "$path" && grep -q '"max-size"' -- "$path" ;;
+    gai_file) grep -Fxq -- "$(gai_prefer_line)" "$path" ;;
+    *) return 1 ;;
+  esac
+}
+
+# ID: this tool's part leaves the shared file. Still exactly what this tool
+# wrote: the file from before comes back whole (byte for byte). Changed since:
+# only the tool's keys or lines go, the rest stays as its owner has it now; a
+# file the tool created that holds nothing else afterwards is removed.
+restore_shared_apply() {
+  local id="$1" path original temp rc=0 left=1
+  path="$(restore_path "$id")" || return 1
+  state_path_safe "$path" || return 1
+  if [[ ! -e "$path" && ! -L "$path" ]]; then return 0; fi
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  if [[ "$(restore_fingerprint "$id" 2>/dev/null || true)" == "$(restore_read "$id" last_fp 2>/dev/null || true)" ]]; then
+    restore_file_apply "$id"; return "$?"
+  fi
+  original="$(restore_read "$id" origin_fp)" || return 1
+  temp="$(mktemp "${path%/*}/.vps-restore.XXXXXX")" || return 1
+  # The copy keeps the mode and the owner of the file.
+  cp -p -- "$path" "$temp" || { rm -f -- "$temp"; return 1; }
+  case "$id" in
+    dockerlog_file)
+      if ! command -v python3 >/dev/null; then
+        rm -f -- "$temp"
+        warn "没有 python3，不能只拿掉本工具写的日志设置：$path 保持不变。要去掉的话，手动删掉里面的 log-driver 和 log-opts 两项。"
+        return 1
+      fi
+      # 3: nothing is left in the file but "{}".
+      python3 -I -c 'import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+if not isinstance(d, dict):
+    sys.exit(1)
+if d.get("log-driver") == "json-file":
+    del d["log-driver"]
+opts = d.get("log-opts")
+if isinstance(opts, dict):
+    opts.pop("max-size", None)
+    opts.pop("max-file", None)
+    if not opts:
+        del d["log-opts"]
+with open(sys.argv[2], "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+sys.exit(0 if d else 3)' "$path" "$temp" 2>/dev/null || rc=$?
+      if ((rc == 3)); then left=0; rc=0; fi
+      if ((rc)); then rm -f -- "$temp"; warn "$path 不是有效的 JSON，保持不变。"; return 1; fi ;;
+    gai_file)
+      # grep exits 1 when no line remains.
+      grep -vxF -e "$(gai_note_line)" -e "$(gai_prefer_line)" -- "$path" > "$temp" || (($? == 1)) || rc=1
+      if ((rc)); then rm -f -- "$temp"; return 1; fi
+      if ! grep -q '[^[:space:]]' -- "$temp"; then left=0; fi ;;
+    *) rm -f -- "$temp"; return 1 ;;
+  esac
+  if ((left == 0)) && [[ "$original" == absent ]]; then
+    rm -f -- "$temp" "$path" || return 1
+    echo "$path 是本工具建的，里面没有别的内容了：已删除。"
+  else
+    mv -fT -- "$temp" "$path" || { rm -f -- "$temp"; return 1; }
+    echo "$path 在本工具写入之后被改过：只拿掉了本工具写的那部分，其余内容没有动。"
+  fi
+  ! restore_shared_present "$id"
+}
+
+# ID PATH: PATH is about to be replaced or removed by the rollback although it
+# changed since this tool last wrote it (by hand, or by another program). What
+# is there now is kept under restore-v2/replaced first, and the user is told.
+restore_keep_replaced() {
+  local id="$1" path="$2" dir="$RESTORE_ROOT/replaced" copy
+  [[ -f "$path" && ! -L "$path" ]] || return 0
+  [[ "$(restore_fingerprint "$id" 2>/dev/null || true)" != "$(restore_read "$id" last_fp 2>/dev/null || true)" ]] || return 0
+  state_path_safe "$dir" || return 1
+  mkdir -p -- "$dir" && chmod 700 -- "$dir" || return 1
+  copy="$dir/$id.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -p -- "$path" "$copy" || return 1
+  echo "$path 在本工具上次写入之后被改过：现在的内容先另存到 $copy，再恢复成本工具运行前的样子。"
 }
 
 restore_file_apply() {
@@ -9802,6 +9916,7 @@ restore_file_apply() {
   original="$(restore_read "$id" origin_fp)" || return 1
   state_path_safe "$path" || return 1
   [[ ! -e "$path" || ( -f "$path" && ! -L "$path" ) ]] || return 1
+  restore_keep_replaced "$id" "$path" || return 1
   if [[ "$original" == absent ]]; then rm -f -- "$path"; return "$?"; fi
   snapshot="$RESTORE_ROOT/$id/origin"
   restore_data_safe "$snapshot" || return 1
@@ -9857,6 +9972,7 @@ restore_zram_safe() {
 restore_apply_one() {
   local id="$1" value verb
   if [[ "$id" == hosts_file && -e "$RESTORE_ROOT/hosts_line" ]]; then restore_hosts_lines_apply; return "$?"; fi
+  if restore_shared "$id"; then restore_shared_apply "$id"; return "$?"; fi
   if restore_path "$id" >/dev/null; then restore_file_apply "$id"; return "$?"; fi
   value="$(restore_read "$id" origin_value)" || return 1
   case "$id" in

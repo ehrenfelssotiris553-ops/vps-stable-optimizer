@@ -9,7 +9,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions sysctl_owned_apply restore_sysctl_original conntrack_stage ping_stage ping_ufw_sync ping_ufw_text check_conntrack check_ping \
+load_optimizer_functions gai_note_line gai_prefer_line sysctl_owned_apply restore_sysctl_original conntrack_stage ping_stage ping_ufw_sync ping_ufw_text check_conntrack check_ping \
   verify_conntrack_usage verify_line verify_set param_value param_read param_recommended param_check param_caution param_store \
   ipv6_broken append_line_safely ipv4_stage check_ipv4 apt_time_apply check_keepalive param_kind perf_tcp_limits perf_net_queues perf_fd_pressure tcp_bdp_mib ssh_rtt_ms
 TEST_ROOT="$(mktemp -d)"
