@@ -180,16 +180,15 @@ sudo bash "$CI/journal-probe.sh" > "$LOGS/journal-probe.log" 2>&1 || rc=$?
 notice "journal probe ($mode, $(uname -m))" "$LOGS/journal-probe.log"
 ((rc == 0)) || fail 'the health report counts journal lines on a fresh machine (see the journal probe notice)'
 
-# NAME KEY CHOICE...: one `vps item` run that picks KEY in the menu, answers
-# CHOICE... in turn in the item's own menu, and is then back at the menu and
+# NAME KEY CHOICE...: one `vps item KEY` run: the page of the item, where
+# CHOICE... are answered in turn (the page comes again after each), then 0
 # leaves it. Stage questions are answered as in the custom setup.
 item_do() {
-  local name="$1" key="$2" index rules="$LOGS/$1.rules"
+  local name="$1" key="$2" rules="$LOGS/$1.rules"
   shift 2
-  index="$(item_index "$key")" || fail "no single item $key"
-  { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq %s\n' "$index" "$*"
+  { printf '请选择: ==> @seq %s 0\n' "$*"
     cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$rules"
-  drive "$rules" "$name" sudo vps item || fail "single item $key ($*) exited with $?"
+  drive "$rules" "$name" sudo vps item "$key" || fail "single item $key ($*) exited with $?"
 }
 
 check_all() {
@@ -376,12 +375,17 @@ group 'Single items: each switched off (back to how the system was) and on again
 # change keeps one.
 runs() { sudo find /var/lib/vps-stable-opt /var/backups/vps-stable-opt -maxdepth 1 -name 'run-*' | wc -l; }
 runs_before="$(runs)" latest_before="$(sudo cat /var/lib/vps-stable-opt/latest)"
-printf '%s\n' '请选择要修改的项目 ==> 0' > "$LOGS/item-look.rules"
+# Through the two levels of the menu: the second group, its first item (BBR),
+# and back out again without doing anything.
+printf '%s\n' '请选择分组 ==> @seq 2 0' '请选择要修改的项目 ==> @seq 1 0' '请选择: ==> 0' > "$LOGS/item-look.rules"
 drive "$LOGS/item-look.rules" item-look sudo vps item || fail "looking at the single items exited with $?"
+has item-look '单项设置：网络'
+has item-look ' 作用：换用 BBR 拥塞算法'
 # When it keeps its record: what was newer than its start (the run it kept
 # has the mark). The run goes on; the failure comes at the end.
 look_problem=''
-if ! grep -Fq '这次只是查看，没有改动' "$LOGS/item-look.log" || [[ "$(runs)" != "$runs_before" ]] ||
+# (Only looking begins no run at all since 3.2: no log, no record, no lock.)
+if grep -Fq '运行记录：' "$LOGS/item-look.log" || [[ "$(runs)" != "$runs_before" ]] ||
    [[ "$(sudo cat /var/lib/vps-stable-opt/latest)" != "$latest_before" ]]; then
   look_problem="a session that only looked kept its record: $runs_before -> $(runs) records and backups (see the notice)"
   mark="/var/lib/vps-stable-opt/$(sudo cat /var/lib/vps-stable-opt/latest)/.started"
@@ -574,9 +578,9 @@ python3 "$CI/fake-tg.py" "$LOGS/tg-sent.log" 8443 > "$LOGS/fake-tg.out" 2>&1 < /
 tg_pid=$!
 trap 'kill "$tg_pid" 2>/dev/null || true' EXIT
 sleep 1
-index="$(item_index notify)" || fail 'no single item notify'
-{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq 1\n' "$index"; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/item-notify-on.rules"
-drive "$LOGS/item-notify-on.rules" item-notify-on sudo VPS_TG_API=http://127.0.0.1:8443 vps item || fail "TG on exited with $?"
+{ printf '请选择: ==> @seq 1 0\n'; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/item-notify-on.rules"
+drive "$LOGS/item-notify-on.rules" item-notify-on sudo VPS_TG_API=http://127.0.0.1:8443 vps item notify || fail "TG on exited with $?"
+has item-notify-on '你在 Telegram 里收到了吗'
 if ! grep -Fq 'TG 通知已开启' "$LOGS/tg-sent.log" || ! grep -Fxq 'chat=424242' "$LOGS/tg-sent.log"; then fail "no test message: $(cat "$LOGS/tg-sent.log" 2>&1)"; fi
 [[ "$(sudo stat -c %a /var/lib/vps-stable-opt/notify.conf)" == 600 ]] || fail 'the TG settings are readable by others'
 systemctl is-active -q vps-stable-check.timer || fail 'the check timer is not running'
@@ -805,15 +809,14 @@ echo 'precious data' | sudo tee /srv/ci-data/sub/keep.txt > /dev/null
 echo 'scratch' | sudo tee /srv/ci-data/skip.tmp > /dev/null
 printf '%s\n' 'backup_paths=/srv/ci-data /nonexistent/not-there' 'backup_drill_days=1' > "$LOGS/backup-params.txt"
 drive params.rules backup-params sudo vps params import "$LOGS/backup-params.txt" || fail "params import exited with $?"
-backup_index="$(item_index databackup)" || fail 'no single item databackup'
-# NAME CHOICE RULE...: `vps item`, data backup, CHOICE on its page.
+# NAME CHOICE RULE...: `vps item databackup`, CHOICE on its page, then 0.
 backup_item() {
   local name="$1" choice="$2"
   shift 2
-  { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> %s\n' "$backup_index" "$choice"
+  { printf '请选择: ==> @seq %s 0\n' "$choice"
     if (($#)); then printf '%s\n' "$@"; fi
     cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/$name.rules"
-  drive "$LOGS/$name.rules" "$name" sudo vps item || fail "data backup ($name) exited with $?"
+  drive "$LOGS/$name.rules" "$name" sudo vps item databackup || fail "data backup ($name) exited with $?"
 }
 # Independently of the tool: restic itself, with the tool's password.
 restic_ci() { sudo restic --no-cache --password-file "$backup_dir/password" "$@"; }
@@ -942,9 +945,8 @@ group 'TG and the traffic alert both on before the rollback'
 python3 "$CI/fake-tg.py" "$LOGS/tg-sent-2.log" 8443 > "$LOGS/fake-tg-2.out" 2>&1 < /dev/null &
 tg_pid=$!
 for _ in $(seq 1 50); do if (exec 3<>/dev/tcp/127.0.0.1/8443) 2>/dev/null; then break; fi; sleep 0.2; done
-index="$(item_index notify)" || fail 'no single item notify'
-{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> @seq 1\n' "$index"; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/item-notify-on-2.rules"
-drive "$LOGS/item-notify-on-2.rules" item-notify-on-2 sudo VPS_TG_API=http://127.0.0.1:8443 vps item || fail "TG on again exited with $?"
+{ printf '请选择: ==> @seq 1 0\n'; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/item-notify-on-2.rules"
+drive "$LOGS/item-notify-on-2.rules" item-notify-on-2 sudo VPS_TG_API=http://127.0.0.1:8443 vps item notify || fail "TG on again exited with $?"
 if ! sudo test -s /var/lib/vps-stable-opt/notify.conf || ! sudo test -s /var/lib/vps-stable-opt/quota.conf; then fail 'TG and the traffic alert are not both on'; fi
 grep -Fxq 'OnCalendar=*:0/1' /etc/systemd/system/vps-stable-check.timer || fail "the timer with TG: $(cat /etc/systemd/system/vps-stable-check.timer)"
 kill "$tg_pid" 2>/dev/null || true

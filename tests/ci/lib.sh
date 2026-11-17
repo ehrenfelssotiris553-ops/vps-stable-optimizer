@@ -93,14 +93,6 @@ previous_release() {
   printf '%s %s\n' "$release" "$found"
 }
 
-# The menu number of single item KEY, from the tool's own list (item_keys).
-item_index() {
-  awk -v key="$1" '
-    /^item_keys\(\) \{/ {list = 1; next}
-    list && /printf/ {for (i = 3; i <= NF; i++) if ($i == key) {print i - 2; found = 1}; exit}
-    END {exit !found}
-  ' "$ROOT/vps-stable-opt.sh"
-}
 lacks() { if grep -Fq -- "$2" "$LOGS/$1.log"; then fail "$1: \"$2\" should not be there"; fi; }
 
 # The tool's error trap ("出错：第 N 行") in any transcript or saved output is

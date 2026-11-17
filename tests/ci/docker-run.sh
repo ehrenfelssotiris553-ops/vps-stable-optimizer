@@ -69,14 +69,13 @@ container_ok 'after Docker restarted under the new kernel settings'
 endgroup
 
 group 'The firewall paused and on again: Docker keeps its FORWARD policy, the container keeps working'
-index="$(item_index firewall)" || fail 'no single item firewall'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 5' '临时关闭防火墙吗？ ==> y' > "$LOGS/fw-pause.rules"
-drive "$LOGS/fw-pause.rules" fw-pause sudo vps item || fail "pausing the firewall exited with $?"
+printf '%s\n' '请选择: ==> @seq 5 0' '临时关闭防火墙吗？ ==> y' > "$LOGS/fw-pause.rules"
+drive "$LOGS/fw-pause.rules" fw-pause sudo vps item firewall || fail "pausing the firewall exited with $?"
 if sudo ufw status 2>/dev/null | grep -Fx 'Status: active' > /dev/null; then fail 'the firewall is still on after the pause'; fi
 [[ "$(forward)" == "$before_forward" ]] || fail "pausing the firewall left FORWARD at '$(forward)', Docker had '$before_forward'"
 container_ok 'with the firewall paused'
-{ printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1'; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/fw-on.rules"
-drive "$LOGS/fw-on.rules" fw-on sudo vps item || fail "turning the firewall on again exited with $?"
+{ printf '%s\n' '请选择: ==> @seq 1 0'; cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/fw-on.rules"
+drive "$LOGS/fw-on.rules" fw-on sudo vps item firewall || fail "turning the firewall on again exited with $?"
 sudo ufw status 2>/dev/null | grep -Fx 'Status: active' > /dev/null || fail 'the firewall did not come on again'
 container_ok 'with the firewall on again'
 endgroup
@@ -101,15 +100,14 @@ closes() { local i; for ((i = 0; i < 12; i++)); do if ! from_outside "${1:-198.1
 in_set() { sudo nft list set inet vps-stable-docker open_tcp 2>/dev/null | grep -E "[ ,{]$1[ ,}]" > /dev/null; }
 table_there() { sudo nft list table inet vps-stable-docker > /dev/null 2>&1; }
 opens || fail 'the baseline is wrong: the published port should answer from outside, past the firewall'
-dockerfw_index="$(item_index dockerfw)" || fail 'no single item dockerfw'
 # NAME CHOICE RULE...
 dockerfw_item() {
   local name="$1" choice="$2"
   shift 2
-  { printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> %s\n' "$dockerfw_index" "$choice"
+  { printf '请选择: ==> @seq %s 0\n' "$choice"
     if (($#)); then printf '%s\n' "$@"; fi
     cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/$name.rules"
-  drive "$LOGS/$name.rules" "$name" sudo vps item || fail "Docker ports ($name) exited with $?"
+  drive "$LOGS/$name.rules" "$name" sudo vps item dockerfw || fail "Docker ports ($name) exited with $?"
 }
 # Not confirmed: as it was.
 dockerfw_item dockerfw-no 1 '继续让外面访问这些端口吗 ==> n' '从外面打开你的网站 ==> n'
@@ -143,10 +141,10 @@ sudo systemctl restart docker
 sudo docker start web > /dev/null
 for ((i = 0; i < 15; i++)); do if web_ok; then break; fi; sleep 2; done
 closes || fail 'open from outside after Docker restarted'
-drive "$LOGS/fw-pause.rules" dockerfw-fw-pause sudo vps item || fail "pausing the firewall exited with $?"
+drive "$LOGS/fw-pause.rules" dockerfw-fw-pause sudo vps item firewall || fail "pausing the firewall exited with $?"
 opens || fail 'still closed with the firewall off'
 if table_there; then fail 'the rules stayed with the firewall off'; fi
-drive "$LOGS/fw-on.rules" dockerfw-fw-on sudo vps item || fail "turning the firewall on again exited with $?"
+drive "$LOGS/fw-on.rules" dockerfw-fw-on sudo vps item firewall || fail "turning the firewall on again exited with $?"
 closes || fail 'not closed again with the firewall back on'
 # Off: as without the switch. The check tells the state.
 dockerfw_item dockerfw-off 2
@@ -171,26 +169,25 @@ sudo mkdir -p /srv/ci-s3
 echo 'object storage payload' | sudo tee /srv/ci-s3/file.txt > /dev/null
 printf 'backup_paths=/srv/ci-s3\nbackup_drill_days=1\n' > "$LOGS/backup-params.txt"
 drive params.rules backup-params sudo vps params import "$LOGS/backup-params.txt" || fail "params import exited with $?"
-backup_index="$(item_index databackup)" || fail 'no single item databackup'
 # ACCESS-KEY: the answers for this storage.
 s3_answers() {
   printf '%s\n' '备份目标 \[1-4 ==> 2' '对象存储的地址 ==> http://127.0.0.1:9000' '存储桶的名字 ==> ci-bucket' '桶里的目录 ==> vps/one' '区域 ==> us-east-1' "Access Key ==> $1" 'Secret Key ==> cisecretvalue123'
 }
 # A key the storage does not know: said so, and nothing is switched on.
-{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> 1\n' "$backup_index"
+{ printf '请选择: ==> @seq 1 0\n'
   s3_answers wrongaccesskey
   printf '%s\n' '备份密码（输入时不显示 ==>' '已经把这个密码存到 ==> y'
   cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3-bad.rules"
-drive "$LOGS/backup-s3-bad.rules" backup-s3-bad sudo vps item || fail "data backup with a wrong key exited with $?"
+drive "$LOGS/backup-s3-bad.rules" backup-s3-bad sudo vps item databackup || fail "data backup with a wrong key exited with $?"
 has backup-s3-bad '没能在备份目标上建好仓库'
 lacks backup-s3-bad '数据备份已开启'
 if sudo test -e /etc/systemd/system/vps-stable-backup.timer; then fail 'a backup that never worked was scheduled'; fi
 # The right key: backed up, encrypted, and restored from there.
-{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> 1\n' "$backup_index"
+{ printf '请选择: ==> @seq 1 0\n'
   printf '%s\n' '沿用上次的备份目标吗 ==> n'
   s3_answers ciaccesskey
   cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3.rules"
-drive "$LOGS/backup-s3.rules" backup-s3 sudo vps item || fail "data backup to S3 exited with $?"
+drive "$LOGS/backup-s3.rules" backup-s3 sudo vps item databackup || fail "data backup to S3 exited with $?"
 has backup-s3 '数据备份已开启'
 has backup-s3 '恢复演练通过'
 [[ -f "$s3_store/ci-bucket/vps/one/config" ]] || fail "nothing arrived in the bucket: $(find "$s3_store" | head -n 20)"
@@ -198,10 +195,10 @@ if grep -rqF 'object storage payload' "$s3_store"; then fail 'the backup is not 
 lacks backup-s3 'cisecretvalue123'
 if sudo grep -rlF --exclude=conf -- cisecretvalue123 /var/lib/vps-stable-opt /var/backups/vps-stable-opt | grep .; then fail 'the storage secret is in a log or backup of the tool'; fi
 [[ "$(sudo stat -c %a /var/lib/vps-stable-opt/databackup/conf)" == 600 ]] || fail 'the settings with the storage secret are readable by others'
-{ printf '请选择要修改的项目 ==> @seq %s 0\n请选择: ==> 5\n' "$backup_index"
+{ printf '请选择: ==> @seq 5 0\n'
   printf '%s\n' '回车返回: ==> 3' '恢复哪一次 ==>' '恢复哪个文件或目录 ==>' '恢复到 /root/vps-restore ==> y'
   cat "$CI/rules/item.rules" "$CI/rules/setup-custom.rules"; } > "$LOGS/backup-s3-restore.rules"
-drive "$LOGS/backup-s3-restore.rules" backup-s3-restore sudo vps item || fail "restore from S3 exited with $?"
+drive "$LOGS/backup-s3-restore.rules" backup-s3-restore sudo vps item databackup || fail "restore from S3 exited with $?"
 target="$(sudo find /root -maxdepth 1 -name 'vps-restore-*' | awk 'NR == 1')"
 [[ "$(sudo cat "$target/srv/ci-s3/file.txt")" == 'object storage payload' ]] || fail 'not restored from the bucket'
 sudo rm -rf -- "$target" /srv/ci-s3

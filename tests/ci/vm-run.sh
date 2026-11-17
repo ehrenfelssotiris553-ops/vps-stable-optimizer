@@ -366,19 +366,18 @@ for i in 1 2 3 4 5 6 7 8 9 10; do vm true || fail "SSH login $i refused although
 endgroup
 
 group 'Allowlist management: one more address, then removed again'
-index="$(item_index fail2ban)" || fail 'no single item fail2ban'
 allow_rules() {
-  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 5' "a 添加，d 删除，0 返回 ==> @seq $1 0" \
+  printf '%s\n' '请选择: ==> @seq 5 0' "a 添加，d 删除，0 返回 ==> @seq $1 0" \
     '要加的 IP 或网段 ==> 192.0.2.50' '要删除第几个？ ==> 2' > "$WORK/allow-$1.rules"
 }
 allow_rules a
-vm_drive "$WORK/allow-a.rules" allow-add vps item || fail "allowlist add exited with $?"
+vm_drive "$WORK/allow-a.rules" allow-add vps item fail2ban || fail "allowlist add exited with $?"
 vm "grep -Fx 'ignoreip = 127.0.0.1/8 ::1 10.0.2.2 192.0.2.50' /etc/fail2ban/jail.d/99-vps-stable-sshd.local" || fail 'jail file not updated'
 [[ "$(vm 'fail2ban-client get sshd ignoreip')" == *192.0.2.50* ]] || fail 'the running jail does not have the new address'
 vm 'ufw show added' > "$LOGS/ufw-allow.log"
 grep -Fxq 'ufw allow from 192.0.2.50 to any port 22 proto tcp' "$LOGS/ufw-allow.log" || fail 'the new address does not skip the SSH limit'
 allow_rules d
-vm_drive "$WORK/allow-d.rules" allow-delete vps item || fail "allowlist delete exited with $?"
+vm_drive "$WORK/allow-d.rules" allow-delete vps item fail2ban || fail "allowlist delete exited with $?"
 vm "grep -Fx 'ignoreip = 127.0.0.1/8 ::1 10.0.2.2' /etc/fail2ban/jail.d/99-vps-stable-sshd.local" || fail 'address not removed from the jail file'
 [[ "$(vm 'fail2ban-client get sshd ignoreip')" != *192.0.2.50* ]] || fail 'the running jail still has the removed address'
 vm 'ufw show added' > "$LOGS/ufw-allow.log"
@@ -478,10 +477,9 @@ endgroup
 group 'Rename the machine; the display name in Chinese'
 old_name="$(vm hostname)"
 # The single item from the tool's own list: 1 renames, then 5 sets the display name.
-index="$(item_index hostname)" || fail 'no single item hostname'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index $index 0" '请选择: ==> @seq 1 5' \
+printf '%s\n' '请选择: ==> @seq 1 5 0' \
   '新的主机名（直接回车取消） ==> vps-ci-renamed' '把主机名从 ==> y' '新的显示名 ==> 测试机-一号' > "$WORK/rename.rules"
-vm_drive "$WORK/rename.rules" rename vps item || fail "rename exited with $?"
+vm_drive "$WORK/rename.rules" rename vps item hostname || fail "rename exited with $?"
 [[ "$(vm hostname)" == vps-ci-renamed ]] || fail "hostname after the rename: $(vm hostname)"
 [[ "$(vm 'head -n 1 /etc/hostname')" == vps-ci-renamed ]] || fail '/etc/hostname not renamed'
 vm 'getent hosts vps-ci-renamed' > /dev/null || fail 'the new name does not resolve'
@@ -493,9 +491,8 @@ group 'Not answering ping, on through the reboot'
 # UFW applies its own sysctl.conf whenever it starts, and the stock one answers
 # ping (net/ipv4/icmp_echo_ignore_all=0): on a real Debian 13 VPS ping was
 # answered again after every reboot, which no reboot here had covered.
-index="$(item_index ping)" || fail 'no single item ping'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '仍然禁止 ping 吗？ ==> y' > "$WORK/ping.rules"
-vm_drive "$WORK/ping.rules" ping-on vps item || fail "ping on exited with $?"
+printf '%s\n' '请选择: ==> @seq 1 0' '仍然禁止 ping 吗？ ==> y' > "$WORK/ping.rules"
+vm_drive "$WORK/ping.rules" ping-on vps item ping || fail "ping on exited with $?"
 [[ "$(vm 'sysctl -n net.ipv4.icmp_echo_ignore_all')" == 1 ]] || fail 'ping on: echo still answered'
 [[ "$(vm 'ufw status | head -n 1')" == 'Status: active' ]] || fail 'the firewall is not on for the ping check'
 endgroup
@@ -505,9 +502,8 @@ endgroup
 # (it rounds the table up to whole pages); vps check after the reboot compares them.
 group 'Connection tracking: the limit and its hash table'
 buckets_before="$(vm 'sysctl -n net.netfilter.nf_conntrack_buckets')"
-index="$(item_index conntrack)" || fail 'no single item conntrack'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' > "$WORK/conntrack.rules"
-vm_drive "$WORK/conntrack.rules" conntrack-on vps item || fail "connection tracking on exited with $?"
+printf '%s\n' '请选择: ==> @seq 1 0' > "$WORK/conntrack.rules"
+vm_drive "$WORK/conntrack.rules" conntrack-on vps item conntrack || fail "connection tracking on exited with $?"
 buckets_now="$(vm 'sysctl -n net.netfilter.nf_conntrack_buckets')"
 ((buckets_now > buckets_before)) || fail "the hash table stayed at $buckets_now buckets (was $buckets_before)"
 [[ "$(vm "awk '\$1 == \"net.netfilter.nf_conntrack_buckets\" {print \$3}' /etc/sysctl.d/99-vps-stable-conntrack.conf")" == "$buckets_now" ]] ||
@@ -543,9 +539,8 @@ group 'Single items only the menu has: system upgrade, old kernels, time sync, h
 # recommendation. After the reboot an old image runs a newer kernel, so its
 # old one can go.
 for key in upgrade kernel ntp hosts; do
-  index="$(item_index "$key")" || fail "no single item $key"
-  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '升级这 [0-9]+ 个软件包吗？ ==> y' '确认删除这些旧内核吗？ ==> y' '现在重启吗？ ==> n' > "$WORK/item-$key.rules"
-  vm_drive "$WORK/item-$key.rules" "item-$key" vps item || fail "single item $key exited with $?"
+  printf '%s\n' '请选择: ==> @seq 1 0' '升级这 [0-9]+ 个软件包吗？ ==> y' '确认删除这些旧内核吗？ ==> y' '现在重启吗？ ==> n' > "$WORK/item-$key.rules"
+  vm_drive "$WORK/item-$key.rules" "item-$key" vps item "$key" || fail "single item $key exited with $?"
 done
 grep -Eq '系统软件(已经是最新的|已升级)' "$LOGS/item-upgrade.log" || fail 'the system upgrade item did not finish'
 vm 'apt-get -s upgrade --with-new-pkgs | grep -c "^Inst " || true' > "$LOGS/upgrade-left.txt"
@@ -558,13 +553,13 @@ vm 'ls /boot/vmlinuz-* | grep -c "$(uname -r)"' > /dev/null || fail 'the running
 vm 'getent hosts "$(hostname)"' > /dev/null || fail 'the host name does not resolve after the item'
 # Fail2ban: 3 tries instead of 5, then back to the recommendation; the running
 # jail follows both times.
-index="$(item_index fail2ban)" || fail 'no single item fail2ban'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 3' '新的值 ==> @seq 3 auto' > "$WORK/f2b-params.rules"
-vm_drive "$WORK/f2b-params.rules" f2b-params vps item || fail "Fail2ban parameters exited with $?"
+# (The list of the parameters first: "a" goes through all of them in turn.)
+printf '%s\n' '请选择: ==> @seq 3 0' '要改哪个参数 ==> @seq a 0' '新的值 ==> @seq 3 auto' > "$WORK/f2b-params.rules"
+vm_drive "$WORK/f2b-params.rules" f2b-params vps item fail2ban || fail "Fail2ban parameters exited with $?"
 [[ "$(vm 'fail2ban-client get sshd maxretry')" == 3 ]] || fail "the running jail does not use 3 tries: $(vm 'fail2ban-client get sshd maxretry')"
 vm "grep -Fxq 'maxretry = 3' /etc/fail2ban/jail.d/99-vps-stable-sshd.local" || fail 'the jail file does not say 3 tries'
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 4' > "$WORK/f2b-reset.rules"
-vm_drive "$WORK/f2b-reset.rules" f2b-reset vps item || fail "Fail2ban parameters reset exited with $?"
+printf '%s\n' '请选择: ==> @seq 4 0' > "$WORK/f2b-reset.rules"
+vm_drive "$WORK/f2b-reset.rules" f2b-reset vps item fail2ban || fail "Fail2ban parameters reset exited with $?"
 [[ "$(vm 'fail2ban-client get sshd maxretry')" == 5 ]] || fail "the running jail is not back at 5 tries: $(vm 'fail2ban-client get sshd maxretry')"
 endgroup
 
@@ -629,11 +624,10 @@ lc_mark 'after the reboot and the setups again'
 group 'SSH port: 22 to 2244 from outside (the old port closed only after a login on the new one), then back'
 # The single item from the tool's own list; the login that confirms stays a
 # few seconds on the new port ($VM_SSH_NEW is expanded by the shell answer.exp starts).
-index="$(item_index sshport)" || fail 'no single item sshport'
 # shellcheck disable=SC2016
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '仍然要改 SSH 端口吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+printf '%s\n' '请选择: ==> @seq 1 0' '要我把这几行注释掉吗 ==> y' '仍然要改 SSH 端口吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
   '等待确认（剩余 ==> !$VM_SSH_NEW sleep 10' > "$LOGS/sshport-on.rules"
-vm_drive "$LOGS/sshport-on.rules" sshport-on vps item || fail "the port change exited with $?"
+vm_drive "$LOGS/sshport-on.rules" sshport-on vps item sshport || fail "the port change exited with $?"
 has sshport-on 'SSH 端口已改成 2244'
 has sshport-on '00-aaa-provider.conf 第 3 行：Port 22'
 # Fail2ban follows the port; systemd's lines about its SysV script stay out.
@@ -647,8 +641,8 @@ if ! grep -Fxq 'Port 2244' "$LOGS/sshport-state.txt" || ! grep -Fxq 'ufw limit 2
 fi
 if grep -Eq '^ufw (allow|limit) 22/tcp$' "$LOGS/sshport-state.txt"; then fail "the firewall still lets the old port in"; fi
 # Back, logged in on the new port: the old port is let in again first.
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 2' '撤销本工具对 ==> y' > "$LOGS/sshport-off.rules"
-drive "$LOGS/sshport-off.rules" sshport-off ssh "${VM_NEW_OPTS[@]}" -tt "$VM_HOST" 'TERM=xterm vps item' || fail "putting the port back exited with $?"
+printf '%s\n' '请选择: ==> @seq 2 0' '撤销本工具对 ==> y' > "$LOGS/sshport-off.rules"
+drive "$LOGS/sshport-off.rules" sshport-off ssh "${VM_NEW_OPTS[@]}" -tt "$VM_HOST" 'TERM=xterm vps item sshport' || fail "putting the port back exited with $?"
 vm true || fail 'no login on port 22 after putting the port back'
 if ssh "${VM_NEW_OPTS[@]}" -o ConnectTimeout=5 "$VM_HOST" true 2>/dev/null; then fail 'port 2244 still lets logins in after putting the port back'; fi
 provider_line 'Port 22' || fail "putting the port back did not put the provider's Port line back: $(vm "cat $PROVIDER_CONF")"
@@ -692,6 +686,43 @@ fi
 provider_line 'PasswordAuthentication yes' || fail "the guard timer did not put the provider's line back: $(vm "cat $PROVIDER_CONF")"
 endgroup
 
+group 'SSH hardening: a reboot before the confirmation puts the old settings back at boot'
+# The same again, and this time the machine is rebooted while the change waits
+# for its confirmation: what someone locked out does first, from the provider's
+# panel. The timer is gone with the reboot; up to 3.1.4 the unconfirmed change
+# then stayed for good. Now a unit of the tool undoes it at boot.
+vm_drive ssh-drop.rules ssh-reboot vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (before the reboot) exited with $rc"; }
+has ssh-reboot '已关闭 SSH 密码登录'
+vm_ops "[ -e $KEYONLY ]" || fail 'the hardening was not in place before the reboot'
+vm_ops_sudo 'test -f /etc/systemd/system/vps-stable-guard-boot.service' || fail 'no boot unit while the change waits for its confirmation'
+reboot_at=$SECONDS
+vm_ops_sudo systemctl reboot || true
+sleep 20
+wait_ssh vm_ops
+undone=0
+for ((i = 0; i < 12; i++)); do
+  if vm_ops "[ ! -e $KEYONLY ]" 2>/dev/null; then undone=1; break; fi
+  sleep 5
+done
+printf 'Key-only login undone %s s after the reboot was asked for (the timer would have taken 240 s, and is gone).\n' "$((SECONDS - reboot_at))"
+if ((undone == 0)); then
+  vm_ops_sudo 'sh -c "date; ls -l /var/lib/vps-stable-opt/guard /etc/systemd/system/vps-stable-guard-boot.service; systemctl status vps-stable-guard-boot.service --no-pager; journalctl -b --no-pager -o short-precise -u vps-stable-guard-boot.service | tail -n 20"' \
+    > "$LOGS/ssh-reboot-undo.log" 2>&1 || true
+  notice "SSH undo at boot ($system)" "$LOGS/ssh-reboot-undo.log"
+  fail 'the unconfirmed key-only login stayed after the reboot'
+fi
+# The undo removes the file, then reloads sshd: give the reload a moment.
+for ((i = 0; i < 60; i++)); do vm true 2>/dev/null && break; sleep 5; done
+vm true || fail 'root cannot log in again after the boot undid the hardening'
+[[ "$(ssh_methods root)" == *password* ]] || fail "password login not back after the reboot: $(ssh_methods root)"
+provider_line 'PasswordAuthentication yes' || fail "the boot did not put the provider's line back: $(vm "cat $PROVIDER_CONF")"
+# Nothing of the guard is left, and the menu will say what happened.
+if vm 'test -e /etc/systemd/system/vps-stable-guard-boot.service || ls /var/lib/vps-stable-opt/guard/*.sh 2>/dev/null | grep -q .'; then
+  fail "the boot unit or a guard file stayed after the reboot: $(vm 'ls -l /var/lib/vps-stable-opt/guard /etc/systemd/system/vps-stable-guard-boot.service' 2>&1)"
+fi
+vm 'grep -q "^vps-stable-ssh-revert-" /var/lib/vps-stable-opt/guard/replayed' || fail 'what was undone at boot is not noted for the menu'
+endgroup
+
 group 'SSH hardening: key-only login, admin ops with sudo, no root login'
 vm_drive ssh-apply.rules ssh-apply vps ssh || { rc=$?; sudo_journal; fail "ssh hardening exited with $rc"; }
 has ssh-apply '已在系统日志里看到新窗口登录成功，自动确认'
@@ -733,14 +764,13 @@ ssh_back 'the provider line commented out again'
 hardened 'with the provider line commented out again'
 # The session limits are parameters: 6 tries instead of 4 is written under a
 # guard and kept after a key login of ops; back to the recommendation the same way.
-index="$(item_index ssh)" || fail 'no single item ssh'
 for step in 'adjust 3 6' 'reset 4 4'; do
   read -r name choice tries <<< "$step"
   # ($VM_SSH_OPS and $ADMIN_PW are answer.exp's to expand.)
   # shellcheck disable=SC2016
-  printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" "请选择: ==> $choice" '新的值 ==> @seq 6 30 no' \
+  printf '%s\n' "请选择: ==> @seq $choice 0" '要改哪个参数 ==> @seq a 0' '新的值 ==> @seq 6 30 no' \
     '等待确认（剩余 ==> !$VM_SSH_OPS true' '\[sudo[^]]*\] [Pp]assword ==> $ADMIN_PW' > "$LOGS/ssh-params-$name.rules"
-  VM_AS=$VM_OPS_HOST vm_drive "$LOGS/ssh-params-$name.rules" "ssh-params-$name" sudo vps item || fail "SSH parameters ($name) exited with $?"
+  VM_AS=$VM_OPS_HOST vm_drive "$LOGS/ssh-params-$name.rules" "ssh-params-$name" sudo vps item ssh || fail "SSH parameters ($name) exited with $?"
   has "ssh-params-$name" '新的 SSH 参数已保留'
   ssh_back "the SSH parameters ($name)"
   [[ "$(vm_ops_sudo sshd -T | awk '$1 == "maxauthtries" {print $2}')" == "$tries" ]] ||
@@ -755,12 +785,11 @@ group 'Full rollback and uninstall'
 # and must delete the rule it lets port 22 in with again (a real Debian 13 VPS
 # kept "limit 22/tcp" in UFW after that; the single item above hid it, as it
 # records that rule itself). The admin confirms on the new port.
-index="$(item_index sshport)" || fail 'no single item sshport'
 # ($ADMIN_PW is answer.exp's to expand.)
 # shellcheck disable=SC2016
-printf '%s\n' "请选择要修改的项目 ==> @seq $index 0" '请选择: ==> 1' '要我把这几行注释掉吗 ==> y' '仍然要改 SSH 端口吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
+printf '%s\n' '请选择: ==> @seq 1 0' '要我把这几行注释掉吗 ==> y' '仍然要改 SSH 端口吗 ==> y' '新的端口 ==> 2244' '服务商那边已经放行 TCP ==> y' \
   "等待确认（剩余 ==> !ssh ${VM_NEW_OPTS[*]} $VM_OPS_HOST sleep 10" '\[sudo[^]]*\] [Pp]assword ==> $ADMIN_PW' > "$LOGS/sshport-again.rules"
-VM_AS=$VM_OPS_HOST vm_drive "$LOGS/sshport-again.rules" sshport-again sudo vps item || fail "the second port change exited with $?"
+VM_AS=$VM_OPS_HOST vm_drive "$LOGS/sshport-again.rules" sshport-again sudo vps item sshport || fail "the second port change exited with $?"
 has sshport-again 'SSH 端口已改成 2244'
 # Root has no SSH login now: the admin rolls back (on port 2244), which brings it back.
 drive rollback.rules rollback ssh "${VM_NEW_OPTS[@]}" -tt "$VM_OPS_HOST" 'TERM=xterm sudo vps rollback' || fail "rollback exited with $?"

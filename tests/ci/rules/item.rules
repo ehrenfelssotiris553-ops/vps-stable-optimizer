@@ -14,14 +14,18 @@
 # TG (a stand-in on 127.0.0.1 answers), the traffic alert, Docker's log limit.
 Bot Token ==> $TG_TOKEN
 发好了按回车 ==>
+# The stand-in got the test message: the chat is this run's own.
+你在 Telegram 里收到了吗 ==> y
 每月流量额度 ==> 1000
 每月几号重置 ==> 1
 计费方式 ==> 2
 这个周期已经用了 ==> 5
 现在重启 Docker 让设置生效吗？ ==> n
 请输入端口 ==> 8080
-# The parameters, asked after "3. 调整参数": the TCP cap (in MiB), then the
+# The parameters, after "3. 调整参数": the list of them first, where "a" goes
+# through all in turn and 0 leaves; then the TCP cap (in MiB), then the
 # TCP switches, left automatic (40 is no answer for them: asked again).
+要改哪个参数 ==> @seq a 0
 新的值（直接回车不改 ==> @seq 40 auto
 只允许某个 IP 访问吗？ ==>
 协议：1\) TCP ==> 1

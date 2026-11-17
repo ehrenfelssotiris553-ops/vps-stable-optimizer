@@ -11928,6 +11928,19 @@ port_listen_note() {
   else printf '  %s/%s：当前没有程序监听（服务启动后才能连上）\n' "$item" "$proto"; fi
 }
 
+# ITEM...: the protocol for opening them when none is named: UDP, or both,
+# where that is what listens there now (WireGuard, a QUIC proxy); else TCP.
+port_default_proto() {
+  local item tcp=0 udp=0
+  if ! command -v ss >/dev/null; then echo tcp; return 0; fi
+  for item in "$@"; do
+    [[ "$item" != *:* ]] || continue
+    if [[ -n "$(ss -Hlnt "( sport = :$item )" 2>/dev/null || true)" ]]; then tcp=1; fi
+    if [[ -n "$(ss -Hlnu "( sport = :$item )" 2>/dev/null || true)" ]]; then udp=1; fi
+  done
+  if ((tcp && udp)); then echo both; elif ((udp)); then echo udp; else echo tcp; fi
+}
+
 # Names the well-known database/admin ports that the given items cover.
 port_risky_names() {
   local item entry out=''
@@ -11943,7 +11956,7 @@ port_risky_names() {
 }
 
 port_open() {
-  local spec="$1" proto_choice="${2:-}" src="${3:-}" item proto rule total=0 added=0 rules risky list
+  local spec="$1" proto_choice="${2:-}" src="${3:-}" item proto rule total=0 added=0 rules risky list auto n
   local -a items=() protos=()
   # Parsed through "$(...)": a failing function inside "< <(...)" runs outside
   # this condition and set off the error trap ("[出错] line=…") on a mere typo.
@@ -11951,10 +11964,18 @@ port_open() {
     warn "端口格式不对：$spec（例：8080、443-600、8080,9000-9100；范围 1-65535，且不能一次放行全部端口）"; return 0
   fi
   mapfile -t items <<< "$list"
-  if [[ -z "$proto_choice" && -t 0 ]]; then
-    # Most services listen on TCP only: nothing wider unless asked for.
-    read -r -p '协议：1) TCP  2) UDP  3) TCP+UDP  [回车默认 1]: ' proto_choice || true
-    case "$proto_choice" in 2) proto_choice=udp ;; 3) proto_choice=both ;; *) proto_choice=tcp ;; esac
+  # No protocol named: what listens on the port now, else TCP alone (up to
+  # 3.1.4 TCP and UDP together, wider than most services need). The menu asks,
+  # with that as what Enter means; the command line just takes it.
+  if [[ -z "$proto_choice" ]]; then
+    auto="$(port_default_proto "${items[@]}")"
+    if [[ -t 0 && "${PORT_ASK_PROTO:-1}" == 1 ]]; then
+      case "$auto" in udp) n=2 ;; both) n=3 ;; *) n=1 ;; esac
+      read -r -p "协议：1) TCP  2) UDP  3) TCP+UDP  [回车默认 $n]: " proto_choice || true
+      case "${proto_choice:-$n}" in 1) proto_choice=tcp ;; 2) proto_choice=udp ;; 3) proto_choice=both ;; *) proto_choice="$auto" ;; esac
+    else
+      proto_choice="$auto"
+    fi
   fi
   if ! list="$(port_protocols "${proto_choice:-both}")" || [[ -z "$list" ]]; then warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; fi
   mapfile -t protos <<< "$list"
@@ -12190,7 +12211,7 @@ port_menu() {
 # A missing, misspelt or extra argument stops with an error instead of falling
 # back to a wider default (such as "from" without an address meaning everyone).
 port_main() {
-  local action="${MODE_ARGS[0]:-}" spec='' proto=both src='' usage
+  local action="${MODE_ARGS[0]:-}" spec='' proto='' src='' usage
   local -a rest=("${MODE_ARGS[@]:1}")
   usage='用法：vps port open 端口 [tcp|udp|both] [from IP] ｜ vps port close 端口 [tcp|udp|both] ｜ vps port list'
   [[ $EUID -eq 0 ]] || die '端口管理需要 root：请用 sudo vps port。'
@@ -12214,8 +12235,8 @@ port_main() {
   start_logging
   case "$action" in
     '') port_menu ;;
-    open) port_open "$spec" "$proto" "$src" ;;
-    close) port_close "$spec" "$proto" ;;
+    open) PORT_ASK_PROTO=0 port_open "$spec" "$proto" "$src" ;;
+    close) port_close "$spec" "${proto:-both}" ;;
     list) port_list ;;
   esac
 }

@@ -225,8 +225,10 @@ printf 'PASS: closing ports protects SSH, matches exactly, explains ranges and s
   port_menu() { echo menu; }
   run() { MODE_ARGS=("$@"); ( port_main ) 2>&1 || true; }
   [[ "$(run open 8080 tcp from 198.51.100.7)" == 'open 8080 tcp 198.51.100.7' ]] || fail 'source rule arguments'
-  [[ "$(run open 8080)" == 'open 8080 both ALL' ]] || fail 'default protocol'
-  [[ "$(run open 8080 from 198.51.100.0/24)" == 'open 8080 both 198.51.100.0/24' ]] || fail 'network source without protocol'
+  # No protocol named: port_open decides (what listens there, else TCP); closing means both.
+  [[ "$(run open 8080)" == 'open 8080  ALL' ]] || fail "default protocol: $(run open 8080)"
+  [[ "$(run close 8080)" == 'close 8080 both' ]] || fail "default protocol when closing: $(run close 8080)"
+  [[ "$(run open 8080 from 198.51.100.0/24)" == 'open 8080  198.51.100.0/24' ]] || fail "network source without protocol: $(run open 8080 from 198.51.100.0/24)"
   [[ "$(run close 22 udp)" == 'close 22 udp' ]] || fail 'close arguments'
   [[ "$(run list)" == list && "$(run)" == menu ]] || fail 'list and menu'
   for bad in 'open 8080 tcp from' 'open 8080 from' 'open 8080 tcp 198.51.100.7' 'open' 'open 8080 icmp' \
@@ -277,9 +279,33 @@ unset STATE_ROOT
 if port_forget_rule 'ufw allow 80/tcp'; then fail 'a rule was forgotten without a record'; fi
 printf 'PASS: a rule closed or asked for again through the port management belongs to the user: the rollback keeps it.\n'
 
-# Opening a port asks for the protocol; Enter means TCP alone (TCP and UDP up
-# to 3.1.4, wider than most services need).
-grep -Fq "回车默认 1" "$TEST_SCRIPT" || fail 'the protocol question does not say that Enter means TCP'
-fn="$(awk '$0 == "port_open() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT")"
-[[ "$fn" == *'2) proto_choice=udp ;; 3) proto_choice=both ;; *) proto_choice=tcp ;;'* ]] || fail 'Enter at the protocol question does not mean TCP alone'
-printf 'PASS: opening a port defaults to TCP alone.\n'
+# Opening a port without naming the protocol: what listens there decides,
+# else TCP alone (TCP and UDP together up to 3.1.4, wider than most services
+# need). The menu asks with that as what Enter means; the command line takes it.
+load_optimizer_functions port_default_proto
+command() { [[ "$2" != ss ]] || return 0; builtin command "$@"; }
+LISTEN=''
+ss() {
+  local kind=tcp
+  [[ "$1" == -Hlnu ]] && kind=udp
+  [[ "$LISTEN" == *" $kind:${2//[^0-9]/} "* ]] && echo listener
+  return 0
+}
+[[ "$(port_default_proto 8080)" == tcp ]] || fail "nothing listening: $(port_default_proto 8080)"
+LISTEN=' udp:51820 '
+[[ "$(port_default_proto 51820)" == udp ]] || fail "a UDP service: $(port_default_proto 51820)"
+LISTEN=' udp:443 tcp:443 '
+[[ "$(port_default_proto 443)" == both && "$(port_default_proto 8080 443)" == both ]] || fail "TCP and UDP listening: $(port_default_proto 443)"
+[[ "$(port_default_proto 400:500)" == tcp ]] || fail 'a range is not looked up port by port'
+# The command line (no terminal here): the protocol left out.
+reset; LISTEN=''
+port_open 8080 '' '' > /dev/null
+[[ "$(cat "$TEST_ROOT/calls")" == 'allow 8080/tcp' ]] || fail "a port opened without naming the protocol: $(tr '\n' '|' < "$TEST_ROOT/calls")"
+reset; LISTEN=' udp:51820 '
+port_open 51820 '' '' > /dev/null
+[[ "$(cat "$TEST_ROOT/calls")" == 'allow 51820/udp' ]] || fail "a UDP service opened without naming the protocol: $(tr '\n' '|' < "$TEST_ROOT/calls")"
+unset -f command
+fn="$(awk '$0 == "port_main() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT")"
+[[ "$fn" == *'PORT_ASK_PROTO=0 port_open "$spec" "$proto" "$src"'* && "$fn" == *'port_close "$spec" "${proto:-both}"'* && "$fn" != *'proto=both'* ]] ||
+  fail 'vps port open without a protocol still means TCP and UDP, or closing no longer means both'
+printf 'PASS: a port opened without naming the protocol gets what listens there, else TCP alone.\n'
