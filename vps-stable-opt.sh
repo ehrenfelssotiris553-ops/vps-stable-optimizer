@@ -2,10 +2,17 @@
 # VPS Stable Optimizer v3.1.4 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
-set -Eeuo pipefail
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
-umask 077
+# Sourced (a test loading every function with the real global settings): the
+# caller keeps its own shell options, PATH and umask, nothing is detected and
+# nothing runs. Run directly, as every user does: all of it applies.
+VPS_SOURCED=0
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then VPS_SOURCED=1; fi
+if ((VPS_SOURCED == 0)); then
+  set -Eeuo pipefail
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LC_ALL=C
+  umask 077
+fi
 
 SCRIPT_VERSION=3.1.4
 MODE="${1:-menu}"
@@ -125,7 +132,9 @@ BACKUP_SERVICE_FILE=/etc/systemd/system/vps-stable-backup.service
 BACKUP_TIMER_FILE=/etc/systemd/system/vps-stable-backup.timer
 NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE='' SSHPORT_CHOICE=''
 
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report|clean|backup|databackup-run|docker-fw-sync|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|report|clean|backup|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+# The command line of a direct run: an unknown mode, --version and help end here.
+runtime_args() {
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report|clean|backup|databackup-run|docker-fw-sync|guard-boot|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|report|clean|backup|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
@@ -171,6 +180,7 @@ VPS 机器管家 V3.1.4 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 HELP
   exit 0
 fi
+}
 
 # Text interface. One symbol per state: ✔ done, ⚠ needs a look, ✖ failed,
 # ○ not done. Colour only on a terminal, never in logs or saved reports
@@ -246,30 +256,38 @@ on_exit() {
   if [[ -n "${TOOL_LIFECYCLE_PID:-}" && "$TOOL_LIFECYCLE_PID" == "$BASHPID" ]]; then rm -f -- "$LOCK_OWNER_FILE" 2>/dev/null || true; fi
 }
 
-trap 'on_error "$?" "$LINENO"' ERR
-trap 'on_exit "$?"' EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# The handlers of every run. A test that sources this file installs them the
+# same way: what holds only without them does not hold for a user.
+runtime_traps() {
+  trap 'on_error "$?" "$LINENO"' ERR
+  trap 'on_exit "$?"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
 
-[[ -r /etc/os-release ]] || die '找不到 /etc/os-release，无法识别系统。'
-# shellcheck source=/etc/os-release
-# Linux provides this file; it is deliberately not bundled or followed on Windows.
-# shellcheck disable=SC1091
-. /etc/os-release
-OS="${ID:-unknown}"
-OS_VERSION="${VERSION_ID:-unknown}"
-case "$OS:$OS_VERSION" in
-  debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;;
-  *) die "不支持的系统：${PRETTY_NAME:-$OS $OS_VERSION}；没有做任何修改。" ;;
-esac
-command -v systemctl >/dev/null || die '缺少 systemctl。'
-VIRT="$(systemd-detect-virt 2>/dev/null || true)"
-[[ -n "$VIRT" ]] || VIRT=none
-MEM_MIB="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)"
-ROOT_DEV="$(findmnt -no SOURCE / 2>/dev/null || echo unknown)"
-ROOT_FS="$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)"
-ROOT_GIB="$(df -Pk / | awk 'NR==2 {printf "%d", $2/1024/1024}')"
+# What this machine is: the release (only the supported ones go on) and the
+# few facts every mode reads.
+runtime_detect() {
+  [[ -r /etc/os-release ]] || die '找不到 /etc/os-release，无法识别系统。'
+  # shellcheck source=/etc/os-release
+  # Linux provides this file; it is deliberately not bundled or followed on Windows.
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS="${ID:-unknown}"
+  OS_VERSION="${VERSION_ID:-unknown}"
+  case "$OS:$OS_VERSION" in
+    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;;
+    *) die "不支持的系统：${PRETTY_NAME:-$OS $OS_VERSION}；没有做任何修改。" ;;
+  esac
+  command -v systemctl >/dev/null || die '缺少 systemctl。'
+  VIRT="$(systemd-detect-virt 2>/dev/null || true)"
+  [[ -n "$VIRT" ]] || VIRT=none
+  MEM_MIB="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)"
+  ROOT_DEV="$(findmnt -no SOURCE / 2>/dev/null || echo unknown)"
+  ROOT_FS="$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)"
+  ROOT_GIB="$(df -Pk / | awk 'NR==2 {printf "%d", $2/1024/1024}')"
+}
 
 # Keys pressed on the terminal before a question is shown (Enter during a long
 # upgrade, say) must not answer it: they are dropped first. Input from a pipe
@@ -2264,12 +2282,21 @@ setup_step_independent() {
 # in a subshell. What the stage sets stays in the subshell (none of these sets
 # anything read later) but for the count of warnings.
 stage_run_isolated() {
-  local stage="$1" rc=0 count
+  local stage="$1" rc=0 count trapped=0
   count="$(mktemp)" || die '无法创建临时文件。'
+  # The ERR trap does not look at errexit: left in place, the failing subshell
+  # set it off in this shell as well, and the whole run ended after all (up to
+  # 3.1.4). It is taken away here, the subshell installs its own, and this
+  # shell's comes back right after.
+  if [[ -n "$(trap -p ERR)" ]]; then trapped=1; trap - ERR; fi
   set +e
-  ( set -e; STAGE_ISOLATED=1; stage_run "$@"; printf '%s\n' "$WARNINGS" > "$count" )
+  (
+    if ((trapped)); then trap 'on_error "$?" "$LINENO"' ERR; fi
+    set -e; STAGE_ISOLATED=1; stage_run "$@"; printf '%s\n' "$WARNINGS" > "$count"
+  )
   rc=$?
   set -e
+  if ((trapped)); then trap 'on_error "$?" "$LINENO"' ERR; fi
   if ((rc == 0)); then
     WARNINGS="$(cat -- "$count")"
     rm -f -- "$count"
@@ -12683,5 +12710,10 @@ main() {
   offer_reboot
 }
 
-# Main entry point.
-main "$@"
+# Main entry point: only when run, not when a test sources the file.
+if ((VPS_SOURCED == 0)); then
+  runtime_args
+  runtime_traps
+  runtime_detect
+  main "$@"
+fi

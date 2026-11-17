@@ -23,6 +23,14 @@ step() { say "$2"; }
 # Answers come through pipes here, which the real one leaves alone anyway;
 # consistency-tests checks it.
 input_flush() { :; }
+# True when the script under test can be sourced whole: it then defines every
+# function with the real global settings and runs nothing (3.2 and later; an
+# older one would start its menu). Tests of what depends on those settings (the
+# error trap, errexit) source it at their top level and install the traps with
+# runtime_traps; mocks are defined after that.
+optimizer_sourceable() {
+  grep -q '^VPS_SOURCED=0$' "$TEST_SCRIPT"
+}
 load_optimizer_functions() {
   local name definition
   for name in "$@"; do
