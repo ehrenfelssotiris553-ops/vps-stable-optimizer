@@ -4,7 +4,7 @@ set -Eeuo pipefail
 HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
-load_optimizer_functions port_parse_spec port_item_count port_item_text port_item_covers port_protocols port_source_valid port_ssh_ports port_rule_text port_listen_note port_risky_names port_open port_rule_parse port_split_blocker port_close port_list port_main
+load_optimizer_functions port_forget_rule record_line_remove port_parse_spec port_item_count port_item_text port_item_covers port_protocols port_source_valid port_ssh_ports port_rule_text port_listen_note port_risky_names port_open port_rule_parse port_split_blocker port_close port_list port_main
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -246,3 +246,40 @@ grep -Eq '^443-600 +udp' "$TEST_ROOT/out" || fail 'range not listed'
 grep -Fq '203.0.113.5' "$TEST_ROOT/out" || fail 'source not listed'
 grep -Fq 'deny from 198.51.100.7' "$TEST_ROOT/out" || fail 'other rules not listed'
 printf 'PASS: port list shows ranges, sources, SSH marks and other rules.\n'
+
+# A rule this tool added when it turned the firewall on is on record, and the
+# rollback of the firewall deletes what is on record. Closed and opened again by
+# the user through the port management it is their own: up to 3.1.4 the record
+# stayed, and the rollback took the user's port away ("your own ports are kept").
+reset
+STATE_ROOT="$TEST_ROOT/state"; mkdir -p "$STATE_ROOT/restore-v2"
+RECORD="$STATE_ROOT/restore-v2/fw_rules"
+printf 'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 443/tcp\n' > "$RECORD"
+ADDED=$'ufw limit 22/tcp\nufw allow 80/tcp\nufw allow 443/tcp'
+port_close 80 tcp > "$TEST_ROOT/out"
+grep -Fxq -- '--force delete allow 80/tcp' "$TEST_ROOT/calls" || fail "the port was not closed: $(cat "$TEST_ROOT/calls")"
+[[ "$(tr '\n' '|' < "$RECORD")" == 'ufw limit 22/tcp|ufw allow 443/tcp|' ]] || fail "a rule the user closed stayed on record: $(tr '\n' '|' < "$RECORD")"
+# Asked for again while it is there: theirs from now on, and they are told.
+reset; ADDED=$'ufw limit 22/tcp\nufw allow 443/tcp'
+port_open 443 tcp '' > "$TEST_ROOT/out"
+[[ ! -s "$TEST_ROOT/calls" ]] || fail "a rule that is there was added again: $(cat "$TEST_ROOT/calls")"
+[[ "$(tr '\n' '|' < "$RECORD")" == 'ufw limit 22/tcp|' ]] || fail "a rule the user asked for stayed on record as the tool's: $(tr '\n' '|' < "$RECORD")"
+grep -Fq '撤销防火墙时会保留' "$TEST_ROOT/messages" || fail "the user is not told that the rule is theirs now: $(cat "$TEST_ROOT/messages")"
+# One that was never on record is skipped as before; the last line gone, the record goes.
+reset; ADDED=$'ufw limit 22/tcp\nufw allow 443/tcp'
+port_open 443 tcp '' > "$TEST_ROOT/out"
+grep -Fq '已放行过，跳过' "$TEST_ROOT/messages" || fail "a rule of the user's own: $(cat "$TEST_ROOT/messages")"
+printf 'ufw allow 8080/tcp\n' > "$RECORD"; reset; ADDED='ufw allow 8080/tcp'
+port_close 8080 tcp > /dev/null
+[[ ! -e "$RECORD" ]] || fail "an empty record stayed: $(cat "$RECORD")"
+# The record of another user, or a link, is not touched.
+unset STATE_ROOT
+if port_forget_rule 'ufw allow 80/tcp'; then fail 'a rule was forgotten without a record'; fi
+printf 'PASS: a rule closed or asked for again through the port management belongs to the user: the rollback keeps it.\n'
+
+# Opening a port asks for the protocol; Enter means TCP alone (TCP and UDP up
+# to 3.1.4, wider than most services need).
+grep -Fq "回车默认 1" "$TEST_SCRIPT" || fail 'the protocol question does not say that Enter means TCP'
+fn="$(awk '$0 == "port_open() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT")"
+[[ "$fn" == *'2) proto_choice=udp ;; 3) proto_choice=both ;; *) proto_choice=tcp ;;'* ]] || fail 'Enter at the protocol question does not mean TCP alone'
+printf 'PASS: opening a port defaults to TCP alone.\n'

@@ -999,18 +999,18 @@ setup_questions() {
     if ! setup_skipped timezone; then timezone_ask; fi
     TZ_ASKED=1
   fi
-  if ! setup_skipped ssh && confirm_yes '加固 SSH 登录吗？（只允许密钥登录，带防失联保护）（推荐）'; then
+  if ! setup_skipped ssh && confirm_yes '加固 SSH 登录吗？（只允许密钥登录，带防失联保护）（推荐，输入 y 才做）'; then
     SSH_CHOICE=1
     login="${SUDO_USER:-}"
     [[ -n "$login" && "$login" != root ]] || login="$(logname 2>/dev/null || id -un)"
     if [[ "$login" == root ]]; then
-      if confirm_yes '同时新建一个普通管理员账户（带 sudo），以后用它登录，并禁止 root 直接 SSH 登录吗？（推荐）'; then
+      if confirm_yes '同时新建一个普通管理员账户（带 sudo），以后用它登录，并禁止 root 直接 SSH 登录吗？（推荐，输入 y 才做）'; then
         ADMIN_CHOICE=1
         until admin_name_valid "${ADMIN_NAME:-}"; do
           read -r -p '管理员账户名（小写字母开头，例如 ops）: ' ADMIN_NAME || { ADMIN_NAME=''; ADMIN_CHOICE=0; break; }
         done
       else ADMIN_CHOICE=0; fi
-    elif confirm_yes "同时禁止 root 直接 SSH 登录吗？以后用 $login 登录再 sudo。（推荐）"; then ADMIN_CHOICE=1
+    elif confirm_yes "同时禁止 root 直接 SSH 登录吗？以后用 $login 登录再 sudo。（推荐，输入 y 才做）"; then ADMIN_CHOICE=1
     else ADMIN_CHOICE=0; fi
   else
     SSH_CHOICE=0
@@ -5058,7 +5058,7 @@ ufw_ipv6_check() {
   [[ -r /etc/default/ufw && "$(audit_ufw_ipv6 < /etc/default/ufw)" == no ]] || return 0
   host_has_global_ipv6 || return 0
   warn '本机有公网 IPv6 地址，但 UFW 设置了 IPV6=no：IPv6 入口完全不受防火墙保护。'
-  confirm_yes '开启 UFW 的 IPv6 防护吗？（把 /etc/default/ufw 里的 IPV6=no 改为 yes）（推荐）' || return 0
+  confirm_yes '开启 UFW 的 IPv6 防护吗？（把 /etc/default/ufw 里的 IPV6=no 改为 yes）（推荐，输入 y 才做）' || return 0
   backup_config_path /etc/default/ufw || die '无法备份 /etc/default/ufw'
   if ufw_set_ipv6 yes; then
     record_config_change /etc/default/ufw ipv6-enabled || die '无法记录 /etc/default/ufw 的变更。'
@@ -5756,7 +5756,7 @@ ssh_harden_stage() {
   local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail tag
   local -a overridden=() pairs=() off_files=()
   if [[ -z "${SSH_CHOICE:-}" ]]; then
-    if [[ "$MODE" == ssh ]] || confirm_yes '加固 SSH 登录（只允许密钥登录，可选新建管理员并禁止 root 直接登录）吗？（推荐）'; then SSH_CHOICE=1; else SSH_CHOICE=0; fi
+    if [[ "$MODE" == ssh ]] || confirm_yes '加固 SSH 登录（只允许密钥登录，可选新建管理员并禁止 root 直接登录）吗？（推荐，输入 y 才做）'; then SSH_CHOICE=1; else SSH_CHOICE=0; fi
   fi
   if [[ "$SSH_CHOICE" != 1 ]]; then ok 'SSH 登录设置保持不变。'; module_result ssh declined 'not requested'; return 0; fi
   if ! command -v sshd >/dev/null || ! command -v ssh-keygen >/dev/null || ! command -v runuser >/dev/null; then
@@ -5770,7 +5770,7 @@ ssh_harden_stage() {
   [[ -n "$user" && "$user" != root ]] || user="$(logname 2>/dev/null || id -un)"
   if [[ "$user" == root ]]; then
     if [[ -z "${ADMIN_CHOICE:-}" ]]; then
-      if confirm_yes '新建一个普通管理员账户（带 sudo），以后用它登录，并禁止 root 直接 SSH 登录吗？（推荐）'; then ADMIN_CHOICE=1; else ADMIN_CHOICE=0; fi
+      if confirm_yes '新建一个普通管理员账户（带 sudo），以后用它登录，并禁止 root 直接 SSH 登录吗？（推荐，输入 y 才做）'; then ADMIN_CHOICE=1; else ADMIN_CHOICE=0; fi
     fi
     if [[ "$ADMIN_CHOICE" == 1 ]]; then
       for ((tries = 0; tries < 3; tries++)); do
@@ -5785,7 +5785,7 @@ ssh_harden_stage() {
   else
     # Already working through a sudo account: root SSH login can be turned off too.
     if [[ -z "${ADMIN_CHOICE:-}" ]]; then
-      if confirm_yes "同时禁止 root 直接 SSH 登录吗？以后用 $user 登录再 sudo。（推荐）"; then ADMIN_CHOICE=1; else ADMIN_CHOICE=0; fi
+      if confirm_yes "同时禁止 root 直接 SSH 登录吗？以后用 $user 登录再 sudo。（推荐，输入 y 才做）"; then ADMIN_CHOICE=1; else ADMIN_CHOICE=0; fi
     fi
     [[ "$ADMIN_CHOICE" != 1 ]] || want_admin=1
   fi
@@ -7601,11 +7601,19 @@ databackup_ask_sftp() {
 }
 
 databackup_ask_s3() {
-  local endpoint bucket prefix access secret region
+  local endpoint bucket prefix access secret region host
   read -r -p '对象存储的地址（例如 https://xxx.r2.cloudflarestorage.com，直接回车取消）: ' endpoint || endpoint=''
   [[ -n "$endpoint" ]] || return 1
   endpoint="${endpoint%/}"
   [[ "$endpoint" =~ ^https?://[A-Za-z0-9.:-]+$ ]] || { warn '地址要以 https:// 开头，只写到域名。'; return 1; }
+  # Without TLS the keys' signatures and the (encrypted) data cross the network
+  # in the clear: only on this machine or a private network (a MinIO of one's own).
+  if [[ "$endpoint" == http://* ]]; then
+    host="${endpoint#http://}"; host="${host%%:*}"
+    if [[ "$host" != localhost && "$host" != 127.* ]] && ! ipv4_private "$host"; then
+      warn '公网上的对象存储要用 https:// 开头的地址；http:// 只能用在本机或内网地址上（比如自己架的 MinIO）。'; return 1
+    fi
+  fi
   read -r -p '存储桶的名字: ' bucket || bucket=''
   [[ "$bucket" =~ ^[A-Za-z0-9._-]{3,63}$ ]] || { warn '存储桶的名字不对。'; return 1; }
   read -r -p "桶里的目录 [$(hostname -s)]: " prefix || prefix=''
@@ -8228,6 +8236,14 @@ notify_stage() {
   if ! tg_call "$api" "$token" sendMessage -o /dev/null --data-urlencode "chat_id=$chat" \
        --data-urlencode "text=【$(display_name_get || hostname -s) · $(menu_ip)】TG 通知已开启：以后登录、重要操作和异常会发到这里。" 2>/dev/null; then
     warn '测试消息没发出去：检查 Token、网络（这台机器能不能连上 api.telegram.org）。'; module_result notify failed 'test message failed'; return 0
+  fi
+  # The chat is the one of the newest message the bot got, and anyone who finds
+  # the bot can write to it: only the user can tell that it is theirs. Up to
+  # 3.1.4 it was saved unasked, and a stranger's message sent just before would
+  # have made the stranger the one who gets every login alert.
+  if ! confirm_yes "测试消息发到了聊天 $chat：你在 Telegram 里收到了吗？（没收到说明这不是你的聊天，选 n）"; then
+    warn '没有保存：以后的提醒会发到那个聊天，而那不是你。给机器人再发一句话后重新开启，或者开启时直接输入你自己的 chat id。'
+    module_result notify declined 'recipient not confirmed'; return 0
   fi
   temp="$(mktemp "$STATE_ROOT/.notify.XXXXXX")" || return 0
   if ! printf 'token=%s\nchat=%s\napi=%s\nip=%s\n' "$token" "$chat" "$api" "$(menu_ip)" > "$temp" || ! chmod 600 -- "$temp" || ! mv -f -- "$temp" "$conf"; then
@@ -8912,10 +8928,12 @@ menu() {
       3) action=check ;;
       4) action=item ;;
       5)
-        read -r -p '1) 防火墙和防爆破   2) SSH 登录加固   3) 修改 SSH 端口   4) Fail2ban 封禁记录   回车返回: ' choice || choice=''
+        printf '  1. 防火墙和防爆破\n  2. SSH 登录加固\n  3. 修改 SSH 端口\n  4. Fail2ban 封禁记录\n  0. 返回\n'
+        read -r -p '请选择 [1-4，0 返回]: ' choice || choice=''
         case "$choice" in 1) action=firewall ;; 2) action=ssh ;; 3) action=item arg=sshport ;; 4) action=bans ;; *) continue ;; esac ;;
       6)
-        read -r -p '1) 安全排查（只读）   2) 查看登录记录   回车返回: ' choice || choice=''
+        printf '  1. 安全排查（只读）\n  2. 查看登录记录\n  0. 返回\n'
+        read -r -p '请选择 [1-2，0 返回]: ' choice || choice=''
         case "$choice" in 1) action=audit ;; 2) action=logins ;; *) continue ;; esac ;;
       7) action=port ;;
       8) action=clean ;;
@@ -8923,7 +8941,8 @@ menu() {
       r|R) action=reboot ;;
       l|L) action=records ;;
       z|Z)
-        read -r -p '1) 撤销本工具的设置   2) 卸载本工具（保留优化效果）   回车返回: ' choice || choice=''
+        printf '  1. 撤销本工具的设置\n  2. 卸载本工具（保留优化效果）\n  0. 返回\n'
+        read -r -p '请选择 [1-2，0 返回]: ' choice || choice=''
         case "$choice" in 1) action=rollback ;; 2) action=uninstall ;; *) continue ;; esac ;;
       u|U) action=update ;;
       h|H) /bin/bash -- "$self" help ;;
@@ -11933,8 +11952,9 @@ port_open() {
   fi
   mapfile -t items <<< "$list"
   if [[ -z "$proto_choice" && -t 0 ]]; then
-    read -r -p '协议：1) TCP  2) UDP  3) TCP+UDP  [回车默认 3]: ' proto_choice || true
-    case "$proto_choice" in 1) proto_choice=tcp ;; 2) proto_choice=udp ;; *) proto_choice=both ;; esac
+    # Most services listen on TCP only: nothing wider unless asked for.
+    read -r -p '协议：1) TCP  2) UDP  3) TCP+UDP  [回车默认 1]: ' proto_choice || true
+    case "$proto_choice" in 2) proto_choice=udp ;; 3) proto_choice=both ;; *) proto_choice=tcp ;; esac
   fi
   if ! list="$(port_protocols "${proto_choice:-both}")" || [[ -z "$list" ]]; then warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; fi
   mapfile -t protos <<< "$list"
@@ -11966,7 +11986,11 @@ port_open() {
   for item in "${items[@]}"; do
     for proto in "${protos[@]}"; do
       rule="$(port_rule_text "$item" "$proto" "$src")"
-      if grep -Fxq -- "$rule" <<< "$rules"; then ok "已放行过，跳过：$(port_item_text "$item")/$proto"; continue; fi
+      if grep -Fxq -- "$rule" <<< "$rules"; then
+        if port_forget_rule "$rule"; then ok "已经放行着：$(port_item_text "$item")/$proto。这条规则原来是本工具开防火墙时加的，现在算你自己放行的，撤销防火墙时会保留。"
+        else ok "已放行过，跳过：$(port_item_text "$item")/$proto"; fi
+        continue
+      fi
       if [[ -z "$src" ]]; then ufw allow "$item/$proto" >/dev/null || { warn "放行失败：$item/$proto"; continue; }
       else ufw allow proto "$proto" from "$src" to any port "$item" >/dev/null || { warn "放行失败：$item/$proto"; continue; }; fi
       ok "已放行 $(port_item_text "$item")/$proto${src:+（仅 $src）}"
@@ -11974,6 +11998,20 @@ port_open() {
     done
   done
   printf '本次新增 %s 条放行规则。回退本工具的设置时，这些业务端口会保留。\n' "$added"
+}
+
+# RULE: a rule this tool added itself (when it turned the firewall on) is the
+# user's own from here on: they closed it, or asked for it again, through the
+# port management. True when it was on record. Up to 3.1.4 the record stayed:
+# a port closed and opened again by the user was still taken away by the
+# rollback of the firewall, against "your own ports are kept".
+port_forget_rule() {
+  local RESTORE_ROOT="${STATE_ROOT:-/nonexistent}/restore-v2" file
+  file="$RESTORE_ROOT/fw_rules"
+  [[ -f "$file" && ! -L "$file" && -O "$file" ]] || return 1
+  grep -Fxq -- "$1" "$file" || return 1
+  record_line_remove "$file" "$1"
+  if [[ ! -s "$file" ]]; then rm -f -- "$file"; fi
 }
 
 # Parses an allow rule from `ufw show added` into "item<TAB>proto<TAB>source".
@@ -12097,7 +12135,7 @@ port_close() {
       ok "已单独放行 $(port_item_text "$r_item")/${keeps[i]}${srcs[i]:+（仅 ${srcs[i]}）}"
     fi
     read -r -a words <<< "${line#ufw }"
-    if ufw --force delete "${words[@]}" >/dev/null; then ok "已关闭：${line#ufw }"
+    if ufw --force delete "${words[@]}" >/dev/null; then ok "已关闭：${line#ufw }"; port_forget_rule "$line" || true
     else warn "关闭失败：${line#ufw }"; fi
   done
 }

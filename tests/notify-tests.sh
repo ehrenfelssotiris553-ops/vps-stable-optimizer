@@ -390,7 +390,10 @@ printf 'PASS: the timer runs every minute with TG, every 5 minutes for traffic o
 mv "$T/notify.conf.saved" "$STATE_ROOT/notify.conf"; rm -f "$STATE_ROOT/notify.conf"
 display_name_get() { echo 东京-1; }
 menu_ip() { echo 203.0.113.1; }
-confirm_yes() { return 1; }
+# "Did the test message reach you?" is the one question asked here.
+RECEIVED=1
+confirm_yes() { printf 'ASK %s\n' "$1" >> "$T/asks"; ((RECEIVED)); }
+: > "$T/asks"
 TG_UPDATES='{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":987654,"type":"private"},"text":"hi"}}]}' TG_SEND=0
 tg_call() { record "tg $3 $(cat)"; case "$3" in getUpdates) echo "$TG_UPDATES" ;; sendMessage) return "$TG_SEND" ;; esac; }
 # The test containers have no curl: TG needs it to be there (tg_call answers).
@@ -418,7 +421,16 @@ grep -Fxq 'chat=-100123' "$STATE_ROOT/notify.conf" || fail "chat in spaced JSON:
 rm -f "$STATE_ROOT/notify.conf"; TG_SEND=1
 reset; printf '123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq\n\n' | notify_stage > /dev/null
 grep -q '^result notify failed test message failed' "$TEST_ROOT/trace" && [[ ! -e "$STATE_ROOT/notify.conf" ]] || fail 'a failed test message still saved the settings'
-printf 'PASS: TG checks the token, finds the chat, sends a test and keeps the settings for root only.\n'
+# The chat is the one of the newest message the bot got, which anyone who finds
+# the bot can send: it is saved only when the user says the test message came
+# (up to 3.1.4 it was saved unasked).
+rm -f "$STATE_ROOT/notify.conf"; TG_SEND=0 RECEIVED=0; : > "$T/asks"
+reset; printf '123456789:AAbbccddeeffgghhiijjkkllmmnnooppqq\n\n' | notify_stage > "$T/out"
+grep -q '^ASK 测试消息发到了聊天 -100123：你在 Telegram 里收到了吗' "$T/asks" || fail "the user is not asked whether the test message came: $(cat "$T/asks")"
+[[ ! -e "$STATE_ROOT/notify.conf" ]] && grep -q '^result notify declined recipient not confirmed' "$TEST_ROOT/trace" || fail "a chat the user did not confirm was saved: $(cat "$TEST_ROOT/trace")"
+if grep -Fxq reconcile "$TEST_ROOT/trace"; then fail 'the check was started for a chat nobody confirmed'; fi
+RECEIVED=1
+printf 'PASS: TG checks the token, finds the chat, sends a test, saves only a chat the user confirmed and keeps the settings for root only.\n'
 
 # The traffic alert's questions (its interface looked up in the fixture).
 eval "$(awk '$0 == "quota_stage() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT" | sed -e "s#/proc/#$F/proc/#g")"

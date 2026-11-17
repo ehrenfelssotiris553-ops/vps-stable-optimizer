@@ -10,7 +10,7 @@ source "$HERE/test-common.sh"
 load_optimizer_functions databackup_timer_off databackup_on databackup_conf databackup_conf_write databackup_restic databackup_notify databackup_finish databackup_drill databackup_run \
   databackup_service_text databackup_timer_text databackup_units_write databackup_ask_sftp databackup_ask_s3 databackup_ask_rclone databackup_ask_local databackup_ask_target \
   databackup_password databackup_stage databackup_restore databackup_now databackup_menu databackup_main menu_backup_alert check_databackup audit_clean_text audit_when \
-  restore_ids restore_group_ids restore_databackup_group restore_groups item_keys item_label
+  restore_ids restore_group_ids restore_databackup_group restore_groups item_keys item_label ipv4_private
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -316,6 +316,9 @@ printf '2001:db8::7\n22\nbak\nb\n\n' | databackup_ask_sftp > /dev/null 2>&1 || f
 
 refused 'empty S3 address' databackup_ask_s3 '\n'
 refused 'S3 address without a scheme' databackup_ask_s3 'x.example\nbucket\np\nauto\nAK\nSK\n'
+# Plain http crosses the network in the clear: only on this machine or a private network.
+refused 'public S3 address over plain http' databackup_ask_s3 'http://s3.example.com\nbucket\np\nauto\nAK\nSK\n'
+refused 'public S3 address (IP) over plain http' databackup_ask_s3 'http://198.51.100.7:9000\nbucket\np\nauto\nAK\nSK\n'
 refused 'S3 address with a path' databackup_ask_s3 'https://x.example/a;b\nbucket\np\nauto\nAK\nSK\n'
 refused 'bucket with a slash' databackup_ask_s3 'https://x.example\na/b\np\nauto\nAK\nSK\n'
 refused 'prefix with ..' databackup_ask_s3 'https://x.example\nbucket\n../p\nauto\nAK\nSK\n'
@@ -325,6 +328,14 @@ rm_conf
 out="$(printf 'https://x.example/\nbucket\nsome/prefix\nauto\nAKID\nSECRETVALUE\n' | databackup_ask_s3 2>&1)" || fail "S3: $out"
 [[ "$(databackup_conf repo)|$(databackup_conf access_key)|$(databackup_conf secret_key)|$(databackup_conf region)" == 's3:https://x.example/bucket/some/prefix|AKID|SECRETVALUE|auto' ]] || fail "S3 settings: $(cat "$D/conf")"
 if grep -Fq SECRETVALUE <<< "$out"; then fail 'the S3 secret was printed'; fi
+# A storage of one's own on this machine or a private network may be plain http.
+for endpoint in http://127.0.0.1:9000 http://localhost:9000 http://10.0.0.5:9000 http://192.168.1.9; do
+  rm_conf
+  out="$(printf '%s\nbucket\np\nauto\nAKID\nSECRETVALUE\n' "$endpoint" | databackup_ask_s3 2>&1)" || fail "S3 at $endpoint refused: $out"
+  [[ "$(databackup_conf repo)" == "s3:$endpoint/bucket/p" ]] || fail "S3 at $endpoint: $(cat "$D/conf")"
+done
+out="$(printf 'http://s3.example.com\nbucket\np\nauto\nAKID\nSECRETVALUE\n' | databackup_ask_s3 2>&1 || true)"
+grep -Fq '公网上的对象存储要用 https://' <<< "$out" || fail "why a public http address is refused is not said: $out"
 
 rclone() { case "$1" in listremotes) printf '%s' "${RCLONE_REMOTES-gdrive:
 }" ;; lsd) return "${RCLONE_RC:-0}" ;; esac; }
