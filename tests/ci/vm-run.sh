@@ -693,6 +693,9 @@ group 'SSH hardening: a reboot before the confirmation puts the old settings bac
 # then stayed for good. Now a unit of the tool undoes it at boot.
 vm_drive ssh-drop.rules ssh-reboot vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (before the reboot) exited with $rc"; }
 has ssh-reboot '已关闭 SSH 密码登录'
+# The dropped session ends on SIGHUP at once; a key login of ops while it still
+# waited would count as the confirmation. A moment first, then the first login.
+sleep 3
 vm_ops "[ -e $KEYONLY ]" || fail 'the hardening was not in place before the reboot'
 vm_ops_sudo 'test -f /etc/systemd/system/vps-stable-guard-boot.service' || fail 'no boot unit while the change waits for its confirmation'
 reboot_at=$SECONDS

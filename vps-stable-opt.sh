@@ -137,7 +137,7 @@ NOTIFY_CHOICE='' QUOTA_CHOICE='' DOCKERLOG_CHOICE='' SSHPORT_CHOICE=''
 
 # The command line of a direct run: an unknown mode, --version and help end here.
 runtime_args() {
-case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report|clean|backup|databackup-run|docker-fw-sync|guard-boot|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|report|clean|backup|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
+case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report|clean|backup|databackup-run|docker-fw-sync|audit|logins|check|firewall|ssh|port|item|params|reboot|update|bans|help|-h|--help|--version) ;; *) echo '用法：bash vps-stable-opt.sh [menu|report|clean|backup|plan|perf|resources|audit|logins|setup|item|params|firewall|ssh|port|check|records|rollback|uninstall|reboot|update|bans|help]' >&2; exit 2 ;; esac
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
@@ -5761,9 +5761,23 @@ ssh_enable_pubkey() {
   ok "已开启 SSH 公钥登录：$SSH_PUBKEY_DROPIN（密码登录照常可用）。"
 }
 
+# PREVIOUS: the SSH hardening undone. This tool's earlier key-only file comes
+# back when there was one (PREVIOUS is a copy of it); else none is left, and
+# password login is back. Should the copy fail, the file goes: going back must
+# never leave less access than before.
+ssh_dropin_back() {
+  if [[ -s "$1" ]]; then cp -pf -- "$1" "$SSH_DROPIN" || rm -f -- "$SSH_DROPIN"
+  else rm -f -- "$SSH_DROPIN"; fi
+}
+
+# PREVIOUS: the same as commands for the guard (they run on their own, with sh).
+ssh_dropin_back_cmd() {
+  printf "if [ -s '%s' ]; then cp -pf '%s' '%s' || rm -f -- '%s'; else rm -f -- '%s'; fi" "$1" "$1" "$SSH_DROPIN" "$SSH_DROPIN" "$SSH_DROPIN"
+}
+
 ssh_harden_stage() {
   step 13 'SSH 登录加固（可选）'
-  local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail tag
+  local user answer='' home effective auth_file count key since unit deadline want_admin=0 tries detail tag previous="$STATE_ROOT/ssh-harden-previous"
   local -a overridden=() pairs=() off_files=()
   if [[ -z "${SSH_CHOICE:-}" ]]; then
     if [[ "$MODE" == ssh ]] || confirm_yes '加固 SSH 登录（只允许密钥登录，可选新建管理员并禁止 root 直接登录）吗？（推荐，输入 y 才做）'; then SSH_CHOICE=1; else SSH_CHOICE=0; fi
@@ -5892,10 +5906,25 @@ ssh_harden_stage() {
     fi
   fi
   ssh_console_guard "$user" || { ok '保留密码登录；SSH 设置没有改动。'; module_result ssh declined 'no console password'; return 0; }
-  put_file "$SSH_DROPIN" "$(ssh_dropin_text "$want_admin")" || { module_result ssh preserved 'drop-in path conflict'; return 0; }
+  # This tool's own key-only file from an earlier hardening (root login still
+  # allowed) gives way to the new one, and is what going back means: key-only
+  # login again, not password login. Up to 3.1.4 the new file could not be
+  # written over it ("drop-in path conflict"), so root login could not be
+  # turned off on a machine this tool had made key-only.
+  rm -f -- "$previous"
+  if [[ -f "$SSH_DROPIN" && ! -L "$SSH_DROPIN" ]] && restore_file_ours ssh_dropin; then
+    if ! cp -p -- "$SSH_DROPIN" "$previous" || ! rm -f -- "$SSH_DROPIN"; then
+      rm -f -- "$previous"; warn '没能保存现在的 SSH 配置，什么都没改。'; module_result ssh failed 'drop-in not saved'; return 0
+    fi
+  fi
+  # Not written (a file of someone else's there): only this tool's own old file comes back.
+  if ! put_file "$SSH_DROPIN" "$(ssh_dropin_text "$want_admin")"; then
+    if [[ -s "$previous" ]]; then ssh_dropin_back "$previous"; fi
+    module_result ssh preserved 'drop-in path conflict'; return 0
+  fi
   sshd_runtime_dir
   if ! sshd -t; then
-    rm -f -- "$SSH_DROPIN"; warn 'sshd -t 不接受新配置，已删除。'; module_result ssh failed 'sshd -t failed'; return 0
+    ssh_dropin_back "$previous"; warn 'sshd -t 不接受新配置，已撤回。'; module_result ssh failed 'sshd -t failed'; return 0
   fi
   # The change's name: the guard timer's, and the mark of lines it comments out.
   tag="$(date +%s)-$$"
@@ -5914,26 +5943,28 @@ ssh_harden_stage() {
     fi
   fi
   if ((${#overridden[@]})); then
-    rm -f -- "$SSH_DROPIN"
-    warn "这些设置没有生效：${overridden[*]}。本工具的配置已删除，SSH 登录设置保持原样。"
+    ssh_dropin_back "$previous"
+    warn "这些设置没有生效：${overridden[*]}。本工具的新配置已撤回，SSH 登录设置保持原样。"
     module_result ssh preserved 'earlier sshd setting wins'; return 0
   fi
   unit="vps-stable-ssh-revert-$tag"
-  guard_arm "$unit" "rm -f -- '$SSH_DROPIN'$(sshd_lines_on_cmd ssh "$tag" "${off_files[@]}"); systemctl try-reload-or-restart ssh.service" || {
-    rm -f -- "$SSH_DROPIN"; sshd_lines_on ssh "$tag" "${off_files[@]}" || true
+  guard_arm "$unit" "$(ssh_dropin_back_cmd "$previous")$(sshd_lines_on_cmd ssh "$tag" "${off_files[@]}"); systemctl try-reload-or-restart ssh.service" || {
+    ssh_dropin_back "$previous"; sshd_lines_on ssh "$tag" "${off_files[@]}" || true
     warn '无法启用 SSH 自动撤销计时器；没有做任何修改。'; module_result ssh failed 'guard not armed'; return 0
   }
   deadline=$((SECONDS + $(param_value guard_seconds)))
   if ! ssh_reload; then warn 'sshd 重新加载失败；自动撤销计时器保持启用。'; module_result ssh failed 'sshd reload failed'; return 0; fi
   # Only a key login after the reload proves the new settings work.
   since="$(guard_since)"
-  echo '已关闭 SSH 密码登录。请保留这个窗口不要关，再新开一个终端，用密钥登录一次：'
+  if [[ -s "$previous" ]]; then echo '已禁止 root 直接登录（密码登录本来就关着）。请保留这个窗口不要关，再新开一个终端，用密钥登录一次：'
+  else echo '已关闭 SSH 密码登录。请保留这个窗口不要关，再新开一个终端，用密钥登录一次：'; fi
   echo "  ssh $user@服务器IP"
   if ((want_admin)); then echo '现在 root 直接登录应该被拒绝，这是正常的。'; fi
   echo "用密钥登录成功后，这里通常几秒内就会自动确认，新窗口里什么都不用输入。"
   echo "如果没有自动确认，就回到这个窗口输入 CONNECTED；$(param_value guard_seconds) 秒内没有确认，会自动恢复原来的设置。"
   if guard_confirm "$unit" "$deadline" ssh_login_seen "$since" "$user" publickey; then
-    if [[ -f "$SSH_DROPIN" ]]; then
+    if [[ "$(cat -- "$SSH_DROPIN" 2>/dev/null || true)" == "$(ssh_dropin_text "$want_admin")" ]]; then
+      rm -f -- "$previous"
       detail="key-only user=$user"
       if ((want_admin)); then detail+=' root-ssh=off'; fi
       ok '新的 SSH 登录设置已保留，自动撤销计时器已取消。'
@@ -5946,7 +5977,7 @@ ssh_harden_stage() {
     warn '已收到确认，但新的 SSH 配置文件已经不在了（可能已被自动撤销）。'
   fi
   warn '这次没有确认成功：正在恢复原来的 SSH 设置；可以稍后重试。'
-  rm -f -- "$SSH_DROPIN"
+  ssh_dropin_back "$previous"
   sshd_lines_on ssh "$tag" "${off_files[@]}" || true
   # The guard reloads sshd again when it fires: keep it unless this reload worked.
   if ssh_reload; then guard_cancel "$unit"
@@ -12746,9 +12777,12 @@ item_action() {
   echo
   item_actions "$key" "$state" "$owner" "$text"
   read -r -p '请选择: ' choice || { ITEM_LEAVE=1; return 0; }
+  case "$key:$choice" in *:|*:0) ITEM_LEAVE=1; return 0 ;; esac
+  # A key that is no choice at all is only refused: it begins no run (no lock,
+  # no record, no backup of the configuration scrolling past before the refusal).
+  if [[ ! "$choice" =~ ^[1-5]$ ]]; then echo '无效选项。'; return 0; fi
   # Only looking needs no lock, no run record and no backup of the configuration.
   case "$key:$choice" in
-    *:|*:0) ITEM_LEAVE=1; return 0 ;;
     login:5|dockerfw:5) ;;
     *) item_session_begin ;;
   esac

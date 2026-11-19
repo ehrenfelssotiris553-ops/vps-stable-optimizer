@@ -7,6 +7,7 @@ HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/test-common.sh"
 load_optimizer_functions audit_passwd_state ssh_dropin_text ssh_pubkey_valid ssh_key_count ssh_effective ssh_effective_value ssh_login_seen ssh_sudo_seen console_password_state ssh_home_safe ssh_append_key admin_name_valid admin_prepare ssh_console_guard ssh_enable_pubkey guard_since ssh_harden_stage \
+  ssh_dropin_back ssh_dropin_back_cmd \
   sshd_line_value sshd_config_walk sshd_include_args sshd_reads sshd_setting_overrides sshd_lines_show sshd_lines_off sshd_lines_on \
   sshd_lines_on_cmd sshd_off_files ssh_overrides_offer ssh_hardening_overridden restore_record_sshd_file audit_clean_text \
   restore_ssh_group check_ssh check_ssh_override verify_set
@@ -146,6 +147,8 @@ confirm_default_yes() {
 guard_leftovers() { return 1; }
 guard_arm() { record "arm $*"; }
 guard_confirm() { ((GUARD_OK)); }
+# The drop-in is this tool's own from an earlier run only where a case says so.
+restore_file_ours() { return 1; }
 ssh_reload() { record reload; }
 systemctl() { record "systemctl $*"; }
 systemd-run() { :; }
@@ -228,8 +231,8 @@ new_case() {
   SSH_CHOICE='' ADMIN_CHOICE=0 ADMIN_NAME=''
   ADD_MORE=0 KEYOK=0 SUDOOK=0 NOCONSOLE=0 SET_PW=0 GUARD_OK=1 SEEN=1 SUDO_SEEN=1 HOME_SAFE=1
   ALREADY_OFF=0 DROPIN_WINS=1 ROOT_WINS=1 SSHD_T_RC=0 PROVIDER=0 COMMENT_OK=1
-  SSHD_CONFIG="$CASE/sshd_config" RESTORE_ROOT="$CASE/restore" RESTORE_READY=1
-  mkdir -p "$RESTORE_ROOT"
+  SSHD_CONFIG="$CASE/sshd_config" RESTORE_ROOT="$CASE/restore" RESTORE_READY=1 STATE_ROOT="$CASE/state"
+  mkdir -p "$RESTORE_ROOT" "$STATE_ROOT"
   AKF='.ssh/authorized_keys .ssh/authorized_keys2'
   printf '\n%s\n\n' "$KEY" > "$CASE/input"
 }
@@ -277,6 +280,54 @@ printf '%s\n\n' "$KEY" > "$CASE/input"
 ssh_harden_stage < "$CASE/input"
 grep -Fxq 'PermitRootLogin no' "$SSH_DROPIN" || fail 'root login kept although a sudo account was confirmed'
 grep -Fxq 'result ssh applied key-only user=alice root-ssh=off' "$CASE/trace" || fail 'root-off result missing'
+
+# Key-only already, by this tool's own file, root still allowed in: root login
+# is turned off on top. The old file gives way to the new one, and going back
+# (not confirmed, the guard, a reboot) means that old file again: key-only, not
+# password login. Up to 3.1.4 the new file could not be written over the old
+# one ("drop-in path conflict"). put_file here refuses to overwrite, as the
+# real one does.
+(
+  put_file() { if [[ -e "$1" && "$(cat -- "$1")" != "$2" ]]; then return 1; fi; mkdir -p -- "$(dirname -- "$1")"; printf '%s\n' "$2" > "$1"; }
+  restore_file_ours() { [[ "$1" == ssh_dropin ]] && ((OURS)); }
+  STUB="$TEST_ROOT/stub-bin"; mkdir -p "$STUB"; printf '#!/bin/sh\nexit 0\n' > "$STUB/systemctl"; chmod +x "$STUB/systemctl"
+  for confirmed in 1 0; do
+    new_case "root_off_on_top_$confirmed"
+    mkdir -p "$(dirname "$SSH_DROPIN")"; ssh_dropin_text 0 > "$SSH_DROPIN"; cp -- "$SSH_DROPIN" "$CASE/old"
+    OURS=1 ADMIN_CHOICE=1 GUARD_OK="$confirmed"
+    printf '%s\n\n' "$KEY" > "$CASE/input"
+    ssh_harden_stage < "$CASE/input" > "$CASE/out"
+    # The way back the guard was given, run as the guard runs it (sh), over the new file.
+    cmd="$(sed -n 's/^arm vps-stable-ssh-revert-[0-9-]* //p' "$CASE/trace")"
+    [[ -n "$cmd" ]] || fail "no guard for turning root login off on top: $(cat "$CASE/trace")"
+    if ((confirmed)); then
+      grep -Fxq 'PermitRootLogin no' "$SSH_DROPIN" || fail "root login not turned off over this tool's key-only file: $(cat "$CASE/trace")"
+      grep -Fxq 'result ssh applied key-only user=alice root-ssh=off' "$CASE/trace" || fail "turning root login off on top: $(cat "$CASE/trace")"
+      grep -Fq '已禁止 root 直接登录' "$CASE/out" || fail "what was changed is not said: $(cat "$CASE/out")"
+      [[ ! -e "$STATE_ROOT/ssh-harden-previous" ]] || fail 'the copy of the old file stayed after the confirmation'
+      cp -- "$SSH_DROPIN" "$CASE/new"
+      # The copy was there when the guard was armed: the guard (or a reboot) puts it back.
+      cp -- "$CASE/old" "$STATE_ROOT/ssh-harden-previous"
+      PATH="$STUB:$PATH" sh -c "$cmd"
+      cmp -s "$CASE/old" "$SSH_DROPIN" || fail "the guard does not put this tool's key-only file back: $(cat "$SSH_DROPIN" 2>&1)"
+      # Without the copy the guard removes the file: never less access than before.
+      cp -- "$CASE/new" "$SSH_DROPIN"; rm -f -- "$STATE_ROOT/ssh-harden-previous"
+      PATH="$STUB:$PATH" sh -c "$cmd"
+      [[ ! -e "$SSH_DROPIN" ]] || fail 'the guard left the new file when the copy of the old one was gone'
+    else
+      cmp -s "$CASE/old" "$SSH_DROPIN" || fail "not confirmed: this tool's key-only file did not come back (password login would be on again): $(cat "$SSH_DROPIN" 2>&1)"
+      grep -q '^result ssh failed' "$CASE/trace" || fail "not confirmed, not recorded as failed: $(cat "$CASE/trace")"
+    fi
+  done
+  # A file at that path that is not this tool's: left as it is, nothing removed.
+  new_case root_off_foreign
+  mkdir -p "$(dirname "$SSH_DROPIN")"; printf 'PasswordAuthentication no\n' > "$SSH_DROPIN"; cp -- "$SSH_DROPIN" "$CASE/old"
+  OURS=0 ADMIN_CHOICE=1
+  printf '%s\n\n' "$KEY" > "$CASE/input"
+  ssh_harden_stage < "$CASE/input" > "$CASE/out"
+  cmp -s "$CASE/old" "$SSH_DROPIN" || fail "a drop-in that is not this tool's was changed: $(cat "$SSH_DROPIN" 2>&1)"
+  grep -Fxq 'result ssh preserved drop-in path conflict' "$CASE/trace" || fail "a drop-in that is not this tool's: $(cat "$CASE/trace")"
+) || exit 1
 
 new_case root_login_creates_admin
 SUDO_USER='' LOGIN=root TARGET=ops ADMIN_CHOICE=1 ADMIN_NAME=ops
@@ -441,7 +492,8 @@ tag="$(sed -n 's/^#vps-stable-off(ssh,\([0-9-]*\)): PasswordAuthentication yes$/
 [[ "$(sed -n 2p "$CASE/sshd_config.d/00-ppflight-cloud.conf")" == "#vps-stable-off(ssh,$tag): PasswordAuthentication yes" ]] || fail 'provider drop-in not commented out'
 cmp -s "$CASE/sshd_config.d/50-cloud-init.conf" "$CASE/before/50-cloud-init.conf" || fail 'cloud-init'"'"'s file, read later, was changed'
 arm="$(grep '^arm ' "$CASE/trace")"
-[[ "$arm" == "arm vps-stable-ssh-revert-$tag rm -f -- '$SSH_DROPIN'; sed -i 's/^#vps-stable-off(ssh,$tag): //' "* ]] || fail "guard does not put the lines back: $arm"
+# The drop-in goes (no earlier one of this tool's to bring back), then the lines come back.
+[[ "$arm" == "arm vps-stable-ssh-revert-$tag $(ssh_dropin_back_cmd "$STATE_ROOT/ssh-harden-previous"); sed -i 's/^#vps-stable-off(ssh,$tag): //' "* ]] || fail "guard does not put the lines back: $arm"
 [[ "$arm" == *"'$CASE/ppflight-login.conf'"* && "$arm" == *"'$CASE/sshd_config.d/00-ppflight-cloud.conf'"* ]] || fail "guard misses a file: $arm"
 grep -Fxq 'result ssh applied key-only user=alice' "$CASE/trace" || fail "hardening not applied: $(cat "$CASE/trace")"
 grep -q '注释掉的行保持注释' "$CASE/out" || fail 'what stays commented out was not said'

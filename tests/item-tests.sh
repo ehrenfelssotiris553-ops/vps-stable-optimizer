@@ -348,8 +348,11 @@ item_action ports < /dev/null > /dev/null
   item_session_begin() { record begin; }
   reset
   dockerfw_show() { record shown; }
-  for pair in 'login 5' 'dockerfw 5' 'bbr 0' 'bbr ' 'bbr 9'; do item_action "${pair% *}" <<< "${pair#* }" > /dev/null; done
-  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'logins shown begin ' ]] || fail "what begins a run on the page of an item: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+  # A key that is no choice (a typo) is refused and begins nothing either.
+  for pair in 'login 5' 'dockerfw 5' 'bbr 0' 'bbr ' 'bbr 9' 'bbr x' 'bbr 11' 'bbr 1'; do item_action "${pair% *}" <<< "${pair#* }" > "$TEST_ROOT/page"; done
+  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'logins shown begin on bbr ' ]] || fail "what begins a run on the page of an item: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+  reset; item_action bbr <<< 7 > "$TEST_ROOT/page"
+  [[ "$(tail -n 1 "$TEST_ROOT/page")" == '无效选项。' && ! -s "$TEST_ROOT/trace" ]] || fail "a typo on the page of an item: $(tail -n 2 "$TEST_ROOT/page") / $(cat "$TEST_ROOT/trace")"
 )
 printf 'PASS: a number on the page of a single item means the same on every page; only looking begins no run.\n'
 # What a page offers follows the state of the item and whose doing it is.
