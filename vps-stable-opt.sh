@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Stable Optimizer v3.1.4 — tracked configuration restore and tool cleanup
+# VPS Stable Optimizer v3.2.0 — tracked configuration restore and tool cleanup
 # Supports Debian 12/13, Ubuntu 22.04/24.04/26.04 on systemd VMs.
 # Review locally before running as root. Opening the menu does not apply optimization.
 # Sourced (a test loading every function with the real global settings): the
@@ -14,7 +14,7 @@ if ((VPS_SOURCED == 0)); then
   umask 077
 fi
 
-SCRIPT_VERSION=3.1.4
+SCRIPT_VERSION=3.2.0
 MODE="${1:-menu}"
 MODE_ARGS=("${@:2}")
 # Inside the root-only state directory: Ubuntu's /var/log is group-writable
@@ -141,7 +141,7 @@ case "$MODE" in menu|records|uninstall|rollback|setup|plan|perf|resources|report
 [[ "$MODE" == --version ]] && { echo "$SCRIPT_VERSION"; exit 0; }
 if [[ "$MODE" == help || "$MODE" == -h || "$MODE" == --help ]]; then
   cat <<'HELP'
-VPS 机器管家 V3.1.4 — Debian 12/13、Ubuntu 22.04/24.04/26.04
+VPS 机器管家 V3.2.0 — Debian 12/13、Ubuntu 22.04/24.04/26.04
 安装后输入 vps 打开菜单；也可直接运行 bash vps-stable-opt.sh。
   vps report     机器体检（只读）：性能、资源、磁盘、服务和系统状况一份看完，要留意的排在最前
   vps clean      磁盘清理：先列出能清掉多少，你选了才清
@@ -2214,6 +2214,7 @@ param_list() {
     docker_log_max_mb dockerlog '每个容器日志文件的上限' MiB \
     docker_log_files dockerlog '每个容器保留的日志文件数' 个 \
     guard_seconds general '防失联确认的等待时间' 秒 \
+    guard_boot_minutes general '开机时撤销没确认的改动最多等多久' 分钟 \
     setup_skip general '一键开荒时跳过的项目' '' \
     run_keep general '保留最近几次运行记录和配置备份' 次 \
     audit_days general '安全排查看最近几天的登录' 天 \
@@ -2432,6 +2433,8 @@ param_recommended() {
     docker_log_files) echo 3 ;;
     # The confirmation window; the timer that undoes the change runs a minute longer.
     guard_seconds) echo 180 ;;
+    # The boot unit's limit: its undo takes seconds; a hang must not hold the boot.
+    guard_boot_minutes) echo 5 ;;
     setup_skip|sysctl_hardening_skip) echo none ;;
     run_keep) echo 20 ;;
     audit_days) echo 30 ;;
@@ -2516,6 +2519,7 @@ param_reason() {
     docker_log_max_mb) echo '每个文件 10 MiB、留 3 个：一个容器的日志最多 30 MiB，Docker 默认不设上限，日志多的容器能把硬盘写满。' ;;
     docker_log_files) echo '3 个：轮换时留下最近的几个，出了问题还能往回看一点。' ;;
     guard_seconds) echo '180 秒：新开一个窗口、找到密钥登录一次足够了。防火墙、SSH 加固、改 SSH 端口都用它；没确认就自动撤销的计时器再多等 60 秒。' ;;
+    guard_boot_minutes) echo '5 分钟：等确认时机器重启了，开机时撤销没确认的改动通常几秒就做完；万一卡住，到时就停下，开机照常走完（SSH 在它之前就已经启动，不受影响）。' ;;
     setup_skip) printf '%s\n' "none：一键开荒每一步都照常（每一步本来就会判断要不要做）。写上不想让开荒碰的项目，开荒就跳过它们、也不问：$(setup_skippable | tr '\n' ' ' | sed 's/ $//')。" ;;
     run_keep) echo '20 次：最近几周的改动都能查到、都有配置备份；第一次运行（工具运行前的原始配置）总是保留。' ;;
     audit_days) echo '30 天：安全排查看最近一个月谁登录过；登录记录本身保存得更久（登录记录和提醒里调）。' ;;
@@ -2679,6 +2683,9 @@ param_check() {
     guard_seconds)
       if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 120 && 10#$2 <= 900)); then return 0; fi
       echo '请输入 120 到 900 之间的整数（秒）。' ;;
+    guard_boot_minutes)
+      if [[ "$2" =~ ^[0-9]{1,2}$ ]] && ((10#$2 >= 1 && 10#$2 <= 60)); then return 0; fi
+      echo '请输入 1 到 60 之间的整数（分钟）。' ;;
     run_keep)
       if [[ "$2" =~ ^[0-9]{1,3}$ ]] && ((10#$2 >= 5 && 10#$2 <= 200)); then return 0; fi
       echo '请输入 5 到 200 之间的整数（次）。' ;;
@@ -2845,6 +2852,8 @@ param_caution() {
     guard_seconds)
       if ((10#$2 < 150)); then echo '比较短：来不及新开窗口登录的话，改动会被自动撤销（安全，但要重做）。'
       elif ((10#$2 > 600)); then echo '比较长：万一把自己锁在外面，要多等一会儿才会自动恢复。'; fi ;;
+    guard_boot_minutes)
+      if ((10#$2 > 30)); then echo '比较长：开机时的撤销万一卡住，开机要等这么久才走完。'; fi ;;
     setup_skip)
       if [[ " $2 " == *' firewall '* ]]; then echo '跳过防火墙：一键开荒后所有在监听的端口都直接暴露在公网（Fail2ban 照常工作，它不靠防火墙）。'; fi ;;
     ssh_rate_limit)
@@ -4457,11 +4466,14 @@ guard_boot_replay_text() {
     'done' 'exit 0'
 }
 
+# A oneshot unit has no start limit of its own: should its script hang, the
+# boot would wait for it for good (SSH, started before it, would still work).
 guard_boot_service_text() {
   printf '%s\n' '# VPS Stable Optimizer: after a reboot, undoes a change that was waiting for its confirmation' '[Unit]' \
     'Description=VPS Stable Optimizer: undo an unconfirmed change after a reboot' "ConditionPathExistsGlob=$STATE_ROOT/guard/*.sh" \
     'After=network.target ufw.service ssh.service ssh.socket vps-stable-docker-fw.service' \
-    '[Service]' 'Type=oneshot' "ExecStart=/bin/sh $STATE_ROOT/guard/replay" '[Install]' 'WantedBy=multi-user.target'
+    '[Service]' 'Type=oneshot' "TimeoutStartSec=$(param_value guard_boot_minutes)min" "ExecStart=/bin/sh $STATE_ROOT/guard/replay" \
+    '[Install]' 'WantedBy=multi-user.target'
 }
 
 # The boot unit in place and enabled (written again only when it differs).

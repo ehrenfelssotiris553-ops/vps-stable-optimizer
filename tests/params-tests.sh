@@ -213,7 +213,7 @@ printf 'PASS: the ASCII symbols setting is saved and removed from the single-ite
 
 # The switches and numbers opened up in 2.9: each limit accepted, one past it
 # refused. Checked under LC_ALL=C, as this tool runs.
-for pair in 'guard_seconds 120' 'guard_seconds 900' 'setup_skip none' 'setup_skip bbr firewall' 'run_keep 5' 'run_keep 200' \
+for pair in 'guard_seconds 120' 'guard_seconds 900' 'guard_boot_minutes 1' 'guard_boot_minutes 60' 'setup_skip none' 'setup_skip bbr firewall' 'run_keep 5' 'run_keep 200' \
     'audit_days 7' 'audit_days 365' 'menu_alerts all' 'menu_alerts none' 'menu_alerts verify reboot' 'menu_alert_days 1' 'menu_alert_days 30' \
     'ssh_rate_limit yes' 'ssh_rate_limit no' 'ssh_max_auth_tries 2' 'ssh_max_auth_tries 10' 'ssh_login_grace_seconds 10' 'ssh_login_grace_seconds 120' \
     'ssh_x11_forwarding yes' 'ssh_x11_forwarding no' 'sysctl_hardening_skip none' 'sysctl_hardening_skip kernel.kptr_restrict' \
@@ -225,7 +225,7 @@ for pair in 'guard_seconds 120' 'guard_seconds 900' 'setup_skip none' 'setup_ski
     'check_minutes_tg 1' 'check_minutes_tg 30' 'check_minutes_quota 1' 'check_minutes_quota 60' 'notify_events_minutes 1' 'notify_events_minutes 60'; do
   LC_ALL=C param_check "${pair%% *}" "${pair#* }" > /dev/null || fail "rejected: $pair"
 done
-for pair in 'guard_seconds 119' 'guard_seconds 901' 'setup_skip apt_index' 'setup_skip bbr bbr2' 'run_keep 4' 'run_keep 201' 'audit_days 6' \
+for pair in 'guard_seconds 119' 'guard_seconds 901' 'guard_boot_minutes 0' 'guard_boot_minutes 61' 'guard_boot_minutes 5m' 'setup_skip apt_index' 'setup_skip bbr bbr2' 'run_keep 4' 'run_keep 201' 'audit_days 6' \
     'audit_days 366' 'menu_alerts some' 'menu_alerts none login' 'menu_alert_days 0' 'menu_alert_days 31' 'ssh_rate_limit maybe' 'ssh_max_auth_tries 1' \
     'ssh_max_auth_tries 11' 'ssh_login_grace_seconds 9' 'ssh_login_grace_seconds 121' 'ssh_x11_forwarding 1' 'sysctl_hardening_skip net.ipv4.ip_forward' \
     'bbr_qdisc pfifo_fast' 'zram_swappiness 0' 'zram_swappiness 201' 'zram_page_cluster 4' 'auto_swap_below_mib 511' 'auto_swap_below_mib 16385' \

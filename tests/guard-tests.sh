@@ -77,6 +77,8 @@ boot_unit_there || fail 'no boot unit while a change waits for its confirmation'
 grep -Fxq "ExecStart=/bin/sh $STATE_ROOT/guard/replay" "$GUARD_BOOT_SERVICE_FILE" || fail "the boot unit does not run the script: $(cat "$GUARD_BOOT_SERVICE_FILE")"
 grep -Fxq "ConditionPathExistsGlob=$STATE_ROOT/guard/*.sh" "$GUARD_BOOT_SERVICE_FILE" || fail 'the boot unit would run with nothing waiting'
 grep -Fxq 'WantedBy=multi-user.target' "$GUARD_BOOT_SERVICE_FILE" || fail 'the boot unit is not started at boot'
+# A oneshot unit has no start limit of its own: a hung script would hold the boot.
+grep -Fxq 'TimeoutStartSec=5min' "$GUARD_BOOT_SERVICE_FILE" || fail "the boot unit has no start limit of 5 minutes: $(cat "$GUARD_BOOT_SERVICE_FILE")"
 [[ "$(grep -n '^systemctl enable vps-stable-guard-boot.service$' "$TRACE" | cut -d: -f1)" -lt "$(grep -n '^systemd-run ' "$TRACE" | cut -d: -f1)" ]] ||
   fail "the boot unit was not enabled before the timer started: $(tr '\n' '|' < "$TRACE")"
 # A reboot before the confirmation: the change is undone at boot, once, and
@@ -93,6 +95,16 @@ reboot_now
 [[ "$(guard_replayed_hint)" == *'开机时已经自动撤销：防火墙。'* ]] || fail "the menu does not tell what was undone at boot: $(guard_replayed_hint)"
 if ((EUID == 0)); then [[ -z "$(guard_replayed_hint)" ]] || fail 'the menu tells it again'; fi
 printf 'PASS: a reboot before the confirmation undoes the change at boot, once, and leaves nothing behind.\n'
+
+# The limit is a parameter: the unit is written again with the value asked for.
+fresh limit
+PARAMS_FILE="$CASE/params"
+printf 'guard_boot_minutes=12\n' > "$PARAMS_FILE"
+guard_arm "$A" "touch '$CASE/undone-a'" || fail 'the guard was not armed'
+grep -Fxq 'TimeoutStartSec=12min' "$GUARD_BOOT_SERVICE_FILE" || fail "the boot unit does not take the start limit asked for: $(grep -i timeout "$GUARD_BOOT_SERVICE_FILE")"
+guard_cancel "$A"
+PARAMS_FILE="$TEST_ROOT/no-params"
+printf 'PASS: the boot unit gives up after a start limit (5 minutes, or the one asked for), so a hang cannot hold the boot.\n'
 
 # Confirmed: the file goes before the timer is stopped, the boot unit goes
 # with it, and no reboot undoes the change afterwards.
