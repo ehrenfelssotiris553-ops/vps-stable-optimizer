@@ -13,8 +13,18 @@ notice() {
   text="$(head -n 40 -- "$2" | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')"
   printf '::notice title=%s::%s\n' "$1" "$text"
 }
-group() { printf '::group::%s\n' "$*"; }
-endgroup() { printf '::endgroup::\n'; }
+# Each group's time goes to $LOGS/group-times.txt: a run that is slow, or is
+# stopped at its time limit, says where its time went (vm-run posts the list).
+GROUP_NAME='' GROUP_AT=0
+group() {
+  printf '::group::%s\n' "$*"
+  GROUP_NAME="$*" GROUP_AT=$SECONDS
+}
+endgroup() {
+  printf '::endgroup::\n'
+  if [[ -n "$GROUP_NAME" ]]; then printf '%5d s  %s\n' "$((SECONDS - GROUP_AT))" "$GROUP_NAME" >> "$LOGS/group-times.txt"; fi
+  GROUP_NAME=''
+}
 
 # Answers one interactive command with a rules file; the readable transcript
 # (colours and carriage returns removed) lands in $LOGS/NAME.log.

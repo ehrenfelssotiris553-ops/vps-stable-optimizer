@@ -44,6 +44,10 @@ jobs:
             qemu-system-x86 qemu-utils cloud-image-utils expect openssh-client
       - name: ${{ matrix.system }} VM (${{ matrix.memory }} MiB)
         run: bash tests/ci/report.sh '${{ matrix.system }} VM ${{ matrix.memory }} MiB' bash tests/ci/vm-run.sh ${{ matrix.system }} ${{ matrix.memory }}
+        # Stopped before the job's limit (which ends a job without a word), so
+        # that a run that hangs still posts where it was.
+        env:
+          STEP_MINUTES: 105
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@v6

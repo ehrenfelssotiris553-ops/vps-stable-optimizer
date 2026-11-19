@@ -40,6 +40,10 @@ jobs:
         run: bash tests/ci/report.sh 'prepare ${{ matrix.os }}' bash tests/ci/runner-prepare.sh
       - name: Real run
         run: bash tests/ci/report.sh 'real run ${{ matrix.mode }} ${{ matrix.os }}' bash tests/ci/real-run.sh ${{ matrix.mode }}
+        # Stopped before the job's limit (which ends a job without a word), so
+        # that a run that hangs still posts where it was.
+        env:
+          STEP_MINUTES: 60
       - name: Keep the transcripts
         if: always()
         uses: actions/upload-artifact@v6

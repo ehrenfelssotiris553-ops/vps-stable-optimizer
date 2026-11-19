@@ -84,7 +84,47 @@ qemu-system-x86_64 -machine accel="$accel" -cpu "$cpu" -m "$memory" -smp 2 \
   -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:01 \
   -netdev user,id=n1,net=10.0.3.0/24,hostfwd=tcp:127.0.0.1:2223-:22 -device virtio-net-pci,netdev=n1,mac=52:54:00:12:34:02 \
   -display none -serial file:"$LOGS/console-$system.log" -daemonize -pidfile qemu.pid
-trap 'kill "$(cat "$WORK/qemu.pid" 2>/dev/null)" 2>/dev/null || true' EXIT
+
+# A script for the VM, as root or else as ops with sudo (root may not log in
+# while the SSH hardening is on), within 20 seconds each: for the reports below.
+vm_any() {
+  printf '%s\n' "$1" | timeout 20 ssh "${VM_OPTS[@]}" -o BatchMode=yes "$VM_HOST" sh 2>/dev/null && return 0
+  # (sudo -k asks for the password every time, so it is not left over for sh.)
+  printf '%s\n%s\n' "${ADMIN_PW:-}" "$1" | timeout 20 ssh "${VM_OPTS[@]}" -o BatchMode=yes "${VM_OPS_HOST:-ops@127.0.0.1}" "sudo -k -S -p '' sh" 2>/dev/null
+}
+# However the run ends: where its time went, and what the system's own daily
+# updates did meanwhile (from 06:00 in the VM's time zone, UTC here; they take
+# the package lock the tool then waits for). The run of 2026-11-19 started at
+# 06:10 UTC: every Ubuntu VM took 10 to 25 minutes longer than before, and on
+# the old 24.04 image the download of the upgrade crawled (5 percent in 2
+# minutes) until the run gave up; the Debian VMs, with another mirror, did not
+# slow down. Then the VM goes.
+vm_end() {
+  local code=$?
+  if [[ -n "$GROUP_NAME" ]]; then
+    printf '%5d s  %s (where it ended: exit %s)\n' "$((SECONDS - GROUP_AT))" "$GROUP_NAME" "$code" >> "$LOGS/group-times.txt"
+    GROUP_NAME=''
+  fi
+  if [[ -n "${VM_OPTS+set}" ]]; then
+    { printf 'Now %s UTC. apt-daily and apt-daily-upgrade:\n' "$(date -u +%H:%M:%S)"
+      vm_any "journalctl -q --no-pager -o short-iso -u apt-daily.service -u apt-daily-upgrade.service | grep -E 'Start|Finish|Deactivat|Fail' | tail -n 12
+        echo 'unattended-upgrades:'; grep -h -E 'Starting unattended|Packages that will be upgraded|All upgrades installed|No packages found|Lock could not' /var/log/unattended-upgrades/unattended-upgrades.log | cut -c1-170 | tail -n 10"
+    } > "$LOGS/daily-updates.txt" 2>&1 || true
+    notice "the daily updates of the system during the run ($system $memory MiB)" "$LOGS/daily-updates.txt"
+  fi
+  if [[ -s "$LOGS/group-times.txt" ]]; then notice "time per group ($system $memory MiB: $((SECONDS / 60)) min)" "$LOGS/group-times.txt"; fi
+  kill "$(cat "$WORK/qemu.pid" 2>/dev/null)" 2>/dev/null || true
+}
+# Stopped at the step's time limit (report.sh): what runs on the VM, then the above.
+vm_stopped() {
+  { printf 'Stopped at the time limit, %s UTC, in: %s\n' "$(date -u +%H:%M:%S)" "${GROUP_NAME:-no group}"
+    vm_any 'ps -eo pid,ppid,stat,etimes,args --forest | grep -v "\[" | tail -n 30 | cut -c1-150; systemctl list-jobs --no-pager | head -n 6'
+  } > "$LOGS/at-the-limit.txt" 2>&1 || true
+  notice "the VM at the time limit ($system $memory MiB)" "$LOGS/at-the-limit.txt"
+  exit 143
+}
+trap vm_end EXIT
+trap vm_stopped TERM
 
 # Options go before the host (after it, ssh would send them as the command).
 VM_OPTS=(-i "$WORK/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
@@ -687,19 +727,55 @@ provider_line 'PasswordAuthentication yes' || fail "the guard timer did not put 
 endgroup
 
 group 'SSH hardening: a reboot before the confirmation puts the old settings back at boot'
-# The same again, and this time the machine is rebooted while the change waits
-# for its confirmation: what someone locked out does first, from the provider's
-# panel. The timer is gone with the reboot; up to 3.1.4 the unconfirmed change
-# then stayed for good. Now a unit of the tool undoes it at boot.
-vm_drive ssh-drop.rules ssh-reboot vps ssh || { rc=$?; sudo_journal; fail "ssh hardening (before the reboot) exited with $rc"; }
-has ssh-reboot '已关闭 SSH 密码登录'
-# The dropped session ends on SIGHUP at once; a key login of ops while it still
-# waited would count as the confirmation. A moment first, then the first login.
-sleep 3
-vm_ops "[ -e $KEYONLY ]" || fail 'the hardening was not in place before the reboot'
-vm_ops_sudo 'test -f /etc/systemd/system/vps-stable-guard-boot.service' || fail 'no boot unit while the change waits for its confirmation'
+# The same again, and this time the machine reboots while the change waits for
+# its confirmation, its session still open: what someone locked out does
+# first, from the provider's panel. The timer is gone with the reboot; up to
+# 3.1.4 the unconfirmed change then stayed for good. Now a unit of the tool
+# undoes it at boot.
+# A login of ops would confirm the change, and root may not log in by then: the
+# test looks and reboots through a root connection made before (a session on a
+# connection already made is no new login). A dropped connection first, then a
+# new login to look, failed once on Ubuntu 24.04 (1.5 GiB) without showing why.
+KEPT="$WORK/root.ctl"
+# (Its output goes nowhere: the step's output is a pipe that must not stay open.)
+ssh "${VM_OPTS[@]}" -o ControlMaster=yes -o ControlPersist=yes -o ControlPath="$KEPT" -fN "$VM_HOST" < /dev/null > /dev/null 2>&1 ||
+  fail 'no root connection kept for the reboot'
+# shellcheck disable=SC2029
+vm_kept() { ssh "${VM_OPTS[@]}" -o ControlPath="$KEPT" "$VM_HOST" "$@"; }
+vm_kept true || fail 'the kept root connection does not work'
+# The hardening as in the drop above, left waiting: its question is answered with nothing.
+sed 's/^等待确认（剩余 ==> .*$/等待确认（剩余 ==> !true/' "$CI/rules/ssh-drop.rules" > "$WORK/ssh-reboot.rules"
+grep -Fxq '等待确认（剩余 ==> !true' "$WORK/ssh-reboot.rules" || fail 'no rules for a hardening left waiting'
+vm_drive "$WORK/ssh-reboot.rules" ssh-reboot vps ssh &
+drive_pid=$!
+for ((i = 0; i < 600; i++)); do
+  if grep -Fqs '等待确认（剩余 ==> !true' "$LOGS/ssh-reboot.raw.answers"; then break; fi
+  kill -0 "$drive_pid" 2>/dev/null || break
+  sleep 1
+done
+if ! grep -Fqs '等待确认（剩余 ==> !true' "$LOGS/ssh-reboot.raw.answers"; then
+  pkill -f 'answer\.exp .*ssh-reboot\.rules' || true
+  rc=0; wait "$drive_pid" || rc=$?
+  sudo_journal
+  fail "ssh hardening (before the reboot) did not come to its confirmation (exit $rc)"
+fi
+sleep 2
+if ! vm_kept "[ -e $KEYONLY ]"; then
+  # shellcheck disable=SC2016
+  vm_kept 'ls -l /etc/ssh/sshd_config.d /var/lib/vps-stable-opt/guard; tail -n 8 "$(ls -t /var/lib/vps-stable-opt/logs/run-*.log | head -n 1)"' \
+    > "$LOGS/ssh-reboot-before.log" 2>&1 || true
+  notice "SSH hardening waiting for its confirmation ($system)" "$LOGS/ssh-reboot-before.log"
+  fail 'the hardening was not in place while it waited for its confirmation'
+fi
+vm_kept 'systemctl is-enabled -q vps-stable-guard-boot.service && ls /var/lib/vps-stable-opt/guard/vps-stable-ssh-revert-*.sh' > /dev/null ||
+  fail "no boot unit or guard file while the change waits for its confirmation: $(vm_kept 'ls -l /etc/systemd/system/vps-stable-guard-boot.service /var/lib/vps-stable-opt/guard' 2>&1)"
 reboot_at=$SECONDS
-vm_ops_sudo systemctl reboot || true
+vm_kept 'systemctl reboot' || true
+# The session of the hardening ends with the machine.
+rc=0; wait "$drive_pid" || rc=$?
+printf 'The waiting hardening ended with %s as the machine went down.\n' "$rc"
+ssh -o ControlPath="$KEPT" -O exit "$VM_HOST" 2>/dev/null || true
+has ssh-reboot '已关闭 SSH 密码登录'
 sleep 20
 wait_ssh vm_ops
 undone=0
