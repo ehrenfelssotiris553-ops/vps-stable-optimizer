@@ -204,6 +204,32 @@ guard_arm "$B" "touch '$CASE/undone-b'" || fail 'the second guard was not armed'
 [[ -e "$STATE_ROOT/guard/$A.sh" && ! -e "$CASE/undone-a" ]] || fail 'arming a guard deleted or ran another way back'
 printf 'PASS: a way back nothing ran is run at the start of the next run, and told; arming leaves other files alone.\n'
 
+# What 3.1.x left behind: it removed no file, not even for a change that was
+# confirmed, and took them away at its next arming. Such a file is no way back
+# still owed. Run, it took a confirmed change away: in the first fix of 3.2.0
+# the firewall was off after an upgrade from 3.1.4 (the CI's upgrade runs). It
+# goes unrun at the start of a run and at the next arming, is never run at
+# boot, and keeps no boot unit.
+fresh legacy
+mkdir -p "$STATE_ROOT/guard"
+printf '%s\n' "touch '$CASE/undone-legacy'" > "$STATE_ROOT/guard/vps-stable-ufw-rollback-314-1.sh"
+if guard_owed_any; then fail 'a file of 3.1.x counted as a way back still owed'; fi
+unconfirmed_settle > /dev/null 2>&1
+[[ ! -e "$CASE/undone-legacy" ]] || fail 'a file of 3.1.x was run at the start of a run: a confirmed change was taken away'
+[[ ! -e "$STATE_ROOT/guard/vps-stable-ufw-rollback-314-1.sh" ]] || fail 'a file of 3.1.x stayed after the start of a run'
+if grep -q '^WARN' "$TRACE"; then fail "told of an undo for a file of 3.1.x: $(cat "$TRACE")"; fi
+printf '%s\n' "touch '$CASE/undone-legacy'" > "$STATE_ROOT/guard/vps-stable-ssh-revert-314-2.sh"
+guard_arm "$A" "touch '$CASE/undone-a'" || fail 'the guard was not armed'
+[[ ! -e "$STATE_ROOT/guard/vps-stable-ssh-revert-314-2.sh" && ! -e "$CASE/undone-legacy" ]] || fail 'arming left a file of 3.1.x, or ran it'
+# Should one still be there at boot: not run, while a way back of this version is.
+printf '%s\n' "touch '$CASE/undone-legacy'" > "$STATE_ROOT/guard/vps-stable-ssh-revert-314-3.sh"
+rm -f -- "$MARKS"/*.timer
+reboot_now
+[[ -e "$CASE/undone-a" && ! -e "$CASE/undone-legacy" ]] || fail "at boot, a file of 3.1.x was run, or the owed one was not: $(ls "$CASE" | tr '\n' ' ')"
+guard_boot_off
+boot_unit_gone || fail 'a file of 3.1.x kept the boot unit'
+printf 'PASS: what 3.1.x left behind is no way back still owed: it goes, and is never run.\n'
+
 # Whole or not at all: a file cut short (its end lines lost) would run at every
 # boot and never go. Up to the first 3.2.0 the undo line was written without them.
 fresh half

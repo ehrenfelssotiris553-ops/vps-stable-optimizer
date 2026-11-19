@@ -60,6 +60,7 @@ GUARD_BOOT_SERVICE_FILE="${GUARD_BOOT_SERVICE_FILE:-/nonexistent/vps-test-guard-
 load_optimizer_functions guard_script_end guard_boot_replay_text guard_boot_service_text guard_boot_on guard_boot_off guard_cancel guard_replayed_hint 2>/dev/null || true
 # (Apart: an older script without them still gets the ones above.)
 load_optimizer_functions guard_write guard_owed_any guard_owed_run 2>/dev/null || true
+load_optimizer_functions guard_file_current 2>/dev/null || true
 # What main says first in a run someone watches (nothing here: no terminal).
 load_optimizer_functions startup_notes ui_on_terminal 2>/dev/null || true
 # The single items: how a state is printed and marked, the names and groups.

@@ -4434,11 +4434,16 @@ guard_since() {
 # first. A run that settles the change itself takes the file away first
 # (guard_cancel), so nothing undoes a confirmed change later.
 guard_arm() {
-  local unit="$1" dir="$STATE_ROOT/guard" text
+  local unit="$1" dir="$STATE_ROOT/guard" text old
   mkdir -p -- "$dir" || return 1
-  # Other files are left alone: one still owed has run at the start of this run
-  # already (unconfirmed_settle), before anything changed. Up to the first
-  # 3.2.0 such a file was deleted here, and its change stayed without a word.
+  # What 3.1.x left behind goes, as 3.1.x itself took it away here (see
+  # guard_file_current): the boot unit must never find one. A way back of this
+  # version is left alone, even one whose timer is gone: still owed, it has run
+  # at the start of this run already (unconfirmed_settle), before anything
+  # changed; up to the first 3.2.0 such a file was deleted here unrun.
+  for old in "$dir"/*.sh; do
+    if [[ -f "$old" && ! -L "$old" ]] && ! guard_file_current "$old"; then rm -f -- "$old"; fi
+  done
   # Whole or not at all: a half file would run at every boot, and never go.
   text="$(printf '%s\n' "$2" && guard_script_end "$unit")" || return 1
   guard_write "$dir/$unit.sh" 600 "$text" || return 1
@@ -4461,13 +4466,23 @@ guard_write() {
   fi
 }
 
+# FILE: a way back of this version: it ends by removing itself (the first of
+# guard_script_end's lines), and while it is there its change waits for its
+# confirmation (confirming or putting back here removes it). A file without that
+# line is what 3.1.x left behind: it removed none, not even for a change that
+# was confirmed, and took them away at its next arming. Run, such a file would
+# take a confirmed change away: the firewall off after an upgrade from 3.1.x.
+guard_file_current() {
+  grep -Fxq -- "rm -f -- '$1'" "$1" 2>/dev/null
+}
+
 # True when a way back is still waiting with its timer gone and nothing
 # running it: a change nobody confirmed that nothing undid (the boot unit could
 # not run it, say).
 guard_owed_any() {
   local file unit
   for file in "${STATE_ROOT:-/nonexistent}/guard"/*.sh; do
-    [[ -f "$file" && ! -L "$file" ]] || continue
+    if [[ ! -f "$file" || -L "$file" ]] || ! guard_file_current "$file"; then continue; fi
     unit="$(basename -- "$file" .sh)"
     if ! active "$unit.timer" && ! active "$unit.service"; then return 0; fi
   done
@@ -4476,11 +4491,13 @@ guard_owed_any() {
 
 # Those ways back, each run here, as its timer or the boot unit would have,
 # and said so. Only at the start of a run, before anything changes: run later,
-# an old way back could take a new change at the same place away.
+# an old way back could take a new change at the same place away. What 3.1.x
+# left behind is deleted unrun (see guard_file_current).
 guard_owed_run() {
   local dir="${STATE_ROOT:-/nonexistent}/guard" file unit undone=''
   for file in "$dir"/*.sh; do
     [[ -f "$file" && ! -L "$file" ]] || continue
+    if ! guard_file_current "$file"; then rm -f -- "$file"; continue; fi
     unit="$(basename -- "$file" .sh)"
     if active "$unit.timer" || active "$unit.service"; then continue; fi
     case "$unit" in
@@ -4513,6 +4530,8 @@ guard_boot_replay_text() {
   printf '%s\n' '#!/bin/sh' '# VPS Stable Optimizer: after a reboot, undoes a change that was waiting for its confirmation.' \
     "for f in '$dir'/*.sh; do" \
     '  [ -f "$f" ] || continue' \
+    '  # (A file of 3.1.x, without the line that removes it, is no way back still owed.)' \
+    "  grep -Fqx \"rm -f -- '\$f'\" \"\$f\" || continue" \
     '  unit="$(basename "$f" .sh)"' \
     '  if systemctl is-active -q "$unit.timer" 2>/dev/null; then continue; fi' \
     "  printf '%s\\n' \"\$unit\" >> '$dir/replayed'" \
@@ -4544,8 +4563,9 @@ guard_boot_on() {
 # Nothing waits any more: the boot unit and its script leave the system.
 guard_boot_off() {
   local dir="${STATE_ROOT:-/nonexistent}/guard" file
+  # (What 3.1.x left behind waits for nothing.)
   for file in "$dir"/*.sh; do
-    if [[ -f "$file" ]]; then return 0; fi
+    if [[ -f "$file" ]] && guard_file_current "$file"; then return 0; fi
   done
   [[ -e "$GUARD_BOOT_SERVICE_FILE" || -L "$GUARD_BOOT_SERVICE_FILE" || -e "$dir/replay" ]] || return 0
   # One reload of systemd, once the file is gone (disable alone reloads too).
