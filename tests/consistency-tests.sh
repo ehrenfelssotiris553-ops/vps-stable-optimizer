@@ -266,3 +266,13 @@ INSTALL_SH="$(dirname -- "$TEST_SCRIPT")/install.sh"
   [[ -n "$known" && "$known" == "$(tool_known_launchers)" ]] || fail "earlier launchers: install.sh $known, tool_known_launchers $(tool_known_launchers)"
 )
 printf 'PASS: install.sh writes the launcher the main script knows, and both know the same earlier ones.\n'
+
+# No function that nothing calls: what a change leaves behind (item_status
+# after the single items were redone in 3.2.0, called by nothing but tests).
+# Each name of a function appears somewhere else in the script.
+unused="$(awk '
+  /^[a-z_][a-z0-9_]*\(\) \{$/ { defined[substr($0, 1, index($0, "(") - 1)] = 1 }
+  { n = split($0, words, /[^A-Za-z0-9_]+/); for (i = 1; i <= n; i++) if (words[i] != "") seen[words[i]]++ }
+  END { for (name in defined) if (seen[name] < 2) print name }' "$TEST_SCRIPT" | sort | tr '\n' ' ')"
+[[ -z "$unused" ]] || fail "functions nothing calls: $unused"
+printf 'PASS: every function of the script is called somewhere.\n'

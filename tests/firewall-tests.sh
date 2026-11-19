@@ -165,7 +165,7 @@ systemctl() {
       [[ "$(cat "$CASE_DIR/ufw-active")" == 1 ]] || fail 'ufw.service started while UFW was off'
       printf 'active\n' > "$CASE_DIR/ufw-service" ;;
     # The boot unit leaves again with the last pending change (guard_boot_off).
-    disable) [[ "$*" == 'disable vps-stable-guard-boot.service' ]] || fail "unmocked systemctl disable: $*" ;;
+    disable) [[ "$*" == 'disable --no-reload vps-stable-guard-boot.service' ]] || fail "unmocked systemctl disable: $*" ;;
     daemon-reload) ;;
     *) fail "unmocked systemctl command: $*" ;;
   esac

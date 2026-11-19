@@ -304,6 +304,15 @@ port_open 8080 '' '' > /dev/null
 reset; LISTEN=' udp:51820 '
 port_open 51820 '' '' > /dev/null
 [[ "$(cat "$TEST_ROOT/calls")" == 'allow 51820/udp' ]] || fail "a UDP service opened without naming the protocol: $(tr '\n' '|' < "$TEST_ROOT/calls")"
+# Several ports, no protocol named: each gets what listens on it. The first
+# 3.2.0 took one protocol for them all, and 53,8080 opened 8080/udp as well.
+reset; LISTEN=' udp:53 tcp:8080 '
+port_open 53,8080 '' '' > /dev/null
+[[ "$(tr '\n' '|' < "$TEST_ROOT/calls")" == 'allow 53/udp|allow 8080/tcp|' ]] || fail "two ports, each by what listens on it: $(tr '\n' '|' < "$TEST_ROOT/calls")"
+# One named for all of them is taken for all of them.
+reset
+port_open 53,8080 tcp '' > /dev/null
+[[ "$(tr '\n' '|' < "$TEST_ROOT/calls")" == 'allow 53/tcp|allow 8080/tcp|' ]] || fail "two ports with the protocol named: $(tr '\n' '|' < "$TEST_ROOT/calls")"
 unset -f command
 fn="$(awk '$0 == "port_main() {" {c = 1} c {print} c && $0 == "}" {exit}' "$TEST_SCRIPT")"
 [[ "$fn" == *'PORT_ASK_PROTO=0 port_open "$spec" "$proto" "$src"'* && "$fn" == *'port_close "$spec" "${proto:-both}"'* && "$fn" != *'proto=both'* ]] ||

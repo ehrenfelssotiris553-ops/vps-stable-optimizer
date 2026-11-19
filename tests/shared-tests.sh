@@ -69,8 +69,16 @@ if command -v python3 > /dev/null && python3 -c 1 > /dev/null 2>&1; then
   python3 -I -c 'import json, sys
 d = json.load(open(sys.argv[1])); d["data-root"] = "/data/docker"
 json.dump(d, open(sys.argv[1], "w"), indent=2)' "$DOCKER_DAEMON_FILE"
+  cp -- "$DOCKER_DAEMON_FILE" "$CASE/edited"
   undo dockerlog
   [[ "$(json_value "$DOCKER_DAEMON_FILE" data-root)" == '"/data/docker"' ]] || fail "undoing the log limits lost what the owner added later: $(cat "$DOCKER_DAEMON_FILE")"
+  # The file is written anew (its owner's layout is gone): kept as it was
+  # first, byte for byte, as any changed file the rollback replaces. Up to the
+  # first 3.2.0 no copy was kept of a shared file.
+  kept=("$RESTORE_ROOT"/replaced/dockerlog_file.*)
+  [[ ${#kept[@]} == 1 && -f "${kept[0]}" ]] && cmp -s "$CASE/edited" "${kept[0]}" ||
+    fail "no exact copy of daemon.json as its owner had it: $(ls "$RESTORE_ROOT/replaced" 2>&1)"
+  grep -Fq "另存到 ${kept[0]}，再只拿掉本工具写的那部分" "$CASE/undo.out" || fail "where the copy is is not said: $(cat "$CASE/undo.out")"
   [[ "$(json_value "$DOCKER_DAEMON_FILE" registry-mirrors)" == '["https://mirror.example"]' ]] || fail "undoing the log limits lost what was there before: $(cat "$DOCKER_DAEMON_FILE")"
   [[ "$(json_value "$DOCKER_DAEMON_FILE" log-driver)$(json_value "$DOCKER_DAEMON_FILE" log-opts)" == '--' ]] || fail "the tool's log settings stayed: $(cat "$DOCKER_DAEMON_FILE")"
   grep -Fq '只拿掉了本工具写的那部分' "$CASE/undo.out" || fail "the user is not told that only the tool's part went: $(cat "$CASE/undo.out")"
@@ -150,9 +158,12 @@ IPV4_CHOICE=1
 as_stage ipv4 ipv4_stage
 grep -Fxq -- "$(gai_prefer_line)" "$GAI_FILE" || fail "the stage did not write its line: $(cat "$GAI_FILE")"
 printf 'label 2002::/16 2\n' >> "$GAI_FILE"
+cp -- "$GAI_FILE" "$CASE/edited"
 undo ipv4
 [[ "$(cat "$GAI_FILE")" == "$(cat "$CASE/before")"$'\n''label 2002::/16 2' ]] || fail "gai.conf after the undo: $(cat "$GAI_FILE")"
 grep -Fq '只拿掉了本工具写的那部分' "$CASE/undo.out" || fail "the user is not told that only the tool's lines went: $(cat "$CASE/undo.out")"
+kept=("$RESTORE_ROOT"/replaced/gai_file.*)
+[[ ${#kept[@]} == 1 && -f "${kept[0]}" ]] && cmp -s "$CASE/edited" "${kept[0]}" || fail "no exact copy of gai.conf as its owner had it: $(ls "$RESTORE_ROOT/replaced" 2>&1)"
 # Untouched: byte for byte as before.
 fresh gai-untouched
 printf '# Configuration for getaddrinfo(3).\n' > "$GAI_FILE"

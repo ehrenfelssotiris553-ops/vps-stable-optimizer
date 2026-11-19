@@ -98,10 +98,17 @@ printf '%s\n' 1 auto 0 | param_adjust tcp > /dev/null
 : > "$TEST_ROOT/applied"; STATE=off MODULE='applied'
 out="$(printf '%s\n' 1 16 0 | param_adjust tcp)"
 [[ "$out" == *'开启时就会用新的参数'* && ! -s "$TEST_ROOT/applied" ]] || fail "an item that is off in the system was applied because of its record: $out"
-# In force although the record knows nothing of it (set up by hand): applied.
+# In force although the record knows nothing of it (set up by hand): applied,
+# and said as what it is. Up to the first 3.2.0 it read "applied again", as if
+# this tool had set it up, although the step keeps what someone else wrote.
 STATE=on MODULE=''
-printf '%s\n' 1 24 0 | param_adjust tcp > /dev/null
+out="$(printf '%s\n' 1 24 0 | param_adjust tcp)"
 grep -Fxq 'apply tcp' "$TEST_ROOT/applied" || fail 'an item in force without a record was not applied again'
+[[ "$out" == *'这一项开着，是系统原来的设置：按新的参数试着应用一次'* && "$out" != *'重新应用'* ]] || fail "the system's own item, as if this tool had set it up: $out"
+item_owner() { echo tool; }
+out="$(printf '%s\n' 1 28 0 | param_adjust tcp)"
+[[ "$out" == *'这一项是本工具设的：按新的参数重新应用。'* ]] || fail "this tool's own item: $out"
+item_owner() { echo system; }
 # Not something switched on or off: the record of its last result decides.
 : > "$TEST_ROOT/applied"; STATE=none MODULE='declined'
 printf '%s\n' 1 16 0 | param_adjust tcp > /dev/null
@@ -118,7 +125,6 @@ printf 'PASS: parameters are picked from a list; applied again only when the ite
 # items without parameters do not.
 item_turn_off() { :; }
 port_menu() { :; }
-load_optimizer_functions item_status
 page="$(printf '0\n' | item_action tcp)"
 [[ "$page" == *'  3. 调整参数'* && "$page" != *'恢复推荐值'* && "$page" == *'参数：3 个，现在都是推荐值'* ]] || fail "tcp page with nothing adjusted: $page"
 [[ "$(printf '0\n' | item_action trim)" != *'调整参数'* ]] || fail 'an item without parameters offers to adjust'

@@ -58,13 +58,28 @@ load_optimizer_functions f2b_action_text f2b_action_legacy_text f2b_action_kind 
 # a place of its own (firewall-tests and ssh-tests look at what is written).
 GUARD_BOOT_SERVICE_FILE="${GUARD_BOOT_SERVICE_FILE:-/nonexistent/vps-test-guard-boot.service}"
 load_optimizer_functions guard_script_end guard_boot_replay_text guard_boot_service_text guard_boot_on guard_boot_off guard_cancel guard_replayed_hint 2>/dev/null || true
+# (Apart: an older script without them still gets the ones above.)
+load_optimizer_functions guard_write guard_owed_any guard_owed_run 2>/dev/null || true
+# What main says first in a run someone watches (nothing here: no terminal).
+load_optimizer_functions startup_notes ui_on_terminal 2>/dev/null || true
 # The single items: how a state is printed and marked, the names and groups.
 # A `vps item` run changes nothing in these tests until one says so
 # (robustness-tests loads the real beginning of such a run), and no item is
 # this tool's doing unless a test has its own rollback record (item-tests).
 load_optimizer_functions item_put item_state item_mark item_brief item_about item_groups item_group_keys ui_columns 2>/dev/null || true
+# The table the names, groups and texts of the items come from (since 3.2.0).
+load_optimizer_functions item_info_load 2>/dev/null || true
 item_session_begin() { :; }
 item_owner() { echo system; }
+# What the page offers to undo follows the owner here (restore-tests and
+# item-tests look at the real one).
+item_undoable() { [[ "$(item_owner "$1")" == tool ]]; }
+# The text of one item as the lists show it (a helper of the tests).
+item_status() {
+  local probe
+  probe="$(item_probe "$1")"
+  printf '%s\n' "${probe#*$'\t'}"
+}
 # One look in the (mocked) journal; ssh-tests loads the real one to test it.
 journal_settle() { "$@"; }
 # The switch for published Docker ports is off, unless a test says otherwise;
@@ -74,6 +89,9 @@ dockerfw_on() { return 1; }
 zram_module_offerable() { return 1; }
 # The rollback tables, which every restore_* lookup reads.
 load_optimizer_functions restore_table restore_group_table 2>/dev/null || true
+# What a group has on record besides its resources (restore_group_pending and
+# item_owner read it; since 3.2.0, apart for an older script).
+load_optimizer_functions restore_group_extra 2>/dev/null || true
 # Files shared with their owner (only the tool's part goes), and the copy kept
 # of a file that changed since the tool wrote it; shared-tests is about them.
 load_optimizer_functions restore_shared restore_shared_present restore_shared_apply restore_keep_replaced gai_note_line gai_prefer_line 2>/dev/null || true

@@ -4,9 +4,12 @@
 # Review locally before running as root. Opening the menu does not apply optimization.
 # Sourced (a test loading every function with the real global settings): the
 # caller keeps its own shell options, PATH and umask, nothing is detected and
-# nothing runs. Run directly, as every user does: all of it applies.
+# nothing runs. Run directly, as every user does: all of it applies. Only a
+# sourced file may return: a script read from a pipe ("curl … | bash") is run,
+# though its BASH_SOURCE differs from $0 (taken for sourced, such a run did
+# nothing at all in the first 3.2.0).
 VPS_SOURCED=0
-if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then VPS_SOURCED=1; fi
+if (return 0 2>/dev/null); then VPS_SOURCED=1; fi
 if ((VPS_SOURCED == 0)); then
   set -Eeuo pipefail
   export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -3072,7 +3075,10 @@ param_apply() {
     if [[ -s "$STATE_ROOT/notify.conf" || -s "$STATE_ROOT/quota.conf" ]]; then check_reconcile || warn '检查定时任务没能按新的间隔更新。'; fi
     ok '新的参数下次检查时（几分钟内）就会用上。'
   elif param_item_on "$1"; then
-    echo '这一项已经开启：按新的参数重新应用。'
+    # In force as the system came, the item keeps what someone else set up (as
+    # every step does): "applied again" would promise what may not happen.
+    if [[ "$(item_owner "$1")" == tool ]]; then echo '这一项是本工具设的：按新的参数重新应用。'
+    else echo '这一项开着，是系统原来的设置：按新的参数试着应用一次；别人写的设置会照旧保留，结果见下面。'; fi
     item_turn_on "$1"
   else
     ok '这一项还没开启：开启时就会用新的参数。'
@@ -4428,12 +4434,14 @@ guard_since() {
 # first. A run that settles the change itself takes the file away first
 # (guard_cancel), so nothing undoes a confirmed change later.
 guard_arm() {
-  local unit="$1" dir="$STATE_ROOT/guard" old
+  local unit="$1" dir="$STATE_ROOT/guard" text
   mkdir -p -- "$dir" || return 1
-  for old in "$dir"/*.sh; do
-    if [[ -f "$old" ]] && ! active "$(basename -- "$old" .sh).timer"; then rm -f -- "$old"; fi
-  done
-  printf '%s\n' "$2" "$(guard_script_end "$unit")" > "$dir/$unit.sh" || return 1
+  # Other files are left alone: one still owed has run at the start of this run
+  # already (unconfirmed_settle), before anything changed. Up to the first
+  # 3.2.0 such a file was deleted here, and its change stayed without a word.
+  # Whole or not at all: a half file would run at every boot, and never go.
+  text="$(printf '%s\n' "$2" && guard_script_end "$unit")" || return 1
+  guard_write "$dir/$unit.sh" 600 "$text" || return 1
   guard_boot_on || warn '没能准备好重启后的自动撤销：确认结束之前不要重启这台机器（计时器照常有效）。'
   if ! systemd-run --quiet --unit="$unit" --on-active="$(($(param_value guard_seconds) + 60))s" --timer-property=AccuracySec=1s \
        --timer-property=RemainAfterElapse=no /bin/sh "$dir/$unit.sh"; then
@@ -4442,12 +4450,58 @@ guard_arm() {
   active "$unit.timer"
 }
 
+# FILE MODE TEXT: FILE holds TEXT afterwards, or is as it was before: written
+# beside it first, then renamed over it (a full disk or a power cut while
+# writing leaves no half file).
+guard_write() {
+  local temp
+  temp="$(mktemp "${1%/*}/.guard.XXXXXX")" || return 1
+  if ! printf '%s\n' "$3" > "$temp" || ! chmod "$2" -- "$temp" || ! mv -f -- "$temp" "$1"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+
+# True when a way back is still waiting with its timer gone and nothing
+# running it: a change nobody confirmed that nothing undid (the boot unit could
+# not run it, say).
+guard_owed_any() {
+  local file unit
+  for file in "${STATE_ROOT:-/nonexistent}/guard"/*.sh; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    unit="$(basename -- "$file" .sh)"
+    if ! active "$unit.timer" && ! active "$unit.service"; then return 0; fi
+  done
+  return 1
+}
+
+# Those ways back, each run here, as its timer or the boot unit would have,
+# and said so. Only at the start of a run, before anything changes: run later,
+# an old way back could take a new change at the same place away.
+guard_owed_run() {
+  local dir="${STATE_ROOT:-/nonexistent}/guard" file unit undone=''
+  for file in "$dir"/*.sh; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    unit="$(basename -- "$file" .sh)"
+    if active "$unit.timer" || active "$unit.service"; then continue; fi
+    case "$unit" in
+      vps-stable-ufw-rollback-docker-*) undone+='「Docker 端口受防火墙管」 ' ;;
+      vps-stable-ufw-rollback-*) undone+='防火墙 ' ;;
+      vps-stable-ssh-revert-*) undone+='SSH 设置 ' ;;
+    esac
+    /bin/sh "$file" >/dev/null 2>&1 || true
+    rm -f -- "$file"
+  done
+  if [[ -n "$undone" ]]; then
+    warn "上次有修改一直没有确认，计时器和开机时都没能撤销：现在撤销了：${undone% }。需要的话重新设置一次。"
+  fi
+}
+
 # UNIT: the last lines of its file. The file goes once it has run, and with
-# the last file the boot unit and its script.
+# the last file the boot unit and its script (one reload of systemd).
 guard_script_end() {
   local dir="$STATE_ROOT/guard"
   printf '%s\n' "rm -f -- '$dir/$1.sh'" \
-    "ls '$dir'/*.sh >/dev/null 2>&1 || { systemctl disable vps-stable-guard-boot.service >/dev/null 2>&1; rm -f -- '$GUARD_BOOT_SERVICE_FILE' '$dir/replay'; }"
+    "ls '$dir'/*.sh >/dev/null 2>&1 || { systemctl disable --no-reload vps-stable-guard-boot.service >/dev/null 2>&1; rm -f -- '$GUARD_BOOT_SERVICE_FILE' '$dir/replay'; systemctl daemon-reload >/dev/null 2>&1; }"
 }
 
 # What the boot unit runs: every file still waiting (one whose timer is alive
@@ -4480,9 +4534,9 @@ guard_boot_service_text() {
 guard_boot_on() {
   local dir="$STATE_ROOT/guard"
   [[ ! -L "$GUARD_BOOT_SERVICE_FILE" && ! -L "$dir/replay" ]] || return 1
-  guard_boot_replay_text > "$dir/replay" || return 1
+  guard_write "$dir/replay" 600 "$(guard_boot_replay_text)" || return 1
   if [[ "$(cat -- "$GUARD_BOOT_SERVICE_FILE" 2>/dev/null || true)" != "$(guard_boot_service_text)" ]]; then
-    guard_boot_service_text > "$GUARD_BOOT_SERVICE_FILE" && chmod 644 -- "$GUARD_BOOT_SERVICE_FILE" || return 1
+    guard_write "$GUARD_BOOT_SERVICE_FILE" 644 "$(guard_boot_service_text)" || return 1
   fi
   systemctl enable vps-stable-guard-boot.service >/dev/null 2>&1
 }
@@ -4494,7 +4548,8 @@ guard_boot_off() {
     if [[ -f "$file" ]]; then return 0; fi
   done
   [[ -e "$GUARD_BOOT_SERVICE_FILE" || -L "$GUARD_BOOT_SERVICE_FILE" || -e "$dir/replay" ]] || return 0
-  systemctl disable vps-stable-guard-boot.service >/dev/null 2>&1 || true
+  # One reload of systemd, once the file is gone (disable alone reloads too).
+  systemctl disable --no-reload vps-stable-guard-boot.service >/dev/null 2>&1 || true
   rm -f -- "$GUARD_BOOT_SERVICE_FILE" "$dir/replay"
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
@@ -4506,6 +4561,14 @@ guard_cancel() {
   systemctl stop "$1.timer" >/dev/null 2>&1 || true
   guard_boot_off
 }
+
+# The start of a run someone watches: what a boot undid since the last look is
+# told once, wherever the user looks first (the main menu says it itself, on
+# every drawing; up to the first 3.2.0 only the menu said it).
+startup_notes() {
+  if [[ "${MODE:-}" != menu ]] && ui_on_terminal; then guard_replayed_hint; fi
+}
+ui_on_terminal() { [[ -t 1 ]]; }
 
 # Changes that were undone at boot since the last look: told once.
 guard_replayed_hint() {
@@ -5325,26 +5388,29 @@ ssh_dropin_refresh() {
   if guard_leftovers; then return 0; fi
   cp -p -- "$SSH_DROPIN" "$previous" || { warn '没能保存现在的 SSH 配置，什么都没改。'; return 0; }
   rm -f -- "$SSH_DROPIN"
+  # Going back as the hardening does: should the copy fail, the file goes, which
+  # only widens access. The copy itself goes once nothing may need it.
   if ! put_file "$SSH_DROPIN" "$new" || ! { sshd_runtime_dir; sshd -t; }; then
-    cp -pf -- "$previous" "$SSH_DROPIN"; warn 'sshd 不接受新的参数，已放回原来的设置。'; return 0
+    ssh_dropin_back "$previous"; rm -f -- "$previous"; warn 'sshd 不接受新的参数，已放回原来的设置。'; return 0
   fi
   unit="vps-stable-ssh-revert-$(date +%s)-$$"
-  if ! guard_arm "$unit" "cp -pf '$previous' '$SSH_DROPIN'; systemctl try-reload-or-restart ssh.service"; then
-    cp -pf -- "$previous" "$SSH_DROPIN"; warn '无法启用自动撤销计时器；什么都没改。'; return 0
+  if ! guard_arm "$unit" "$(ssh_dropin_back_cmd "$previous"); systemctl try-reload-or-restart ssh.service"; then
+    ssh_dropin_back "$previous"; rm -f -- "$previous"; warn '无法启用自动撤销计时器；什么都没改。'; return 0
   fi
   deadline=$((SECONDS + $(param_value guard_seconds)))
   if ! ssh_reload; then warn 'sshd 重新加载失败：自动撤销计时器保留，到期时会放回原来的设置。'; return 0; fi
   since="$(guard_since)"
   echo "新的 SSH 参数已生效。请保留这个窗口，再新开一个终端，用密钥登录一次；登录成功后这里会自动确认。$(param_value guard_seconds) 秒内没有确认就放回原来的设置。"
   if guard_confirm "$unit" "$deadline" ssh_login_seen "$since" '' publickey; then
+    rm -f -- "$previous"
     info="$(module_expect ssh 2>/dev/null || true)"
     module_result ssh applied "${info##*$'\t'}"
     ok '新的 SSH 参数已保留。'
     return 0
   fi
   warn '这次没有确认：放回原来的 SSH 设置。'
-  cp -pf -- "$previous" "$SSH_DROPIN"
-  if ssh_reload; then guard_cancel "$unit"
+  ssh_dropin_back "$previous"
+  if ssh_reload; then guard_cancel "$unit"; rm -f -- "$previous"
   else warn 'sshd 重新加载失败：自动撤销计时器保留，到期时会再试一次。'; fi
 }
 
@@ -5782,9 +5848,11 @@ ssh_dropin_back() {
   else rm -f -- "$SSH_DROPIN"; fi
 }
 
-# PREVIOUS: the same as commands for the guard (they run on their own, with sh).
+# PREVIOUS: the same as commands for the guard (they run on their own, with
+# sh); the copy goes once it has been put back.
 ssh_dropin_back_cmd() {
-  printf "if [ -s '%s' ]; then cp -pf '%s' '%s' || rm -f -- '%s'; else rm -f -- '%s'; fi" "$1" "$1" "$SSH_DROPIN" "$SSH_DROPIN" "$SSH_DROPIN"
+  printf "if [ -s '%s' ]; then cp -pf '%s' '%s' || rm -f -- '%s'; else rm -f -- '%s'; fi; rm -f -- '%s'" \
+    "$1" "$1" "$SSH_DROPIN" "$SSH_DROPIN" "$SSH_DROPIN" "$1"
 }
 
 ssh_harden_stage() {
@@ -5930,13 +5998,15 @@ ssh_harden_stage() {
     fi
   fi
   # Not written (a file of someone else's there): only this tool's own old file comes back.
+  # (The copy goes once the change is settled: kept only while a guard may need it.)
   if ! put_file "$SSH_DROPIN" "$(ssh_dropin_text "$want_admin")"; then
     if [[ -s "$previous" ]]; then ssh_dropin_back "$previous"; fi
-    module_result ssh preserved 'drop-in path conflict'; return 0
+    rm -f -- "$previous"; module_result ssh preserved 'drop-in path conflict'; return 0
   fi
   sshd_runtime_dir
   if ! sshd -t; then
-    ssh_dropin_back "$previous"; warn 'sshd -t 不接受新配置，已撤回。'; module_result ssh failed 'sshd -t failed'; return 0
+    ssh_dropin_back "$previous"; rm -f -- "$previous"
+    warn 'sshd -t 不接受新配置，已撤回。'; module_result ssh failed 'sshd -t failed'; return 0
   fi
   # The change's name: the guard timer's, and the mark of lines it comments out.
   tag="$(date +%s)-$$"
@@ -5955,13 +6025,13 @@ ssh_harden_stage() {
     fi
   fi
   if ((${#overridden[@]})); then
-    ssh_dropin_back "$previous"
+    ssh_dropin_back "$previous"; rm -f -- "$previous"
     warn "这些设置没有生效：${overridden[*]}。本工具的新配置已撤回，SSH 登录设置保持原样。"
     module_result ssh preserved 'earlier sshd setting wins'; return 0
   fi
   unit="vps-stable-ssh-revert-$tag"
   guard_arm "$unit" "$(ssh_dropin_back_cmd "$previous")$(sshd_lines_on_cmd ssh "$tag" "${off_files[@]}"); systemctl try-reload-or-restart ssh.service" || {
-    ssh_dropin_back "$previous"; sshd_lines_on ssh "$tag" "${off_files[@]}" || true
+    ssh_dropin_back "$previous"; rm -f -- "$previous"; sshd_lines_on ssh "$tag" "${off_files[@]}" || true
     warn '无法启用 SSH 自动撤销计时器；没有做任何修改。'; module_result ssh failed 'guard not armed'; return 0
   }
   deadline=$((SECONDS + $(param_value guard_seconds)))
@@ -5991,8 +6061,9 @@ ssh_harden_stage() {
   warn '这次没有确认成功：正在恢复原来的 SSH 设置；可以稍后重试。'
   ssh_dropin_back "$previous"
   sshd_lines_on ssh "$tag" "${off_files[@]}" || true
-  # The guard reloads sshd again when it fires: keep it unless this reload worked.
-  if ssh_reload; then guard_cancel "$unit"
+  # The guard reloads sshd again when it fires: keep it unless this reload
+  # worked (and the copy with it, which the guard puts back).
+  if ssh_reload; then guard_cancel "$unit"; rm -f -- "$previous"
   else warn 'sshd 重新加载失败：自动撤销计时器保留，到期时会再重新加载一次。'; fi
   module_result ssh failed 'second login not confirmed; reverted'
 }
@@ -6306,6 +6377,7 @@ restore_sshport_group() {
 # Called at the start of a run: changes whose session ended before they were
 # confirmed (the timers only put back what keeps the machine reachable).
 unconfirmed_settle() {
+  guard_owed_run
   guard_boot_off
   if [[ -s "${STATE_ROOT:-}/sshport-pending" ]]; then stage_run sshport ssh_port_settle; fi
   if [[ -s "${RESTORE_ROOT:-}/dockerfw_rules" ]] && ! dockerfw_on; then stage_run dockerfw dockerfw_settle; fi
@@ -8983,11 +9055,11 @@ menu() {
       5)
         printf '  1. 防火墙和防爆破\n  2. SSH 登录加固\n  3. 修改 SSH 端口\n  4. Fail2ban 封禁记录\n  0. 返回\n'
         read -r -p '请选择 [1-4，0 返回]: ' choice || choice=''
-        case "$choice" in 1) action=firewall ;; 2) action=ssh ;; 3) action=item arg=sshport ;; 4) action=bans ;; *) continue ;; esac ;;
+        case "$choice" in 1) action=firewall ;; 2) action=ssh ;; 3) action=item arg=sshport ;; 4) action=bans ;; ''|0) continue ;; *) echo '无效选项。'; continue ;; esac ;;
       6)
         printf '  1. 安全排查（只读）\n  2. 查看登录记录\n  0. 返回\n'
         read -r -p '请选择 [1-2，0 返回]: ' choice || choice=''
-        case "$choice" in 1) action=audit ;; 2) action=logins ;; *) continue ;; esac ;;
+        case "$choice" in 1) action=audit ;; 2) action=logins ;; ''|0) continue ;; *) echo '无效选项。'; continue ;; esac ;;
       7) action=port ;;
       8) action=clean ;;
       9) action=item arg=databackup ;;
@@ -8996,7 +9068,7 @@ menu() {
       z|Z)
         printf '  1. 撤销本工具的设置\n  2. 卸载本工具（保留优化效果）\n  0. 返回\n'
         read -r -p '请选择 [1-2，0 返回]: ' choice || choice=''
-        case "$choice" in 1) action=rollback ;; 2) action=uninstall ;; *) continue ;; esac ;;
+        case "$choice" in 1) action=rollback ;; 2) action=uninstall ;; ''|0) continue ;; *) echo '无效选项。'; continue ;; esac ;;
       u|U) action=update ;;
       h|H) /bin/bash -- "$self" help ;;
       *) echo '无效选项，请输入 1 至 9，或 r、l、z、u、h，0 退出。'; continue ;;
@@ -9508,7 +9580,7 @@ tool_uninstall() {
     ok '定时备份已停止，已经备份的数据还在目标上。'
   fi
   # The unit that would undo an unconfirmed change at boot runs a file of this tool's data.
-  systemctl disable vps-stable-guard-boot.service >/dev/null 2>&1 || true
+  systemctl disable --no-reload vps-stable-guard-boot.service >/dev/null 2>&1 || true
   rm -f -- "$GUARD_BOOT_SERVICE_FILE"
   systemctl daemon-reload >/dev/null 2>&1 || true
   # Each recursive target is a literal member of the fixed allowlist and was
@@ -10097,6 +10169,9 @@ sys.exit(0 if d else 3)' "$path" "$temp" 2>/dev/null || rc=$?
       if ! grep -q '[^[:space:]]' -- "$temp"; then left=0; fi ;;
     *) rm -f -- "$temp"; return 1 ;;
   esac
+  # The file as it is now is kept first, as for any changed file the rollback
+  # replaces: its owner's formatting is gone with the edit (JSON is written anew).
+  restore_keep_replaced "$id" "$path" '再只拿掉本工具写的那部分' || { rm -f -- "$temp"; return 1; }
   if ((left == 0)) && [[ "$original" == absent ]]; then
     rm -f -- "$temp" "$path" || return 1
     echo "$path 是本工具建的，里面没有别的内容了：已删除。"
@@ -10107,11 +10182,12 @@ sys.exit(0 if d else 3)' "$path" "$temp" 2>/dev/null || rc=$?
   ! restore_shared_present "$id"
 }
 
-# ID PATH: PATH is about to be replaced or removed by the rollback although it
-# changed since this tool last wrote it (by hand, or by another program). What
-# is there now is kept under restore-v2/replaced first, and the user is told.
+# ID PATH [WHAT]: PATH is about to be replaced or removed by the rollback
+# although it changed since this tool last wrote it (by hand, or by another
+# program). What is there now is kept under restore-v2/replaced first, and the
+# user is told, with WHAT happens to the file then.
 restore_keep_replaced() {
-  local id="$1" path="$2" dir="$RESTORE_ROOT/replaced" copy
+  local id="$1" path="$2" what="${3:-再恢复成本工具运行前的样子}" dir="$RESTORE_ROOT/replaced" copy
   [[ -f "$path" && ! -L "$path" ]] || return 0
   [[ "$(restore_fingerprint "$id" 2>/dev/null || true)" != "$(restore_read "$id" last_fp 2>/dev/null || true)" ]] || return 0
   state_path_safe "$dir" || return 1
@@ -10119,7 +10195,7 @@ restore_keep_replaced() {
   copy="$dir/$id.$(date -u +%Y%m%dT%H%M%SZ)"
   # Never writable by others: the uninstall refuses to clear a tree that has such files.
   cp -p -- "$path" "$copy" && chmod go-w -- "$copy" || return 1
-  echo "$path 在本工具上次写入之后被改过：现在的内容先另存到 $copy，再恢复成本工具运行前的样子。"
+  echo "$path 在本工具上次写入之后被改过：现在的内容先另存到 $copy，$what。"
 }
 
 restore_file_apply() {
@@ -10828,18 +10904,26 @@ restore_group_pending() {
     # "applied" while already at the original: a service reload is still due.
     if [[ "$(restore_read "$id" state 2>/dev/null || true)" == applied ]]; then return 0; fi
   done < <(restore_group_ids "$group")
-  case "$group" in
-    firewall) [[ -s "$RESTORE_ROOT/fw_rules" ]] && return 0 ;;
-    dockerfw) [[ -s "$RESTORE_ROOT/dockerfw_rules" ]] && return 0 ;;
-    sysctl) [[ -s "$RESTORE_ROOT/sysctl_runtime" ]] && return 0 ;;
-    tcp) [[ -s "$RESTORE_ROOT/tcp_sysctl_runtime" ]] && return 0 ;;
-    conntrack) [[ -s "$RESTORE_ROOT/conntrack_sysctl_runtime" ]] && return 0 ;;
-    ping) [[ -s "$RESTORE_ROOT/ping_sysctl_runtime" ]] && return 0 ;;
-    zram) [[ -s "$RESTORE_ROOT/zram_sysctl_runtime" ]] && return 0 ;;
-    hostname) [[ -s "$RESTORE_ROOT/hostname_hosts_line" ]] && return 0 ;;
-    ssh|sshport) [[ -n "$(sshd_off_files "$group")" ]] && return 0 ;;
+  restore_group_extra "$group"
+}
+
+# GROUP: what a group has on record besides its resources (runtime values it
+# took over, rules it added, lines it commented out): something to undo too.
+# Only files are looked at, so the single-item lists can ask it of every item.
+restore_group_extra() {
+  local root="${RESTORE_ROOT:-${STATE_ROOT:-/nonexistent}/restore-v2}"
+  case "$1" in
+    firewall) [[ -s "$root/fw_rules" ]] ;;
+    dockerfw) [[ -s "$root/dockerfw_rules" ]] ;;
+    sysctl) [[ -s "$root/sysctl_runtime" ]] ;;
+    tcp) [[ -s "$root/tcp_sysctl_runtime" ]] ;;
+    conntrack) [[ -s "$root/conntrack_sysctl_runtime" ]] ;;
+    ping) [[ -s "$root/ping_sysctl_runtime" ]] ;;
+    zram) [[ -s "$root/zram_sysctl_runtime" ]] ;;
+    hostname) [[ -s "$root/hostname_hosts_line" ]] ;;
+    ssh|sshport) [[ -n "$(RESTORE_ROOT="$root" sshd_off_files "$1")" ]] ;;
+    *) return 1 ;;
   esac
-  return 1
 }
 
 restore_group_apply() {
@@ -12009,39 +12093,45 @@ port_risky_names() {
 }
 
 port_open() {
-  local spec="$1" proto_choice="${2:-}" src="${3:-}" item proto rule total=0 added=0 rules risky list auto n
-  local -a items=() protos=()
+  local spec="$1" proto_choice="${2:-}" src="${3:-}" item proto rule total=0 added=0 rules risky list n i pair same=1
+  local -a items=() protos=() autos=() pairs=()
   # Parsed through "$(...)": a failing function inside "< <(...)" runs outside
   # this condition and set off the error trap ("[出错] line=…") on a mere typo.
   if ! list="$(port_parse_spec "$spec")" || [[ -z "$list" ]]; then
     warn "端口格式不对：$spec（例：8080、443-600、8080,9000-9100；范围 1-65535，且不能一次放行全部端口）"; return 0
   fi
   mapfile -t items <<< "$list"
-  # No protocol named: what listens on the port now, else TCP alone (up to
-  # 3.1.4 TCP and UDP together, wider than most services need). The menu asks,
-  # with that as what Enter means; the command line just takes it.
+  # No protocol named: each port by what listens on it now, else TCP alone (up
+  # to 3.1.4 TCP and UDP together, wider than most services need; in the first
+  # 3.2.0 one protocol for all the ports named, so 53,8080 opened 8080/udp too).
+  # The menu asks, with that as what Enter means; the command line just takes it.
   if [[ -z "$proto_choice" ]]; then
-    auto="$(port_default_proto "${items[@]}")"
+    for item in "${items[@]}"; do autos+=("$(port_default_proto "$item")"); done
+    for i in "${!autos[@]}"; do [[ "${autos[i]}" == "${autos[0]}" ]] || same=0; done
     if [[ -t 0 && "${PORT_ASK_PROTO:-1}" == 1 ]]; then
-      case "$auto" in udp) n=2 ;; both) n=3 ;; *) n=1 ;; esac
-      read -r -p "协议：1) TCP  2) UDP  3) TCP+UDP  [回车默认 $n]: " proto_choice || true
-      case "${proto_choice:-$n}" in 1) proto_choice=tcp ;; 2) proto_choice=udp ;; 3) proto_choice=both ;; *) proto_choice="$auto" ;; esac
-    else
-      proto_choice="$auto"
+      if ((same)); then
+        case "${autos[0]}" in udp) n=2 ;; both) n=3 ;; *) n=1 ;; esac
+        read -r -p "协议：1) TCP  2) UDP  3) TCP+UDP  [回车默认 $n]: " proto_choice || true
+        proto_choice="${proto_choice:-$n}"
+      else
+        read -r -p '协议：1) TCP  2) UDP  3) TCP+UDP  [回车：每个端口按它现在监听的协议]: ' proto_choice || true
+      fi
+      case "$proto_choice" in 1) proto_choice=tcp ;; 2) proto_choice=udp ;; 3) proto_choice=both ;; *) proto_choice='' ;; esac
     fi
   fi
-  if ! list="$(port_protocols "${proto_choice:-both}")" || [[ -z "$list" ]]; then warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; fi
-  mapfile -t protos <<< "$list"
+  for i in "${!items[@]}"; do
+    if ! list="$(port_protocols "${proto_choice:-${autos[i]:-both}}")" || [[ -z "$list" ]]; then warn "协议只能是 tcp、udp 或 both：$proto_choice"; return 0; fi
+    mapfile -t protos <<< "$list"
+    for proto in "${protos[@]}"; do pairs+=("${items[i]}"$'\t'"$proto"); done
+  done
   if [[ -n "$src" ]] && ! port_source_valid "$src"; then warn "来源地址格式不对：$src"; return 0; fi
-  for item in "${items[@]}"; do total=$((total + $(port_item_count "$item") * ${#protos[@]})); done
+  for pair in "${pairs[@]}"; do total=$((total + $(port_item_count "${pair%$'\t'*}"))); done
   echo '即将放行：'
-  for item in "${items[@]}"; do
-    for proto in "${protos[@]}"; do
-      printf '  %s/%s  来源：%s\n' "$(port_item_text "$item")" "$proto" "${src:-所有人}"
-    done
+  for pair in "${pairs[@]}"; do
+    printf '  %s/%s  来源：%s\n' "$(port_item_text "${pair%$'\t'*}")" "${pair#*$'\t'}" "${src:-所有人}"
   done
   printf '共 %s 个端口/协议组合。\n' "$total"
-  for item in "${items[@]}"; do for proto in "${protos[@]}"; do port_listen_note "$item" "$proto"; done; done
+  for pair in "${pairs[@]}"; do port_listen_note "${pair%$'\t'*}" "${pair#*$'\t'}"; done
   if ! ufw_active; then warn '防火墙当前没有开启：规则会保存，但要等防火墙开启后才生效。'; fi
   echo '提醒：服务商的安全组（云防火墙）也要放行同样的端口，否则外网仍然连不上。'
   if docker_present; then
@@ -12051,25 +12141,24 @@ port_open() {
   risky="$(port_risky_names "${items[@]}")"
   if [[ -n "$risky" && -z "$src" ]]; then
     warn "这些端口通常不应该对整个公网开放：$risky"
-    echo "更安全的做法是只允许你自己的 IP，例如：vps port open $spec ${proto_choice:-tcp} from 你的IP"
+    echo "更安全的做法是只允许你自己的 IP，例如：vps port open $spec ${proto_choice:-${autos[0]:-tcp}} from 你的IP"
     if ! confirm_yes '仍然对所有人开放吗？'; then ok '已取消。'; return 0; fi
   fi
   if ((total > 1000)) && ! confirm_yes "一次放行 ${total} 个端口范围较大，确定吗？"; then ok '已取消。'; return 0; fi
   confirm_yes '确认放行？' || { ok '已取消。'; return 0; }
   rules="$(ufw show added)" || { warn '无法读取 UFW 规则。'; return 0; }
-  for item in "${items[@]}"; do
-    for proto in "${protos[@]}"; do
-      rule="$(port_rule_text "$item" "$proto" "$src")"
-      if grep -Fxq -- "$rule" <<< "$rules"; then
-        if port_forget_rule "$rule"; then ok "已经放行着：$(port_item_text "$item")/$proto。这条规则原来是本工具开防火墙时加的，现在算你自己放行的，撤销防火墙时会保留。"
-        else ok "已放行过，跳过：$(port_item_text "$item")/$proto"; fi
-        continue
-      fi
-      if [[ -z "$src" ]]; then ufw allow "$item/$proto" >/dev/null || { warn "放行失败：$item/$proto"; continue; }
-      else ufw allow proto "$proto" from "$src" to any port "$item" >/dev/null || { warn "放行失败：$item/$proto"; continue; }; fi
-      ok "已放行 $(port_item_text "$item")/$proto${src:+（仅 $src）}"
-      added=$((added + 1))
-    done
+  for pair in "${pairs[@]}"; do
+    item="${pair%$'\t'*}" proto="${pair#*$'\t'}"
+    rule="$(port_rule_text "$item" "$proto" "$src")"
+    if grep -Fxq -- "$rule" <<< "$rules"; then
+      if port_forget_rule "$rule"; then ok "已经放行着：$(port_item_text "$item")/$proto。这条规则原来是本工具开防火墙时加的，现在算你自己放行的，撤销防火墙时会保留。"
+      else ok "已放行过，跳过：$(port_item_text "$item")/$proto"; fi
+      continue
+    fi
+    if [[ -z "$src" ]]; then ufw allow "$item/$proto" >/dev/null || { warn "放行失败：$item/$proto"; continue; }
+    else ufw allow proto "$proto" from "$src" to any port "$item" >/dev/null || { warn "放行失败：$item/$proto"; continue; }; fi
+    ok "已放行 $(port_item_text "$item")/$proto${src:+（仅 $src）}"
+    added=$((added + 1))
   done
   printf '本次新增 %s 条放行规则。回退本工具的设置时，这些业务端口会保留。\n' "$added"
 }
@@ -12239,12 +12328,21 @@ port_list() {
   if ((${#others[@]})); then echo '其他规则（SSH 限速、封禁等）：'; printf '  %s\n' "${others[@]}"; fi
 }
 
+# Opening or closing begins the run of `vps item` there (lock, record, backup);
+# looking at the list needs none of it. `vps port` holds them from its start.
+port_change_begin() {
+  if [[ "${MODE:-}" == item ]]; then item_session_begin; fi
+}
+
 port_menu() {
   local choice spec proto src
   while :; do
     say '端口管理'
     echo '1. 放行端口   2. 关闭端口   3. 查看已放行端口   0. 返回'
     read -r -p '请选择: ' choice || return 0
+    case "$choice" in
+      1|2) port_change_begin ;;
+    esac
     case "$choice" in
       1) read -r -p '请输入端口（例：8080 或 443-600 或 8080,9000-9100）: ' spec || return 0
          read -r -p '只允许某个 IP 访问吗？输入 IP 或网段，直接回车表示所有人: ' src || src=''
@@ -12298,28 +12396,80 @@ port_main() {
 # Every item can be turned on on its own (the same stage as in setup, with
 # backups and rollback tracking) or have this tool's own changes undone.
 # "Off" never touches a setting the system already had before this tool.
-item_keys() {
-  printf '%s\n' upgrade updates autoreboot kernel bbr tcp conntrack ipv4 sysctl zram swap journal trim databackup ssh sshport keepalive firewall fail2ban dockerfw ports login notify quota dockerlog ntp timezone hosts hostname tools vnstat ping general
+# The single items, one line each in the order they are listed: key, group,
+# title (of its page), short name (in the overview) and what it is for (the
+# first line of its page). Adding an item is one line here, and its steps.
+# Read into arrays once, in this shell and without one of its own: every
+# lookup below runs inside a "$(...)" of its caller, and the overview asks for
+# the group of each item once per group.
+ITEM_INFO_READY=0
+item_info_load() {
+  ((${ITEM_INFO_READY:-0})) && return 0
+  local row key group label brief
+  local -a rows=(
+    'upgrade|系统更新|系统升级（立即升级一次）|系统升级|把已经装着的软件升级到最新（只在当前大版本内，不删任何软件包）。'
+    'updates|系统更新|自动安全更新|自动更新|每天自动装安全更新，漏洞补丁不用自己盯。'
+    'autoreboot|系统更新|更新后自动重启|自动重启|安全更新需要重启时，在你定的时间自动重启；不设就不会自动重启。'
+    'kernel|系统更新|清理旧内核|旧内核|删掉不再需要的旧内核，腾出 /boot 和硬盘空间（保留正在用的和上一个）。'
+    'bbr|网络|BBR 网络加速|BBR|换用 BBR 拥塞算法：线路有丢包时，下载和代理的速度更稳。'
+    'tcp|网络|TCP 窗口和缓冲区上限|TCP 调优|提高 TCP 缓冲区上限：跨洲代理、远距离传大文件时单个连接更快。'
+    'conntrack|网络|连接跟踪容量|连接跟踪|加大防火墙能同时记住的连接数：连接特别多的机器不会因为表满而丢包。'
+    'ipv4|网络|优先使用 IPv4|优先 IPv4|域名同时有 IPv4 和 IPv6 时先连 IPv4：IPv6 不通的机器不再卡几秒。'
+    'sysctl|网络|内核网络安全参数|内核参数|一组内核网络安全参数：不接受 ICMP 重定向和源路由、开启 SYN Cookies 等。'
+    'zram|内存、硬盘和备份|ZRAM 内存缓冲|ZRAM|把一部分内存压缩起来当 Swap 用：内存突然不够时，进程不会马上被杀。'
+    'swap|内存、硬盘和备份|硬盘 Swap|硬盘 Swap|在硬盘上建一个 Swap 文件：用不了 ZRAM 的小内存机器的应急缓冲。'
+    'journal|内存、硬盘和备份|日志空间限制|日志上限|给系统日志定一个空间上限和保留天数，免得日志把小硬盘写满。'
+    'trim|内存、硬盘和备份|定期 TRIM|TRIM|每周通知一次硬盘哪些空间已经不用了（SSD 和云硬盘需要）。'
+    'databackup|内存、硬盘和备份|数据备份|数据备份|每天把选定的目录加密备份到另一台机器、对象存储或网盘，并定期试着恢复。'
+    'ssh|SSH 和安全|SSH 登录加固|SSH 加固|只允许用密钥登录 SSH，可以再禁止 root 直接登录：猜密码的攻击从此无效。'
+    'sshport|SSH 和安全|SSH 端口|SSH 端口|把 SSH 换到别的端口：挡不住真正的攻击者，但日志里的自动扫描会少很多。'
+    'keepalive|SSH 和安全|SSH 保活|SSH 保活|SSH 连接空着不动时定时探测一下，不会被路由器悄悄断掉后卡死。'
+    'firewall|SSH 和安全|防火墙|防火墙|只放行你允许的端口（SSH、网站和你自己加的），其余从外面连不进来。'
+    'fail2ban|SSH 和安全|Fail2ban 防爆破|Fail2ban|同一个 IP 连续输错 SSH 密码，就封它一段时间。'
+    'dockerfw|SSH 和安全|Docker 端口受防火墙管|Docker 端口|让 Docker 用 -p 发布的容器端口也归防火墙管（默认它们会绕过防火墙）。'
+    'ports|SSH 和安全|端口管理|端口管理|在防火墙上放行或关闭端口。'
+    'login|SSH 和安全|登录记录和提醒|登录记录|每次登录记一行，登录时显示上次是谁从哪里登录的，第一次出现的 IP 标红。'
+    'notify|通知和监控|TG 通知|TG 通知|有人登录、服务停了、硬盘快满这类事，发一条 Telegram 消息给你。'
+    'quota|通知和监控|月流量提醒|流量提醒|按月统计流量，用到额度的几成时提醒你（菜单顶部，开了 TG 也发消息）。'
+    'dockerlog|通知和监控|Docker 容器日志上限|Docker 日志|给每个容器的日志定一个上限：Docker 默认不限，日志能把硬盘写满。'
+    'ntp|基础设置|时间同步|时间同步|让系统时间自动对准：时间差太多，装软件和 HTTPS 都会出错。'
+    'timezone|基础设置|时区|时区|系统显示时间用的时区；定时任务（自动更新、备份）也按它算。'
+    'hosts|基础设置|主机名解析|主机名解析|让本机的主机名能解析：解析不了时 sudo 每次都会多等几秒并报错。'
+    'hostname|基础设置|主机名和显示名|主机名|改系统的主机名，或者只给这台机器起一个显示名（菜单和通知里用）。'
+    'tools|基础设置|常用工具|常用工具|装上常用的小工具（curl、vim、htop、tmux 等，清单可以调）。'
+    'vnstat|高级|vnStat 流量统计|vnStat|装 vnStat 按天按月统计网卡流量，用 vnstat 命令查看。'
+    'ping|高级|禁止 ping|禁止 ping|不回应 ping：只挡最粗的扫描，代价是你自己也没法用 ping 检查这台机器。'
+    'general|高级|本工具的通用设置|通用设置|本工具自己的设置：防失联确认等多久、保留几次运行记录、菜单提醒等。'
+  )
+  declare -ga ITEM_ORDER=()
+  declare -gA ITEM_GROUP_OF=() ITEM_LABEL_OF=() ITEM_BRIEF_OF=() ITEM_ABOUT_OF=()
+  for row in "${rows[@]}"; do
+    key="${row%%|*}" row="${row#*|}"
+    group="${row%%|*}" row="${row#*|}"
+    label="${row%%|*}" row="${row#*|}"
+    brief="${row%%|*}" row="${row#*|}"
+    ITEM_ORDER+=("$key")
+    ITEM_GROUP_OF[$key]="$group" ITEM_LABEL_OF[$key]="$label" ITEM_BRIEF_OF[$key]="$brief" ITEM_ABOUT_OF[$key]="$row"
+  done
+  ITEM_INFO_READY=1
 }
 
-# The heading a single item is listed under (item_keys holds them in order).
+item_keys() {
+  item_info_load
+  printf '%s\n' "${ITEM_ORDER[@]}"
+}
+
+# The heading a single item is listed under.
 item_group() {
-  case "$1" in
-    upgrade|updates|autoreboot|kernel) echo '系统更新' ;;
-    bbr|tcp|conntrack|ipv4|sysctl) echo '网络' ;;
-    zram|swap|journal|trim|databackup) echo '内存、硬盘和备份' ;;
-    ssh|sshport|keepalive|firewall|fail2ban|dockerfw|ports|login) echo 'SSH 和安全' ;;
-    notify|quota|dockerlog) echo '通知和监控' ;;
-    ntp|timezone|hosts|hostname|tools) echo '基础设置' ;;
-    *) echo '高级' ;;
-  esac
+  item_info_load
+  printf '%s\n' "${ITEM_GROUP_OF[$1]:-高级}"
 }
 
 # What the list of items reads once per drawing instead of once per item.
 ITEM_LIST_MODE=0 ITEM_SSHD_T='' ITEM_APT_DUMP=''
 # The page of an item was left (item_action); a `vps item` run has begun to
 # change things (item_session_begin), and the run record from before it.
-ITEM_LEAVE=0 ITEM_SESSION=0 ITEM_PREVIOUS=''
+ITEM_LEAVE=0 ITEM_SESSION=0 ITEM_PREVIOUS='' ITEM_CHOICES=''
 # STATE TEXT: what item_probe prints for one item.
 item_put() {
   printf '%s\t%s\n' "$1" "$2"
@@ -12356,7 +12506,22 @@ item_owner() {
   while IFS= read -r id; do
     if [[ -f "$root/$id/state" && ! -L "$root/$id/state" && "$(cat -- "$root/$id/state" 2>/dev/null || true)" == applied ]]; then echo tool; return 0; fi
   done < <(restore_group_ids "$1")
+  if RESTORE_ROOT="$root" restore_group_extra "$1"; then echo tool; return 0; fi
   echo system
+}
+
+# KEY: this tool has something of this item to undo, by the very test of the
+# undo (item_turn_off): the page of the item offers "2" exactly then.
+# item_owner, for the lists, reads the records only; this also compares the
+# files with how they were before this tool.
+item_undoable() {
+  local root="${STATE_ROOT:-/nonexistent}/restore-v2"
+  case "$1" in
+    upgrade|kernel|ports|general) return 1 ;;
+    tools|vnstat) [[ "$(item_owner "$1")" == tool ]]; return ;;
+  esac
+  [[ -d "$root" && ! -L "$root" ]] || return 1
+  RESTORE_ROOT="$root" restore_group_pending "$1"
 }
 
 # STATE OWNER: the mark of an item. In force and this tool's doing (it can be
@@ -12381,77 +12546,29 @@ item_status_prepare() {
 }
 
 item_label() {
-  case "$1" in
-    upgrade) echo '系统升级（立即升级一次）' ;; updates) echo '自动安全更新' ;; autoreboot) echo '更新后自动重启' ;;
-    bbr) echo 'BBR 网络加速' ;; sysctl) echo '内核网络安全参数' ;; zram) echo 'ZRAM 内存缓冲' ;;
-    journal) echo '日志空间限制' ;; trim) echo '定期 TRIM' ;; ntp) echo '时间同步' ;; timezone) echo '时区' ;;
-    hosts) echo '主机名解析' ;; hostname) echo '主机名和显示名' ;; swap) echo '硬盘 Swap' ;; tools) echo '常用工具' ;;
-    conntrack) echo '连接跟踪容量' ;; ping) echo '禁止 ping' ;; keepalive) echo 'SSH 保活' ;; ipv4) echo '优先使用 IPv4' ;; vnstat) echo 'vnStat 流量统计' ;; kernel) echo '清理旧内核' ;;
-    login) echo '登录记录和提醒' ;;
-    notify) echo 'TG 通知' ;; quota) echo '月流量提醒' ;; dockerlog) echo 'Docker 容器日志上限' ;; sshport) echo 'SSH 端口' ;;
-    firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban 防爆破' ;; ssh) echo 'SSH 登录加固' ;; ports) echo '端口管理' ;;
-    tcp) echo 'TCP 窗口和缓冲区上限' ;;
-    dockerfw) echo 'Docker 端口受防火墙管' ;;
-    databackup) echo '数据备份' ;;
-    general) echo '本工具的通用设置' ;;
-    *) printf '%s\n' "$1" ;;
-  esac
+  item_info_load
+  printf '%s\n' "${ITEM_LABEL_OF[$1]:-$1}"
 }
 
 # KEY TEXT: how an item reads in the overview: a short name, with the value
 # itself where that says more than a mark would.
 item_brief() {
+  local brief
+  item_info_load
+  brief="${ITEM_BRIEF_OF[$1]:-$1}"
   case "$1" in
-    upgrade) echo '系统升级' ;; updates) echo '自动更新' ;; autoreboot) echo '自动重启' ;; kernel) echo '旧内核' ;;
-    bbr) echo 'BBR' ;; tcp) echo 'TCP 调优' ;; conntrack) echo '连接跟踪' ;; ipv4) echo '优先 IPv4' ;; sysctl) echo '内核参数' ;;
-    zram) echo 'ZRAM' ;; swap) echo '硬盘 Swap' ;; journal) echo '日志上限' ;; trim) echo 'TRIM' ;; databackup) echo '数据备份' ;;
-    ssh) echo 'SSH 加固' ;; sshport) echo "SSH 端口 ${2%% *}" ;; keepalive) echo 'SSH 保活' ;; firewall) echo '防火墙' ;; fail2ban) echo 'Fail2ban' ;;
-    dockerfw) echo 'Docker 端口' ;; ports) echo '端口管理' ;; login) echo '登录记录' ;;
-    notify) echo 'TG 通知' ;; quota) echo '流量提醒' ;; dockerlog) echo 'Docker 日志' ;;
-    ntp) echo '时间同步' ;; timezone) echo "时区 $2" ;; hosts) echo '主机名解析' ;; hostname) echo "主机名 ${2%%，*}" ;;
-    tools) echo "常用工具 ${2#已安装 }" ;; vnstat) echo 'vnStat' ;; ping) echo '禁止 ping' ;; general) echo '通用设置' ;;
-    *) printf '%s\n' "$1" ;;
+    sshport) brief+=" ${2%% *}" ;;
+    timezone) brief+=" ${2:-}" ;;
+    hostname) brief+=" ${2%%，*}" ;;
+    tools) brief+=" ${2#已安装 }" ;;
   esac
+  printf '%s\n' "$brief"
 }
 
 # KEY: what the item is for, in one sentence (the first line of its page).
 item_about() {
-  case "$1" in
-    upgrade) echo '把已经装着的软件升级到最新（只在当前大版本内，不删任何软件包）。' ;;
-    updates) echo '每天自动装安全更新，漏洞补丁不用自己盯。' ;;
-    autoreboot) echo '安全更新需要重启时，在你定的时间自动重启；不设就不会自动重启。' ;;
-    kernel) echo '删掉不再需要的旧内核，腾出 /boot 和硬盘空间（保留正在用的和上一个）。' ;;
-    bbr) echo '换用 BBR 拥塞算法：线路有丢包时，下载和代理的速度更稳。' ;;
-    tcp) echo '提高 TCP 缓冲区上限：跨洲代理、远距离传大文件时单个连接更快。' ;;
-    conntrack) echo '加大防火墙能同时记住的连接数：连接特别多的机器不会因为表满而丢包。' ;;
-    ipv4) echo '域名同时有 IPv4 和 IPv6 时先连 IPv4：IPv6 不通的机器不再卡几秒。' ;;
-    sysctl) echo '一组内核网络安全参数：不接受 ICMP 重定向和源路由、开启 SYN Cookies 等。' ;;
-    zram) echo '把一部分内存压缩起来当 Swap 用：内存突然不够时，进程不会马上被杀。' ;;
-    swap) echo '在硬盘上建一个 Swap 文件：用不了 ZRAM 的小内存机器的应急缓冲。' ;;
-    journal) echo '给系统日志定一个空间上限和保留天数，免得日志把小硬盘写满。' ;;
-    trim) echo '每周通知一次硬盘哪些空间已经不用了（SSD 和云硬盘需要）。' ;;
-    databackup) echo '每天把选定的目录加密备份到另一台机器、对象存储或网盘，并定期试着恢复。' ;;
-    ssh) echo '只允许用密钥登录 SSH，可以再禁止 root 直接登录：猜密码的攻击从此无效。' ;;
-    sshport) echo '把 SSH 换到别的端口：挡不住真正的攻击者，但日志里的自动扫描会少很多。' ;;
-    keepalive) echo 'SSH 连接空着不动时定时探测一下，不会被路由器悄悄断掉后卡死。' ;;
-    firewall) echo '只放行你允许的端口（SSH、网站和你自己加的），其余从外面连不进来。' ;;
-    fail2ban) echo '同一个 IP 连续输错 SSH 密码，就封它一段时间。' ;;
-    dockerfw) echo '让 Docker 用 -p 发布的容器端口也归防火墙管（默认它们会绕过防火墙）。' ;;
-    ports) echo '在防火墙上放行或关闭端口。' ;;
-    login) echo '每次登录记一行，登录时显示上次是谁从哪里登录的，第一次出现的 IP 标红。' ;;
-    notify) echo '有人登录、服务停了、硬盘快满这类事，发一条 Telegram 消息给你。' ;;
-    quota) echo '按月统计流量，用到额度的几成时提醒你（菜单顶部，开了 TG 也发消息）。' ;;
-    dockerlog) echo '给每个容器的日志定一个上限：Docker 默认不限，日志能把硬盘写满。' ;;
-    ntp) echo '让系统时间自动对准：时间差太多，装软件和 HTTPS 都会出错。' ;;
-    timezone) echo '系统显示时间用的时区；定时任务（自动更新、备份）也按它算。' ;;
-    hosts) echo '让本机的主机名能解析：解析不了时 sudo 每次都会多等几秒并报错。' ;;
-    hostname) echo '改系统的主机名，或者只给这台机器起一个显示名（菜单和通知里用）。' ;;
-    tools) echo '装上常用的小工具（curl、vim、htop、tmux 等，清单可以调）。' ;;
-    vnstat) echo '装 vnStat 按天按月统计网卡流量，用 vnstat 命令查看。' ;;
-    ping) echo '不回应 ping：只挡最粗的扫描，代价是你自己也没法用 ping 检查这台机器。' ;;
-    general) echo '本工具自己的设置：防失联确认等多久、保留几次运行记录、菜单提醒等。' ;;
-    *) echo '' ;;
-  esac
+  item_info_load
+  printf '%s\n' "${ITEM_ABOUT_OF[$1]:-}"
 }
 
 # The groups of the single items, in the order they are listed (item_group
@@ -12466,13 +12583,6 @@ item_group_keys() {
   while IFS= read -r key; do
     if [[ "$(item_group "$key")" == "$1" ]]; then printf '%s\n' "$key"; fi
   done < <(item_keys)
-}
-
-# Read-only: the text of one item, as its page and the lists show it.
-item_status() {
-  local probe
-  probe="$(item_probe "$1")"
-  printf '%s\n' "${probe#*$'\t'}"
 }
 
 # KEY: one item as it is now, read-only: its state (see item_state) and the
@@ -12764,13 +12874,14 @@ item_firewall_pause() {
 # KEY: the page of one single item: what it is for, how it stands, what can
 # be done, then one choice. ITEM_LEAVE is 1 when the user left the page.
 item_action() {
-  local key="$1" choice='' probe state text owner note='' name total=0 changed=0
+  local key="$1" choice='' probe state text owner=system note='' name total=0 changed=0
   ITEM_LEAVE=0
-  if [[ "$key" == ports ]]; then item_session_begin; port_menu; ITEM_LEAVE=1; return 0; fi
+  # (The port management begins a run only for what changes something.)
+  if [[ "$key" == ports ]]; then port_menu; ITEM_LEAVE=1; return 0; fi
   say "$(item_label "$key")"
   probe="$(item_probe "$key")"
   state="${probe%%$'\t'*}" text="${probe#*$'\t'}"
-  owner="$(item_owner "$key")"
+  if item_undoable "$key"; then owner=tool; fi
   case "$state:$owner" in
     on:tool|warn:tool) note='（本工具设的，可以撤销）' ;;
     on:system|warn:system) note='（系统原来就是这样，不是本工具设的）' ;;
@@ -12790,9 +12901,10 @@ item_action() {
   item_actions "$key" "$state" "$owner" "$text"
   read -r -p '请选择: ' choice || { ITEM_LEAVE=1; return 0; }
   case "$key:$choice" in *:|*:0) ITEM_LEAVE=1; return 0 ;; esac
-  # A key that is no choice at all is only refused: it begins no run (no lock,
-  # no record, no backup of the configuration scrolling past before the refusal).
-  if [[ ! "$choice" =~ ^[1-5]$ ]]; then echo '无效选项。'; return 0; fi
+  # Only a choice the page lists. Anything else is refused and begins no run
+  # (no lock, no record, no backup of the configuration scrolling past first);
+  # up to the first 3.2.0 a number the page did not list was taken as well.
+  if [[ ! "$choice" =~ ^[1-5]$ || "$ITEM_CHOICES" != *" $choice "* ]]; then echo '无效选项。'; return 0; fi
   # Only looking needs no lock, no run record and no backup of the configuration.
   case "$key:$choice" in
     login:5|dockerfw:5) ;;
@@ -12807,14 +12919,10 @@ item_action() {
     dockerfw:5) dockerfw_show ;;
     databackup:5) databackup_menu ;;
     hostname:5) display_name_ask ;;
-    upgrade:1|kernel:1) item_turn_on "$key" ;;
-    upgrade:*|kernel:*) echo '无效选项。' ;;
-    *:3) if [[ -n "$(param_names "$key")" ]]; then param_adjust "$key"; else echo '这一项没有可以调的参数。'; fi ;;
-    *:4) if [[ -n "$(param_names "$key")" ]]; then param_reset "$key"; else echo '这一项没有可以调的参数。'; fi ;;
-    general:*) echo '无效选项。' ;;
     *:1) item_turn_on "$key" ;;
     *:2) item_turn_off "$key" ;;
-    *) echo '无效选项。' ;;
+    *:3) param_adjust "$key" ;;
+    *:4) param_reset "$key" ;;
   esac
 }
 
@@ -12882,7 +12990,12 @@ item_actions() {
     databackup) a+=('5. 备份操作（立即备份、查看、恢复）') ;;
     hostname) a+=('5. 修改显示名') ;;
   esac
-  for line in "${a[@]}"; do printf '  %s\n' "$line"; done
+  # The numbers listed, for item_action to take only these.
+  ITEM_CHOICES=' '
+  for line in "${a[@]}"; do
+    printf '  %s\n' "$line"
+    ITEM_CHOICES+="${line%%.*} "
+  done
   printf '  0. 返回\n'
 }
 
@@ -13048,8 +13161,11 @@ item_main() {
     grep -Fxq -- "${MODE_ARGS[0]}" <<< "$(item_keys)" || die "没有这一项：${MODE_ARGS[0]}。"
   fi
   # What an earlier run left unfinished (a port change or a Docker switch that
-  # never got its confirmation) is finished first: that changes things.
-  if [[ -s "$STATE_ROOT/sshport-pending" ]] || { [[ -s "$STATE_ROOT/restore-v2/dockerfw_rules" ]] && ! dockerfw_on; }; then item_session_begin; fi
+  # never got its confirmation, a way back nothing ran) is finished first:
+  # that changes things.
+  if [[ -s "$STATE_ROOT/sshport-pending" ]] || { [[ -s "$STATE_ROOT/restore-v2/dockerfw_rules" ]] && ! dockerfw_on; } || guard_owed_any; then
+    item_session_begin
+  fi
   if [[ -n "${MODE_ARGS[0]:-}" ]]; then item_page "${MODE_ARGS[0]}"
   else item_menu; fi
   item_session_end
@@ -13269,6 +13385,7 @@ offer_reboot() {
 main() {
   # The tools list is a parameter (root only can read it; others get the default).
   read -r -a TOOLS_PACKAGES <<< "$(param_value tools_list 2>/dev/null || echo "${TOOLS_PACKAGES[*]}")"
+  startup_notes
   case "$MODE" in
     menu) menu; return 0 ;;
     uninstall) tool_uninstall; return 0 ;;

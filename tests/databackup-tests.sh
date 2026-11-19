@@ -459,7 +459,7 @@ printf 'PASS: imported backup parameters reach the schedule without setting anyt
 # Turned on again with restic there: no package index needed. The list marks a
 # backup that failed differently from one that works.
 (
-  load_optimizer_functions item_turn_on item_probe item_status
+  load_optimizer_functions item_turn_on item_probe
   apt_index_ready() { printf 'index\n' >> "$CALLS"; return 1; }
   stage_run() { printf 'stage %s\n' "$1" >> "$CALLS"; }
   : > "$CALLS"

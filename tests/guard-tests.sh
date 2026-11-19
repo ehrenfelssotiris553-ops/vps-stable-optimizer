@@ -87,14 +87,23 @@ reboot_now
 [[ -e "$CASE/undone-a" ]] || fail 'a reboot before the confirmation left the change in place: nothing undid it at boot'
 [[ ! -e "$STATE_ROOT/guard/$A.sh" ]] || fail 'the file stayed after it ran at boot: it would run again at the next one'
 boot_unit_gone || fail 'the boot unit stayed after the last change was undone'
-grep -Fxq 'systemctl disable vps-stable-guard-boot.service' "$TRACE" || fail 'the boot unit was not disabled'
+grep -Fxq 'systemctl disable --no-reload vps-stable-guard-boot.service' "$TRACE" || fail 'the boot unit was not disabled'
 rm -f -- "$CASE/undone-a"
 reboot_now
 [[ ! -e "$CASE/undone-a" ]] || fail 'the change was undone again at a later boot'
 # The menu says so, once (for root, who reads it there).
 [[ "$(guard_replayed_hint)" == *'开机时已经自动撤销：防火墙。'* ]] || fail "the menu does not tell what was undone at boot: $(guard_replayed_hint)"
 if ((EUID == 0)); then [[ -z "$(guard_replayed_hint)" ]] || fail 'the menu tells it again'; fi
-printf 'PASS: a reboot before the confirmation undoes the change at boot, once, and leaves nothing behind.\n'
+# Told at the start of whatever run someone watches, not only in the main menu
+# (which says it itself on every drawing): up to the first 3.2.0 `vps item` or
+# `vps check` right after the reboot said nothing. Not in a run nobody watches.
+printf '%s\n' "$B" > "$STATE_ROOT/guard/replayed"
+ui_on_terminal() { return 1; }
+[[ -z "$(MODE=check startup_notes 2> /dev/null)" ]] || fail 'told in a run nobody watches'
+ui_on_terminal() { return 0; }
+[[ -z "$(MODE=menu startup_notes 2> /dev/null)" ]] || fail 'told twice in the main menu'
+[[ "$(MODE=check startup_notes 2>&1)" == *'开机时已经自动撤销：SSH 设置。'* ]] || fail "not told at the start of vps check: $(MODE=check startup_notes 2>&1)"
+printf 'PASS: a reboot before the confirmation undoes the change at boot, once, and leaves nothing behind; the next run someone watches says so.\n'
 
 # The limit is a parameter: the unit is written again with the value asked for.
 fresh limit
@@ -153,6 +162,64 @@ reboot_now
 [[ -e "$CASE/undone-b" && ! -e "$CASE/undone-a" ]] || fail "after a reboot with one change waiting: $(ls "$CASE" | tr '\n' ' ')"
 boot_unit_gone || fail 'the boot unit stayed after the reboot'
 printf 'PASS: with two changes waiting each is settled on its own.\n'
+
+# Settled with one reload of systemd, after the boot unit's file is gone (a
+# plain disable reloads as well: two, up to the first 3.2.0), by the run and by
+# the last file alike.
+fresh one-reload
+guard_arm "$A" "touch '$CASE/undone-a'" || fail 'the guard was not armed'
+: > "$TRACE"
+guard_confirm "$A" "$((SECONDS + 60))" true < /dev/null > /dev/null 2>&1 || fail 'the confirmation was not accepted'
+[[ "$(grep -c '^systemctl daemon-reload$' "$TRACE")" == 1 ]] && grep -Fxq 'systemctl disable --no-reload vps-stable-guard-boot.service' "$TRACE" &&
+  ! grep -Fxq 'systemctl disable vps-stable-guard-boot.service' "$TRACE" || fail "the boot unit settled with more than one reload: $(tr '\n' '|' < "$TRACE")"
+guard_arm "$A" "touch '$CASE/undone-a'" || fail 'the guard was not armed again'
+: > "$TRACE"
+/bin/sh "$STATE_ROOT/guard/$A.sh"
+[[ "$(grep -c '^systemctl daemon-reload$' "$TRACE")" == 1 ]] && grep -Fxq 'systemctl disable --no-reload vps-stable-guard-boot.service' "$TRACE" ||
+  fail "the last file took the boot unit away with more than one reload: $(tr '\n' '|' < "$TRACE")"
+printf 'PASS: the boot unit goes with one reload of systemd, whoever settles the last change.\n'
+
+# A way back still waiting, its timer gone and nothing having run it (the boot
+# unit could not, say): the start of the next run undoes the change and says
+# so. Up to the first 3.2.0 the next arming deleted such a file unrun, and the
+# change stayed without a word.
+fresh owed
+guard_arm "$A" "touch '$CASE/undone-a'" || fail 'the guard was not armed'
+rm -f -- "$MARKS"/*.timer
+guard_owed_any || fail 'a way back nothing ran is not seen as owed'
+out="$(unconfirmed_settle 2>&1)"
+[[ -e "$CASE/undone-a" && ! -e "$STATE_ROOT/guard/$A.sh" ]] || fail "the start of a run left an owed way back unrun: $(ls "$STATE_ROOT/guard" | tr '\n' ' ')"
+grep -q '^WARN .*计时器和开机时都没能撤销.*防火墙' "$TRACE" || fail "the user is not told what was undone: $(tr '\n' '|' < "$TRACE")"
+boot_unit_gone || fail 'the boot unit stayed after the owed way back ran'
+if guard_owed_any; then fail 'still owed after it ran'; fi
+# One whose timer still counts is the timer's: not run at the start of a run.
+fresh not-owed
+guard_arm "$A" "touch '$CASE/undone-a'" || fail 'the guard was not armed'
+unconfirmed_settle > /dev/null 2>&1
+[[ ! -e "$CASE/undone-a" && -e "$STATE_ROOT/guard/$A.sh" ]] || fail 'a way back whose timer still counts was run at the start of a run'
+# A new arming leaves an owed file alone: run then, an old way back could take
+# the new change at the same place away (the start of the run has run it).
+rm -f -- "$MARKS"/*.timer
+guard_arm "$B" "touch '$CASE/undone-b'" || fail 'the second guard was not armed'
+[[ -e "$STATE_ROOT/guard/$A.sh" && ! -e "$CASE/undone-a" ]] || fail 'arming a guard deleted or ran another way back'
+printf 'PASS: a way back nothing ran is run at the start of the next run, and told; arming leaves other files alone.\n'
+
+# Whole or not at all: a file cut short (its end lines lost) would run at every
+# boot and never go. Up to the first 3.2.0 the undo line was written without them.
+fresh half
+guard_script_end() { return 1; }
+if guard_arm "$A" "touch '$CASE/undone-a'" 2> /dev/null; then fail 'a guard armed without the end of its file'; fi
+[[ ! -e "$STATE_ROOT/guard/$A.sh" ]] || fail "a file without its end lines was left: $(cat "$STATE_ROOT/guard/$A.sh")"
+load_optimizer_functions guard_script_end
+# A full disk (where the system enforces a file size limit, as Linux does).
+if ( trap '' XFSZ; ulimit -f 0; printf 'x\n' > "$TEST_ROOT/limit-probe" ) 2> /dev/null; then
+  printf 'SKIP: file size limits are not enforced here: a write cut short by a full disk was not tried.\n'
+else
+  fresh full-disk
+  if ( trap '' XFSZ; ulimit -f 0; guard_arm "$A" "touch '$CASE/undone-a'" ) 2> /dev/null; then fail 'a guard armed on a full disk'; fi
+  [[ ! -e "$STATE_ROOT/guard/$A.sh" ]] || fail "a full disk left a half file: <$(cat "$STATE_ROOT/guard/$A.sh")>"
+fi
+printf 'PASS: a way back is written whole or not at all.\n'
 
 # The timer cannot be started: nothing is left that a reboot would run.
 fresh no-timer

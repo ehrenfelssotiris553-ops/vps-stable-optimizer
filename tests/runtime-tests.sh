@@ -34,7 +34,13 @@ optimizer_sourceable || fail "this version of the script cannot be sourced whole
 bash "$TEST_SCRIPT" help | grep -Fq 'vps setup' || fail 'run directly, help does not print the help'
 rc=0; bash "$TEST_SCRIPT" no-such-mode > /dev/null 2>&1 || rc=$?
 [[ "$rc" == 2 ]] || fail "run directly, a wrong mode exits with $rc"
-printf 'PASS: sourced, the script defines everything and runs nothing; run directly, it is the tool.\n'
+# Read from a pipe ("curl … | bash"), it is run as well: its BASH_SOURCE is not
+# its $0 then, which the first 3.2.0 took for sourced, and it did nothing at all.
+version="$(sed -n 's/^SCRIPT_VERSION=//p' "$TEST_SCRIPT")"
+[[ "$(bash -s -- --version < "$TEST_SCRIPT" 2>&1)" == "$version" ]] || fail "read from a pipe, the script did not run: <$(bash -s -- --version < "$TEST_SCRIPT" 2>&1)>"
+rc=0; bash -s -- no-such-mode < "$TEST_SCRIPT" > /dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "read from a pipe, a wrong mode exits with $rc"
+printf 'PASS: sourced, the script defines everything and runs nothing; run directly or from a pipe, it is the tool.\n'
 
 # One-click setup with the real traps: STEPS... are run through setup_run, each
 # "name:function". Prints what happened; the status is that of the run. Never

@@ -168,8 +168,14 @@ printf '%s\n' 'PASS: the menu points out a check script from an earlier version.
   menu <<< 0 > "$TEST_ROOT/menu-out"
   if grep -Eq 'HINT' "$TEST_ROOT/menu-out"; then fail 'a hint shown with none asked for'; fi
   : > "$PARAMS_FILE"
+  # A typo in a second-level menu (5, 6 and z) is said, as everywhere else: up
+  # to the first 3.2.0 it went back to the main menu without a word.
+  for sub in 5 6 z; do
+    printf '%s\nx\n0\n' "$sub" | menu > "$TEST_ROOT/menu-out"
+    grep -Fxq '无效选项。' "$TEST_ROOT/menu-out" || fail "a typo in menu $sub is not said: $(tail -n 4 "$TEST_ROOT/menu-out")"
+  done
 )
-printf '%s\n' 'PASS: the menu shows only the hints the parameter asks for.'
+printf '%s\n' 'PASS: the menu shows only the hints the parameter asks for; a typo in a second-level menu is said.'
 
 # Up to three columns, aligned by display width (CJK counts two); one on a
 # phone; every entry in each.

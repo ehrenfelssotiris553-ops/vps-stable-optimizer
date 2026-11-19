@@ -308,7 +308,7 @@ reset; item_firewall_pause
   [[ "$out" == *'Fail2ban 的封禁照常'* && "$out" != *不起作用* ]] || fail "pause with the nftables bans: $out"
 )
 # The pages and the menus of the single items (two levels since 3.2).
-load_optimizer_functions item_page item_group_menu item_overview item_status
+load_optimizer_functions item_page item_group_menu item_overview
 ui_columns() { printf '%s\n' "${COLUMNS:-80}"; }
 say() { printf '\n[%s]\n' "$*"; }
 SYM_OK='+' SYM_HAVE='=' SYM_SKIP='-' SYM_WARN='!' C_OK='' C_DIM='' C_WARN='' C_BOLD='' C_RESET=''
@@ -336,6 +336,11 @@ item_action ports < /dev/null > /dev/null
   logins_show() { record logins; }
   tcp_bdp_menu() { record bdp; }
   display_name_ask() { record display; }
+  # Every number on its page (this tool's doing, a parameter adjusted on each
+  # page with a 4): each does the same on every page.
+  item_owner() { echo tool; }
+  PARAMS_FILE="$TEST_ROOT/all-offered"
+  printf 'guard_seconds=200\nssh_max_auth_tries=5\nssh_rate_limit=no\nf2b_maxretry=3\n' > "$PARAMS_FILE"
   reset
   for pair in 'general 3' 'general 4' 'general 1' 'ssh 3' 'ssh 4' 'ssh 1' 'firewall 2' 'firewall 3' 'firewall 4' 'firewall 5' 'fail2ban 3' 'fail2ban 4' 'fail2ban 5' \
       'login 3' 'login 5' 'tcp 3' 'tcp 5' 'hostname 1' 'hostname 2' 'hostname 5' 'bbr 0' 'bbr '; do
@@ -343,6 +348,23 @@ item_action ports < /dev/null > /dev/null
   done
   [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'adjust general reset general adjust ssh reset ssh on ssh off firewall adjust firewall reset firewall pause adjust fail2ban reset fail2ban allowlist adjust login logins adjust tcp bdp on hostname off hostname display ' ]] ||
     fail "the numbers of a page: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+  # A number its page does not list is refused, and begins nothing: nothing of
+  # this tool's to undo on the system's own item, no recommended value to go
+  # back to with nothing adjusted, no pause for a firewall that is off. Up to the
+  # first 3.2.0 each was taken (and said there was nothing, after a run began).
+  item_owner() { echo system; }
+  PARAMS_FILE=/nonexistent/vps-test-params
+  item_session_begin() { record begin; }
+  reset
+  for pair in 'bbr 2' 'hostname 2' 'fail2ban 4' 'general 4' 'ssh 2'; do
+    item_action "${pair% *}" <<< "${pair#* }" > "$TEST_ROOT/page"
+    [[ "$(tail -n 1 "$TEST_ROOT/page")" == '无效选项。' ]] || fail "$pair is not on its page, and was not refused: $(tail -n 3 "$TEST_ROOT/page")"
+  done
+  PROBE=$'off\t未开启'
+  item_action firewall <<< 5 > "$TEST_ROOT/page"
+  [[ "$(tail -n 1 "$TEST_ROOT/page")" == '无效选项。' ]] || fail "pausing a firewall that is off was not refused: $(tail -n 3 "$TEST_ROOT/page")"
+  PROBE=$'on\t已开启'
+  [[ ! -s "$TEST_ROOT/trace" ]] || fail "a number not on its page began a run or did something: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
   # Only looking (the login record, the list of container ports, leaving the
   # page) begins no run; anything that may change something does.
   item_session_begin() { record begin; }
@@ -353,6 +375,16 @@ item_action ports < /dev/null > /dev/null
   [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'logins shown begin on bbr ' ]] || fail "what begins a run on the page of an item: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
   reset; item_action bbr <<< 7 > "$TEST_ROOT/page"
   [[ "$(tail -n 1 "$TEST_ROOT/page")" == '无效选项。' && ! -s "$TEST_ROOT/trace" ]] || fail "a typo on the page of an item: $(tail -n 2 "$TEST_ROOT/page") / $(cat "$TEST_ROOT/trace")"
+  # The port management begins a run only to open or close a port: looking at
+  # the list is only a look (up to the first 3.2.0 entering it began one).
+  unset -f port_menu
+  load_optimizer_functions port_menu port_change_begin
+  port_list() { record list; }
+  port_open() { record "open $1"; }
+  reset; MODE=item item_action ports < <(printf '3\n0\n') > /dev/null
+  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'list ' ]] || fail "only looking at the open ports began a run: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
+  reset; MODE=item item_action ports < <(printf '1\n8080\n\n0\n') > /dev/null
+  [[ "$(tr '\n' ' ' < "$TEST_ROOT/trace")" == 'begin open 8080 ' ]] || fail "opening a port from the single items: $(tr '\n' ' ' < "$TEST_ROOT/trace")"
 )
 printf 'PASS: a number on the page of a single item means the same on every page; only looking begins no run.\n'
 # What a page offers follows the state of the item and whose doing it is.
@@ -437,7 +469,7 @@ starts="$(sed -n 's/^ *[0-9]*\. \(.*\)  = 已开启$/\1/p' <<< "$second" | while
 [[ "$(while IFS= read -r group; do item_group_keys "$group"; done < <(item_groups) | sort)" == "$(item_keys | sort)" ]] || fail 'the groups do not hold every item once'
 (
   # Drawing the lists does not simulate an upgrade or ask sshd for every item.
-  load_optimizer_functions item_status item_probe
+  load_optimizer_functions item_probe
   apt-get() { fail 'the list ran apt-get'; }
   ITEM_LIST_MODE=1
   [[ "$(item_status upgrade)" == 进入后检查 ]] || fail "upgrade in the list: $(item_status upgrade)"
@@ -479,6 +511,15 @@ starts="$(sed -n 's/^ *[0-9]*\. \(.*\)  = 已开启$/\1/p' <<< "$second" | while
   [[ "$(item_owner tools)" == system && "$(item_owner vnstat)" == tool ]] || fail "owner of packages: $(item_owner tools) $(item_owner vnstat)"
   printf 'htop\n' >> "$STATE_ROOT/restore-v2/packages/installed"
   [[ "$(item_owner tools)" == tool ]] || fail 'a tool package this tool installed'
+  # Only on record outside the resources (a running value it took over): this
+  # tool's to undo as well, in the lists as on the page. Up to the first 3.2.0
+  # the page said "system" and offered no undo, which the rollback would do.
+  unset -f item_undoable; load_optimizer_functions item_undoable restore_group_extra restore_needed restore_read
+  [[ "$(item_owner ping)" == system ]] && ! item_undoable ping || fail "ping with nothing on record: $(item_owner ping)"
+  printf 'net.ipv4.icmp_echo_ignore_all=0\n' > "$STATE_ROOT/restore-v2/ping_sysctl_runtime"
+  [[ "$(item_owner ping)" == tool ]] && item_undoable ping || fail "a running value on record, not this tool's to undo: $(item_owner ping)"
+  if item_undoable general || item_undoable upgrade; then fail 'an item without anything to undo offers it'; fi
+  [[ "$(item_owner vnstat)" == tool ]] && item_undoable vnstat || fail 'a package this tool installed is not offered to uninstall'
 )
 printf 'PASS: the single items are two levels deep, fit a screen, are aligned and do not run the expensive checks for every item.\n'
 item_ask_reboot_time <<< '04:30' > /dev/null 2>&1 || fail 'valid reboot time rejected'

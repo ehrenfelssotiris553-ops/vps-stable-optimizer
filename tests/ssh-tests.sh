@@ -310,6 +310,8 @@ grep -Fxq 'result ssh applied key-only user=alice root-ssh=off' "$CASE/trace" ||
       cp -- "$CASE/old" "$STATE_ROOT/ssh-harden-previous"
       PATH="$STUB:$PATH" sh -c "$cmd"
       cmp -s "$CASE/old" "$SSH_DROPIN" || fail "the guard does not put this tool's key-only file back: $(cat "$SSH_DROPIN" 2>&1)"
+      # Put back, the copy goes (up to the first 3.2.0 it stayed for good).
+      [[ ! -e "$STATE_ROOT/ssh-harden-previous" ]] || fail 'the guard left the copy of the old file behind'
       # Without the copy the guard removes the file: never less access than before.
       cp -- "$CASE/new" "$SSH_DROPIN"; rm -f -- "$STATE_ROOT/ssh-harden-previous"
       PATH="$STUB:$PATH" sh -c "$cmd"
@@ -317,6 +319,8 @@ grep -Fxq 'result ssh applied key-only user=alice root-ssh=off' "$CASE/trace" ||
     else
       cmp -s "$CASE/old" "$SSH_DROPIN" || fail "not confirmed: this tool's key-only file did not come back (password login would be on again): $(cat "$SSH_DROPIN" 2>&1)"
       grep -q '^result ssh failed' "$CASE/trace" || fail "not confirmed, not recorded as failed: $(cat "$CASE/trace")"
+      # Put back here and the guard cancelled: nothing needs the copy any more.
+      [[ ! -e "$STATE_ROOT/ssh-harden-previous" ]] || fail 'the copy of the old file stayed after it was put back'
     fi
   done
   # A file at that path that is not this tool's: left as it is, nothing removed.
@@ -578,13 +582,17 @@ printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and
   OURS=1 GUARD_OK=1
   PARAMS_FILE="$P" ssh_dropin_refresh > "$CASE/out"
   [[ "$(cat "$SSH_DROPIN")" == "$text" ]] || fail "new limits not written: $(cat "$SSH_DROPIN")"
-  grep -q "^arm vps-stable-ssh-revert-[0-9-]* cp -pf '$STATE_ROOT/ssh-dropin-previous' '$SSH_DROPIN'" "$CASE/trace" || fail "no guard: $(cat "$CASE/trace")"
+  # The way back as the hardening's: should the copy fail, the file goes (never less access).
+  grep -Fxq "arm $(sed -n 's/^arm \(vps-stable-ssh-revert-[0-9-]*\) .*/\1/p' "$CASE/trace") $(ssh_dropin_back_cmd "$STATE_ROOT/ssh-dropin-previous"); systemctl try-reload-or-restart ssh.service" "$CASE/trace" ||
+    fail "no guard, or not the way back: $(cat "$CASE/trace")"
   grep -Fxq 'result ssh applied key-only user=alice root-ssh=off' "$CASE/trace" || fail "result after the refresh: $(cat "$CASE/trace")"
-  # No key login: the previous drop-in back, reloaded.
+  [[ ! -e "$STATE_ROOT/ssh-dropin-previous" ]] || fail 'the copy of the old limits stayed after the confirmation'
+  # No key login: the previous drop-in back, reloaded, and its copy gone.
   cp "$CASE/old" "$SSH_DROPIN"; : > "$CASE/trace"; GUARD_OK=0
   PARAMS_FILE="$P" ssh_dropin_refresh > "$CASE/out"
   cmp -s "$SSH_DROPIN" "$CASE/old" && grep -Fxq reload "$CASE/trace" || fail 'an unconfirmed refresh was kept'
   if grep -q '^result ' "$CASE/trace"; then fail 'an unconfirmed refresh recorded as applied'; fi
+  [[ ! -e "$STATE_ROOT/ssh-dropin-previous" ]] || fail 'the copy of the old limits stayed after it was put back'
   # Nothing to do: the same limits, or not this tool's file.
   : > "$CASE/trace"; ssh_dropin_refresh > "$CASE/out"
   if grep -q '^arm ' "$CASE/trace"; then fail 'a guard for unchanged limits'; fi
@@ -607,9 +615,11 @@ printf 'PASS: a provider'"'"'s earlier line is named, commented out on a yes and
   if grep -Eq '[;]| -c ' "$CASE/run"; then fail "commands on systemd's command line: $(cat "$CASE/run")"; fi
   [[ "$(head -n 1 "$CASE/state/guard/unit-c.sh")" == "rm -f -- 'a b'; systemctl try-reload-or-restart ssh.service" ]] || fail "guard file: $(cat "$CASE/state/guard/unit-c.sh")"
   grep -Fq "/bin/sh $CASE/state/guard/unit-c.sh" "$CASE/run" || fail "guard file not run: $(cat "$CASE/run")"
-  # A file whose timer is gone goes at the next arming; one still counting stays.
+  # Arming leaves the other files alone, one whose timer is gone included: that
+  # one is still owed and runs at the start of the next run (guard-tests), not
+  # deleted unrun here as up to the first 3.2.0.
   active() { [[ "$1" != unit-a.timer ]]; }
   PARAMS_FILE=/nonexistent guard_arm unit-d true
-  [[ ! -e "$CASE/state/guard/unit-a.sh" && -e "$CASE/state/guard/unit-b.sh" ]] || fail "guard files: $(ls "$CASE/state/guard" | tr '\n' ' ')"
+  [[ -e "$CASE/state/guard/unit-a.sh" && -e "$CASE/state/guard/unit-b.sh" ]] || fail "guard files: $(ls "$CASE/state/guard" | tr '\n' ' ')"
 )
 printf 'PASS: the SSH session limits and the guard time are parameters; changed limits are applied under a guard.\n'
